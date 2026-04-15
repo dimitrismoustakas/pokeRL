@@ -300,7 +300,7 @@ class ParallelBattleEnv:
     def close(self):
         for env in self.envs:
             env.close()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _collate(

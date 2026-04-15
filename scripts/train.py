@@ -3,9 +3,10 @@
 Usage:
     python -m scripts.train
     python -m scripts.train --device cuda
+    python -m scripts.train --num-envs 1 --rollout-steps 8 --total-timesteps 24
 """
 
-import sys
+import argparse
 import time
 import numpy as np
 import torch
@@ -19,6 +20,49 @@ from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, make_local_acc
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train pokeRL with PPO.")
+    parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
+    parser.add_argument("--num-envs", type=int, default=None, help="Override the number of parallel battle environments.")
+    parser.add_argument("--rollout-steps", type=int, default=None, help="Override rollout steps collected per update.")
+    parser.add_argument("--total-timesteps", type=int, default=None, help="Override the total environment steps to train for.")
+    parser.add_argument("--num-epochs", type=int, default=None, help="Override PPO epochs per update.")
+    parser.add_argument("--num-minibatches", type=int, default=None, help="Override PPO minibatches per update.")
+    parser.add_argument("--log-interval", type=int, default=None, help="Override logging frequency in updates.")
+    parser.add_argument("--save-interval", type=int, default=None, help="Override checkpoint save frequency in updates.")
+    parser.add_argument(
+        "--league-update-interval",
+        type=int,
+        default=None,
+        help="Override league checkpoint and opponent refresh frequency in updates.",
+    )
+    return parser.parse_args()
+
+
+def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, TrainingConfig]:
+    model_config = ModelConfig()
+    env_config = EnvConfig()
+    train_config = TrainingConfig()
+
+    if args.num_envs is not None:
+        env_config.num_envs = args.num_envs
+
+    overrides = {
+        "rollout_steps": args.rollout_steps,
+        "total_timesteps": args.total_timesteps,
+        "num_epochs": args.num_epochs,
+        "num_minibatches": args.num_minibatches,
+        "log_interval": args.log_interval,
+        "save_interval": args.save_interval,
+        "league_update_interval": args.league_update_interval,
+    }
+    for field_name, value in overrides.items():
+        if value is not None:
+            setattr(train_config, field_name, value)
+
+    return model_config, env_config, train_config
 
 
 def make_opponent(env_config, game_data, league, device):
@@ -61,16 +105,20 @@ def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str,
 
 
 def train():
-    device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    if len(sys.argv) > 1 and sys.argv[1] == "--device":
-        device_name = sys.argv[2]
+    args = parse_args()
+    device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
 
     print(f"Device: {device}")
 
-    model_config = ModelConfig()
-    env_config = EnvConfig()
-    train_config = TrainingConfig()
+    model_config, env_config, train_config = build_configs(args)
+
+    steps_per_update = train_config.rollout_steps * env_config.num_envs
+    if train_config.total_timesteps < steps_per_update:
+        raise ValueError(
+            f"total_timesteps ({train_config.total_timesteps}) must be at least one full update "
+            f"({steps_per_update} = rollout_steps * num_envs)."
+        )
 
     # Game data and model
     game_data = GameData(gen=9)
@@ -93,10 +141,10 @@ def train():
         buffer = RolloutBuffer(train_config.rollout_steps, env_config.num_envs, obs_keys)
 
         hidden = agent.initial_hidden(env_config.num_envs)
-        num_updates = train_config.total_timesteps // (train_config.rollout_steps * env_config.num_envs)
+        num_updates = train_config.total_timesteps // steps_per_update
 
         print(f"Total updates: {num_updates}")
-        print(f"Steps per update: {train_config.rollout_steps * env_config.num_envs}")
+        print(f"Steps per update: {steps_per_update}")
         print("Starting training...")
 
         episode_rewards = []
