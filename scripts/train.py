@@ -110,6 +110,10 @@ def train():
                 obs_t = obs_to_device(obs, device)
                 masks_t = torch.from_numpy(masks).to(device).bool()
 
+                # Store the hidden state BEFORE the forward pass so PPO
+                # can reconstruct the same computation during updates.
+                pre_hidden = hidden
+
                 out = agent(obs_t, hidden, action_masks=masks_t)
 
                 actions = out["actions"].cpu().numpy()
@@ -120,7 +124,7 @@ def train():
             # Step environments
             next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
 
-            buffer.add(obs, actions, masks, log_probs, values, rewards, dones, hidden)
+            buffer.add(obs, actions, masks, log_probs, values, rewards, dones, pre_hidden)
 
             # Reset hidden state for done environments
             if hidden is not None and dones.any():

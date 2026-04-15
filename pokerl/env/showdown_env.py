@@ -32,6 +32,7 @@ class ShowdownPlayer(Player):
         self.obs_builder = obs_builder
         self.obs_queue: Queue = Queue()
         self.action_queue: Queue = Queue()
+        self._team_preview_fn = None
 
     def choose_move(self, battle: DoubleBattle) -> BattleOrder:
         obs = self.obs_builder.build(battle)
@@ -49,18 +50,20 @@ class ShowdownPlayer(Player):
         return self._make_order(action, battle)
 
     def teampreview(self, battle: DoubleBattle) -> str:
-        """For now, return the team order from the action queue.
+        """Pick 4 pokemon from the team preview.
 
-        The RL agent can send a team order as a list of indices [0-5].
+        Handled internally with a heuristic -- not routed through the
+        training loop. Learned team preview can be added later by
+        passing a callback via set_team_preview_fn().
         """
-        obs = self.obs_builder.build(battle)
-        mask = np.ones((2, ACTIONS_PER_SLOT), dtype=bool)  # dummy mask for preview
-        self.obs_queue.put((obs, mask, 0.0, False, battle))
-
-        team_order = self.action_queue.get()
-        if isinstance(team_order, (list, np.ndarray)):
-            return "/team " + "".join(str(i + 1) for i in team_order)
+        if self._team_preview_fn is not None:
+            return self._team_preview_fn(battle)
+        # Default: bring first 4 in order
         return "/team 1234"
+
+    def set_team_preview_fn(self, fn):
+        """Optional: override team preview with a custom function."""
+        self._team_preview_fn = fn
 
     def _make_order(self, action: np.ndarray, battle: DoubleBattle) -> BattleOrder:
         """Convert a (2,) action array to a DoubleBattleOrder."""
