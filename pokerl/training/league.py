@@ -7,14 +7,15 @@ from collections import deque
 
 import torch
 import numpy as np
-from poke_env.player import Player
-from poke_env.environment import DoubleBattle
+from poke_env.battle import DoubleBattle
+from poke_env.player import DoubleBattleOrder, PassBattleOrder, Player
 
 from ..model.agent import PokeAgent
 from ..data import GameData
 from ..config import TrainingConfig, EnvConfig
 from ..env.observation import ObservationBuilder
-from ..env.actions import build_action_mask, action_to_order, ACTIONS_PER_SLOT
+from ..env.actions import build_action_mask, action_to_order
+from ..env.showdown_env import make_local_account_configuration
 
 
 class LeaguePlayer(Player):
@@ -39,8 +40,6 @@ class LeaguePlayer(Player):
         self._hidden = None
 
     def choose_move(self, battle: DoubleBattle):
-        from poke_env.player import DoubleBattleOrder
-
         obs = self.obs_builder.build(battle)
         masks = np.stack([build_action_mask(battle, s) for s in range(2)])
 
@@ -59,7 +58,7 @@ class LeaguePlayer(Player):
         for slot in range(2):
             orders.append(action_to_order(int(actions[slot]), battle, slot))
 
-        if orders[0] is None and orders[1] is None:
+        if all(isinstance(order, PassBattleOrder) for order in orders):
             return self.choose_default_move()
         return DoubleBattleOrder(orders[0], orders[1])
 
@@ -135,6 +134,7 @@ class League:
             agent_copy,
             obs_builder,
             self.device,
+            account_configuration=make_local_account_configuration("league"),
             battle_format=self.env_config.battle_format,
             server_configuration=server_config,
         )

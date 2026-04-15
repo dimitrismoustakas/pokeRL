@@ -1,9 +1,8 @@
 """Action space for doubles battles: indices, masking, and conversion to battle orders."""
 
-import torch
 import numpy as np
-from poke_env.environment import DoubleBattle, Pokemon, Move
-from poke_env.player import BattleOrder
+from poke_env.battle import DoubleBattle, Move
+from poke_env.player import PassBattleOrder, SingleBattleOrder
 
 
 # --- Action layout per active slot ---
@@ -20,19 +19,6 @@ SWITCH_OFFSET = 2 * NUM_MOVES * NUM_TARGETS   # 24
 MAX_SWITCHES = 4
 PASS_ACTION = SWITCH_OFFSET + MAX_SWITCHES    # 28
 ACTIONS_PER_SLOT = PASS_ACTION + 1            # 29
-
-# Target index -> Showdown move_target value, per acting slot.
-# In Showdown doubles: -1 = opp left, -2 = opp right, +N = ally position.
-_TARGET_MAP = {
-    0: {0: -1, 1: -2, 2: 2},   # slot 0 (left): ally is position 2
-    1: {0: -1, 1: -2, 2: 1},   # slot 1 (right): ally is position 1
-}
-
-# Move target types that require no target choice (single valid action per move)
-_NO_CHOICE_TARGETS = {
-    "self", "allAdjacentFoes", "allAdjacent", "all", "adjacentAllyOrSelf",
-    "foeSide", "allyTeam", "allyOrSelf", "randomNormal",
-}
 
 
 def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
@@ -60,21 +46,24 @@ def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
 
 def action_to_order(
     action_idx: int, battle: DoubleBattle, slot: int
-) -> BattleOrder | None:
-    """Convert a flat action index to a poke-env BattleOrder."""
+) -> SingleBattleOrder:
+    """Convert a flat action index to a poke-env single-slot order."""
+    if any(battle.force_switch) and not battle.force_switch[slot]:
+        return PassBattleOrder()
+
     kind, idx, target, tera = decode_action(action_idx)
 
     if kind == "pass":
-        return None
+        return PassBattleOrder()
 
     if kind == "switch":
         pokemon = battle.available_switches[slot][idx]
-        return BattleOrder(pokemon)
+        return SingleBattleOrder(pokemon)
 
     # Move order
     move = battle.available_moves[slot][idx]
     showdown_target = _resolve_target(move, slot, target, battle)
-    return BattleOrder(
+    return SingleBattleOrder(
         move,
         move_target=showdown_target,
         terastallize=tera,
@@ -88,8 +77,7 @@ def build_action_mask(battle: DoubleBattle, slot: int) -> np.ndarray:
     """
     mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
 
-    pokemon = battle.active_pokemon[slot]
-    if pokemon is None or pokemon.fainted:
+    if any(battle.force_switch) and not battle.force_switch[slot]:
         mask[PASS_ACTION] = True
         return mask
 
@@ -102,10 +90,14 @@ def build_action_mask(battle: DoubleBattle, slot: int) -> np.ndarray:
             mask[PASS_ACTION] = True
         return mask
 
+    pokemon = battle.active_pokemon[slot]
+    if pokemon is None or pokemon.fainted:
+        mask[PASS_ACTION] = True
+        return mask
+
     # Moves
     moves = battle.available_moves[slot]
-    can_tera = battle.can_tera[slot] if hasattr(battle, "can_tera") else False
-    opp_pokemon = battle.opponent_active_pokemon
+    can_tera = bool(battle.can_tera[slot])
 
     for i, move in enumerate(moves):
         valid_targets = _valid_targets_for_move(move, slot, battle)
@@ -130,37 +122,59 @@ def _valid_targets_for_move(
     move: Move, slot: int, battle: DoubleBattle
 ) -> list[int]:
     """Which of our 3 target indices are valid for this move from this slot."""
-    target_type = move.target if hasattr(move, "target") else "normal"
+    pokemon = battle.active_pokemon[slot]
+    if pokemon is None:
+        return [0]
 
-    if target_type in _NO_CHOICE_TARGETS:
-        return [0]  # no choice -- use first slot as placeholder
+    showdown_targets = battle.get_possible_showdown_targets(move, pokemon)
+    valid_targets = []
+    for showdown_target in showdown_targets:
+        target_idx = _showdown_target_to_index(showdown_target, slot, battle)
+        if target_idx is not None and target_idx not in valid_targets:
+            valid_targets.append(target_idx)
 
-    if target_type == "adjacentAlly":
-        # Can only target ally
-        ally_slot = 1 - slot
-        ally = battle.active_pokemon[ally_slot]
-        if ally and not ally.fainted:
-            return [2]
-        return []
-
-    # "normal" and other single-target types: can target opp_1, opp_2, ally
-    valid = []
-    for j, opp in enumerate(battle.opponent_active_pokemon):
-        if opp and not opp.fainted:
-            valid.append(j)
-    # Ally
-    ally_slot = 1 - slot
-    ally = battle.active_pokemon[ally_slot]
-    if ally and not ally.fainted:
-        valid.append(2)
-    return valid
+    return valid_targets or [0]
 
 
 def _resolve_target(
     move: Move, slot: int, target_idx: int, battle: DoubleBattle
 ) -> int:
     """Convert our abstract target index to a Showdown move_target integer."""
-    target_type = move.target if hasattr(move, "target") else "normal"
-    if target_type in _NO_CHOICE_TARGETS:
-        return 0  # Showdown ignores the target for these
-    return _TARGET_MAP[slot][target_idx]
+    pokemon = battle.active_pokemon[slot]
+    if pokemon is None:
+        return battle.EMPTY_TARGET_POSITION
+
+    possible_targets = battle.get_possible_showdown_targets(move, pokemon)
+    showdown_target = _target_index_to_showdown(target_idx, slot, battle)
+    if showdown_target in possible_targets:
+        return showdown_target
+    return possible_targets[0]
+
+
+def _showdown_target_to_index(
+    showdown_target: int, slot: int, battle: DoubleBattle
+) -> int | None:
+    if showdown_target == battle.EMPTY_TARGET_POSITION:
+        return 0
+
+    ally_position = (
+        battle.POKEMON_2_POSITION if slot == 0 else battle.POKEMON_1_POSITION
+    )
+    mapping = {
+        battle.OPPONENT_1_POSITION: 0,
+        battle.OPPONENT_2_POSITION: 1,
+        ally_position: 2,
+    }
+    return mapping.get(showdown_target)
+
+
+def _target_index_to_showdown(
+    target_idx: int, slot: int, battle: DoubleBattle
+) -> int:
+    ally_position = battle.POKEMON_2_POSITION if slot == 0 else battle.POKEMON_1_POSITION
+    mapping = {
+        0: battle.OPPONENT_1_POSITION,
+        1: battle.OPPONENT_2_POSITION,
+        2: ally_position,
+    }
+    return mapping.get(target_idx, battle.EMPTY_TARGET_POSITION)

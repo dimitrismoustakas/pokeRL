@@ -1,6 +1,6 @@
 """Reward functions for Pokemon battles."""
 
-from poke_env.environment import DoubleBattle
+from poke_env.battle import DoubleBattle
 
 
 def sparse_reward(battle: DoubleBattle) -> float:

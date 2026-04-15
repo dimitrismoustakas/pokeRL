@@ -2,28 +2,17 @@
 
 import json
 from pathlib import Path
-from poke_env.environment import DoubleBattle
+from poke_env.battle import DoubleBattle
 
 
 def save_replay(battle: DoubleBattle, output_dir: str = "replays") -> str | None:
-    """Save a battle's log as a Showdown-compatible replay file.
-
-    The replay can be viewed by uploading it to replay.pokemonshowdown.com
-    or opening it in a local Showdown client.
-
-    Returns the file path, or None if no log available.
-    """
-    if not hasattr(battle, "battle_msg_history") or not battle.battle_msg_history:
-        return None
+    """Save a battle's replay HTML using poke-env's public replay API."""
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     tag = battle.battle_tag.replace("[", "").replace("]", "").replace(" ", "_")
-    path = f"{output_dir}/{tag}.log"
-
-    with open(path, "w") as f:
-        f.write(battle.battle_msg_history)
-
-    return path
+    path = Path(output_dir) / f"{tag}.html"
+    battle.save_replay(path)
+    return str(path)
 
 
 def save_replay_json(battle: DoubleBattle, output_dir: str = "replays") -> str | None:

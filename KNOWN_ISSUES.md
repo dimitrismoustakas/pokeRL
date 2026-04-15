@@ -1,14 +1,12 @@
 # Known Issues
 
-## Will likely need fixing on first run
+## Runtime assumptions
 
-- **poke-env API names**: `battle.can_tera` (might be `can_terastallize`), `pokemon.effects` (might be `_effects` or different name for volatile statuses), `move.target` attribute. All guarded with `hasattr` or will throw clear errors -- fix by checking poke-env source or error messages.
-
-- **`side_conditions` type**: code uses both `in` and `.get()` on `battle.side_conditions`. If poke-env returns a set (not dict), `.get()` will fail. Check actual type and adjust.
+- **poke-env version**: the codebase now targets `poke-env 0.15.x`.
 
 ## Performance
 
-- **Sequential env stepping**: `ParallelBattleEnv.step()` steps envs one at a time. Each blocks until its turn resolves. With 16 envs this is ~16x slower than true parallel stepping. Fix with `ThreadPoolExecutor` or async stepping if throughput becomes the bottleneck.
+- **Single-battle latency**: localhost is the intended setup, and `ParallelBattleEnv` now steps envs concurrently. Individual random doubles battles are still relatively slow to finish end to end, so long smoke battles can exceed short terminal timeouts even when the battle loop is progressing correctly.
 
 - **LSTM truncated BPTT**: per-step hidden states are stored and restored, so transitions can be shuffled freely in PPO. The tradeoff is gradients don't flow back through time. Standard simplification, fine for v1.
 

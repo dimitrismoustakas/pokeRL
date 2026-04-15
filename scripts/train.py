@@ -10,28 +10,29 @@ import time
 import numpy as np
 import torch
 
-from poke_env.player import RandomPlayer
+from poke_env.player import MaxBasePowerPlayer
 
 from pokerl.config import ModelConfig, EnvConfig, TrainingConfig
 from pokerl.data import GameData
 from pokerl.model.agent import PokeAgent
-from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv
+from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, make_local_account_configuration
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
 
 
 def make_opponent(env_config, game_data, league, device):
-    """Create an opponent: either from the league or a random bot."""
+    """Create an opponent: either from the league or a max-base-power bot."""
     if league.should_use_league():
         opponent = league.make_opponent()
         if opponent is not None:
             return opponent, "league"
 
-    return RandomPlayer(
+    return MaxBasePowerPlayer(
+        account_configuration=make_local_account_configuration("maxbase"),
         battle_format=env_config.battle_format,
         server_configuration=_server_config(env_config),
-    ), "random"
+    ), "max-base-power"
 
 
 def make_envs(env_config, game_data, league, device):
@@ -52,7 +53,7 @@ def refresh_opponents(parallel_env, env_config, game_data, league, device):
     """
     for env in parallel_env.envs:
         opponent, kind = make_opponent(env_config, game_data, league, device)
-        env.opponent = opponent
+        env.set_next_opponent(opponent)
 
 
 def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -82,106 +83,109 @@ def train():
     trainer = PPOTrainer(agent, train_config, device)
     league = League(train_config, env_config, game_data, agent, device)
 
-    # Environments (start with random opponents, league is empty)
+    # Environments (start with max-base-power opponents, league is empty)
     parallel_env = make_envs(env_config, game_data, league, device)
 
-    # Rollout buffer
-    obs, masks = parallel_env.reset()
-    obs_keys = list(obs.keys())
-    buffer = RolloutBuffer(train_config.rollout_steps, env_config.num_envs, obs_keys)
+    try:
+        # Rollout buffer
+        obs, masks = parallel_env.reset()
+        obs_keys = list(obs.keys())
+        buffer = RolloutBuffer(train_config.rollout_steps, env_config.num_envs, obs_keys)
 
-    hidden = agent.initial_hidden(env_config.num_envs)
-    num_updates = train_config.total_timesteps // (train_config.rollout_steps * env_config.num_envs)
+        hidden = agent.initial_hidden(env_config.num_envs)
+        num_updates = train_config.total_timesteps // (train_config.rollout_steps * env_config.num_envs)
 
-    print(f"Total updates: {num_updates}")
-    print(f"Steps per update: {train_config.rollout_steps * env_config.num_envs}")
-    print("Starting training...")
+        print(f"Total updates: {num_updates}")
+        print(f"Steps per update: {train_config.rollout_steps * env_config.num_envs}")
+        print("Starting training...")
 
-    episode_rewards = []
-    start_time = time.time()
+        episode_rewards = []
+        start_time = time.time()
 
-    for update in range(1, num_updates + 1):
-        agent.eval()
-        buffer.reset()
+        for update in range(1, num_updates + 1):
+            agent.eval()
+            buffer.reset()
 
-        # --- Collect rollout ---
-        for step in range(train_config.rollout_steps):
+            # --- Collect rollout ---
+            for step in range(train_config.rollout_steps):
+                with torch.no_grad():
+                    obs_t = obs_to_device(obs, device)
+                    masks_t = torch.from_numpy(masks).to(device).bool()
+
+                    # Store the hidden state BEFORE the forward pass so PPO
+                    # can reconstruct the same computation during updates.
+                    pre_hidden = hidden
+
+                    out = agent(obs_t, hidden, action_masks=masks_t)
+
+                    actions = out["actions"].cpu().numpy()
+                    log_probs = out["log_prob"].cpu().numpy()
+                    values = out["value"].cpu().numpy()
+                    hidden = out["hidden"]
+
+                # Step environments
+                next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
+
+                buffer.add(obs, actions, masks, log_probs, values, rewards, dones, pre_hidden)
+
+                # Reset hidden state for done environments
+                if hidden is not None and dones.any():
+                    h, c = hidden
+                    done_idx = torch.from_numpy(dones).to(device)
+                    h[:, done_idx] = 0
+                    c[:, done_idx] = 0
+                    hidden = (h, c)
+
+                # Track episode rewards
+                for info in infos:
+                    if "episode_reward" in info:
+                        episode_rewards.append(info["episode_reward"])
+
+                obs, masks = next_obs, next_masks
+
+            # --- Compute advantages ---
             with torch.no_grad():
                 obs_t = obs_to_device(obs, device)
-                masks_t = torch.from_numpy(masks).to(device).bool()
+                last_value = agent.get_value(obs_t, hidden).cpu().numpy()
 
-                # Store the hidden state BEFORE the forward pass so PPO
-                # can reconstruct the same computation during updates.
-                pre_hidden = hidden
+            batch = buffer.compute_gae(last_value, train_config.gamma, train_config.gae_lambda)
 
-                out = agent(obs_t, hidden, action_masks=masks_t)
+            # --- PPO update ---
+            agent.train()
+            metrics = trainer.update(batch)
 
-                actions = out["actions"].cpu().numpy()
-                log_probs = out["log_prob"].cpu().numpy()
-                values = out["value"].cpu().numpy()
-                hidden = out["hidden"]
+            # --- Logging ---
+            if update % train_config.log_interval == 0:
+                elapsed = time.time() - start_time
+                sps = trainer.global_step / elapsed
+                win_rate = np.mean([r > 0 for r in episode_rewards[-100:]]) if episode_rewards else 0
+                print(
+                    f"Update {update}/{num_updates} | "
+                    f"Step {trainer.global_step:,} | "
+                    f"SPS {sps:.0f} | "
+                    f"Win rate (100) {win_rate:.2%} | "
+                    f"Policy loss {metrics['policy_loss']:.4f} | "
+                    f"Value loss {metrics['value_loss']:.4f} | "
+                    f"Entropy {metrics['entropy']:.4f} | "
+                    f"League pool {len(league.checkpoints)}"
+                )
 
-            # Step environments
-            next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
+            # --- Checkpointing ---
+            if update % train_config.save_interval == 0:
+                path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
+                trainer.save(path)
+                print(f"Saved checkpoint: {path}")
 
-            buffer.add(obs, actions, masks, log_probs, values, rewards, dones, pre_hidden)
+            # --- League: add checkpoint and refresh opponents ---
+            if update % train_config.league_update_interval == 0:
+                league.add_checkpoint(agent, trainer.global_step)
+                refresh_opponents(parallel_env, env_config, game_data, league, device)
+                print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
 
-            # Reset hidden state for done environments
-            if hidden is not None and dones.any():
-                h, c = hidden
-                done_idx = torch.from_numpy(dones).to(device)
-                h[:, done_idx] = 0
-                c[:, done_idx] = 0
-                hidden = (h, c)
-
-            # Track episode rewards
-            for info in infos:
-                if "episode_reward" in info:
-                    episode_rewards.append(info["episode_reward"])
-
-            obs, masks = next_obs, next_masks
-
-        # --- Compute advantages ---
-        with torch.no_grad():
-            obs_t = obs_to_device(obs, device)
-            last_value = agent.get_value(obs_t, hidden).cpu().numpy()
-
-        batch = buffer.compute_gae(last_value, train_config.gamma, train_config.gae_lambda)
-
-        # --- PPO update ---
-        agent.train()
-        metrics = trainer.update(batch)
-
-        # --- Logging ---
-        if update % train_config.log_interval == 0:
-            elapsed = time.time() - start_time
-            sps = trainer.global_step / elapsed
-            win_rate = np.mean([r > 0 for r in episode_rewards[-100:]]) if episode_rewards else 0
-            print(
-                f"Update {update}/{num_updates} | "
-                f"Step {trainer.global_step:,} | "
-                f"SPS {sps:.0f} | "
-                f"Win rate (100) {win_rate:.2%} | "
-                f"Policy loss {metrics['policy_loss']:.4f} | "
-                f"Value loss {metrics['value_loss']:.4f} | "
-                f"Entropy {metrics['entropy']:.4f} | "
-                f"League pool {len(league.checkpoints)}"
-            )
-
-        # --- Checkpointing ---
-        if update % train_config.save_interval == 0:
-            path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
-            trainer.save(path)
-            print(f"Saved checkpoint: {path}")
-
-        # --- League: add checkpoint and refresh opponents ---
-        if update % train_config.league_update_interval == 0:
-            league.add_checkpoint(agent, trainer.global_step)
-            refresh_opponents(parallel_env, env_config, game_data, league, device)
-            print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
-
-    print("Training complete.")
-    trainer.save(f"{train_config.checkpoint_dir}/final.pt")
+        print("Training complete.")
+        trainer.save(f"{train_config.checkpoint_dir}/final.pt")
+    finally:
+        parallel_env.close()
 
 
 def _server_config(env_config: EnvConfig):

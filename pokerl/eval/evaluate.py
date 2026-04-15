@@ -6,7 +6,7 @@ import torch
 from ..config import ModelConfig, EnvConfig
 from ..data import GameData
 from ..model.agent import PokeAgent
-from ..env.showdown_env import BattleEnv
+from ..env.showdown_env import BattleEnv, make_local_account_configuration
 from ..env.observation import ObservationBuilder
 from ..env.actions import ACTIONS_PER_SLOT
 
@@ -60,8 +60,8 @@ def load_and_evaluate(
     num_games: int = 100,
     device_name: str = "cpu",
 ):
-    """Load a checkpoint and evaluate against a random bot."""
-    from poke_env.player import RandomPlayer
+    """Load a checkpoint and evaluate against a max-base-power bot."""
+    from poke_env.player import MaxBasePowerPlayer
 
     device = torch.device(device_name)
     game_data = GameData(gen=9)
@@ -73,11 +73,17 @@ def load_and_evaluate(
     agent.load_state_dict(checkpoint["agent"])
     agent.to(device)
 
-    opponent = RandomPlayer(battle_format=env_config.battle_format)
+    opponent = MaxBasePowerPlayer(
+        account_configuration=make_local_account_configuration("eval"),
+        battle_format=env_config.battle_format,
+    )
     env = BattleEnv(env_config, game_data, opponent)
 
-    results = evaluate(agent, env, num_games, device)
-    print(f"Results over {num_games} games:")
-    print(f"  Win rate: {results['win_rate']:.1%}")
-    print(f"  Avg game length: {results['avg_game_length']:.1f} turns")
-    return results
+    try:
+        results = evaluate(agent, env, num_games, device)
+        print(f"Results over {num_games} games:")
+        print(f"  Win rate: {results['win_rate']:.1%}")
+        print(f"  Avg game length: {results['avg_game_length']:.1f} turns")
+        return results
+    finally:
+        env.close()

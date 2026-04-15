@@ -1,5 +1,7 @@
 """Game data: vocab lookups and optional stat-based embedding initialization."""
 
+import hashlib
+
 import torch
 import numpy as np
 from poke_env.data import GenData
@@ -11,7 +13,7 @@ UNKNOWN_IDX = 0  # reserved for unknown / unobserved
 class GameData:
     """Builds vocab mappings and stat tables from poke-env's gen data."""
 
-    def __init__(self, gen: int = 9):
+    def __init__(self, gen: int = 9, item_vocab_size: int = 2048):
         data = GenData.from_gen(gen)
 
         # Build vocabs: string id -> integer index (0 = unknown)
@@ -21,10 +23,11 @@ class GameData:
             a for pokemon in data.pokedex.values()
             for a in (pokemon.get("abilities") or {}).values()
         )
-        self.item_to_idx = self._build_vocab(
-            item for item in data.items.keys() if item  # skip empty
-        )
+        self.item_to_idx = self._build_vocab(self._known_item_ids(data.pokedex.values()))
         self.type_to_idx = self._build_vocab(data.type_chart.keys())
+        self._item_vocab_size = max(item_vocab_size, len(self.item_to_idx))
+        self._item_hash_offset = len(self.item_to_idx)
+        self._item_hash_buckets = self._item_vocab_size - self._item_hash_offset
 
         # Store raw data for stat init
         self._pokedex = data.pokedex
@@ -44,7 +47,7 @@ class GameData:
 
     @property
     def num_items(self) -> int:
-        return len(self.item_to_idx)
+        return self._item_vocab_size
 
     @property
     def num_types(self) -> int:
@@ -92,6 +95,20 @@ class GameData:
         with torch.no_grad():
             embedding.weight.copy_(proj(stats))
 
+    def item_index(self, item: str | None) -> int:
+        if not item:
+            return UNKNOWN_IDX
+
+        item_id = str(item).lower()
+        if item_id in self.item_to_idx:
+            return self.item_to_idx[item_id]
+        if self._item_hash_buckets <= 0:
+            return UNKNOWN_IDX
+
+        digest = hashlib.blake2b(item_id.encode("utf-8"), digest_size=8).digest()
+        bucket = int.from_bytes(digest, byteorder="big") % self._item_hash_buckets
+        return self._item_hash_offset + bucket
+
     @staticmethod
     def _build_vocab(keys) -> dict[str, int]:
         vocab = {"<unk>": UNKNOWN_IDX}
@@ -99,3 +116,16 @@ class GameData:
             if key not in vocab:
                 vocab[key] = len(vocab)
         return vocab
+
+    @staticmethod
+    def _known_item_ids(pokedex_entries) -> list[str]:
+        items = {GenData.UNKNOWN_ITEM}
+        for pokemon in pokedex_entries:
+            required_item = pokemon.get("requiredItem")
+            if required_item:
+                items.add(required_item)
+
+            required_items = pokemon.get("requiredItems") or []
+            items.update(required_items)
+
+        return sorted(str(item).lower() for item in items if item)

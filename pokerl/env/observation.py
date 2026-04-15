@@ -1,7 +1,7 @@
 """Converts a poke-env DoubleBattle into the tensor dict the model expects."""
 
 import numpy as np
-from poke_env.environment import DoubleBattle, Pokemon, Move, Status, SideCondition, Weather, Field
+from poke_env.battle import DoubleBattle, Field, Pokemon, SideCondition, Status, Weather
 
 from ..data import GameData, UNKNOWN_IDX
 
@@ -15,7 +15,7 @@ VOLATILES = [
 NUM_VOLATILES = len(VOLATILES)
 
 # Status conditions for one-hot encoding
-STATUS_LIST = [None, Status.BRN, Status.FRZ, Status.PAR, Status.PSN, Status.SLP, Status.TOK]
+STATUS_LIST = [None, Status.BRN, Status.FRZ, Status.PAR, Status.PSN, Status.SLP, Status.TOX]
 
 # Role indices
 ROLE_ACTIVE_1 = 0
@@ -123,7 +123,7 @@ class ObservationBuilder:
         it = pokemon.item
         if it is None or it == "":
             return UNKNOWN_IDX
-        return self.gd.item_to_idx.get(it.lower(), UNKNOWN_IDX)
+        return self.gd.item_index(it)
 
     def _type_indices(self, pokemon: Pokemon) -> np.ndarray:
         indices = np.zeros(2, dtype=np.int64)
@@ -158,7 +158,7 @@ class ObservationBuilder:
         offset += 7
 
         # Volatile statuses (16 binary)
-        effects = pokemon.effects if hasattr(pokemon, "effects") else {}
+        effects = pokemon.effects
         for j, vol in enumerate(VOLATILES):
             if vol in effects:
                 feats[offset + j] = 1.0
