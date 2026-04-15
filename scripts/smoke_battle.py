@@ -171,19 +171,24 @@ def _emit(payload: dict, as_json: bool) -> None:
         print(payload, flush=True)
 
 
-def _build_opponent(name: str, env_config: EnvConfig, timing: dict[str, float | int]):
+def _build_opponent_factory(name: str, env_config: EnvConfig, timing: dict[str, float | int]):
     opponent_classes = {
         "max-base-power": MaxBasePowerPlayer,
         "random": RandomPlayer,
         "simple-heuristic": SimpleHeuristicsPlayer,
     }
-    opponent = opponent_classes[name](
-        account_configuration=make_local_account_configuration("smokeopp"),
-        battle_format=env_config.battle_format,
-        server_configuration=server_config(env_config),
-    )
-    _attach_choice_timer(opponent, timing, "opponent")
-    return opponent
+
+    def factory(loop):
+        opponent = opponent_classes[name](
+            account_configuration=make_local_account_configuration("smokeopp"),
+            battle_format=env_config.battle_format,
+            server_configuration=server_config(env_config),
+            loop=loop,
+        )
+        _attach_choice_timer(opponent, timing, "opponent")
+        return opponent
+
+    return factory
 
 
 def main() -> None:
@@ -196,11 +201,11 @@ def main() -> None:
     env_config = EnvConfig(num_envs=1)
     agent = PokeAgent(ModelConfig(), game_data).to(device)
     timing = _empty_timing()
-    opponent = _build_opponent(args.opponent, env_config, timing)
+    opponent_factory = _build_opponent_factory(args.opponent, env_config, timing)
     env = BattleEnv(
         env_config,
         game_data,
-        opponent,
+        opponent_factory,
         player_kwargs={
             "account_configuration": make_local_account_configuration("smokeagent"),
         },

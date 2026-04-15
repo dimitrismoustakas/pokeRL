@@ -6,7 +6,7 @@ import torch
 from ..config import ModelConfig, EnvConfig
 from ..data import GameData
 from ..model.agent import PokeAgent
-from ..env.showdown_env import BattleEnv, make_local_account_configuration
+from ..env.showdown_env import BattleEnv, make_local_account_configuration, make_server_configuration
 from ..env.observation import ObservationBuilder
 from ..env.actions import ACTIONS_PER_SLOT
 
@@ -73,11 +73,15 @@ def load_and_evaluate(
     agent.load_state_dict(checkpoint["agent"])
     agent.to(device)
 
-    opponent = MaxBasePowerPlayer(
-        account_configuration=make_local_account_configuration("eval"),
-        battle_format=env_config.battle_format,
-    )
-    env = BattleEnv(env_config, game_data, opponent)
+    def opponent_factory(loop):
+        return MaxBasePowerPlayer(
+            account_configuration=make_local_account_configuration("eval"),
+            battle_format=env_config.battle_format,
+            server_configuration=make_server_configuration(env_config),
+            loop=loop,
+        )
+
+    env = BattleEnv(env_config, game_data, opponent_factory)
 
     try:
         results = evaluate(agent, env, num_games, device)

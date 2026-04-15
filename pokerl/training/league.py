@@ -1,5 +1,6 @@
 """Self-play league: a pool of past agent checkpoints as opponents."""
 
+import asyncio
 import random
 import copy
 from pathlib import Path
@@ -108,7 +109,7 @@ class League:
         torch.save({"agent": agent.state_dict()}, path)
         self.checkpoints.append(path)
 
-    def make_opponent(self) -> LeaguePlayer | None:
+    def make_opponent(self, loop: asyncio.AbstractEventLoop) -> LeaguePlayer | None:
         """Create a LeaguePlayer from a sampled checkpoint.
 
         Returns None if the league is empty.
@@ -137,6 +138,7 @@ class League:
             account_configuration=make_local_account_configuration("league"),
             battle_format=self.env_config.battle_format,
             server_configuration=server_config,
+            loop=loop,
         )
 
     def should_use_league(self) -> bool:

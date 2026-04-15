@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import asyncio
 import time
 import numpy as np
 import torch
@@ -16,7 +17,12 @@ from poke_env.player import MaxBasePowerPlayer
 from pokerl.config import ModelConfig, EnvConfig, TrainingConfig
 from pokerl.data import GameData
 from pokerl.model.agent import PokeAgent
-from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, make_local_account_configuration
+from pokerl.env.showdown_env import (
+    BattleEnv,
+    ParallelBattleEnv,
+    make_local_account_configuration,
+    make_server_configuration,
+)
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
@@ -65,26 +71,34 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     return model_config, env_config, train_config
 
 
-def make_opponent(env_config, game_data, league, device):
-    """Create an opponent: either from the league or a max-base-power bot."""
+def make_opponent_factory(env_config, game_data, league, device):
+    """Create an opponent factory for one environment."""
     if league.should_use_league():
-        opponent = league.make_opponent()
-        if opponent is not None:
-            return opponent, "league"
+        def league_factory(loop: asyncio.AbstractEventLoop):
+            opponent = league.make_opponent(loop)
+            if opponent is None:
+                raise RuntimeError("League opponent requested, but the league is empty.")
+            return opponent
 
-    return MaxBasePowerPlayer(
-        account_configuration=make_local_account_configuration("maxbase"),
-        battle_format=env_config.battle_format,
-        server_configuration=_server_config(env_config),
-    ), "max-base-power"
+        return league_factory, "league"
+
+    def baseline_factory(loop: asyncio.AbstractEventLoop):
+        return MaxBasePowerPlayer(
+            account_configuration=make_local_account_configuration("maxbase"),
+            battle_format=env_config.battle_format,
+            server_configuration=make_server_configuration(env_config),
+            loop=loop,
+        )
+
+    return baseline_factory, "max-base-power"
 
 
 def make_envs(env_config, game_data, league, device):
     """Create parallel battle environments with mixed opponents."""
     envs = []
     for i in range(env_config.num_envs):
-        opponent, _ = make_opponent(env_config, game_data, league, device)
-        env = BattleEnv(env_config, game_data, opponent)
+        opponent_factory, _ = make_opponent_factory(env_config, game_data, league, device)
+        env = BattleEnv(env_config, game_data, opponent_factory)
         envs.append(env)
     return ParallelBattleEnv(envs)
 
@@ -96,8 +110,8 @@ def refresh_opponents(parallel_env, env_config, game_data, league, device):
     and random opponents as training progresses.
     """
     for env in parallel_env.envs:
-        opponent, kind = make_opponent(env_config, game_data, league, device)
-        env.set_next_opponent(opponent)
+        opponent_factory, _ = make_opponent_factory(env_config, game_data, league, device)
+        env.set_next_opponent(opponent_factory)
 
 
 def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -234,16 +248,5 @@ def train():
         trainer.save(f"{train_config.checkpoint_dir}/final.pt")
     finally:
         parallel_env.close()
-
-
-def _server_config(env_config: EnvConfig):
-    from poke_env import ServerConfiguration
-    host, port = env_config.server_url.split(":")
-    return ServerConfiguration(
-        f"ws://{host}:{port}/showdown/websocket",
-        f"http://{host}:{port}/action.php",
-    )
-
-
 if __name__ == "__main__":
     train()

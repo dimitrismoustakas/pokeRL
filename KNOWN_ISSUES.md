@@ -1,9 +1,5 @@
 # Known Issues
 
-## Training
-
-- **Multi-env reset**: single-env training smoke runs complete, but more than one `BattleEnv` in the same process currently hangs during reset before rollout collection begins. The default `num_envs=16` training path is therefore not ready for a real run yet.
-
 ## Performance
 
 - **Single-battle latency**: localhost is the intended setup, and `ParallelBattleEnv` now steps envs concurrently. Individual random doubles battles are still relatively slow to finish end to end, so long smoke battles can exceed short terminal timeouts even when the battle loop is progressing correctly.

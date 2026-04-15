@@ -2,16 +2,18 @@
 
 import asyncio
 import itertools
-import numpy as np
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from threading import Thread
-from threading import Lock
-from queue import Queue
+from collections.abc import Awaitable, Callable
+from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError
+from threading import Lock, Thread
+from typing import Generic, TypeVar
 
-from poke_env import AccountConfiguration
+import numpy as np
+
+from poke_env import AccountConfiguration, ServerConfiguration
 from poke_env.battle import DoubleBattle
-from poke_env.player import BattleOrder, DoubleBattleOrder, PassBattleOrder, Player
+from poke_env.concurrency import create_in_poke_loop
+from poke_env.player import BattleOrder, DoubleBattleOrder, ForfeitBattleOrder, PassBattleOrder, Player
 
 from ..config import EnvConfig
 from ..data import GameData
@@ -25,6 +27,40 @@ from .rewards import sparse_reward
 _ACCOUNT_LOCK = Lock()
 _ACCOUNT_COUNTER = itertools.count()
 _ACCOUNT_RUN_TAG = uuid.uuid4().hex[:4]
+QueueItemT = TypeVar("QueueItemT")
+OpponentFactory = Callable[[asyncio.AbstractEventLoop], Player]
+
+
+class _AsyncQueue(Generic[QueueItemT]):
+    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int = 0):
+        self.queue = create_in_poke_loop(asyncio.Queue, loop, maxsize)
+        self._loop = loop
+
+    async def async_get(self) -> QueueItemT:
+        return await self.queue.get()
+
+    def get(self, timeout: float | None = None) -> QueueItemT:
+        result = asyncio.run_coroutine_threadsafe(
+            asyncio.wait_for(self.async_get(), timeout),
+            self._loop,
+        )
+        return result.result()
+
+    async def async_put(self, item: QueueItemT) -> None:
+        await self.queue.put(item)
+
+    def put(self, item: QueueItemT) -> None:
+        self._loop.call_soon_threadsafe(self.queue.put_nowait, item)
+
+    def clear(self) -> None:
+        async def _clear() -> None:
+            while True:
+                try:
+                    self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+        asyncio.run_coroutine_threadsafe(_clear(), self._loop).result()
 
 
 def make_local_account_configuration(prefix: str) -> AccountConfiguration:
@@ -33,6 +69,14 @@ def make_local_account_configuration(prefix: str) -> AccountConfiguration:
     with _ACCOUNT_LOCK:
         suffix = f"{_ACCOUNT_RUN_TAG}{next(_ACCOUNT_COUNTER):04x}"
     return AccountConfiguration(f"{clean_prefix}{suffix}"[:18], None)
+
+
+def make_server_configuration(config: EnvConfig) -> ServerConfiguration:
+    host, port = config.server_url.split(":")
+    return ServerConfiguration(
+        f"ws://{host}:{port}/showdown/websocket",
+        f"http://{host}:{port}/action.php",
+    )
 
 
 class ShowdownPlayer(Player):
@@ -46,20 +90,27 @@ class ShowdownPlayer(Player):
     def __init__(self, obs_builder: ObservationBuilder, **kwargs):
         super().__init__(**kwargs)
         self.obs_builder = obs_builder
-        self.obs_queue: Queue = Queue()
-        self.action_queue: Queue = Queue()
+        self.obs_queue: _AsyncQueue[tuple[dict, np.ndarray, float, bool, DoubleBattle]] = _AsyncQueue(self.ps_client.loop)
+        self.action_queue: _AsyncQueue[np.ndarray | None] = _AsyncQueue(self.ps_client.loop)
         self.last_battle: DoubleBattle | None = None
         self._last_finished_token: tuple[str, int] | None = None
+        self._closing = False
         self._team_preview_fn = None
 
-    def choose_move(self, battle: DoubleBattle) -> BattleOrder:
+    def choose_move(self, battle: DoubleBattle) -> Awaitable[BattleOrder]:
+        return self._choose_move(battle)
+
+    async def _choose_move(self, battle: DoubleBattle) -> BattleOrder:
         self._emit_battle_update(battle)
 
         if battle.finished:
             return self.choose_default_move()
 
-        # Block until the RL agent sends an action
-        action = self.action_queue.get()
+        action = await self.action_queue.async_get()
+        if action is None:
+            if not self._closing:
+                raise RuntimeError("ShowdownPlayer received a shutdown signal outside env.close().")
+            return ForfeitBattleOrder()
         return self._make_order(action, battle)
 
     def _battle_finished_callback(self, battle):
@@ -80,6 +131,10 @@ class ShowdownPlayer(Player):
     def set_team_preview_fn(self, fn):
         """Optional: override team preview with a custom function."""
         self._team_preview_fn = fn
+
+    def request_close(self) -> None:
+        self._closing = True
+        self.action_queue.put(None)
 
     def _make_order(self, action: np.ndarray, battle: DoubleBattle) -> BattleOrder:
         """Convert a (2,) action array to a DoubleBattleOrder."""
@@ -112,7 +167,7 @@ class BattleEnv:
     """Synchronous environment wrapping one concurrent battle.
 
     Usage:
-        env = BattleEnv(config, game_data, opponent)
+        env = BattleEnv(config, game_data, opponent_factory)
         obs, mask = env.reset()
         while not done:
             obs, mask, reward, done, info = env.step(action)
@@ -122,16 +177,23 @@ class BattleEnv:
         self,
         config: EnvConfig,
         game_data: GameData,
-        opponent: Player,
+        opponent_factory: OpponentFactory,
         player_kwargs: dict | None = None,
     ):
         self.config = config
         self.game_data = game_data
-        self.opponent = opponent
-        self._pending_opponent: Player | None = None
+        self._battle_task = None
+        self._loop, self._thread = self._start_event_loop()
+        self._pending_opponent_factory: OpponentFactory | None = None
+        self._closed = False
 
         obs_builder = ObservationBuilder(game_data, config.team_size)
         player_options = dict(player_kwargs or {})
+        reserved_player_keys = {"battle_format", "loop", "server_configuration"}
+        unexpected_keys = reserved_player_keys.intersection(player_options)
+        if unexpected_keys:
+            bad_keys = ", ".join(sorted(unexpected_keys))
+            raise ValueError(f"BattleEnv manages {bad_keys}; do not pass them via player_kwargs.")
         player_options.setdefault(
             "account_configuration",
             make_local_account_configuration("agent"),
@@ -139,18 +201,19 @@ class BattleEnv:
         self.player = ShowdownPlayer(
             obs_builder,
             battle_format=config.battle_format,
-            server_configuration=self._server_config(),
+            server_configuration=make_server_configuration(config),
+            loop=self._loop,
             **player_options,
         )
-
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: Thread | None = None
-        self._battle_task = None
+        self._assert_player_loop(self.player, "player")
+        self.opponent = self._build_opponent(opponent_factory)
 
     def reset(self) -> tuple[dict, np.ndarray]:
         """Start a new battle and return the first observation + mask."""
+        if self._closed:
+            raise RuntimeError("BattleEnv.reset() called after the environment was closed.")
+
         self._apply_pending_opponent()
-        self._ensure_event_loop()
         self._battle_task = asyncio.run_coroutine_threadsafe(
             self.player.battle_against(self.opponent, n_battles=1),
             self._loop,
@@ -167,6 +230,9 @@ class BattleEnv:
         Returns:
             obs, mask, reward, done, info
         """
+        if self._closed:
+            raise RuntimeError("BattleEnv.step() called after the environment was closed.")
+
         self.player.action_queue.put(action)
 
         obs, mask, reward, done, battle = self.player.obs_queue.get()
@@ -177,63 +243,83 @@ class BattleEnv:
     def last_battle(self) -> DoubleBattle | None:
         return self.player.last_battle
 
-    def _ensure_event_loop(self):
-        if self._loop is not None:
-            return
-
+    @staticmethod
+    def _start_event_loop() -> tuple[asyncio.AbstractEventLoop, Thread]:
         def run_loop(loop):
             asyncio.set_event_loop(loop)
             loop.run_forever()
 
-        self._loop = asyncio.new_event_loop()
-        self._thread = Thread(target=run_loop, args=(self._loop,), daemon=True)
-        self._thread.start()
+        loop = asyncio.new_event_loop()
+        thread = Thread(target=run_loop, args=(loop,), daemon=True)
+        thread.start()
+        return loop, thread
 
-    def _server_config(self):
-        from poke_env import ServerConfiguration
-        host, port = self.config.server_url.split(":")
-        return ServerConfiguration(
-            f"ws://{host}:{port}/showdown/websocket",
-            f"http://{host}:{port}/action.php",
-        )
-
-    def set_next_opponent(self, opponent: Player):
-        if self._pending_opponent is not None:
-            self._disconnect_player(self._pending_opponent)
-        self._pending_opponent = opponent
+    def set_next_opponent(self, opponent_factory: OpponentFactory):
+        self._pending_opponent_factory = opponent_factory
 
     def _apply_pending_opponent(self):
-        if self._pending_opponent is None:
+        if self._pending_opponent_factory is None:
             return
         self._disconnect_player(self.opponent)
-        self.opponent = self._pending_opponent
-        self._pending_opponent = None
+        self.opponent = self._build_opponent(self._pending_opponent_factory)
+        self._pending_opponent_factory = None
+
+    def _build_opponent(self, opponent_factory: OpponentFactory) -> Player:
+        opponent = opponent_factory(self._loop)
+        self._assert_player_loop(opponent, "opponent")
+        return opponent
+
+    def _assert_player_loop(self, participant: Player, role: str) -> None:
+        participant_loop = getattr(getattr(participant, "ps_client", None), "loop", None)
+        if participant_loop is not self._loop:
+            raise ValueError(f"BattleEnv {role} must be created on the environment event loop.")
 
     def close(self):
+        if self._closed:
+            return
+
+        self.player.request_close()
+
         if self._battle_task is not None and not self._battle_task.done():
-            self._battle_task.cancel()
+            try:
+                self._battle_task.result(timeout=2.0)
+            except TimeoutError:
+                self._battle_task.cancel()
+                try:
+                    self._battle_task.result(timeout=1.0)
+                except (CancelledError, TimeoutError):
+                    pass
 
         for participant in (self.player, self.opponent):
             self._disconnect_player(participant)
-        if self._pending_opponent is not None:
-            self._disconnect_player(self._pending_opponent)
 
-        while not self.player.obs_queue.empty():
-            self.player.obs_queue.get_nowait()
-        while not self.player.action_queue.empty():
-            self.player.action_queue.get_nowait()
-
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            if self._thread is not None and self._thread.is_alive():
-                self._thread.join(timeout=1.0)
-            if not self._loop.is_running():
-                self._loop.close()
+        self._cancel_pending_tasks()
+        self.player.obs_queue.clear()
+        self.player.action_queue.clear()
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        if not self._loop.is_running():
+            self._loop.close()
 
         self._battle_task = None
-        self._loop = None
-        self._thread = None
-        self._pending_opponent = None
+        self._pending_opponent_factory = None
+        self._closed = True
+
+    def _cancel_pending_tasks(self) -> None:
+        async def _cancel_pending() -> None:
+            current_task = asyncio.current_task()
+            pending_tasks = [task for task in asyncio.all_tasks() if task is not current_task]
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            await asyncio.get_running_loop().shutdown_asyncgens()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_pending(), self._loop).result(timeout=2.0)
+        except (CancelledError, TimeoutError):
+            pass
 
     @staticmethod
     def _disconnect_player(player: Player):
