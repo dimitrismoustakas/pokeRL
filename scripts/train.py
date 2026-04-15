@@ -10,30 +10,49 @@ import time
 import numpy as np
 import torch
 
+from poke_env.player import RandomPlayer
+
 from pokerl.config import ModelConfig, EnvConfig, TrainingConfig
 from pokerl.data import GameData
 from pokerl.model.agent import PokeAgent
-from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
-from pokerl.env.observation import ObservationBuilder
-from pokerl.env.actions import ACTIONS_PER_SLOT
+from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
 
 
-def make_envs(env_config: EnvConfig, game_data: GameData) -> ParallelBattleEnv:
-    """Create parallel battle environments against random opponents."""
-    from poke_env.player import RandomPlayer
+def make_opponent(env_config, game_data, league, device):
+    """Create an opponent: either from the league or a random bot."""
+    if league.should_use_league():
+        opponent = league.make_opponent()
+        if opponent is not None:
+            return opponent, "league"
 
+    return RandomPlayer(
+        battle_format=env_config.battle_format,
+        server_configuration=_server_config(env_config),
+    ), "random"
+
+
+def make_envs(env_config, game_data, league, device):
+    """Create parallel battle environments with mixed opponents."""
     envs = []
     for i in range(env_config.num_envs):
-        opponent = RandomPlayer(
-            battle_format=env_config.battle_format,
-            server_configuration=_server_config(env_config),
-        )
+        opponent, _ = make_opponent(env_config, game_data, league, device)
         env = BattleEnv(env_config, game_data, opponent)
         envs.append(env)
     return ParallelBattleEnv(envs)
+
+
+def refresh_opponents(parallel_env, env_config, game_data, league, device):
+    """Swap out opponents in existing environments.
+
+    Called periodically so the agent faces a mix of league
+    and random opponents as training progresses.
+    """
+    for env in parallel_env.envs:
+        opponent, kind = make_opponent(env_config, game_data, league, device)
+        env.opponent = opponent
 
 
 def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -61,10 +80,10 @@ def train():
 
     # Training
     trainer = PPOTrainer(agent, train_config, device)
-    league = League(train_config, device)
+    league = League(train_config, env_config, game_data, agent, device)
 
-    # Environments
-    parallel_env = make_envs(env_config, game_data)
+    # Environments (start with random opponents, league is empty)
+    parallel_env = make_envs(env_config, game_data, league, device)
 
     # Rollout buffer
     obs, masks = parallel_env.reset()
@@ -142,7 +161,7 @@ def train():
                 f"Policy loss {metrics['policy_loss']:.4f} | "
                 f"Value loss {metrics['value_loss']:.4f} | "
                 f"Entropy {metrics['entropy']:.4f} | "
-                f"KL {metrics['approx_kl']:.4f}"
+                f"League pool {len(league.checkpoints)}"
             )
 
         # --- Checkpointing ---
@@ -151,10 +170,11 @@ def train():
             trainer.save(path)
             print(f"Saved checkpoint: {path}")
 
-        # --- League update ---
+        # --- League: add checkpoint and refresh opponents ---
         if update % train_config.league_update_interval == 0:
             league.add_checkpoint(agent, trainer.global_step)
-            print(f"Added league checkpoint (pool size: {len(league.checkpoints)})")
+            refresh_opponents(parallel_env, env_config, game_data, league, device)
+            print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
 
     print("Training complete.")
     trainer.save(f"{train_config.checkpoint_dir}/final.pt")

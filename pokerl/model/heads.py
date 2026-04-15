@@ -10,8 +10,9 @@ from ..env.actions import ACTIONS_PER_SLOT
 class ActionHead(nn.Module):
     """Autoregressive action selection for doubles.
 
-    Step 1: select action for active pokemon 1 using its representation + context.
-    Step 2: select action for active pokemon 2 conditioned on pokemon 1's choice.
+    Both heads see BOTH active pokemon representations so they can
+    coordinate. Head 1 sees [context, rep1, rep2], head 2 additionally
+    sees the embedding of pokemon 1's chosen action.
     """
 
     def __init__(self, context_dim: int, pokemon_dim: int, hidden_dim: int = 256):
@@ -21,16 +22,16 @@ class ActionHead(nn.Module):
         # Embeds a chosen action so the second head can condition on it
         self.action_emb = nn.Embedding(self.num_actions, hidden_dim)
 
-        # First pokemon's policy
+        # First pokemon: sees context + own rep + partner rep
         self.head1 = nn.Sequential(
-            nn.Linear(context_dim + pokemon_dim, hidden_dim),
+            nn.Linear(context_dim + pokemon_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, self.num_actions),
         )
 
-        # Second pokemon's policy (also receives the first action embedding)
+        # Second pokemon: sees context + own rep + partner rep + partner's action
         self.head2 = nn.Sequential(
-            nn.Linear(context_dim + pokemon_dim + hidden_dim, hidden_dim),
+            nn.Linear(context_dim + pokemon_dim * 2 + hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, self.num_actions),
         )
@@ -51,8 +52,8 @@ class ActionHead(nn.Module):
         mask1 = masks[:, 0]
         mask2 = masks[:, 1]
 
-        # --- Pokemon 1 ---
-        logits1 = self.head1(torch.cat([context, rep1], dim=-1))
+        # --- Pokemon 1 (sees both active reps for coordination) ---
+        logits1 = self.head1(torch.cat([context, rep1, rep2], dim=-1))
         logits1 = logits1.masked_fill(~mask1, -1e8)
         dist1 = torch.distributions.Categorical(logits=logits1)
 
@@ -61,9 +62,9 @@ class ActionHead(nn.Module):
         else:
             a1 = actions[:, 0]
 
-        # --- Pokemon 2 (conditioned on pokemon 1's action) ---
+        # --- Pokemon 2 (sees both reps + pokemon 1's action) ---
         a1_emb = self.action_emb(a1)
-        logits2 = self.head2(torch.cat([context, rep2, a1_emb], dim=-1))
+        logits2 = self.head2(torch.cat([context, rep2, rep1, a1_emb], dim=-1))
         logits2 = logits2.masked_fill(~mask2, -1e8)
         dist2 = torch.distributions.Categorical(logits=logits2)
 

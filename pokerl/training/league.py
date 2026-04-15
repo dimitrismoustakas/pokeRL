@@ -6,27 +6,75 @@ from pathlib import Path
 from collections import deque
 
 import torch
-from poke_env.player import Player, RandomPlayer
+import numpy as np
+from poke_env.player import Player
+from poke_env.environment import DoubleBattle
 
 from ..model.agent import PokeAgent
-from ..config import TrainingConfig
+from ..data import GameData
+from ..config import TrainingConfig, EnvConfig
+from ..env.observation import ObservationBuilder
+from ..env.actions import build_action_mask, action_to_order, ACTIONS_PER_SLOT
 
 
-class LeagueOpponent:
-    """Wraps a frozen agent checkpoint as a poke-env Player for self-play."""
+class LeaguePlayer(Player):
+    """A poke-env player that uses a frozen agent checkpoint to choose moves.
 
-    def __init__(self, agent: PokeAgent, name: str):
+    This is the opponent in self-play: it loads a past version of the agent
+    and plays battles autonomously (no queue bridging needed).
+    """
+
+    def __init__(
+        self,
+        agent: PokeAgent,
+        obs_builder: ObservationBuilder,
+        device: torch.device,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
         self.agent = agent
         self.agent.eval()
-        self.name = name
+        self.obs_builder = obs_builder
+        self.device = device
+        self._hidden = None
 
-    @classmethod
-    def from_checkpoint(cls, path: str, agent_template: PokeAgent, device: torch.device):
-        agent_copy = copy.deepcopy(agent_template)
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
-        agent_copy.load_state_dict(checkpoint["agent"])
-        agent_copy.to(device)
-        return cls(agent_copy, name=Path(path).stem)
+    def choose_move(self, battle: DoubleBattle):
+        from poke_env.player import DoubleBattleOrder
+
+        obs = self.obs_builder.build(battle)
+        masks = np.stack([build_action_mask(battle, s) for s in range(2)])
+
+        with torch.no_grad():
+            obs_t = {k: torch.from_numpy(v).unsqueeze(0).to(self.device) for k, v in obs.items()}
+            masks_t = torch.from_numpy(masks).unsqueeze(0).to(self.device).bool()
+
+            if self._hidden is None:
+                self._hidden = self.agent.initial_hidden(1)
+
+            out = self.agent(obs_t, self._hidden, action_masks=masks_t)
+            self._hidden = out["hidden"]
+            actions = out["actions"].cpu().numpy()[0]
+
+        orders = []
+        for slot in range(2):
+            orders.append(action_to_order(int(actions[slot]), battle, slot))
+
+        if orders[0] is None and orders[1] is None:
+            return self.choose_default_move()
+        return DoubleBattleOrder(orders[0], orders[1])
+
+    def teampreview(self, battle: DoubleBattle) -> str:
+        # Use the agent's team preview head
+        obs = self.obs_builder.build(battle)
+        with torch.no_grad():
+            obs_t = {k: torch.from_numpy(v).unsqueeze(0).to(self.device) for k, v in obs.items()}
+            out = self.agent.team_preview(obs_t)
+            picks = out["picks"].cpu().numpy()[0]
+        return "/team " + "".join(str(int(p) + 1) for p in picks)
+
+    def reset_hidden(self):
+        """Call between battles to clear LSTM state."""
+        self._hidden = None
 
 
 class League:
@@ -38,8 +86,18 @@ class League:
     - Built-in bots (for diversity)
     """
 
-    def __init__(self, config: TrainingConfig, device: torch.device):
+    def __init__(
+        self,
+        config: TrainingConfig,
+        env_config: EnvConfig,
+        game_data: GameData,
+        agent_template: PokeAgent,
+        device: torch.device,
+    ):
         self.config = config
+        self.env_config = env_config
+        self.game_data = game_data
+        self.agent_template = agent_template
         self.device = device
         self.checkpoints: deque[str] = deque(maxlen=config.league_size)
         self.win_rates: dict[str, float] = {}
@@ -51,24 +109,35 @@ class League:
         torch.save({"agent": agent.state_dict()}, path)
         self.checkpoints.append(path)
 
-    def sample_opponent_path(self) -> str | None:
-        """Sample a checkpoint path from the league.
+    def make_opponent(self) -> LeaguePlayer | None:
+        """Create a LeaguePlayer from a sampled checkpoint.
 
-        Sampling strategy: 70% from recent half, 30% from older half.
-        Returns None if the league is empty (use a built-in bot instead).
+        Returns None if the league is empty.
         """
-        if not self.checkpoints:
+        path = self._sample_checkpoint()
+        if path is None:
             return None
 
-        checkpoints = list(self.checkpoints)
-        mid = len(checkpoints) // 2
+        agent_copy = copy.deepcopy(self.agent_template)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        agent_copy.load_state_dict(checkpoint["agent"])
+        agent_copy.to(self.device)
 
-        if len(checkpoints) < 2 or random.random() < 0.7:
-            # Recent
-            return random.choice(checkpoints[mid:]) if mid < len(checkpoints) else random.choice(checkpoints)
-        else:
-            # Older
-            return random.choice(checkpoints[:mid])
+        from poke_env import ServerConfiguration
+        host, port = self.env_config.server_url.split(":")
+        server_config = ServerConfiguration(
+            f"ws://{host}:{port}/showdown/websocket",
+            f"http://{host}:{port}/action.php",
+        )
+
+        obs_builder = ObservationBuilder(self.game_data, self.env_config.team_size)
+        return LeaguePlayer(
+            agent_copy,
+            obs_builder,
+            self.device,
+            battle_format=self.env_config.battle_format,
+            server_configuration=server_config,
+        )
 
     def should_use_league(self) -> bool:
         """Whether to play against the league vs a built-in bot."""
@@ -80,8 +149,20 @@ class League:
         """Track win rate against each opponent (for monitoring)."""
         if opponent_name not in self.win_rates:
             self.win_rates[opponent_name] = 0.5
-        # Exponential moving average
         alpha = 0.1
         self.win_rates[opponent_name] = (
             alpha * float(won) + (1 - alpha) * self.win_rates[opponent_name]
         )
+
+    def _sample_checkpoint(self) -> str | None:
+        """Sample a checkpoint path. 70% recent, 30% older."""
+        if not self.checkpoints:
+            return None
+
+        checkpoints = list(self.checkpoints)
+        mid = len(checkpoints) // 2
+
+        if len(checkpoints) < 2 or random.random() < 0.7:
+            return random.choice(checkpoints[mid:]) if mid < len(checkpoints) else random.choice(checkpoints)
+        else:
+            return random.choice(checkpoints[:mid])
