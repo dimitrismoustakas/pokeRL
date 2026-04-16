@@ -22,7 +22,8 @@ class _PreviewRequest:
 class TeamPreviewBatcher:
     """Batches concurrent team preview requests from environment threads."""
 
-    _COALESCE_WINDOW_SEC = 0.001
+    _COALESCE_WINDOW_SEC = 0.005
+    _TARGET_BATCH_SIZE = 8
 
     def __init__(self, agent: PokeAgent, device: torch.device):
         self._agent = agent
@@ -66,7 +67,7 @@ class TeamPreviewBatcher:
                     return
                 if self._COALESCE_WINDOW_SEC > 0:
                     deadline = time.perf_counter() + self._COALESCE_WINDOW_SEC
-                    while not self._closed:
+                    while not self._closed and len(self._pending) < self._TARGET_BATCH_SIZE:
                         remaining = deadline - time.perf_counter()
                         if remaining <= 0:
                             break

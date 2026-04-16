@@ -313,6 +313,25 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
             f"start battle {avg_ms(env_profile.get('env_reset_battle_start_sec', 0.0), reset_calls):.2f}ms | "
             f"wait first obs {avg_ms(env_profile.get('env_reset_wait_first_obs_sec', 0.0), reset_calls):.2f}ms"
         )
+        print(
+            "Battle start breakdown (avg per battle reset) | "
+            f"to challenge {avg_ms(env_profile.get('env_reset_to_challenge_send_sec', 0.0), reset_calls):.2f}ms | "
+            f"challenge send {avg_ms(env_profile.get('env_reset_challenge_send_sec', 0.0), reset_calls):.2f}ms | "
+            f"challenge->accept {avg_ms(env_profile.get('env_reset_challenge_to_accept_sec', 0.0), reset_calls):.2f}ms | "
+            f"accept send {avg_ms(env_profile.get('env_reset_accept_send_sec', 0.0), reset_calls):.2f}ms | "
+            f"accept->create {avg_ms(env_profile.get('env_reset_accept_to_create_sec', 0.0), reset_calls):.2f}ms | "
+            f"create battle {avg_ms(env_profile.get('env_reset_create_battle_sec', 0.0), reset_calls):.2f}ms | "
+            f"create->request {avg_ms(env_profile.get('env_reset_create_to_first_request_sec', 0.0), reset_calls):.2f}ms"
+        )
+        print(
+            "First request breakdown (avg per battle reset) | "
+            f"request total {avg_ms(env_profile.get('env_reset_first_request_total_sec', 0.0), reset_calls):.2f}ms | "
+            f"request->preview {avg_ms(env_profile.get('env_reset_first_request_to_teampreview_sec', 0.0), reset_calls):.2f}ms | "
+            f"preview compute {avg_ms(env_profile.get('env_reset_teampreview_compute_sec', 0.0), reset_calls):.2f}ms | "
+            f"preview->first emit {avg_ms(env_profile.get('env_reset_teampreview_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
+            f"request->first emit {avg_ms(env_profile.get('env_reset_request_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
+            f"first emit total {avg_ms(env_profile.get('env_reset_first_emit_total_sec', 0.0), reset_calls):.2f}ms"
+        )
 
 
 def _league_state_path(train_config: TrainingConfig) -> str:
@@ -527,6 +546,11 @@ def train():
             rollout_sec = time.perf_counter() - rollout_started
             rollout_profile["rollout_sec"] = rollout_sec
             env_profile = parallel_env.snapshot_timing() if args.profile_rollout else {}
+            refresh_after_update = (
+                update % train_config.league_update_interval == 0 and update < num_updates
+            )
+            if refresh_after_update:
+                refresh_opponents(parallel_env, league)
 
             # --- Compute advantages ---
             with torch.no_grad():
@@ -595,10 +619,8 @@ def train():
 
             # --- League: add checkpoint and refresh opponents ---
             if update % train_config.league_update_interval == 0:
-                if update < num_updates:
-                    refresh_opponents(parallel_env, league)
                 league.add_checkpoint(agent, trainer.global_step)
-                if update < num_updates:
+                if refresh_after_update:
                     print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
                 else:
                     print(f"League updated (pool: {len(league.checkpoints)})")

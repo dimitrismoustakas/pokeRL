@@ -56,6 +56,21 @@ class _TimingStats:
             self._values.clear()
 
 
+class _BattleStartTrace:
+    def __init__(self):
+        self.started_at = time.perf_counter()
+        self._lock = Lock()
+        self._marks: dict[str, float] = {}
+
+    def mark_once(self, key: str) -> None:
+        with self._lock:
+            self._marks.setdefault(key, time.perf_counter())
+
+    def snapshot(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._marks)
+
+
 class _AsyncQueue(Generic[QueueItemT]):
     def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int = 0):
         self.queue = create_in_poke_loop(asyncio.Queue, loop, maxsize)
@@ -122,6 +137,7 @@ class ShowdownPlayer(Player):
         self._last_finished_token: tuple[str, int] | None = None
         self._closing = False
         self._team_preview_fn = None
+        self._battle_start_trace_getter: Callable[[], _BattleStartTrace | None] | None = None
 
     def choose_move(self, battle: DoubleBattle) -> Awaitable[BattleOrder]:
         return self._choose_move(battle)
@@ -153,6 +169,12 @@ class ShowdownPlayer(Player):
     def set_team_preview_fn(self, fn):
         self._team_preview_fn = fn
 
+    def set_battle_start_trace_getter(
+        self,
+        getter: Callable[[], _BattleStartTrace | None],
+    ) -> None:
+        self._battle_start_trace_getter = getter
+
     def request_close(self) -> None:
         self._closing = True
         self.action_queue.put(None)
@@ -177,6 +199,10 @@ class ShowdownPlayer(Player):
         if battle.finished and finished_token == self._last_finished_token:
             return
 
+        trace = self._battle_start_trace_getter() if self._battle_start_trace_getter is not None else None
+        if trace is not None:
+            trace.mark_once("player_first_emit_started")
+
         emit_started = time.perf_counter()
         obs = self.obs_builder.build(battle)
         self.timing.add("player_emit_obs_sec", time.perf_counter() - emit_started)
@@ -195,6 +221,8 @@ class ShowdownPlayer(Player):
         self.timing.add("player_emit_queue_put_sec", time.perf_counter() - queue_put_started)
         self.timing.increment("player_emit_calls")
         self.timing.add("player_emit_total_sec", time.perf_counter() - emit_started)
+        if trace is not None:
+            trace.mark_once("player_first_emit_finished")
         if done:
             self._last_finished_token = finished_token
 
@@ -223,6 +251,7 @@ class BattleEnv:
         self._battle_task = None
         self._loop, self._thread = self._start_event_loop()
         self._pending_opponent: Player | None = None
+        self._battle_start_trace: _BattleStartTrace | None = None
         self._closed = False
         self._battle_started_at: float | None = None
         self._timing = _TimingStats()
@@ -253,6 +282,8 @@ class BattleEnv:
         self._assert_player_loop(self.player, "player")
         if team_preview_fn is not None:
             self.player.set_team_preview_fn(self._do_team_preview)
+        self.player.set_battle_start_trace_getter(self._get_battle_start_trace)
+        self._install_battle_start_hooks(self.player, role="player")
         self.opponent = self._build_opponent(opponent_factory)
 
     def reset(self) -> tuple[dict, np.ndarray]:
@@ -276,6 +307,7 @@ class BattleEnv:
             self.opponent.reset_hidden()
         self._timing.add("env_reset_hidden_reset_sec", time.perf_counter() - hidden_reset_started)
 
+        self._battle_start_trace = _BattleStartTrace()
         battle_start_started = time.perf_counter()
         self._battle_task = asyncio.run_coroutine_threadsafe(
             self.player.battle_against(self.opponent, n_battles=1),
@@ -287,6 +319,7 @@ class BattleEnv:
         wait_started = time.perf_counter()
         obs, mask, _, _, _ = self.player.obs_queue.get()
         self._timing.add("env_reset_wait_first_obs_sec", time.perf_counter() - wait_started)
+        self._record_battle_start_trace()
         self._timing.increment("env_reset_calls")
         self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
         return obs, mask
@@ -335,9 +368,13 @@ class BattleEnv:
         """
         if self._ext_team_preview_fn is None:
             raise RuntimeError("BattleEnv team preview requested without a team_preview_fn.")
+        if self._battle_start_trace is not None:
+            self._battle_start_trace.mark_once("player_teampreview_started")
         obs = self.player.obs_builder.build(battle)
         picks, team_str = self._ext_team_preview_fn(obs)
         self._episode_team_preview = (obs, picks)
+        if self._battle_start_trace is not None:
+            self._battle_start_trace.mark_once("player_teampreview_finished")
         return team_str
 
     def _assign_teams_for_next_battle(self) -> None:
@@ -387,7 +424,111 @@ class BattleEnv:
         opponent = opponent_factory(self._loop)
         self._attach_choice_timer(opponent)
         self._assert_player_loop(opponent, "opponent")
+        self._install_battle_start_hooks(opponent, role="opponent")
         return opponent
+
+    def _get_battle_start_trace(self) -> _BattleStartTrace | None:
+        return self._battle_start_trace
+
+    def _install_battle_start_hooks(self, participant: Player, role: str) -> None:
+        if getattr(participant, "_pokerl_battle_start_hooks_installed", False):
+            return
+        participant._pokerl_battle_start_hooks_installed = True
+
+        if role == "player":
+            original_challenge = participant.ps_client.challenge
+
+            async def challenge(username: str, format_: str, packed_team: str | None):
+                trace = self._battle_start_trace
+                if trace is not None:
+                    trace.mark_once("player_challenge_send_started")
+                result = await original_challenge(username, format_, packed_team)
+                if trace is not None:
+                    trace.mark_once("player_challenge_send_finished")
+                return result
+
+            participant.ps_client.challenge = challenge
+
+            original_create_battle = participant._create_battle
+
+            async def create_battle(split_message):
+                trace = self._battle_start_trace
+                if trace is not None:
+                    trace.mark_once("player_create_battle_started")
+                battle = await original_create_battle(split_message)
+                if trace is not None:
+                    trace.mark_once("player_create_battle_finished")
+                return battle
+
+            participant._create_battle = create_battle
+
+            original_handle_battle_request = participant._handle_battle_request
+
+            async def handle_battle_request(battle, maybe_default_order: bool = False):
+                trace = self._battle_start_trace
+                if trace is not None:
+                    trace.mark_once("player_first_request_started")
+                result = await original_handle_battle_request(battle, maybe_default_order)
+                if trace is not None:
+                    trace.mark_once("player_first_request_finished")
+                return result
+
+            participant._handle_battle_request = handle_battle_request
+
+        elif role == "opponent":
+            original_accept_challenge = participant.ps_client.accept_challenge
+
+            async def accept_challenge(username: str, packed_team: str | None):
+                trace = self._battle_start_trace
+                if trace is not None:
+                    trace.mark_once("opponent_accept_send_started")
+                result = await original_accept_challenge(username, packed_team)
+                if trace is not None:
+                    trace.mark_once("opponent_accept_send_finished")
+                return result
+
+            participant.ps_client.accept_challenge = accept_challenge
+
+    def _record_battle_start_trace(self) -> None:
+        trace = self._battle_start_trace
+        self._battle_start_trace = None
+        if trace is None:
+            return
+
+        marks = trace.snapshot()
+
+        def add_interval(key: str, start: float | None, end: float | None) -> None:
+            if start is None or end is None or end < start:
+                return
+            self._timing.add(key, end - start)
+
+        started_at = trace.started_at
+        challenge_started = marks.get("player_challenge_send_started")
+        challenge_finished = marks.get("player_challenge_send_finished")
+        accept_started = marks.get("opponent_accept_send_started")
+        accept_finished = marks.get("opponent_accept_send_finished")
+        create_started = marks.get("player_create_battle_started")
+        create_finished = marks.get("player_create_battle_finished")
+        request_started = marks.get("player_first_request_started")
+        request_finished = marks.get("player_first_request_finished")
+        teampreview_started = marks.get("player_teampreview_started")
+        teampreview_finished = marks.get("player_teampreview_finished")
+        emit_started = marks.get("player_first_emit_started")
+        emit_finished = marks.get("player_first_emit_finished")
+
+        add_interval("env_reset_to_challenge_send_sec", started_at, challenge_started)
+        add_interval("env_reset_challenge_send_sec", challenge_started, challenge_finished)
+        add_interval("env_reset_challenge_to_accept_sec", challenge_finished, accept_started)
+        add_interval("env_reset_accept_send_sec", accept_started, accept_finished)
+        add_interval("env_reset_accept_to_create_sec", accept_finished, create_started)
+        add_interval("env_reset_create_battle_sec", create_started, create_finished)
+        add_interval("env_reset_create_to_first_request_sec", create_finished, request_started)
+        add_interval("env_reset_first_request_total_sec", request_started, request_finished)
+        add_interval("env_reset_first_request_to_teampreview_sec", request_started, teampreview_started)
+        add_interval("env_reset_teampreview_compute_sec", teampreview_started, teampreview_finished)
+        add_interval("env_reset_teampreview_to_first_emit_sec", teampreview_finished, emit_started)
+        add_interval("env_reset_request_to_first_emit_sec", request_finished, emit_started)
+        add_interval("env_reset_first_emit_total_sec", emit_started, emit_finished)
 
     def _attach_choice_timer(self, opponent: Player) -> None:
         original_choose_move = opponent.choose_move
