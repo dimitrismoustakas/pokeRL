@@ -58,7 +58,6 @@ class TrainingConfig:
     total_timesteps: int = 10_000_000
     log_interval: int = 10
     save_interval: int = 100
-    eval_interval: int = 50
     checkpoint_dir: str = "checkpoints"
 
     # League

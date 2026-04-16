@@ -143,19 +143,14 @@ class ShowdownPlayer(Player):
         self._emit_battle_update(battle)
 
     def teampreview(self, battle: DoubleBattle) -> str:
-        """Pick 4 pokemon from the team preview.
-
-        Handled internally with a heuristic -- not routed through the
-        training loop. Learned team preview can be added later by
-        passing a callback via set_team_preview_fn().
-        """
-        if self._team_preview_fn is not None:
-            return self._team_preview_fn(battle)
-        # Default: bring first 4 in order
-        return "/team 1234"
+        if self._team_preview_fn is None:
+            raise RuntimeError(
+                "ShowdownPlayer.teampreview() called but no team_preview_fn was set. "
+                "Pass team_preview_fn to BattleEnv so the agent learns team selection."
+            )
+        return self._team_preview_fn(battle)
 
     def set_team_preview_fn(self, fn):
-        """Optional: override team preview with a custom function."""
         self._team_preview_fn = fn
 
     def request_close(self) -> None:
@@ -220,6 +215,7 @@ class BattleEnv:
         config: EnvConfig,
         game_data: GameData,
         opponent_factory: OpponentFactory,
+        team_preview_fn: Callable[[dict], tuple[np.ndarray, str]],
         player_kwargs: dict | None = None,
     ):
         self.config = config
@@ -230,6 +226,9 @@ class BattleEnv:
         self._closed = False
         self._battle_started_at: float | None = None
         self._timing = _TimingStats()
+        self._ext_team_preview_fn = team_preview_fn
+        # Set at team preview time, read when the episode ends to attach to info.
+        self._episode_team_preview: tuple[dict, np.ndarray] | None = None
 
         obs_builder = ObservationBuilder(game_data, config.team_size)
         player_options = dict(player_kwargs or {})
@@ -251,6 +250,7 @@ class BattleEnv:
             **player_options,
         )
         self._assert_player_loop(self.player, "player")
+        self.player.set_team_preview_fn(self._do_team_preview)
         self.opponent = self._build_opponent(opponent_factory)
 
     def reset(self) -> tuple[dict, np.ndarray]:
@@ -299,9 +299,26 @@ class BattleEnv:
             "battle_tag": battle.battle_tag if battle else "",
             "battle_turn": getattr(battle, "turn", 0),
         }
-        if done and self._battle_started_at is not None:
-            info["episode_sec"] = time.perf_counter() - self._battle_started_at
+        if done:
+            if self._battle_started_at is not None:
+                info["episode_sec"] = time.perf_counter() - self._battle_started_at
+            if self._episode_team_preview is not None:
+                obs_tp, picks_tp = self._episode_team_preview
+                info["team_preview_obs"] = obs_tp
+                info["team_preview_picks"] = picks_tp
         return obs, mask, reward, done, info
+
+    def _do_team_preview(self, battle: DoubleBattle) -> str:
+        """Build the team preview response using the agent callback.
+
+        Called synchronously from ShowdownPlayer.teampreview() at the start of
+        each battle. Stores (obs, picks) so they can be returned in the info dict
+        when this episode ends, enabling the REINFORCE team preview gradient.
+        """
+        obs = self.player.obs_builder.build(battle)
+        picks, team_str = self._ext_team_preview_fn(obs)
+        self._episode_team_preview = (obs, picks)
+        return team_str
 
     @property
     def last_battle(self) -> DoubleBattle | None:

@@ -140,14 +140,36 @@ def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
     return server_urls
 
 
-def make_envs(env_config: EnvConfig, game_data: GameData, league: League, server_urls: list[str]) -> ParallelBattleEnv:
+def make_team_preview_fn(agent: PokeAgent, device: torch.device):
+    """Create a team preview callback that uses the current agent policy.
+
+    The closure captures the agent object (not a copy), so it always reflects
+    the latest weights during rollout collection.
+    """
+    def team_preview_fn(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
+        with torch.no_grad():
+            obs_t = {k: torch.from_numpy(v).unsqueeze(0).to(device) for k, v in obs.items()}
+            out = agent.team_preview(obs_t)
+            picks = out["picks"].cpu().numpy()[0]  # (pick_size,)
+        team_str = "/team " + "".join(str(int(p) + 1) for p in picks)
+        return picks, team_str
+    return team_preview_fn
+
+
+def make_envs(
+    env_config: EnvConfig,
+    game_data: GameData,
+    league: League,
+    server_urls: list[str],
+    team_preview_fn,
+) -> ParallelBattleEnv:
     """Create parallel battle environments with mixed opponents."""
     envs = []
     for i in range(env_config.num_envs):
         env_server_url = server_urls[i % len(server_urls)]
         env_instance_config = replace(env_config, server_url=env_server_url)
         opponent_factory, _ = pick_opponent_factory(env_instance_config, league)
-        env = BattleEnv(env_instance_config, game_data, opponent_factory)
+        env = BattleEnv(env_instance_config, game_data, opponent_factory, team_preview_fn=team_preview_fn)
         envs.append(env)
     return ParallelBattleEnv(envs)
 
@@ -275,9 +297,8 @@ def train():
         print(f"Seeded league with agent at step {trainer.global_step}")
 
     # --- Environments ---
-    parallel_env = make_envs(env_config, game_data, league, server_urls)
-    # Refresh so environments pick up the seeded/restored league checkpoint
-    refresh_opponents(parallel_env, league)
+    team_preview_fn = make_team_preview_fn(agent, device)
+    parallel_env = make_envs(env_config, game_data, league, server_urls, team_preview_fn=team_preview_fn)
 
     try:
         # Rollout buffer
@@ -310,6 +331,7 @@ def train():
             update_episode_rewards: list[float] = []
             update_episode_secs: list[float] = []
             update_episode_turns: list[float] = []
+            team_preview_data: list[tuple[dict, np.ndarray, float]] = []
             rollout_profile = {
                 "obs_to_device_sec": 0.0,
                 "mask_to_device_sec": 0.0,
@@ -365,12 +387,16 @@ def train():
                     hidden = (h, c)
                     rollout_profile["hidden_reset_sec"] += time.perf_counter() - hidden_reset_started
 
-                # Track episode rewards
+                # Track episode rewards and team preview decisions
                 for info in infos:
                     if "episode_reward" in info:
                         reward = info["episode_reward"]
                         episode_rewards.append(reward)
                         update_episode_rewards.append(reward)
+                        if "team_preview_obs" in info:
+                            team_preview_data.append(
+                                (info["team_preview_obs"], info["team_preview_picks"], reward)
+                            )
                     if "episode_sec" in info:
                         update_episode_secs.append(info["episode_sec"])
                     if "battle_turn" in info and info.get("episode_reward") is not None:
@@ -393,6 +419,8 @@ def train():
             agent.train()
             ppo_started = time.perf_counter()
             metrics = trainer.update(batch)
+            if team_preview_data:
+                metrics["team_preview_loss"] = trainer.update_team_preview(team_preview_data)
             ppo_sec = time.perf_counter() - ppo_started
 
             # --- Logging ---
@@ -416,6 +444,7 @@ def train():
                     f"Policy loss {metrics['policy_loss']:.4f} | "
                     f"Value loss {metrics['value_loss']:.4f} | "
                     f"Entropy {metrics['entropy']:.4f} | "
+                    f"Preview loss {metrics.get('team_preview_loss', float('nan')):.4f} | "
                     f"League pool {len(league.checkpoints)}"
                 )
                 if args.profile_rollout:

@@ -1,8 +1,8 @@
 """PPO trainer with support for action masking and LSTM policies."""
 
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 from pathlib import Path
 
 from ..config import TrainingConfig
@@ -95,6 +95,36 @@ class PPOTrainer:
         self.global_step += batch_size
 
         return {k: v / num_updates for k, v in metrics.items()}
+
+    def update_team_preview(self, data: list[tuple[dict, np.ndarray, float]]) -> float:
+        """REINFORCE update for team preview decisions.
+
+        Called once per PPO update cycle using all team preview decisions made
+        during the rollout. Each entry is (obs_dict, picks_np, episode_reward)
+        where episode_reward is +1 for a win and -1 for a loss.
+
+        Returns the loss value for logging.
+        """
+        obs_batch = {
+            k: torch.from_numpy(np.stack([d[0][k] for d in data])).to(self.device)
+            for k in data[0][0]
+        }
+        picks_batch = torch.from_numpy(np.stack([d[1] for d in data])).long().to(self.device)
+        rewards_batch = torch.tensor([d[2] for d in data], dtype=torch.float32, device=self.device)
+
+        out = self.agent.team_preview(obs_batch, picks=picks_batch)
+        log_prob = out["log_prob"]
+        entropy = out["entropy"]
+
+        # REINFORCE: minimize -E[log_prob * reward]; add entropy bonus to encourage exploration.
+        loss = -(log_prob * rewards_batch).mean() - self.config.entropy_coef * entropy.mean()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
+        self.optimizer.step()
+
+        return loss.item()
 
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
