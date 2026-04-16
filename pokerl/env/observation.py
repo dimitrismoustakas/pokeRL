@@ -1,16 +1,35 @@
 """Converts a poke-env DoubleBattle into the tensor dict the model expects."""
 
 import numpy as np
-from poke_env.battle import DoubleBattle, Field, Pokemon, SideCondition, Status, Weather
+from poke_env.battle import DoubleBattle, Effect, Field, Pokemon, SideCondition, Status, Weather
 
 from ..data import GameData, UNKNOWN_IDX
 
 
-# Volatile statuses we track (binary flags)
-VOLATILES = [
-    "confusion", "substitute", "leechseed", "taunt", "encore", "torment",
-    "disable", "yawn", "perishsong", "protect", "endure", "focusenergy",
-    "attract", "curse", "nightmare", "flashfire",
+# Continuous features per pokemon: hp(1) + status_one_hot(7) + stat_stages(7)
+# + volatiles(16) + move_pp(4) = 35 total. Must match PokemonEncoder continuous_dim.
+CONTINUOUS_DIM = 35
+
+# Volatile effects to track as binary flags.
+# Each entry is either a single Effect or a frozenset of Effects (any match = True).
+# Perish song is tracked as any of PERISH0/1/2/3 (countdown from 3 to 0).
+VOLATILES: list = [
+    Effect.CONFUSION,
+    Effect.SUBSTITUTE,
+    Effect.LEECH_SEED,
+    Effect.TAUNT,
+    Effect.ENCORE,
+    Effect.TORMENT,
+    Effect.DISABLE,
+    Effect.YAWN,
+    frozenset({Effect.PERISH0, Effect.PERISH1, Effect.PERISH2, Effect.PERISH3}),
+    Effect.PROTECT,
+    Effect.ENDURE,
+    Effect.FOCUS_ENERGY,
+    Effect.ATTRACT,
+    Effect.CURSE,
+    Effect.NIGHTMARE,
+    Effect.FLASH_FIRE,
 ]
 NUM_VOLATILES = len(VOLATILES)
 
@@ -21,6 +40,12 @@ STATUS_LIST = [None, Status.BRN, Status.FRZ, Status.PAR, Status.PSN, Status.SLP,
 ROLE_ACTIVE_1 = 0
 ROLE_ACTIVE_2 = 1
 ROLE_BENCH = 2
+
+assert 1 + 7 + 7 + NUM_VOLATILES + 4 == CONTINUOUS_DIM, (
+    f"CONTINUOUS_DIM={CONTINUOUS_DIM} does not match the actual feature count "
+    f"(1 + 7 + 7 + {NUM_VOLATILES} + 4 = {1 + 7 + 7 + NUM_VOLATILES + 4}). "
+    "Update CONTINUOUS_DIM or the feature list."
+)
 
 
 class ObservationBuilder:
@@ -73,7 +98,7 @@ class ObservationBuilder:
         ability = np.zeros(ts, dtype=np.int64)
         item = np.zeros(ts, dtype=np.int64)
         types = np.zeros((ts, 2), dtype=np.int64)
-        continuous = np.zeros((ts, 35), dtype=np.float32)
+        continuous = np.zeros((ts, CONTINUOUS_DIM), dtype=np.float32)
         roles = np.full(ts, ROLE_BENCH, dtype=np.int64)
         mask = np.ones(ts, dtype=bool)  # True = padding
 
@@ -82,9 +107,9 @@ class ObservationBuilder:
                 break
             mask[i] = False
             species[i] = self._species_idx(pokemon)
-            moves[i] = self._move_indices(pokemon, full_info)
-            ability[i] = self._ability_idx(pokemon, full_info)
-            item[i] = self._item_idx(pokemon, full_info)
+            moves[i] = self._move_indices(pokemon)
+            ability[i] = self._ability_idx(pokemon)
+            item[i] = self._item_idx(pokemon)
             types[i] = self._type_indices(pokemon)
             continuous[i] = self._continuous_features(pokemon, full_info)
 
@@ -105,7 +130,8 @@ class ObservationBuilder:
         key = pokemon.species.lower() if pokemon.species else "<unk>"
         return self.gd.species_to_idx.get(key, UNKNOWN_IDX)
 
-    def _move_indices(self, pokemon: Pokemon, full_info: bool) -> np.ndarray:
+    def _move_indices(self, pokemon: Pokemon) -> np.ndarray:
+        # poke-env tracks only revealed moves for the opponent; zeros = unknown
         indices = np.zeros(4, dtype=np.int64)
         known_moves = list(pokemon.moves.values()) if pokemon.moves else []
         for j, move in enumerate(known_moves[:4]):
@@ -113,13 +139,15 @@ class ObservationBuilder:
             indices[j] = self.gd.move_to_idx.get(key, UNKNOWN_IDX)
         return indices
 
-    def _ability_idx(self, pokemon: Pokemon, full_info: bool) -> int:
+    def _ability_idx(self, pokemon: Pokemon) -> int:
+        # poke-env fills in the ability once it is revealed; None = still unknown
         ab = pokemon.ability
         if ab is None:
             return UNKNOWN_IDX
         return self.gd.abilities_to_idx.get(ab.lower(), UNKNOWN_IDX)
 
-    def _item_idx(self, pokemon: Pokemon, full_info: bool) -> int:
+    def _item_idx(self, pokemon: Pokemon) -> int:
+        # poke-env fills in the item once it is revealed; None/empty = still unknown
         it = pokemon.item
         if it is None or it == "":
             return UNKNOWN_IDX
@@ -134,7 +162,7 @@ class ObservationBuilder:
         return indices
 
     def _continuous_features(self, pokemon: Pokemon, full_info: bool) -> np.ndarray:
-        feats = np.zeros(35, dtype=np.float32)
+        feats = np.zeros(CONTINUOUS_DIM, dtype=np.float32)
         offset = 0
 
         # HP (normalized)
@@ -157,14 +185,16 @@ class ObservationBuilder:
             feats[offset + j] = boosts.get(stat, 0) / 6.0
         offset += 7
 
-        # Volatile statuses (16 binary)
-        effects = pokemon.effects
+        # Volatile statuses (NUM_VOLATILES binary flags)
+        effects = pokemon.effects  # Dict[Effect, int]
         for j, vol in enumerate(VOLATILES):
-            if vol in effects:
-                feats[offset + j] = 1.0
+            if isinstance(vol, frozenset):
+                feats[offset + j] = float(any(e in effects for e in vol))
+            else:
+                feats[offset + j] = float(vol in effects)
         offset += NUM_VOLATILES
 
-        # Move PP (4), normalized by max PP, only for full info
+        # Move PP (4), normalized by max PP, only for own pokemon (full_info)
         if full_info and pokemon.moves:
             for j, move in enumerate(list(pokemon.moves.values())[:4]):
                 if move.max_pp and move.max_pp > 0:
@@ -206,13 +236,22 @@ class ObservationBuilder:
 
     @staticmethod
     def _find_active_index(team_list: list, pokemon) -> int:
-        """Find where a specific pokemon is in the team list."""
+        """Find where a specific pokemon is in the ordered team list.
+
+        Returns 0 if the slot is empty (fainted/not yet sent out) — the action
+        mask will force pass or switch for that slot so the rep value doesn't matter.
+        Raises if a non-None pokemon cannot be found, which indicates a bug.
+        """
         if pokemon is None:
             return 0
         for i, p in enumerate(team_list):
             if p is pokemon:
                 return i
-        return 0
+        raise ValueError(
+            f"Active pokemon {pokemon.species!r} was not found in the ordered team list. "
+            "This indicates a mismatch between battle.active_pokemon and battle.team — "
+            "check poke-env battle state tracking."
+        )
 
     @staticmethod
     def _encode_field(battle: DoubleBattle) -> np.ndarray:
@@ -235,18 +274,21 @@ class ObservationBuilder:
                     break
         offset += 9
 
-        # Terrain (5: 4 types + none)
+        # Terrain (5: 4 types + none).
+        # Note: battle.fields also contains TRICK_ROOM and other non-terrain effects,
+        # so we must check for each terrain type explicitly rather than using `not battle.fields`.
         terrain_types = [
             Field.ELECTRIC_TERRAIN, Field.GRASSY_TERRAIN,
             Field.MISTY_TERRAIN, Field.PSYCHIC_TERRAIN,
         ]
-        if not battle.fields:
-            feats[offset] = 1.0
-        else:
-            for j, t in enumerate(terrain_types):
-                if t in battle.fields:
-                    feats[offset + 1 + j] = 1.0
-                    break
+        terrain_active = False
+        for j, t in enumerate(terrain_types):
+            if battle.fields and t in battle.fields:
+                feats[offset + 1 + j] = 1.0
+                terrain_active = True
+                break
+        if not terrain_active:
+            feats[offset] = 1.0  # no terrain
         offset += 5
 
         # Side conditions, per side (own then opp)
@@ -275,7 +317,7 @@ class ObservationBuilder:
             offset += 1
 
         # Trick Room (global)
-        feats[offset] = float(Field.TRICK_ROOM in battle.fields) if battle.fields else 0.0
+        feats[offset] = float(battle.fields and Field.TRICK_ROOM in battle.fields)
         offset += 1
 
         return feats

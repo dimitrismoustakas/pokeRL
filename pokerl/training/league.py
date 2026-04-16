@@ -1,6 +1,7 @@
 """Self-play league: a pool of past agent checkpoints as opponents."""
 
 import asyncio
+import json
 import random
 import copy
 from pathlib import Path
@@ -64,7 +65,6 @@ class LeaguePlayer(Player):
         return DoubleBattleOrder(orders[0], orders[1])
 
     def teampreview(self, battle: DoubleBattle) -> str:
-        # Use the agent's team preview head
         obs = self.obs_builder.build(battle)
         with torch.no_grad():
             obs_t = {k: torch.from_numpy(v).unsqueeze(0).to(self.device) for k, v in obs.items()}
@@ -73,17 +73,16 @@ class LeaguePlayer(Player):
         return "/team " + "".join(str(int(p) + 1) for p in picks)
 
     def reset_hidden(self):
-        """Call between battles to clear LSTM state."""
+        """Clear LSTM state between battles. Called by BattleEnv.reset()."""
         self._hidden = None
 
 
 class League:
     """Manages a pool of opponent checkpoints for self-play training.
 
-    Opponents are sampled with a mix of:
-    - Recent checkpoints (to track current skill)
-    - Older checkpoints (to prevent forgetting)
-    - Built-in bots (for diversity)
+    Opponents are sampled from a rolling window of past checkpoints, with a
+    bias towards recent ones (70%) over older ones (30%) to track current skill
+    while retaining some diversity.
     """
 
     def __init__(
@@ -100,7 +99,6 @@ class League:
         self.agent_template = agent_template
         self.device = device
         self.checkpoints: deque[str] = deque(maxlen=config.league_size)
-        self.win_rates: dict[str, float] = {}
 
     def add_checkpoint(self, agent: PokeAgent, step: int):
         """Snapshot the current agent as a new league member."""
@@ -109,8 +107,18 @@ class League:
         torch.save({"agent": agent.state_dict()}, path)
         self.checkpoints.append(path)
 
-    def make_opponent(self, loop: asyncio.AbstractEventLoop) -> LeaguePlayer | None:
+    def make_opponent(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        server_url: str | None = None,
+    ) -> "LeaguePlayer | None":
         """Create a LeaguePlayer from a sampled checkpoint.
+
+        Args:
+            loop: The asyncio event loop the opponent will run on.
+            server_url: The Showdown server URL to connect to. Must match the URL
+                used by the paired player so both are on the same server. Defaults
+                to the league's own env_config.server_url if not provided.
 
         Returns None if the league is empty.
         """
@@ -123,8 +131,9 @@ class League:
         agent_copy.load_state_dict(checkpoint["agent"])
         agent_copy.to(self.device)
 
+        url = server_url if server_url is not None else self.env_config.server_url
+        host, port = url.split(":")
         from poke_env import ServerConfiguration
-        host, port = self.env_config.server_url.split(":")
         server_config = ServerConfiguration(
             f"ws://{host}:{port}/showdown/websocket",
             f"http://{host}:{port}/action.php",
@@ -142,22 +151,35 @@ class League:
         )
 
     def should_use_league(self) -> bool:
-        """Whether to play against the league vs a built-in bot."""
+        """Whether to use the league this time (False if league is empty)."""
         if not self.checkpoints:
             return False
         return random.random() < self.config.self_play_prob
 
-    def record_result(self, opponent_name: str, won: bool):
-        """Track win rate against each opponent (for monitoring)."""
-        if opponent_name not in self.win_rates:
-            self.win_rates[opponent_name] = 0.5
-        alpha = 0.1
-        self.win_rates[opponent_name] = (
-            alpha * float(won) + (1 - alpha) * self.win_rates[opponent_name]
-        )
+    def save_state(self, path: str) -> None:
+        """Persist the ordered list of checkpoint paths to disk."""
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(list(self.checkpoints), f)
+
+    def load_state(self, path: str) -> None:
+        """Restore checkpoint paths from a saved state file.
+
+        Skips any paths that no longer exist on disk and warns if any are missing.
+        """
+        with open(path) as f:
+            paths: list[str] = json.load(f)
+
+        existing = [p for p in paths if Path(p).exists()]
+        missing = len(paths) - len(existing)
+        if missing:
+            print(f"Warning: {missing} league checkpoint(s) no longer on disk, skipping.")
+
+        for p in existing[-self.config.league_size:]:
+            self.checkpoints.append(p)
 
     def _sample_checkpoint(self) -> str | None:
-        """Sample a checkpoint path. 70% recent, 30% older."""
+        """Sample a checkpoint path. 70% recent half, 30% older half."""
         if not self.checkpoints:
             return None
 
@@ -165,6 +187,8 @@ class League:
         mid = len(checkpoints) // 2
 
         if len(checkpoints) < 2 or random.random() < 0.7:
-            return random.choice(checkpoints[mid:]) if mid < len(checkpoints) else random.choice(checkpoints)
+            recent = checkpoints[mid:] if mid < len(checkpoints) else checkpoints
+            return random.choice(recent)
         else:
-            return random.choice(checkpoints[:mid])
+            older = checkpoints[:mid] if mid > 0 else checkpoints
+            return random.choice(older)

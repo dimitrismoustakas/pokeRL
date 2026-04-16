@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from ..config import ModelConfig
 from ..data import GameData
+from ..env.observation import CONTINUOUS_DIM
 from .encoders import PokemonEncoder, TeamEncoder, FieldEncoder, SpatialEncoder
 from .memory import build_memory
 from .heads import ActionHead, TeamPreviewHead, ValueHead
@@ -29,6 +30,7 @@ class PokeAgent(nn.Module):
             num_abilities=game_data.num_abilities,
             num_items=game_data.num_items,
             num_types=game_data.num_types,
+            continuous_dim=CONTINUOUS_DIM,
             species_dim=config.species_dim,
             move_dim=config.move_dim,
             ability_dim=config.ability_dim,
@@ -75,7 +77,7 @@ class PokeAgent(nn.Module):
 
         Returns dict with: actions, log_prob, entropy, value, hidden
         """
-        context, active_reps = self.spatial(obs)
+        context, active_reps, _ = self.spatial(obs)
         context, new_hidden = self.memory(context, hidden)
 
         action_out = self.action_head(context, active_reps, action_masks, actions)
@@ -93,13 +95,14 @@ class PokeAgent(nn.Module):
         hidden=None,
         picks: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Forward pass for team preview (selecting 4 from 6)."""
-        context, _ = self.spatial(obs)
-        context, new_hidden = self.memory(context, hidden)
+        """Forward pass for team preview (selecting 4 from 6).
 
-        # Use all pokemon reps (not just active) for team selection
-        own_reps = self.spatial._encode_team(obs, "own")
-        own_reps = self.spatial.team_own(own_reps, obs["own_roles"], obs.get("own_mask"))
+        Uses the full own-team representations from the spatial encoder so the
+        preview head can score all six pokemon. The spatial encoder is called
+        once; no second pass is needed.
+        """
+        context, _, own_reps = self.spatial(obs)
+        context, new_hidden = self.memory(context, hidden)
 
         preview_out = self.team_preview_head(own_reps, context, picks)
         return {
@@ -109,7 +112,7 @@ class PokeAgent(nn.Module):
 
     def get_value(self, obs: dict[str, torch.Tensor], hidden=None) -> torch.Tensor:
         """Just the value estimate, for GAE computation."""
-        context, _ = self.spatial(obs)
+        context, _, _ = self.spatial(obs)
         context, _ = self.memory(context, hidden)
         return self.value_head(context)
 

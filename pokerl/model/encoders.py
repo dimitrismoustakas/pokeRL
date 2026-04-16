@@ -22,6 +22,7 @@ class PokemonEncoder(nn.Module):
         num_abilities: int,
         num_items: int,
         num_types: int,
+        continuous_dim: int,
         species_dim: int = 64,
         move_dim: int = 32,
         ability_dim: int = 32,
@@ -36,10 +37,6 @@ class PokemonEncoder(nn.Module):
         self.ability_emb = nn.Embedding(num_abilities, ability_dim, padding_idx=0)
         self.item_emb = nn.Embedding(num_items, item_dim, padding_idx=0)
         self.type_emb = nn.Embedding(num_types, type_dim, padding_idx=0)
-
-        # Continuous features per pokemon:
-        #   hp (1) + status one-hot (7) + stat_stages (7) + volatiles (~16) + move_pp (4)
-        continuous_dim = 1 + 7 + 7 + 16 + 4
 
         total_input = (
             species_dim
@@ -64,7 +61,7 @@ class PokemonEncoder(nn.Module):
         ability: torch.Tensor,       # (batch, )
         item: torch.Tensor,          # (batch, )
         types: torch.Tensor,         # (batch, 2)
-        continuous: torch.Tensor,    # (batch, 35)
+        continuous: torch.Tensor,    # (batch, continuous_dim)
     ) -> torch.Tensor:               # (batch, out_dim)
         x = torch.cat([
             self.species_emb(species),
@@ -121,7 +118,6 @@ class FieldEncoder(nn.Module):
     # Global: trick_room
     #
     # Total: 9 + 5 + 2*8 + 1 = 31
-
     INPUT_DIM = 31
 
     def __init__(self, out_dim: int = 64):
@@ -143,6 +139,8 @@ class SpatialEncoder(nn.Module):
       - context: a flat vector for memory / value head
       - active_reps: (batch, 2, dim) representations of our two active pokemon,
         used by the action head to select per-pokemon actions
+      - own_reps: (batch, team_size, dim) full attention-processed own team
+        representations, used by the team preview head
     """
 
     def __init__(
@@ -162,18 +160,20 @@ class SpatialEncoder(nn.Module):
         # context = mean(own_team) + mean(opp_team) + field
         self.context_dim = pokemon_dim * 2 + field_encoder.out_dim
 
-    def forward(self, obs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, obs: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             obs: dictionary with keys for own team, opponent team, field.
                  See observation.py for the exact structure.
 
         Returns:
-            context: (batch, context_dim) flat battle representation
+            context:     (batch, context_dim) flat battle representation
             active_reps: (batch, 2, pokemon_dim) our active pokemon representations
+            own_reps:    (batch, team_size, pokemon_dim) full attention-processed own
+                         team, for use by the team preview head
         """
-        batch = obs["own_species"].shape[0]
-
         # Encode each pokemon (own side)
         own_reps = self._encode_team(obs, prefix="own")  # (batch, 6, pokemon_dim)
         own_reps = self.team_own(own_reps, obs["own_roles"], obs.get("own_mask"))
@@ -192,14 +192,13 @@ class SpatialEncoder(nn.Module):
 
         context = torch.cat([own_summary, opp_summary, field], dim=-1)
 
-        # Extract our active pokemon representations (slots 0 and 1 by convention
-        # after sorting by role -- but roles are in the obs, so we gather by active indices)
+        # Extract our active pokemon representations by index
         active_indices = obs["own_active_indices"]  # (batch, 2)
         active_reps = own_reps.gather(
             1, active_indices.unsqueeze(-1).expand(-1, -1, own_reps.shape[-1])
         )
 
-        return context, active_reps
+        return context, active_reps, own_reps
 
     def _encode_team(self, obs: dict, prefix: str) -> torch.Tensor:
         """Encode all pokemon for one side."""

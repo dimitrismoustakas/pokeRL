@@ -260,6 +260,9 @@ class BattleEnv:
 
         reset_started = time.perf_counter()
         self._apply_pending_opponent()
+        # Give stateful opponents (e.g. LeaguePlayer) a clean slate for the new battle.
+        if hasattr(self.opponent, "reset_hidden"):
+            self.opponent.reset_hidden()
         self._battle_task = asyncio.run_coroutine_threadsafe(
             self.player.battle_against(self.opponent, n_battles=1),
             self._loop,

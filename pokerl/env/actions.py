@@ -111,9 +111,14 @@ def build_action_mask(battle: DoubleBattle, slot: int) -> np.ndarray:
     for k, _ in enumerate(switches):
         mask[SWITCH_OFFSET + k] = True
 
-    # If nothing is valid (shouldn't happen), allow pass as fallback
     if not mask.any():
-        mask[PASS_ACTION] = True
+        raise RuntimeError(
+            f"build_action_mask produced an empty mask for slot {slot} — "
+            f"pokemon={getattr(pokemon, 'species', None)!r}, "
+            f"moves={[m.id for m in moves]}, switches={len(switches)}, "
+            f"force_switch={battle.force_switch}. "
+            "This indicates a bug in action mask construction."
+        )
 
     return mask
 
@@ -139,7 +144,11 @@ def _valid_targets_for_move(
 def _resolve_target(
     move: Move, slot: int, target_idx: int, battle: DoubleBattle
 ) -> int:
-    """Convert our abstract target index to a Showdown move_target integer."""
+    """Convert our abstract target index to a Showdown move_target integer.
+
+    The sampled action should always be valid (the mask prevents illegal ones),
+    so if the target can't be resolved that indicates a mask/action bug.
+    """
     pokemon = battle.active_pokemon[slot]
     if pokemon is None:
         return battle.EMPTY_TARGET_POSITION
@@ -148,7 +157,13 @@ def _resolve_target(
     showdown_target = _target_index_to_showdown(target_idx, slot, battle)
     if showdown_target in possible_targets:
         return showdown_target
-    return possible_targets[0]
+
+    raise RuntimeError(
+        f"_resolve_target: computed showdown_target={showdown_target} is not in "
+        f"possible_targets={possible_targets} for move={move.id!r}, slot={slot}, "
+        f"target_idx={target_idx}. This means the action mask allowed an invalid target — "
+        "check build_action_mask and _valid_targets_for_move."
+    )
 
 
 def _showdown_target_to_index(

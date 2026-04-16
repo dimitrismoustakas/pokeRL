@@ -4,17 +4,17 @@ Usage:
     python -m scripts.train
     python -m scripts.train --device cuda
     python -m scripts.train --num-envs 1 --rollout-steps 8 --total-timesteps 24
+    python -m scripts.train --resume checkpoints/step_204800.pt
 """
 
 import argparse
 import asyncio
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import torch
-
-from poke_env.player import MaxBasePowerPlayer
 
 from pokerl.config import ModelConfig, EnvConfig, TrainingConfig
 from pokerl.data import GameData
@@ -52,6 +52,17 @@ def parse_args() -> argparse.Namespace:
         help="Override league checkpoint and opponent refresh frequency in updates.",
     )
     parser.add_argument(
+        "--self-play-prob",
+        type=float,
+        default=None,
+        help="Probability of facing a league opponent (vs built-in bot). Default 1.0 (pure self-play).",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
+    )
+    parser.add_argument(
         "--profile-rollout",
         action="store_true",
         help="Log a detailed per-update rollout timing breakdown.",
@@ -75,6 +86,7 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "log_interval": args.log_interval,
         "save_interval": args.save_interval,
         "league_update_interval": args.league_update_interval,
+        "self_play_prob": args.self_play_prob,
     }
     for field_name, value in overrides.items():
         if value is not None:
@@ -83,26 +95,40 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     return model_config, env_config, train_config
 
 
-def make_opponent_factory(env_config, game_data, league, device):
-    """Create an opponent factory for one environment."""
-    if league.should_use_league():
-        def league_factory(loop: asyncio.AbstractEventLoop):
-            opponent = league.make_opponent(loop)
-            if opponent is None:
-                raise RuntimeError("League opponent requested, but the league is empty.")
-            return opponent
+def make_league_opponent_factory(env_config: EnvConfig, league: League):
+    """Create a league opponent factory bound to a specific env's server URL."""
+    server_url = env_config.server_url
 
-        return league_factory, "league"
+    def league_factory(loop: asyncio.AbstractEventLoop):
+        opponent = league.make_opponent(loop, server_url=server_url)
+        if opponent is None:
+            raise RuntimeError(
+                "League opponent requested, but the league is empty. "
+                "This should not happen if the league was seeded before training."
+            )
+        return opponent
 
+    return league_factory
+
+
+def make_baseline_factory(env_config: EnvConfig):
+    """Create a MaxBasePowerPlayer factory for a specific env."""
     def baseline_factory(loop: asyncio.AbstractEventLoop):
+        from poke_env.player import MaxBasePowerPlayer
         return MaxBasePowerPlayer(
             account_configuration=make_local_account_configuration("maxbase"),
             battle_format=env_config.battle_format,
             server_configuration=make_server_configuration(env_config),
             loop=loop,
         )
+    return baseline_factory
 
-    return baseline_factory, "max-base-power"
+
+def pick_opponent_factory(env_config: EnvConfig, league: League):
+    """Choose a league or baseline factory for one environment."""
+    if league.should_use_league():
+        return make_league_opponent_factory(env_config, league), "league"
+    return make_baseline_factory(env_config), "max-base-power"
 
 
 def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
@@ -114,26 +140,27 @@ def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
     return server_urls
 
 
-def make_envs(env_config, game_data, league, device, server_urls: list[str]):
+def make_envs(env_config: EnvConfig, game_data: GameData, league: League, server_urls: list[str]) -> ParallelBattleEnv:
     """Create parallel battle environments with mixed opponents."""
     envs = []
     for i in range(env_config.num_envs):
         env_server_url = server_urls[i % len(server_urls)]
         env_instance_config = replace(env_config, server_url=env_server_url)
-        opponent_factory, _ = make_opponent_factory(env_instance_config, game_data, league, device)
+        opponent_factory, _ = pick_opponent_factory(env_instance_config, league)
         env = BattleEnv(env_instance_config, game_data, opponent_factory)
         envs.append(env)
     return ParallelBattleEnv(envs)
 
 
-def refresh_opponents(parallel_env, game_data, league, device):
+def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
     """Swap out opponents in existing environments.
 
-    Called periodically so the agent faces a mix of league
-    and random opponents as training progresses.
+    Called periodically so the agent faces a freshly sampled set of past
+    selves. Each env independently samples from the league, so they naturally
+    get a mix of checkpoints.
     """
     for env in parallel_env.envs:
-        opponent_factory, _ = make_opponent_factory(env.config, game_data, league, device)
+        opponent_factory, _ = pick_opponent_factory(env.config, league)
         env.set_next_opponent(opponent_factory)
 
 
@@ -196,6 +223,10 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
     )
 
 
+def _league_state_path(train_config: TrainingConfig) -> str:
+    return f"{train_config.checkpoint_dir}/league_state.json"
+
+
 def train():
     args = parse_args()
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -224,8 +255,29 @@ def train():
     trainer = PPOTrainer(agent, train_config, device)
     league = League(train_config, env_config, game_data, agent, device)
 
-    # Environments (start with max-base-power opponents, league is empty)
-    parallel_env = make_envs(env_config, game_data, league, device, server_urls)
+    # --- Resume from checkpoint ---
+    if args.resume:
+        trainer.load(args.resume)
+        print(f"Resumed trainer from {args.resume!r} (global step {trainer.global_step:,})")
+
+        league_state = _league_state_path(train_config)
+        if Path(league_state).exists():
+            league.load_state(league_state)
+            print(f"Restored league: {len(league.checkpoints)} checkpoint(s)")
+        else:
+            print("Warning: no league state file found alongside checkpoint — league starts empty.")
+
+    # --- Seed league so self-play is available from update 1 ---
+    # If resuming, this only runs when the league file was missing (edge case).
+    # On a fresh start, this ensures the agent never falls back to bots from the beginning.
+    if not league.checkpoints:
+        league.add_checkpoint(agent, step=trainer.global_step)
+        print(f"Seeded league with agent at step {trainer.global_step}")
+
+    # --- Environments ---
+    parallel_env = make_envs(env_config, game_data, league, server_urls)
+    # Refresh so environments pick up the seeded/restored league checkpoint
+    refresh_opponents(parallel_env, league)
 
     try:
         # Rollout buffer
@@ -236,24 +288,28 @@ def train():
 
         hidden = agent.initial_hidden(env_config.num_envs)
         num_updates = train_config.total_timesteps // steps_per_update
+        updates_done = trainer.global_step // steps_per_update
 
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")
         print(f"Server URLs: {', '.join(server_urls)}")
+        print(f"Self-play prob: {train_config.self_play_prob:.0%}")
+        if updates_done:
+            print(f"Resuming from update {updates_done + 1} / {num_updates}")
         print("Starting training...")
 
-        episode_rewards = []
+        episode_rewards: list[float] = []
         start_time = time.time()
 
-        for update in range(1, num_updates + 1):
+        for update in range(updates_done + 1, num_updates + 1):
             agent.eval()
             buffer.reset()
             if args.profile_rollout:
                 parallel_env.reset_timing()
             rollout_started = time.perf_counter()
-            update_episode_rewards = []
-            update_episode_secs = []
-            update_episode_turns = []
+            update_episode_rewards: list[float] = []
+            update_episode_secs: list[float] = []
+            update_episode_turns: list[float] = []
             rollout_profile = {
                 "obs_to_device_sec": 0.0,
                 "mask_to_device_sec": 0.0,
@@ -369,17 +425,23 @@ def train():
             if update % train_config.save_interval == 0:
                 path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
                 trainer.save(path)
+                league.save_state(_league_state_path(train_config))
                 print(f"Saved checkpoint: {path}")
 
             # --- League: add checkpoint and refresh opponents ---
             if update % train_config.league_update_interval == 0:
                 league.add_checkpoint(agent, trainer.global_step)
-                refresh_opponents(parallel_env, game_data, league, device)
+                refresh_opponents(parallel_env, league)
                 print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
 
         print("Training complete.")
-        trainer.save(f"{train_config.checkpoint_dir}/final.pt")
+        final_path = f"{train_config.checkpoint_dir}/final.pt"
+        trainer.save(final_path)
+        league.save_state(_league_state_path(train_config))
+        print(f"Saved final checkpoint: {final_path}")
     finally:
         parallel_env.close()
+
+
 if __name__ == "__main__":
     train()

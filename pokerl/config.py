@@ -64,4 +64,4 @@ class TrainingConfig:
     # League
     league_size: int = 20
     league_update_interval: int = 50
-    self_play_prob: float = 0.5  # probability of playing vs league (vs built-in bot)
+    self_play_prob: float = 1.0  # probability of playing vs league (vs built-in bot)
