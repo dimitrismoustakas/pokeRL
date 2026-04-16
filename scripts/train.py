@@ -19,6 +19,7 @@ import torch
 from pokerl.config import ModelConfig, EnvConfig, TrainingConfig
 from pokerl.data import GameData
 from pokerl.model.agent import PokeAgent
+from pokerl.teamgen import apply_regulation_profile, maybe_build_teambuilder
 from pokerl.env.showdown_env import (
     BattleEnv,
     ParallelBattleEnv,
@@ -33,6 +34,7 @@ from pokerl.training.league import League
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train pokeRL with PPO.")
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
+    parser.add_argument("--battle-format", default=None, help="Override the Showdown format / regulation id.")
     parser.add_argument("--num-envs", type=int, default=None, help="Override the number of parallel battle environments.")
     parser.add_argument("--rollout-steps", type=int, default=None, help="Override rollout steps collected per update.")
     parser.add_argument("--total-timesteps", type=int, default=None, help="Override the total environment steps to train for.")
@@ -74,6 +76,9 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     model_config = ModelConfig()
     env_config = EnvConfig()
     train_config = TrainingConfig()
+
+    if args.battle_format is not None:
+        env_config.battle_format = args.battle_format
 
     if args.num_envs is not None:
         env_config.num_envs = args.num_envs
@@ -120,6 +125,7 @@ def make_baseline_factory(env_config: EnvConfig):
             battle_format=env_config.battle_format,
             server_configuration=make_server_configuration(env_config),
             loop=loop,
+            team=maybe_build_teambuilder(env_config.battle_format, env_config.team_pool_size),
         )
     return baseline_factory
 
@@ -257,6 +263,7 @@ def train():
     print(f"Device: {device}")
 
     model_config, env_config, train_config = build_configs(args)
+    profile = apply_regulation_profile(model_config, env_config)
     server_urls = parse_server_urls(args.server_urls, env_config.server_url)
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
@@ -267,10 +274,15 @@ def train():
         )
 
     # Game data and model
-    game_data = GameData(gen=9)
+    game_data = GameData(gen=profile.gen)
     agent = PokeAgent(model_config, game_data)
     agent.to(device)
 
+    print(
+        f"Battle format: {profile.name} ({profile.format_id}) | "
+        f"Bring {profile.team_size} Pick {profile.pick_size} | "
+        f"Team source: {'builtin' if profile.built_in_team_kind else 'generated'}"
+    )
     print(f"Model parameters: {sum(p.numel() for p in agent.parameters()):,}")
 
     # Training

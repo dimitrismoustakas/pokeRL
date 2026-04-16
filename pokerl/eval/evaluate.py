@@ -7,8 +7,7 @@ from ..config import ModelConfig, EnvConfig
 from ..data import GameData
 from ..model.agent import PokeAgent
 from ..env.showdown_env import BattleEnv, make_local_account_configuration, make_server_configuration
-from ..env.observation import ObservationBuilder
-from ..env.actions import ACTIONS_PER_SLOT
+from ..teamgen import apply_regulation_profile, maybe_build_teambuilder
 
 
 def evaluate(
@@ -55,6 +54,17 @@ def evaluate(
     }
 
 
+def make_team_preview_fn(agent: PokeAgent, device: torch.device):
+    def team_preview_fn(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
+        with torch.no_grad():
+            obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(device) for key, value in obs.items()}
+            out = agent.team_preview(obs_t)
+            picks = out["picks"].cpu().numpy()[0]
+        return picks, "/team " + "".join(str(int(pick) + 1) for pick in picks)
+
+    return team_preview_fn
+
+
 def load_and_evaluate(
     checkpoint_path: str,
     num_games: int = 100,
@@ -64,9 +74,10 @@ def load_and_evaluate(
     from poke_env.player import MaxBasePowerPlayer
 
     device = torch.device(device_name)
-    game_data = GameData(gen=9)
     model_config = ModelConfig()
     env_config = EnvConfig()
+    profile = apply_regulation_profile(model_config, env_config)
+    game_data = GameData(gen=profile.gen)
 
     agent = PokeAgent(model_config, game_data)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -79,9 +90,15 @@ def load_and_evaluate(
             battle_format=env_config.battle_format,
             server_configuration=make_server_configuration(env_config),
             loop=loop,
+            team=maybe_build_teambuilder(env_config.battle_format, env_config.team_pool_size),
         )
 
-    env = BattleEnv(env_config, game_data, opponent_factory)
+    env = BattleEnv(
+        env_config,
+        game_data,
+        opponent_factory,
+        team_preview_fn=make_team_preview_fn(agent, device),
+    )
 
     try:
         results = evaluate(agent, env, num_games, device)

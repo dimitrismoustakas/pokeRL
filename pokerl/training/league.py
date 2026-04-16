@@ -18,6 +18,7 @@ from ..config import TrainingConfig, EnvConfig
 from ..env.observation import ObservationBuilder
 from ..env.actions import build_action_mask, action_to_order
 from ..env.showdown_env import make_local_account_configuration
+from ..teamgen import maybe_build_teambuilder
 
 
 class LeaguePlayer(Player):
@@ -148,6 +149,7 @@ class League:
             battle_format=self.env_config.battle_format,
             server_configuration=server_config,
             loop=loop,
+            team=maybe_build_teambuilder(self.env_config.battle_format, self.env_config.team_pool_size),
         )
 
     def should_use_league(self) -> bool:

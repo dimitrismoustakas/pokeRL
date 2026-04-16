@@ -18,6 +18,7 @@ from pokerl.data import GameData
 from pokerl.env.actions import NUM_TARGETS, PASS_ACTION, SWITCH_OFFSET, TERA_OFFSET
 from pokerl.env.showdown_env import BattleEnv, make_local_account_configuration
 from pokerl.model.agent import PokeAgent
+from pokerl.teamgen import apply_regulation_profile, maybe_build_teambuilder
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,11 +185,23 @@ def _build_opponent_factory(name: str, env_config: EnvConfig, timing: dict[str, 
             battle_format=env_config.battle_format,
             server_configuration=server_config(env_config),
             loop=loop,
+            team=maybe_build_teambuilder(env_config.battle_format, env_config.team_pool_size),
         )
         _attach_choice_timer(opponent, timing, "opponent")
         return opponent
 
     return factory
+
+
+def make_team_preview_fn(agent: PokeAgent, device: torch.device):
+    def team_preview_fn(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
+        with torch.no_grad():
+            obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(device) for key, value in obs.items()}
+            out = agent.team_preview(obs_t)
+            picks = out["picks"].cpu().numpy()[0]
+        return picks, "/team " + "".join(str(int(pick) + 1) for pick in picks)
+
+    return team_preview_fn
 
 
 def main() -> None:
@@ -197,15 +210,19 @@ def main() -> None:
     device = torch.device(device_name)
     started_at = time.perf_counter()
 
-    game_data = GameData(gen=9)
     env_config = EnvConfig(num_envs=1)
-    agent = PokeAgent(ModelConfig(), game_data).to(device)
+    model_config = ModelConfig()
+    profile = apply_regulation_profile(model_config, env_config)
+    game_data = GameData(gen=profile.gen)
+    agent = PokeAgent(model_config, game_data).to(device)
     timing = _empty_timing()
     opponent_factory = _build_opponent_factory(args.opponent, env_config, timing)
+    team_preview_fn = make_team_preview_fn(agent, device)
     env = BattleEnv(
         env_config,
         game_data,
         opponent_factory,
+        team_preview_fn=team_preview_fn,
         player_kwargs={
             "account_configuration": make_local_account_configuration("smokeagent"),
         },

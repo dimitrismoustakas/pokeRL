@@ -24,7 +24,7 @@ class ModelConfig:
     # Heads
     action_hidden: int = 256
     value_hidden: int = 256
-    pick_size: int = 4  # how many pokemon to select at team preview (must match EnvConfig.pick_size)
+    pick_size: int = 4  # synchronized from battle_format during startup
 
     # Stat-based embedding init
     init_embeddings_from_stats: bool = True
@@ -32,11 +32,12 @@ class ModelConfig:
 
 @dataclass
 class EnvConfig:
-    battle_format: str = "gen9randomdoublesbattle"
+    battle_format: str = "gen9vgc2026regi"  # regulation source of truth
     server_url: str = "localhost:8000"
     num_envs: int = 16
-    team_size: int = 6
-    pick_size: int = 4  # how many pokemon to bring from team_size
+    team_size: int = 6  # synchronized from battle_format during startup
+    pick_size: int = 4  # synchronized from battle_format during startup
+    team_pool_size: int = 32  # cached generated teams when the format needs explicit teams
 
 
 @dataclass

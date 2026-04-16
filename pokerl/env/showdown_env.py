@@ -18,6 +18,7 @@ from poke_env.player import BattleOrder, DoubleBattleOrder, ForfeitBattleOrder, 
 
 from ..config import EnvConfig
 from ..data import GameData
+from ..teamgen import maybe_build_teambuilder
 from .observation import ObservationBuilder
 from .actions import (
     build_action_mask, action_to_order,
@@ -239,6 +240,10 @@ class BattleEnv:
             "account_configuration",
             make_local_account_configuration("agent"),
         )
+        if "team" not in player_options:
+            team_builder = maybe_build_teambuilder(config.battle_format, config.team_pool_size)
+            if team_builder is not None:
+                player_options["team"] = team_builder
         self.player = ShowdownPlayer(
             obs_builder,
             timing=self._timing,
