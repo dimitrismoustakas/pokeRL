@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import random
+import time
 from collections import defaultdict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ class _LeagueInferenceService:
     configured device. This preserves the opponent policy while avoiding one
     tiny GPU forward per environment thread.
     """
+
+    _COALESCE_WINDOW_SEC = 0.001
 
     def __init__(self, agent_template: PokeAgent, device: torch.device):
         self._agent_template = agent_template
@@ -143,6 +146,13 @@ class _LeagueInferenceService:
                     self._condition.wait()
                 if self._closed and not self._pending:
                     return
+                if self._COALESCE_WINDOW_SEC > 0:
+                    deadline = time.perf_counter() + self._COALESCE_WINDOW_SEC
+                    while not self._closed:
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        self._condition.wait(timeout=remaining)
                 batch = self._pending
                 self._pending = []
 

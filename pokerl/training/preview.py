@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Condition, Thread
@@ -20,6 +21,8 @@ class _PreviewRequest:
 
 class TeamPreviewBatcher:
     """Batches concurrent team preview requests from environment threads."""
+
+    _COALESCE_WINDOW_SEC = 0.001
 
     def __init__(self, agent: PokeAgent, device: torch.device):
         self._agent = agent
@@ -61,6 +64,13 @@ class TeamPreviewBatcher:
                     self._condition.wait()
                 if self._closed and not self._pending:
                     return
+                if self._COALESCE_WINDOW_SEC > 0:
+                    deadline = time.perf_counter() + self._COALESCE_WINDOW_SEC
+                    while not self._closed:
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        self._condition.wait(timeout=remaining)
                 batch = self._pending
                 self._pending = []
 
