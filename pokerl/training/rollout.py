@@ -7,7 +7,12 @@ from dataclasses import dataclass
 
 @dataclass
 class RolloutBatch:
-    """A batch of experience for PPO updates."""
+    """A batch of experience for PPO updates.
+
+    All tensors are stored flat: shape (num_steps * num_envs, ...).
+    The num_steps and num_envs fields let the PPO trainer reshape them back
+    into (num_steps, num_envs, ...) for sequence-level LSTM training.
+    """
     obs: dict[str, torch.Tensor]
     actions: torch.Tensor          # (batch, 2)
     action_masks: torch.Tensor     # (batch, 2, num_actions)
@@ -17,6 +22,10 @@ class RolloutBatch:
     dones: torch.Tensor            # (batch,)
     advantages: torch.Tensor       # (batch,)
     returns: torch.Tensor          # (batch,)
+
+    # Shape of the rollout before flattening — required for sequence BPTT.
+    num_steps: int = 0
+    num_envs: int = 0
 
     # LSTM hidden states at the start of each step (for sequence training)
     hidden_h: torch.Tensor | None = None  # (batch, hidden_dim)
@@ -116,6 +125,8 @@ class RolloutBuffer:
             dones=to_tensor(np.array(dones)),
             advantages=to_tensor(advantages),
             returns=to_tensor(returns),
+            num_steps=self.num_steps,
+            num_envs=self.num_envs,
         )
 
         if self._hidden_h:

@@ -43,7 +43,7 @@ class PokemonEncoder(nn.Module):
             + 4 * move_dim    # 4 moves
             + ability_dim
             + item_dim
-            + 2 * type_dim    # up to 2 types
+            + 3 * type_dim    # type_1, type_2, tera_type
             + continuous_dim
         )
 
@@ -60,7 +60,7 @@ class PokemonEncoder(nn.Module):
         moves: torch.Tensor,         # (batch, 4)
         ability: torch.Tensor,       # (batch, )
         item: torch.Tensor,          # (batch, )
-        types: torch.Tensor,         # (batch, 2)
+        types: torch.Tensor,         # (batch, 3)  — type_1, type_2, tera_type
         continuous: torch.Tensor,    # (batch, continuous_dim)
     ) -> torch.Tensor:               # (batch, out_dim)
         x = torch.cat([

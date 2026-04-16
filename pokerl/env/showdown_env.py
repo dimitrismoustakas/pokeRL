@@ -7,7 +7,6 @@ import uuid
 from collections.abc import Awaitable, Callable
 from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError
 from threading import Lock, Thread
-from types import MethodType
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -178,9 +177,8 @@ class ShowdownPlayer(Player):
             return
 
         emit_started = time.perf_counter()
-        obs_started = time.perf_counter()
         obs = self.obs_builder.build(battle)
-        self.timing.add("player_emit_obs_sec", time.perf_counter() - obs_started)
+        self.timing.add("player_emit_obs_sec", time.perf_counter() - emit_started)
 
         mask_started = time.perf_counter()
         mask = np.stack([build_action_mask(battle, s) for s in range(2)])
@@ -259,6 +257,7 @@ class BattleEnv:
             raise RuntimeError("BattleEnv.reset() called after the environment was closed.")
 
         reset_started = time.perf_counter()
+        self._episode_team_preview = None
         self._apply_pending_opponent()
         # Give stateful opponents (e.g. LeaguePlayer) a clean slate for the new battle.
         if hasattr(self.opponent, "reset_hidden"):
@@ -354,14 +353,14 @@ class BattleEnv:
     def _attach_choice_timer(self, opponent: Player) -> None:
         original_choose_move = opponent.choose_move
 
-        def timed_choose_move(this, battle):
+        def timed_choose_move(battle):
             started = time.perf_counter()
             result = original_choose_move(battle)
             self._timing.increment("opponent_choice_calls")
             self._timing.add("opponent_choice_sec", time.perf_counter() - started)
             return result
 
-        opponent.choose_move = MethodType(timed_choose_move, opponent)
+        opponent.choose_move = timed_choose_move
 
     def snapshot_timing(self) -> dict[str, float]:
         return self._timing.snapshot_and_reset()
@@ -391,7 +390,7 @@ class BattleEnv:
                     pass
 
         for participant in (self.player, self.opponent):
-            self._disconnect_player(participant)
+            self._disconnect_player(participant, self._loop)
 
         self._cancel_pending_tasks()
         self.player.obs_queue.clear()
@@ -422,15 +421,18 @@ class BattleEnv:
             pass
 
     @staticmethod
-    def _disconnect_player(player: Player):
+    def _disconnect_player(player: Player, loop: asyncio.AbstractEventLoop) -> None:
         ps_client = getattr(player, "ps_client", None)
         if ps_client is None or not hasattr(ps_client, "websocket"):
             return
 
         try:
-            asyncio.run(asyncio.wait_for(ps_client.stop_listening(), timeout=1.0))
-        except Exception:
-            pass
+            asyncio.run_coroutine_threadsafe(
+                asyncio.wait_for(ps_client.stop_listening(), timeout=1.0),
+                loop,
+            ).result(timeout=2.0)
+        except Exception as exc:
+            print(f"Warning: disconnect failed for {getattr(player, 'username', '?')!r}: {exc}")
 
 
 class ParallelBattleEnv:

@@ -52,7 +52,7 @@ class PokeAgent(nn.Module):
 
         # --- Heads ---
         self.action_head = ActionHead(memory_out, config.pokemon_out, config.action_hidden)
-        self.team_preview_head = TeamPreviewHead(config.pokemon_out, memory_out)
+        self.team_preview_head = TeamPreviewHead(config.pokemon_out, memory_out, config.pick_size)
         self.value_head = ValueHead(memory_out, config.value_hidden)
 
         # Optional: stat-based embedding init

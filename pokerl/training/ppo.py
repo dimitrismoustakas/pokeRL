@@ -23,54 +23,138 @@ class PPOTrainer:
     def update(self, batch: RolloutBatch) -> dict[str, float]:
         """Run PPO update epochs on a rollout batch.
 
+        Minibatches are slices of environments, not random timesteps, so that
+        the LSTM can be unrolled through the full rollout sequence with correct
+        gradient flow across episode boundaries (hidden state is zeroed on done).
+
         Returns a dict of loss metrics for logging.
         """
-        batch_size = batch.actions.shape[0]
-        minibatch_size = batch_size // self.config.num_minibatches
+        T = batch.num_steps
+        E = batch.num_envs
+        envs_per_mb = E // self.config.num_minibatches
+        if envs_per_mb == 0:
+            raise ValueError(
+                f"num_minibatches ({self.config.num_minibatches}) cannot exceed num_envs ({E}); "
+                "reduce num_minibatches."
+            )
 
-        # Normalize advantages
+        # Normalize advantages over the full batch once, before the update loop.
         adv = batch.advantages
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        metrics = {"policy_loss": 0, "value_loss": 0, "entropy": 0, "approx_kl": 0}
+        # Reshape flat (T*E, ...) tensors back to (T, E, ...) for sequence processing.
+        def seq(t: torch.Tensor) -> torch.Tensor:
+            return t.reshape(T, E, *t.shape[1:])
+
+        obs_seq = {k: seq(v) for k, v in batch.obs.items()}
+        actions_seq = seq(batch.actions)         # (T, E, 2)
+        masks_seq = seq(batch.action_masks)      # (T, E, 2, A)
+        old_lp_seq = seq(batch.log_probs)        # (T, E)
+        adv_seq = seq(adv)                       # (T, E)
+        returns_seq = seq(batch.returns)         # (T, E)
+        values_old_seq = seq(batch.values)       # (T, E)
+        dones_seq = seq(batch.dones)             # (T, E)
+
+        # Per-env initial hidden states: stored at rollout step 0.
+        if batch.hidden_h is not None:
+            init_h_all = seq(batch.hidden_h)[0]  # (E, hidden_dim)
+            init_c_all = seq(batch.hidden_c)[0]  # (E, hidden_dim)
+        else:
+            init_h_all = None
+            init_c_all = None
+
+        metrics = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0}
         num_updates = 0
 
         for epoch in range(self.config.num_epochs):
-            indices = torch.randperm(batch_size)
+            env_order = torch.randperm(E)
 
-            for start in range(0, batch_size, minibatch_size):
-                end = start + minibatch_size
-                mb_idx = indices[start:end]
+            for mb_start in range(0, E, envs_per_mb):
+                mb_envs = env_order[mb_start: mb_start + envs_per_mb]
+                E_mb = len(mb_envs)
 
-                mb_obs = {k: v[mb_idx].to(self.device) for k, v in batch.obs.items()}
-                mb_actions = batch.actions[mb_idx].to(self.device)
-                mb_masks = batch.action_masks[mb_idx].to(self.device).bool()
-                mb_old_log_probs = batch.log_probs[mb_idx].to(self.device)
-                mb_advantages = adv[mb_idx].to(self.device)
-                mb_returns = batch.returns[mb_idx].to(self.device)
+                # Move per-minibatch sequence data to device.
+                mb_obs_seq = {k: v[:, mb_envs].to(self.device) for k, v in obs_seq.items()}
+                mb_actions_seq = actions_seq[:, mb_envs].to(self.device)   # (T, E_mb, 2)
+                mb_masks_seq = masks_seq[:, mb_envs].to(self.device).bool()  # (T, E_mb, 2, A)
+                mb_dones_seq = dones_seq[:, mb_envs].to(self.device)          # (T, E_mb)
+                mb_old_lp = old_lp_seq[:, mb_envs].reshape(-1).to(self.device)
+                mb_adv = adv_seq[:, mb_envs].reshape(-1).to(self.device)
+                mb_returns = returns_seq[:, mb_envs].reshape(-1).to(self.device)
+                mb_values_old = values_old_seq[:, mb_envs].reshape(-1).to(self.device)
 
-                # Reconstruct hidden state if using LSTM
-                hidden = None
-                if batch.hidden_h is not None:
-                    h = batch.hidden_h[mb_idx].unsqueeze(0).to(self.device)
-                    c = batch.hidden_c[mb_idx].unsqueeze(0).to(self.device)
-                    hidden = (h, c)
+                # Initial hidden for this env subset.
+                if init_h_all is not None:
+                    hidden: tuple | None = (
+                        init_h_all[mb_envs].unsqueeze(0).to(self.device),
+                        init_c_all[mb_envs].unsqueeze(0).to(self.device),
+                    )
+                else:
+                    hidden = None
 
-                # Forward pass: evaluate the stored actions
-                out = self.agent(mb_obs, hidden, actions=mb_actions, action_masks=mb_masks)
+                # Spatial encoder: process all T*E_mb pokemon in one batched pass
+                # (heavy attention layers run once; only the lightweight LSTM loops).
+                flat_obs = {
+                    k: v.reshape(T * E_mb, *v.shape[2:])
+                    for k, v in mb_obs_seq.items()
+                }
+                context_flat, active_reps_flat, _ = self.agent.spatial(flat_obs)
+                context_seq_mb = context_flat.reshape(T, E_mb, -1)
+                active_reps_seq_mb = active_reps_flat.reshape(T, E_mb, 2, -1)
 
-                # Policy loss (clipped surrogate)
-                log_ratio = out["log_prob"] - mb_old_log_probs
+                # LSTM + heads: step through the sequence one turn at a time.
+                # Gradients flow back through all turns within each non-terminal
+                # episode segment; the hidden is zeroed at episode boundaries.
+                all_log_probs: list[torch.Tensor] = []
+                all_entropies: list[torch.Tensor] = []
+                all_values: list[torch.Tensor] = []
+
+                for t in range(T):
+                    ctx_t, hidden = self.agent.memory(context_seq_mb[t], hidden)
+
+                    action_out = self.agent.action_head(
+                        ctx_t,
+                        active_reps_seq_mb[t],
+                        mb_masks_seq[t],
+                        mb_actions_seq[t],
+                    )
+                    value_t = self.agent.value_head(ctx_t)
+
+                    all_log_probs.append(action_out["log_prob"])
+                    all_entropies.append(action_out["entropy"])
+                    all_values.append(value_t)
+
+                    # Zero hidden state for envs whose episode just ended.
+                    # Multiply by a float mask to avoid in-place ops on the graph.
+                    if hidden is not None and mb_dones_seq[t].any():
+                        not_done = (~mb_dones_seq[t]).float().unsqueeze(0).unsqueeze(-1)
+                        h, c = hidden
+                        hidden = (h * not_done, c * not_done)
+
+                # Flatten (T, E_mb) → (T*E_mb,) for loss computation.
+                log_probs_flat = torch.stack(all_log_probs).reshape(-1)
+                entropies_flat = torch.stack(all_entropies).reshape(-1)
+                values_flat = torch.stack(all_values).reshape(-1)
+
+                # Policy loss (clipped surrogate objective).
+                log_ratio = log_probs_flat - mb_old_lp
                 ratio = log_ratio.exp()
-                surr1 = ratio * mb_advantages
-                surr2 = torch.clamp(ratio, 1 - self.config.clip_eps, 1 + self.config.clip_eps) * mb_advantages
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - self.config.clip_eps, 1.0 + self.config.clip_eps) * mb_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss (simple MSE, could clip too)
-                value_loss = 0.5 * (out["value"] - mb_returns).pow(2).mean()
+                # Value loss with clipping (prevents large value updates).
+                values_clipped = mb_values_old + torch.clamp(
+                    values_flat - mb_values_old,
+                    -self.config.clip_eps,
+                    self.config.clip_eps,
+                )
+                value_loss = 0.5 * torch.max(
+                    (values_flat - mb_returns).pow(2),
+                    (values_clipped - mb_returns).pow(2),
+                ).mean()
 
-                # Entropy bonus
-                entropy_loss = -out["entropy"].mean()
+                entropy_loss = -entropies_flat.mean()
 
                 loss = (
                     policy_loss
@@ -83,7 +167,6 @@ class PPOTrainer:
                 nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
 
-                # Track metrics
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - log_ratio).mean().item()
                 metrics["policy_loss"] += policy_loss.item()
@@ -92,8 +175,7 @@ class PPOTrainer:
                 metrics["approx_kl"] += approx_kl
                 num_updates += 1
 
-        self.global_step += batch_size
-
+        self.global_step += T * E
         return {k: v / num_updates for k, v in metrics.items()}
 
     def update_team_preview(self, data: list[tuple[dict, np.ndarray, float]]) -> float:
@@ -102,6 +184,8 @@ class PPOTrainer:
         Called once per PPO update cycle using all team preview decisions made
         during the rollout. Each entry is (obs_dict, picks_np, episode_reward)
         where episode_reward is +1 for a win and -1 for a loss.
+
+        Uses the value function as a baseline to reduce gradient variance.
 
         Returns the loss value for logging.
         """
@@ -112,12 +196,18 @@ class PPOTrainer:
         picks_batch = torch.from_numpy(np.stack([d[1] for d in data])).long().to(self.device)
         rewards_batch = torch.tensor([d[2] for d in data], dtype=torch.float32, device=self.device)
 
+        # Value baseline: no LSTM state at team preview time (start of battle).
+        with torch.no_grad():
+            baselines = self.agent.get_value(obs_batch)
+
         out = self.agent.team_preview(obs_batch, picks=picks_batch)
         log_prob = out["log_prob"]
         entropy = out["entropy"]
 
-        # REINFORCE: minimize -E[log_prob * reward]; add entropy bonus to encourage exploration.
-        loss = -(log_prob * rewards_batch).mean() - self.config.entropy_coef * entropy.mean()
+        # REINFORCE with baseline: minimise -E[log_prob * (reward - baseline)].
+        # The baseline does not affect the expected gradient but reduces variance.
+        advantages = rewards_batch - baselines
+        loss = -(log_prob * advantages).mean() - self.config.entropy_coef * entropy.mean()
 
         self.optimizer.zero_grad()
         loss.backward()

@@ -97,7 +97,7 @@ class ObservationBuilder:
         moves = np.zeros((ts, 4), dtype=np.int64)
         ability = np.zeros(ts, dtype=np.int64)
         item = np.zeros(ts, dtype=np.int64)
-        types = np.zeros((ts, 2), dtype=np.int64)
+        types = np.zeros((ts, 3), dtype=np.int64)  # type_1, type_2, tera_type
         continuous = np.zeros((ts, CONTINUOUS_DIM), dtype=np.float32)
         roles = np.full(ts, ROLE_BENCH, dtype=np.int64)
         mask = np.ones(ts, dtype=bool)  # True = padding
@@ -154,11 +154,13 @@ class ObservationBuilder:
         return self.gd.item_index(it)
 
     def _type_indices(self, pokemon: Pokemon) -> np.ndarray:
-        indices = np.zeros(2, dtype=np.int64)
+        indices = np.zeros(3, dtype=np.int64)
         if pokemon.type_1:
             indices[0] = self.gd.type_to_idx.get(pokemon.type_1.name.lower(), UNKNOWN_IDX)
         if pokemon.type_2:
             indices[1] = self.gd.type_to_idx.get(pokemon.type_2.name.lower(), UNKNOWN_IDX)
+        if pokemon.tera_type:
+            indices[2] = self.gd.type_to_idx.get(pokemon.tera_type.name.lower(), UNKNOWN_IDX)
         return indices
 
     def _continuous_features(self, pokemon: Pokemon, full_info: bool) -> np.ndarray:

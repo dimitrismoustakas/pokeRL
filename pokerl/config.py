@@ -24,6 +24,7 @@ class ModelConfig:
     # Heads
     action_hidden: int = 256
     value_hidden: int = 256
+    pick_size: int = 4  # how many pokemon to select at team preview (must match EnvConfig.pick_size)
 
     # Stat-based embedding init
     init_embeddings_from_stats: bool = True
