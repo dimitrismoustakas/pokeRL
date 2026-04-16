@@ -1,5 +1,6 @@
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "pokeRL\pokemon-showdown"),
+    [int]$Port = 8000,
     [switch]$InstallOnly,
     [switch]$Update
 )
@@ -7,7 +8,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Test-ShowdownPort {
-    $result = Test-NetConnection -ComputerName localhost -Port 8000 -WarningAction SilentlyContinue
+    param(
+        [int]$Port
+    )
+
+    $result = Test-NetConnection -ComputerName localhost -Port $Port -WarningAction SilentlyContinue
     return [bool]$result.TcpTestSucceeded
 }
 
@@ -43,9 +48,9 @@ if ($InstallOnly) {
     exit 0
 }
 
-if (Test-ShowdownPort) {
-    Write-Output "Pokemon Showdown is already running on localhost:8000"
+if (Test-ShowdownPort -Port $Port) {
+    Write-Output "Pokemon Showdown is already running on localhost:$Port"
     exit 0
 }
 
-node pokemon-showdown start --no-security
+node pokemon-showdown start --no-security $Port

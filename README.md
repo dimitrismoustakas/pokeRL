@@ -23,6 +23,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1
 
 It serves on `localhost:8000` by default.
 
+To run additional local instances on other ports:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1 -Port 8001
+```
+
 ## Smoke battle
 
 ```powershell
@@ -36,3 +42,9 @@ It serves on `localhost:8000` by default.
 ```
 
 Training logs include rollout time, PPO update time, completed episodes, average completed battle duration, and average completed battle turns for the current update.
+
+To shard envs across multiple local Showdown servers:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\train.py --device cpu --num-envs 16 --server-urls localhost:8000,localhost:8001
+```

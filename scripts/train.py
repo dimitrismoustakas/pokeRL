@@ -9,6 +9,7 @@ Usage:
 import argparse
 import asyncio
 import time
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -39,6 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-minibatches", type=int, default=None, help="Override PPO minibatches per update.")
     parser.add_argument("--log-interval", type=int, default=None, help="Override logging frequency in updates.")
     parser.add_argument("--save-interval", type=int, default=None, help="Override checkpoint save frequency in updates.")
+    parser.add_argument(
+        "--server-urls",
+        default=None,
+        help="Comma-separated server URLs to shard envs across, for example localhost:8000,localhost:8001.",
+    )
     parser.add_argument(
         "--league-update-interval",
         type=int,
@@ -99,24 +105,35 @@ def make_opponent_factory(env_config, game_data, league, device):
     return baseline_factory, "max-base-power"
 
 
-def make_envs(env_config, game_data, league, device):
+def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
+    if not raw_value:
+        return [default_url]
+    server_urls = [item.strip() for item in raw_value.split(",") if item.strip()]
+    if not server_urls:
+        raise ValueError("--server-urls did not contain any valid host:port entries.")
+    return server_urls
+
+
+def make_envs(env_config, game_data, league, device, server_urls: list[str]):
     """Create parallel battle environments with mixed opponents."""
     envs = []
     for i in range(env_config.num_envs):
-        opponent_factory, _ = make_opponent_factory(env_config, game_data, league, device)
-        env = BattleEnv(env_config, game_data, opponent_factory)
+        env_server_url = server_urls[i % len(server_urls)]
+        env_instance_config = replace(env_config, server_url=env_server_url)
+        opponent_factory, _ = make_opponent_factory(env_instance_config, game_data, league, device)
+        env = BattleEnv(env_instance_config, game_data, opponent_factory)
         envs.append(env)
     return ParallelBattleEnv(envs)
 
 
-def refresh_opponents(parallel_env, env_config, game_data, league, device):
+def refresh_opponents(parallel_env, game_data, league, device):
     """Swap out opponents in existing environments.
 
     Called periodically so the agent faces a mix of league
     and random opponents as training progresses.
     """
     for env in parallel_env.envs:
-        opponent_factory, _ = make_opponent_factory(env_config, game_data, league, device)
+        opponent_factory, _ = make_opponent_factory(env.config, game_data, league, device)
         env.set_next_opponent(opponent_factory)
 
 
@@ -187,6 +204,7 @@ def train():
     print(f"Device: {device}")
 
     model_config, env_config, train_config = build_configs(args)
+    server_urls = parse_server_urls(args.server_urls, env_config.server_url)
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
     if train_config.total_timesteps < steps_per_update:
@@ -207,7 +225,7 @@ def train():
     league = League(train_config, env_config, game_data, agent, device)
 
     # Environments (start with max-base-power opponents, league is empty)
-    parallel_env = make_envs(env_config, game_data, league, device)
+    parallel_env = make_envs(env_config, game_data, league, device, server_urls)
 
     try:
         # Rollout buffer
@@ -221,6 +239,7 @@ def train():
 
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")
+        print(f"Server URLs: {', '.join(server_urls)}")
         print("Starting training...")
 
         episode_rewards = []
@@ -331,6 +350,7 @@ def train():
                     f"Update {update}/{num_updates} | "
                     f"Step {trainer.global_step:,} | "
                     f"Envs {env_config.num_envs} | "
+                    f"Servers {len(server_urls)} | "
                     f"SPS {sps:.0f} | "
                     f"Rollout {rollout_sec:.2f}s | "
                     f"PPO {ppo_sec:.2f}s | "
@@ -354,7 +374,7 @@ def train():
             # --- League: add checkpoint and refresh opponents ---
             if update % train_config.league_update_interval == 0:
                 league.add_checkpoint(agent, trainer.global_step)
-                refresh_opponents(parallel_env, env_config, game_data, league, device)
+                refresh_opponents(parallel_env, game_data, league, device)
                 print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
 
         print("Training complete.")
