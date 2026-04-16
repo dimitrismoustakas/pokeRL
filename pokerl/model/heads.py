@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..env.actions import ACTIONS_PER_SLOT
+from ..env.actions import ACTIONS_PER_SLOT, PASS_ACTION, SWITCH_OFFSET
 
 
 class ActionHead(nn.Module):
@@ -63,6 +63,15 @@ class ActionHead(nn.Module):
             a1 = actions[:, 0]
 
         # --- Pokemon 2 (sees both reps + pokemon 1's action) ---
+        mask2 = mask2.clone()
+        switch_rows = (a1 >= SWITCH_OFFSET) & (a1 < PASS_ACTION)
+        if switch_rows.any():
+            switch_indices = a1[switch_rows]
+            mask2[switch_rows, switch_indices] = False
+            empty_rows = switch_rows.nonzero(as_tuple=False).squeeze(1)[~mask2[switch_rows].any(dim=1)]
+            if empty_rows.numel() > 0:
+                mask2[empty_rows, PASS_ACTION] = True
+
         a1_emb = self.action_emb(a1)
         logits2 = self.head2(torch.cat([context, rep2, rep1, a1_emb], dim=-1))
         logits2 = logits2.masked_fill(~mask2, -1e8)

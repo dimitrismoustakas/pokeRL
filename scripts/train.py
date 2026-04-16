@@ -459,8 +459,8 @@ def train():
 
             # --- League: add checkpoint and refresh opponents ---
             if update % train_config.league_update_interval == 0:
-                league.add_checkpoint(agent, trainer.global_step)
                 refresh_opponents(parallel_env, league)
+                league.add_checkpoint(agent, trainer.global_step)
                 print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
 
         print("Training complete.")

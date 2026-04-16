@@ -340,7 +340,7 @@ class BattleEnv:
     def _apply_pending_opponent(self):
         if self._pending_opponent_factory is None:
             return
-        self._disconnect_player(self.opponent)
+        self._disconnect_player(self.opponent, self._loop)
         self.opponent = self._build_opponent(self._pending_opponent_factory)
         self._pending_opponent_factory = None
 
