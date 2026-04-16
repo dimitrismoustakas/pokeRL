@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -22,40 +23,64 @@ from pokerl.model.agent import PokeAgent
 from pokerl.env.showdown_env import (
     BattleEnv,
     ParallelBattleEnv,
-    make_local_account_configuration,
-    make_server_configuration,
 )
+from pokerl.team_pool import TeamPool, default_team_pool_manifest_path, load_team_pool
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
+from pokerl.training.preview import TeamPreviewBatcher
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train pokeRL with PPO.")
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
+    parser.add_argument("--battle-format", default=None, help="Override the Showdown battle format.")
     parser.add_argument("--num-envs", type=int, default=None, help="Override the number of parallel battle environments.")
+    parser.add_argument("--team-size", type=int, default=None, help="Override the full team size exposed in observations.")
+    parser.add_argument("--pick-size", type=int, default=None, help="Override how many Pokemon are selected at team preview.")
     parser.add_argument("--rollout-steps", type=int, default=None, help="Override rollout steps collected per update.")
+    parser.add_argument("--num-updates", type=int, default=None, help="Override how many rollout/PPO updates to run.")
     parser.add_argument("--total-timesteps", type=int, default=None, help="Override the total environment steps to train for.")
     parser.add_argument("--num-epochs", type=int, default=None, help="Override PPO epochs per update.")
     parser.add_argument("--num-minibatches", type=int, default=None, help="Override PPO minibatches per update.")
     parser.add_argument("--log-interval", type=int, default=None, help="Override logging frequency in updates.")
     parser.add_argument("--save-interval", type=int, default=None, help="Override checkpoint save frequency in updates.")
+    parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint output directory.")
     parser.add_argument(
         "--server-urls",
         default=None,
         help="Comma-separated server URLs to shard envs across, for example localhost:8000,localhost:8001.",
     )
     parser.add_argument(
+        "--team-pool-format",
+        default=None,
+        help="Load teams from data/team_pools/<format>/manifest.json.",
+    )
+    parser.add_argument(
+        "--team-pool-manifest",
+        default=None,
+        help="Path to a specific team pool manifest.json.",
+    )
+    parser.add_argument(
+        "--team-pool-subset",
+        choices=["curated", "generated", "pool"],
+        default="pool",
+        help="Which manifest subset to sample teams from.",
+    )
+    parser.add_argument(
+        "--team-pool-seed",
+        type=int,
+        default=None,
+        help="Seed for fixed-team sampling. Useful for reproducible benchmarks.",
+    )
+    parser.add_argument(
         "--league-update-interval",
         type=int,
         default=None,
         help="Override league checkpoint and opponent refresh frequency in updates.",
-    )
-    parser.add_argument(
-        "--self-play-prob",
-        type=float,
-        default=None,
-        help="Probability of facing a league opponent (vs built-in bot). Default 1.0 (pure self-play).",
     )
     parser.add_argument(
         "--resume",
@@ -67,6 +92,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log a detailed per-update rollout timing breakdown.",
     )
+    parser.add_argument(
+        "--summary-path",
+        default=None,
+        help="Write a machine-readable JSON run summary to this path.",
+    )
     return parser.parse_args()
 
 
@@ -75,8 +105,21 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     env_config = EnvConfig()
     train_config = TrainingConfig()
 
+    if args.total_timesteps is not None and args.num_updates is not None:
+        raise ValueError("Use either --total-timesteps or --num-updates, not both.")
+
+    if args.battle_format is not None:
+        env_config.battle_format = args.battle_format
+
     if args.num_envs is not None:
         env_config.num_envs = args.num_envs
+
+    if args.team_size is not None:
+        env_config.team_size = args.team_size
+
+    if args.pick_size is not None:
+        env_config.pick_size = args.pick_size
+        model_config.pick_size = args.pick_size
 
     overrides = {
         "rollout_steps": args.rollout_steps,
@@ -85,12 +128,15 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "num_minibatches": args.num_minibatches,
         "log_interval": args.log_interval,
         "save_interval": args.save_interval,
+        "checkpoint_dir": args.checkpoint_dir,
         "league_update_interval": args.league_update_interval,
-        "self_play_prob": args.self_play_prob,
     }
     for field_name, value in overrides.items():
         if value is not None:
             setattr(train_config, field_name, value)
+
+    if args.num_updates is not None:
+        train_config.total_timesteps = args.num_updates * train_config.rollout_steps * env_config.num_envs
 
     return model_config, env_config, train_config
 
@@ -111,26 +157,6 @@ def make_league_opponent_factory(env_config: EnvConfig, league: League):
     return league_factory
 
 
-def make_baseline_factory(env_config: EnvConfig):
-    """Create a MaxBasePowerPlayer factory for a specific env."""
-    def baseline_factory(loop: asyncio.AbstractEventLoop):
-        from poke_env.player import MaxBasePowerPlayer
-        return MaxBasePowerPlayer(
-            account_configuration=make_local_account_configuration("maxbase"),
-            battle_format=env_config.battle_format,
-            server_configuration=make_server_configuration(env_config),
-            loop=loop,
-        )
-    return baseline_factory
-
-
-def pick_opponent_factory(env_config: EnvConfig, league: League):
-    """Choose a league or baseline factory for one environment."""
-    if league.should_use_league():
-        return make_league_opponent_factory(env_config, league), "league"
-    return make_baseline_factory(env_config), "max-base-power"
-
-
 def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
     if not raw_value:
         return [default_url]
@@ -140,20 +166,47 @@ def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
     return server_urls
 
 
-def make_team_preview_fn(agent: PokeAgent, device: torch.device):
+def make_team_preview_fn(batcher: TeamPreviewBatcher):
     """Create a team preview callback that uses the current agent policy.
 
     The closure captures the agent object (not a copy), so it always reflects
     the latest weights during rollout collection.
     """
     def team_preview_fn(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
-        with torch.no_grad():
-            obs_t = {k: torch.from_numpy(v).unsqueeze(0).to(device) for k, v in obs.items()}
-            out = agent.team_preview(obs_t)
-            picks = out["picks"].cpu().numpy()[0]  # (pick_size,)
+        picks = batcher.choose(obs)
         team_str = "/team " + "".join(str(int(p) + 1) for p in picks)
         return picks, team_str
     return team_preview_fn
+
+
+def load_requested_team_pool(args: argparse.Namespace) -> TeamPool | None:
+    manifest_path: Path | None = None
+
+    if args.team_pool_manifest:
+        manifest_path = Path(args.team_pool_manifest)
+        if not manifest_path.is_absolute():
+            manifest_path = REPO_ROOT / manifest_path
+    elif args.team_pool_format:
+        manifest_path = default_team_pool_manifest_path(REPO_ROOT, args.team_pool_format)
+
+    if manifest_path is None:
+        return None
+
+    return load_team_pool(
+        manifest_path,
+        subset=args.team_pool_subset,
+        seed=args.team_pool_seed,
+    )
+
+
+def make_team_pair_provider(team_pool: TeamPool | None):
+    if team_pool is None:
+        return None
+
+    def provider() -> tuple[str, str]:
+        return team_pool.sample_packed_pair(distinct=True)
+
+    return provider
 
 
 def make_envs(
@@ -162,14 +215,21 @@ def make_envs(
     league: League,
     server_urls: list[str],
     team_preview_fn,
+    team_pair_provider=None,
 ) -> ParallelBattleEnv:
-    """Create parallel battle environments with mixed opponents."""
+    """Create parallel battle environments backed by league opponents."""
     envs = []
     for i in range(env_config.num_envs):
         env_server_url = server_urls[i % len(server_urls)]
         env_instance_config = replace(env_config, server_url=env_server_url)
-        opponent_factory, _ = pick_opponent_factory(env_instance_config, league)
-        env = BattleEnv(env_instance_config, game_data, opponent_factory, team_preview_fn=team_preview_fn)
+        opponent_factory = make_league_opponent_factory(env_instance_config, league)
+        env = BattleEnv(
+            env_instance_config,
+            game_data,
+            opponent_factory,
+            team_preview_fn=team_preview_fn,
+            team_pair_provider=team_pair_provider,
+        )
         envs.append(env)
     return ParallelBattleEnv(envs)
 
@@ -182,8 +242,7 @@ def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
     get a mix of checkpoints.
     """
     for env in parallel_env.envs:
-        opponent_factory, _ = pick_opponent_factory(env.config, league)
-        env.set_next_opponent(opponent_factory)
+        env.set_next_opponent(make_league_opponent_factory(env.config, league))
 
 
 def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -249,15 +308,29 @@ def _league_state_path(train_config: TrainingConfig) -> str:
     return f"{train_config.checkpoint_dir}/league_state.json"
 
 
+def _json_ready_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    return {key: float(value) for key, value in metrics.items()}
+
+
+def _write_run_summary(path: str, summary: dict) -> None:
+    out_path = Path(path)
+    if not out_path.is_absolute():
+        out_path = REPO_ROOT / out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
 def train():
     args = parse_args()
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
+    run_started = time.perf_counter()
 
     print(f"Device: {device}")
 
     model_config, env_config, train_config = build_configs(args)
     server_urls = parse_server_urls(args.server_urls, env_config.server_url)
+    team_pool = load_requested_team_pool(args)
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
     if train_config.total_timesteps < steps_per_update:
@@ -272,6 +345,10 @@ def train():
     agent.to(device)
 
     print(f"Model parameters: {sum(p.numel() for p in agent.parameters()):,}")
+    if team_pool is not None:
+        print(
+            f"Team pool: {team_pool.format_id} [{team_pool.subset}] with {team_pool.size} teams"
+        )
 
     # Training
     trainer = PPOTrainer(agent, train_config, device)
@@ -297,12 +374,40 @@ def train():
         print(f"Seeded league with agent at step {trainer.global_step}")
 
     # --- Environments ---
-    team_preview_fn = make_team_preview_fn(agent, device)
-    parallel_env = make_envs(env_config, game_data, league, server_urls, team_preview_fn=team_preview_fn)
+    team_preview_batcher = TeamPreviewBatcher(agent, device)
+    team_preview_fn = make_team_preview_fn(team_preview_batcher)
+    team_pair_provider = make_team_pair_provider(team_pool)
+    parallel_env = make_envs(
+        env_config,
+        game_data,
+        league,
+        server_urls,
+        team_preview_fn=team_preview_fn,
+        team_pair_provider=team_pair_provider,
+    )
+    run_summary = {
+        "config": {
+            "device": str(device),
+            "battle_format": env_config.battle_format,
+            "num_envs": env_config.num_envs,
+            "team_size": env_config.team_size,
+            "pick_size": env_config.pick_size,
+            "rollout_steps": train_config.rollout_steps,
+            "num_epochs": train_config.num_epochs,
+            "num_minibatches": train_config.num_minibatches,
+            "total_timesteps": train_config.total_timesteps,
+            "server_urls": server_urls,
+            "team_pool": team_pool.describe() if team_pool is not None else None,
+        },
+        "updates": [],
+    }
 
     try:
         # Rollout buffer
+        reset_started = time.perf_counter()
         obs, masks = parallel_env.reset()
+        initial_reset_sec = time.perf_counter() - reset_started
+        initial_env_profile = parallel_env.snapshot_timing() if args.profile_rollout else {}
         parallel_env.reset_timing()
         obs_keys = list(obs.keys())
         buffer = RolloutBuffer(train_config.rollout_steps, env_config.num_envs, obs_keys)
@@ -314,10 +419,14 @@ def train():
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")
         print(f"Server URLs: {', '.join(server_urls)}")
-        print(f"Self-play prob: {train_config.self_play_prob:.0%}")
+        print(f"Initial reset: {initial_reset_sec:.2f}s")
         if updates_done:
             print(f"Resuming from update {updates_done + 1} / {num_updates}")
         print("Starting training...")
+
+        run_summary["initial_reset_sec"] = initial_reset_sec
+        if args.profile_rollout:
+            run_summary["initial_env_profile"] = initial_env_profile
 
         episode_rewards: list[float] = []
         start_time = time.time()
@@ -423,13 +532,29 @@ def train():
                 metrics["team_preview_loss"] = trainer.update_team_preview(team_preview_data)
             ppo_sec = time.perf_counter() - ppo_started
 
+            avg_episode_sec = float(np.mean(update_episode_secs)) if update_episode_secs else 0.0
+            avg_episode_turns = float(np.mean(update_episode_turns)) if update_episode_turns else 0.0
+            metrics_json = _json_ready_metrics(metrics)
+            update_summary = {
+                "update": update,
+                "global_step": trainer.global_step,
+                "completed_battles": len(update_episode_rewards),
+                "rollout_sec": rollout_sec,
+                "ppo_sec": ppo_sec,
+                "avg_episode_sec": avg_episode_sec,
+                "avg_episode_turns": avg_episode_turns,
+                "metrics": metrics_json,
+            }
+            if args.profile_rollout:
+                update_summary["rollout_profile"] = rollout_profile
+                update_summary["env_profile"] = env_profile
+            run_summary["updates"].append(update_summary)
+
             # --- Logging ---
             if update % train_config.log_interval == 0:
                 elapsed = time.time() - start_time
                 sps = trainer.global_step / elapsed
                 win_rate = np.mean([r > 0 for r in episode_rewards[-100:]]) if episode_rewards else 0
-                avg_episode_sec = float(np.mean(update_episode_secs)) if update_episode_secs else 0.0
-                avg_episode_turns = float(np.mean(update_episode_turns)) if update_episode_turns else 0.0
                 print(
                     f"Update {update}/{num_updates} | "
                     f"Step {trainer.global_step:,} | "
@@ -468,8 +593,20 @@ def train():
         trainer.save(final_path)
         league.save_state(_league_state_path(train_config))
         print(f"Saved final checkpoint: {final_path}")
+        total_wall_sec = time.perf_counter() - run_started
+        run_summary["final"] = {
+            "global_step": trainer.global_step,
+            "wall_time_sec": total_wall_sec,
+            "steps_per_second": trainer.global_step / total_wall_sec if total_wall_sec > 0 else 0.0,
+            "final_checkpoint": final_path,
+        }
+        if args.summary_path:
+            _write_run_summary(args.summary_path, run_summary)
+        return run_summary
     finally:
         parallel_env.close()
+        team_preview_batcher.close()
+        league.close()
 
 
 if __name__ == "__main__":

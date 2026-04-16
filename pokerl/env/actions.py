@@ -112,13 +112,10 @@ def build_action_mask(battle: DoubleBattle, slot: int) -> np.ndarray:
         mask[SWITCH_OFFSET + k] = True
 
     if not mask.any():
-        raise RuntimeError(
-            f"build_action_mask produced an empty mask for slot {slot} — "
-            f"pokemon={getattr(pokemon, 'species', None)!r}, "
-            f"moves={[m.id for m in moves]}, switches={len(switches)}, "
-            f"force_switch={battle.force_switch}. "
-            "This indicates a bug in action mask construction."
-        )
+        # Some doubles states legitimately leave a slot with no independent action.
+        # Commander Tatsugiri is the main one: the Pokemon is still active but poke-env
+        # exposes no moves or switches for that slot, so the correct order is pass.
+        mask[PASS_ACTION] = True
 
     return mask
 

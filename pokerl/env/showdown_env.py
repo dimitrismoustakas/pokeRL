@@ -30,6 +30,7 @@ _ACCOUNT_COUNTER = itertools.count()
 _ACCOUNT_RUN_TAG = uuid.uuid4().hex[:4]
 QueueItemT = TypeVar("QueueItemT")
 OpponentFactory = Callable[[asyncio.AbstractEventLoop], Player]
+TeamPairProvider = Callable[[], tuple[str | None, str | None]]
 
 
 class _TimingStats:
@@ -213,7 +214,8 @@ class BattleEnv:
         config: EnvConfig,
         game_data: GameData,
         opponent_factory: OpponentFactory,
-        team_preview_fn: Callable[[dict], tuple[np.ndarray, str]],
+        team_preview_fn: Callable[[dict], tuple[np.ndarray, str]] | None = None,
+        team_pair_provider: TeamPairProvider | None = None,
         player_kwargs: dict | None = None,
     ):
         self.config = config
@@ -225,6 +227,7 @@ class BattleEnv:
         self._battle_started_at: float | None = None
         self._timing = _TimingStats()
         self._ext_team_preview_fn = team_preview_fn
+        self._team_pair_provider = team_pair_provider
         # Set at team preview time, read when the episode ends to attach to info.
         self._episode_team_preview: tuple[dict, np.ndarray] | None = None
 
@@ -248,7 +251,8 @@ class BattleEnv:
             **player_options,
         )
         self._assert_player_loop(self.player, "player")
-        self.player.set_team_preview_fn(self._do_team_preview)
+        if team_preview_fn is not None:
+            self.player.set_team_preview_fn(self._do_team_preview)
         self.opponent = self._build_opponent(opponent_factory)
 
     def reset(self) -> tuple[dict, np.ndarray]:
@@ -259,6 +263,7 @@ class BattleEnv:
         reset_started = time.perf_counter()
         self._episode_team_preview = None
         self._apply_pending_opponent()
+        self._assign_teams_for_next_battle()
         # Give stateful opponents (e.g. LeaguePlayer) a clean slate for the new battle.
         if hasattr(self.opponent, "reset_hidden"):
             self.opponent.reset_hidden()
@@ -314,10 +319,22 @@ class BattleEnv:
         each battle. Stores (obs, picks) so they can be returned in the info dict
         when this episode ends, enabling the REINFORCE team preview gradient.
         """
+        if self._ext_team_preview_fn is None:
+            raise RuntimeError("BattleEnv team preview requested without a team_preview_fn.")
         obs = self.player.obs_builder.build(battle)
         picks, team_str = self._ext_team_preview_fn(obs)
         self._episode_team_preview = (obs, picks)
         return team_str
+
+    def _assign_teams_for_next_battle(self) -> None:
+        if self._team_pair_provider is None:
+            return
+
+        player_team, opponent_team = self._team_pair_provider()
+        if player_team is not None:
+            self.player.update_team(player_team)
+        if opponent_team is not None:
+            self.opponent.update_team(opponent_team)
 
     @property
     def last_battle(self) -> DoubleBattle | None:
