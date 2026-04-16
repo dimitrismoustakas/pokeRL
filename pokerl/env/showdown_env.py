@@ -2,10 +2,12 @@
 
 import asyncio
 import itertools
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError
 from threading import Lock, Thread
+from types import MethodType
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -29,6 +31,29 @@ _ACCOUNT_COUNTER = itertools.count()
 _ACCOUNT_RUN_TAG = uuid.uuid4().hex[:4]
 QueueItemT = TypeVar("QueueItemT")
 OpponentFactory = Callable[[asyncio.AbstractEventLoop], Player]
+
+
+class _TimingStats:
+    def __init__(self):
+        self._lock = Lock()
+        self._values: dict[str, float] = {}
+
+    def add(self, key: str, value: float) -> None:
+        with self._lock:
+            self._values[key] = self._values.get(key, 0.0) + value
+
+    def increment(self, key: str, delta: int = 1) -> None:
+        self.add(key, float(delta))
+
+    def snapshot_and_reset(self) -> dict[str, float]:
+        with self._lock:
+            snapshot = dict(self._values)
+            self._values.clear()
+        return snapshot
+
+    def reset(self) -> None:
+        with self._lock:
+            self._values.clear()
 
 
 class _AsyncQueue(Generic[QueueItemT]):
@@ -87,9 +112,10 @@ class ShowdownPlayer(Player):
     async battle loop from a synchronous Gymnasium-style step() function.
     """
 
-    def __init__(self, obs_builder: ObservationBuilder, **kwargs):
+    def __init__(self, obs_builder: ObservationBuilder, timing: _TimingStats, **kwargs):
         super().__init__(**kwargs)
         self.obs_builder = obs_builder
+        self.timing = timing
         self.obs_queue: _AsyncQueue[tuple[dict, np.ndarray, float, bool, DoubleBattle]] = _AsyncQueue(self.ps_client.loop)
         self.action_queue: _AsyncQueue[np.ndarray | None] = _AsyncQueue(self.ps_client.loop)
         self.last_battle: DoubleBattle | None = None
@@ -138,11 +164,14 @@ class ShowdownPlayer(Player):
 
     def _make_order(self, action: np.ndarray, battle: DoubleBattle) -> BattleOrder:
         """Convert a (2,) action array to a DoubleBattleOrder."""
+        started = time.perf_counter()
         orders = []
         for slot in range(2):
             order = action_to_order(int(action[slot]), battle, slot)
             orders.append(order)
 
+        self.timing.increment("player_make_order_calls")
+        self.timing.add("player_make_order_sec", time.perf_counter() - started)
         if all(isinstance(order, PassBattleOrder) for order in orders):
             return self.choose_default_move()
         return DoubleBattleOrder(orders[0], orders[1])
@@ -153,12 +182,25 @@ class ShowdownPlayer(Player):
         if battle.finished and finished_token == self._last_finished_token:
             return
 
+        emit_started = time.perf_counter()
+        obs_started = time.perf_counter()
         obs = self.obs_builder.build(battle)
+        self.timing.add("player_emit_obs_sec", time.perf_counter() - obs_started)
+
+        mask_started = time.perf_counter()
         mask = np.stack([build_action_mask(battle, s) for s in range(2)])
+        self.timing.add("player_emit_mask_sec", time.perf_counter() - mask_started)
+
+        reward_started = time.perf_counter()
         reward = sparse_reward(battle)
+        self.timing.add("player_emit_reward_sec", time.perf_counter() - reward_started)
         done = battle.finished
 
+        queue_put_started = time.perf_counter()
         self.obs_queue.put((obs, mask, reward, done, battle))
+        self.timing.add("player_emit_queue_put_sec", time.perf_counter() - queue_put_started)
+        self.timing.increment("player_emit_calls")
+        self.timing.add("player_emit_total_sec", time.perf_counter() - emit_started)
         if done:
             self._last_finished_token = finished_token
 
@@ -186,6 +228,8 @@ class BattleEnv:
         self._loop, self._thread = self._start_event_loop()
         self._pending_opponent_factory: OpponentFactory | None = None
         self._closed = False
+        self._battle_started_at: float | None = None
+        self._timing = _TimingStats()
 
         obs_builder = ObservationBuilder(game_data, config.team_size)
         player_options = dict(player_kwargs or {})
@@ -200,6 +244,7 @@ class BattleEnv:
         )
         self.player = ShowdownPlayer(
             obs_builder,
+            timing=self._timing,
             battle_format=config.battle_format,
             server_configuration=make_server_configuration(config),
             loop=self._loop,
@@ -213,12 +258,16 @@ class BattleEnv:
         if self._closed:
             raise RuntimeError("BattleEnv.reset() called after the environment was closed.")
 
+        reset_started = time.perf_counter()
         self._apply_pending_opponent()
         self._battle_task = asyncio.run_coroutine_threadsafe(
             self.player.battle_against(self.opponent, n_battles=1),
             self._loop,
         )
+        self._battle_started_at = time.perf_counter()
         obs, mask, _, _, _ = self.player.obs_queue.get()
+        self._timing.increment("env_reset_calls")
+        self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
         return obs, mask
 
     def step(self, action: np.ndarray) -> tuple[dict, np.ndarray, float, bool, dict]:
@@ -233,10 +282,22 @@ class BattleEnv:
         if self._closed:
             raise RuntimeError("BattleEnv.step() called after the environment was closed.")
 
+        step_started = time.perf_counter()
+        enqueue_started = time.perf_counter()
         self.player.action_queue.put(action)
+        self._timing.add("env_action_enqueue_sec", time.perf_counter() - enqueue_started)
 
+        wait_started = time.perf_counter()
         obs, mask, reward, done, battle = self.player.obs_queue.get()
-        info = {"battle_tag": battle.battle_tag if battle else ""}
+        self._timing.add("env_queue_wait_sec", time.perf_counter() - wait_started)
+        self._timing.increment("env_step_calls")
+        self._timing.add("env_step_total_sec", time.perf_counter() - step_started)
+        info = {
+            "battle_tag": battle.battle_tag if battle else "",
+            "battle_turn": getattr(battle, "turn", 0),
+        }
+        if done and self._battle_started_at is not None:
+            info["episode_sec"] = time.perf_counter() - self._battle_started_at
         return obs, mask, reward, done, info
 
     @property
@@ -266,8 +327,27 @@ class BattleEnv:
 
     def _build_opponent(self, opponent_factory: OpponentFactory) -> Player:
         opponent = opponent_factory(self._loop)
+        self._attach_choice_timer(opponent)
         self._assert_player_loop(opponent, "opponent")
         return opponent
+
+    def _attach_choice_timer(self, opponent: Player) -> None:
+        original_choose_move = opponent.choose_move
+
+        def timed_choose_move(this, battle):
+            started = time.perf_counter()
+            result = original_choose_move(battle)
+            self._timing.increment("opponent_choice_calls")
+            self._timing.add("opponent_choice_sec", time.perf_counter() - started)
+            return result
+
+        opponent.choose_move = MethodType(timed_choose_move, opponent)
+
+    def snapshot_timing(self) -> dict[str, float]:
+        return self._timing.snapshot_and_reset()
+
+    def reset_timing(self) -> None:
+        self._timing.reset()
 
     def _assert_player_loop(self, participant: Player, role: str) -> None:
         participant_loop = getattr(getattr(participant, "ps_client", None), "loop", None)
@@ -344,10 +424,14 @@ class ParallelBattleEnv:
         self.envs = envs
         self.num_envs = len(envs)
         self._executor = ThreadPoolExecutor(max_workers=self.num_envs)
+        self._timing = _TimingStats()
 
     def reset(self) -> tuple[dict, np.ndarray]:
         """Reset all environments and return batched obs + masks."""
+        started = time.perf_counter()
         results = list(self._executor.map(lambda env: env.reset(), self.envs))
+        self._timing.increment("parallel_reset_calls")
+        self._timing.add("parallel_reset_wall_sec", time.perf_counter() - started)
         return self._collate([r[0] for r in results], [r[1] for r in results])
 
     def step(
@@ -361,6 +445,7 @@ class ParallelBattleEnv:
         Returns:
             obs_batch, mask_batch, rewards, dones, infos
         """
+        step_started = time.perf_counter()
         results = list(
             self._executor.map(
                 self._step_env,
@@ -368,13 +453,19 @@ class ParallelBattleEnv:
                 actions,
             )
         )
+        step_wait_sec = time.perf_counter() - step_started
         obs_list = [result[0] for result in results]
         mask_list = [result[1] for result in results]
         rewards = [result[2] for result in results]
         dones = [result[3] for result in results]
         infos = [result[4] for result in results]
 
+        collate_started = time.perf_counter()
         batched_obs, batched_mask = self._collate(obs_list, mask_list)
+        self._timing.increment("parallel_step_calls")
+        self._timing.add("parallel_step_wait_sec", step_wait_sec)
+        self._timing.add("parallel_collate_sec", time.perf_counter() - collate_started)
+        self._timing.add("parallel_step_wall_sec", time.perf_counter() - step_started)
         return (
             batched_obs,
             batched_mask,
@@ -382,6 +473,19 @@ class ParallelBattleEnv:
             np.array(dones, dtype=bool),
             infos,
         )
+
+    def snapshot_timing(self) -> dict[str, float]:
+        snapshot = self._timing.snapshot_and_reset()
+        for env in self.envs:
+            env_snapshot = env.snapshot_timing()
+            for key, value in env_snapshot.items():
+                snapshot[key] = snapshot.get(key, 0.0) + value
+        return snapshot
+
+    def reset_timing(self) -> None:
+        self._timing.reset()
+        for env in self.envs:
+            env.reset_timing()
 
     def close(self):
         for env in self.envs:
