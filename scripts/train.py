@@ -302,6 +302,17 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
         f"collate {avg_ms(parallel_collate, parallel_step_calls):.2f}ms | "
         f"battle reset {avg_ms(env_profile.get('env_reset_total_sec', 0.0), reset_calls):.2f}ms over {reset_calls} resets"
     )
+    if reset_calls:
+        print(
+            "Reset breakdown (avg per battle reset) | "
+            f"apply pending {avg_ms(env_profile.get('env_reset_apply_pending_sec', 0.0), reset_calls):.2f}ms | "
+            f"disconnect old opp {avg_ms(env_profile.get('env_reset_opponent_disconnect_sec', 0.0), reset_calls):.2f}ms | "
+            f"build new opp {avg_ms(env_profile.get('env_reset_opponent_build_sec', 0.0), reset_calls):.2f}ms | "
+            f"assign teams {avg_ms(env_profile.get('env_reset_team_assign_sec', 0.0), reset_calls):.2f}ms | "
+            f"reset hidden {avg_ms(env_profile.get('env_reset_hidden_reset_sec', 0.0), reset_calls):.2f}ms | "
+            f"start battle {avg_ms(env_profile.get('env_reset_battle_start_sec', 0.0), reset_calls):.2f}ms | "
+            f"wait first obs {avg_ms(env_profile.get('env_reset_wait_first_obs_sec', 0.0), reset_calls):.2f}ms"
+        )
 
 
 def _league_state_path(train_config: TrainingConfig) -> str:
@@ -584,9 +595,13 @@ def train():
 
             # --- League: add checkpoint and refresh opponents ---
             if update % train_config.league_update_interval == 0:
-                refresh_opponents(parallel_env, league)
+                if update < num_updates:
+                    refresh_opponents(parallel_env, league)
                 league.add_checkpoint(agent, trainer.global_step)
-                print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
+                if update < num_updates:
+                    print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
+                else:
+                    print(f"League updated (pool: {len(league.checkpoints)})")
 
         print("Training complete.")
         final_path = f"{train_config.checkpoint_dir}/final.pt"

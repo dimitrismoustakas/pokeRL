@@ -222,7 +222,7 @@ class BattleEnv:
         self.game_data = game_data
         self._battle_task = None
         self._loop, self._thread = self._start_event_loop()
-        self._pending_opponent_factory: OpponentFactory | None = None
+        self._pending_opponent: Player | None = None
         self._closed = False
         self._battle_started_at: float | None = None
         self._timing = _TimingStats()
@@ -262,17 +262,31 @@ class BattleEnv:
 
         reset_started = time.perf_counter()
         self._episode_team_preview = None
+        apply_pending_started = time.perf_counter()
         self._apply_pending_opponent()
+        self._timing.add("env_reset_apply_pending_sec", time.perf_counter() - apply_pending_started)
+
+        assign_teams_started = time.perf_counter()
         self._assign_teams_for_next_battle()
+        self._timing.add("env_reset_team_assign_sec", time.perf_counter() - assign_teams_started)
+
         # Give stateful opponents (e.g. LeaguePlayer) a clean slate for the new battle.
+        hidden_reset_started = time.perf_counter()
         if hasattr(self.opponent, "reset_hidden"):
             self.opponent.reset_hidden()
+        self._timing.add("env_reset_hidden_reset_sec", time.perf_counter() - hidden_reset_started)
+
+        battle_start_started = time.perf_counter()
         self._battle_task = asyncio.run_coroutine_threadsafe(
             self.player.battle_against(self.opponent, n_battles=1),
             self._loop,
         )
+        self._timing.add("env_reset_battle_start_sec", time.perf_counter() - battle_start_started)
         self._battle_started_at = time.perf_counter()
+
+        wait_started = time.perf_counter()
         obs, mask, _, _, _ = self.player.obs_queue.get()
+        self._timing.add("env_reset_wait_first_obs_sec", time.perf_counter() - wait_started)
         self._timing.increment("env_reset_calls")
         self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
         return obs, mask
@@ -352,14 +366,22 @@ class BattleEnv:
         return loop, thread
 
     def set_next_opponent(self, opponent_factory: OpponentFactory):
-        self._pending_opponent_factory = opponent_factory
+        prebuild_started = time.perf_counter()
+        next_opponent = self._build_opponent(opponent_factory)
+        self._timing.add("env_prebuild_opponent_sec", time.perf_counter() - prebuild_started)
+        if self._pending_opponent is not None:
+            self._disconnect_player(self._pending_opponent, self._loop)
+        self._pending_opponent = next_opponent
 
     def _apply_pending_opponent(self):
-        if self._pending_opponent_factory is None:
+        if self._pending_opponent is None:
             return
+
+        disconnect_started = time.perf_counter()
         self._disconnect_player(self.opponent, self._loop)
-        self.opponent = self._build_opponent(self._pending_opponent_factory)
-        self._pending_opponent_factory = None
+        self._timing.add("env_reset_opponent_disconnect_sec", time.perf_counter() - disconnect_started)
+        self.opponent = self._pending_opponent
+        self._pending_opponent = None
 
     def _build_opponent(self, opponent_factory: OpponentFactory) -> Player:
         opponent = opponent_factory(self._loop)
@@ -408,6 +430,8 @@ class BattleEnv:
 
         for participant in (self.player, self.opponent):
             self._disconnect_player(participant, self._loop)
+        if self._pending_opponent is not None:
+            self._disconnect_player(self._pending_opponent, self._loop)
 
         self._cancel_pending_tasks()
         self.player.obs_queue.clear()
@@ -419,7 +443,7 @@ class BattleEnv:
             self._loop.close()
 
         self._battle_task = None
-        self._pending_opponent_factory = None
+        self._pending_opponent = None
         self._closed = True
 
     def _cancel_pending_tasks(self) -> None:
