@@ -154,6 +154,9 @@ def _resolve_target(
         return battle.EMPTY_TARGET_POSITION
 
     possible_targets = battle.get_possible_showdown_targets(move, pokemon)
+    if target_idx == 0 and battle.EMPTY_TARGET_POSITION in possible_targets:
+        return battle.EMPTY_TARGET_POSITION
+
     showdown_target = _target_index_to_showdown(target_idx, slot, battle)
     if showdown_target in possible_targets:
         return showdown_target

@@ -317,7 +317,7 @@ class ObservationBuilder:
             offset += 1
 
         # Trick Room (global)
-        feats[offset] = float(battle.fields and Field.TRICK_ROOM in battle.fields)
+        feats[offset] = float(Field.TRICK_ROOM in battle.fields)
         offset += 1
 
         return feats
