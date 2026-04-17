@@ -1,0 +1,71 @@
+Indeedee-F @ Psychic Seed  
+Ability: Psychic Surge  
+Level: 50  
+Tera Type: Fairy  
+EVs: 252 HP / 252 Def / 4 SpD  
+Relaxed Nature  
+IVs: 0 Atk / 0 Spe  
+- Dazzling Gleam  
+- Helping Hand  
+- Follow Me  
+- Trick Room
+
+Torkoal @ Charcoal  
+Ability: Drought  
+Level: 50  
+Tera Type: Fire  
+EVs: 252 HP / 252 SpA / 4 SpD  
+Quiet Nature  
+IVs: 0 Atk / 0 Spe  
+- Eruption  
+- Flamethrower  
+- Earth Power  
+- Helping Hand
+
+Kingambit @ Black Glasses  
+Ability: Defiant  
+Level: 50  
+Tera Type: Dark  
+EVs: 252 HP / 252 Atk / 4 SpD  
+Adamant Nature  
+IVs: 0 Spe  
+- Assurance  
+- Iron Head  
+- Sucker Punch  
+- Swords Dance
+
+Hatterene @ Life Orb  
+Ability: Magic Bounce  
+Level: 50  
+Shiny: Yes  
+Tera Type: Water  
+EVs: 212 HP / 44 Def / 252 SpA  
+Quiet Nature  
+IVs: 0 Atk / 0 Spe  
+- Expanding Force  
+- Trick Room  
+- Dazzling Gleam  
+- Protect
+
+Ursaluna-Bloodmoon @ Weakness Policy  
+Ability: Mind's Eye  
+Level: 50  
+Tera Type: Normal  
+EVs: 252 HP / 252 SpA / 4 SpD  
+Quiet Nature  
+IVs: 0 Atk / 0 Spe  
+- Protect  
+- Hyper Voice  
+- Blood Moon  
+- Earth Power
+
+Exeggutor-Alola @ Sitrus Berry  
+Ability: Harvest  
+Tera Type: Water  
+EVs: 252 HP / 100 Def / 156 SpD  
+Relaxed Nature  
+IVs: 12 Atk / 12 Spe  
+- Energy Ball  
+- Sleep Powder  
+- Trick Room  
+- Brick Break

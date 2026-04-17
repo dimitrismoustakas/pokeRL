@@ -1,0 +1,69 @@
+Gholdengo @ Leftovers  
+Ability: Good as Gold  
+Level: 50  
+Tera Type: Dragon  
+EVs: 244 HP / 44 Def / 12 SpA / 4 SpD / 204 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Make It Rain  
+- Shadow Ball  
+- Nasty Plot  
+- Protect
+
+Ogerpon-Wellspring @ Wellspring Mask  
+Ability: Water Absorb  
+Level: 80  
+Tera Type: Water  
+EVs: 188 HP / 4 Atk / 124 Def / 12 SpD / 180 Spe  
+Adamant Nature  
+- Horn Leech  
+- Ivy Cudgel  
+- Follow Me  
+- Spiky Shield
+
+Rillaboom @ Assault Vest  
+Ability: Grassy Surge  
+Level: 50  
+Tera Type: Grass  
+EVs: 164 HP / 148 Atk / 4 Def / 92 SpD / 100 Spe  
+Adamant Nature  
+- Wood Hammer  
+- Grassy Glide  
+- U-turn  
+- Fake Out
+
+Landorus @ Life Orb  
+Ability: Sheer Force  
+Level: 80  
+Tera Type: Poison  
+EVs: 4 HP / 4 Def / 244 SpA / 4 SpD / 252 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Earth Power  
+- Sludge Bomb  
+- Substitute  
+- Protect
+
+Tornadus @ Rocky Helmet  
+Ability: Prankster  
+Level: 50  
+Tera Type: Water  
+EVs: 252 HP / 180 Def / 4 SpA / 4 SpD / 68 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Bleakwind Storm  
+- Tailwind  
+- Rain Dance  
+- Taunt
+
+Incineroar @ Sitrus Berry  
+Ability: Intimidate  
+Level: 59  
+Tera Type: Fire  
+EVs: 244 HP / 124 Def / 140 SpD  
+Relaxed Nature  
+IVs: 13 SpA / 0 Spe  
+- Fake Out  
+- Flare Blitz  
+- Lash Out  
+- Parting Shot

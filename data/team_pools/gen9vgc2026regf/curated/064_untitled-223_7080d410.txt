@@ -1,0 +1,68 @@
+Gouging Fire @ Clear Amulet  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Grass  
+EVs: 252 HP / 196 Atk / 60 Spe  
+Adamant Nature  
+- Burning Bulwark  
+- Flame Charge  
+- Flare Blitz  
+- Breaking Swipe
+
+Tornadus @ Covert Cloak  
+Ability: Prankster  
+Level: 50  
+Tera Type: Ghost  
+EVs: 252 HP / 44 Def / 36 SpA / 4 SpD / 172 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Bleakwind Storm  
+- Sunny Day  
+- Tailwind  
+- Protect
+
+Urshifu-Rapid-Strike @ Choice Scarf  
+Ability: Unseen Fist  
+Level: 50  
+Tera Type: Water  
+EVs: 44 HP / 156 Atk / 4 Def / 92 SpD / 212 Spe  
+Adamant Nature  
+- Surging Strikes  
+- Close Combat  
+- Aqua Jet  
+- U-turn
+
+Rillaboom @ Assault Vest  
+Ability: Grassy Surge  
+Level: 50  
+Tera Type: Fire  
+EVs: 252 HP / 196 Atk / 60 SpD  
+Adamant Nature  
+- Wood Hammer  
+- Grassy Glide  
+- Fake Out  
+- U-turn
+
+Flutter Mane @ Sitrus Berry  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Stellar  
+EVs: 252 HP / 132 Def / 36 SpA / 4 SpD / 84 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Moonblast  
+- Dazzling Gleam  
+- Tera Blast  
+- Protect
+
+Archaludon @ Leftovers  
+Ability: Stamina  
+Level: 50  
+Tera Type: Fairy  
+EVs: 252 HP / 76 Def / 12 SpA / 132 SpD / 36 Spe  
+Bold Nature  
+IVs: 0 Atk  
+- Draco Meteor  
+- Body Press  
+- Stealth Rock  
+- Protect

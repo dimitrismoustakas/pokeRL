@@ -18,8 +18,18 @@ function Test-ShowdownPort {
         [int]$Port
     )
 
-    $result = Test-NetConnection -ComputerName localhost -Port $Port -WarningAction SilentlyContinue
-    return [bool]$result.TcpTestSucceeded
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        $connected = $async.AsyncWaitHandle.WaitOne(500)
+        return [bool]($connected -and $client.Connected)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $client.Close()
+    }
 }
 
 function Wait-ShowdownReady {

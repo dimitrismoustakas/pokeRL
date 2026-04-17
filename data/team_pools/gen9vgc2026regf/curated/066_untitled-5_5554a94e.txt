@@ -1,0 +1,66 @@
+Archaludon @ Assault Vest  
+Ability: Stamina  
+Level: 50  
+Tera Type: Stellar  
+EVs: 236 HP / 4 Def / 204 SpA / 12 SpD / 52 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Body Press  
+- Flash Cannon  
+- Dragon Pulse  
+- Electro Shot
+
+Maushold @ Safety Goggles  
+Ability: Friend Guard  
+Level: 50  
+Tera Type: Ghost  
+EVs: 252 HP / 4 Atk / 124 Def / 124 SpD / 4 Spe  
+Jolly Nature  
+- Follow Me  
+- Beat Up  
+- Thunder Wave  
+- Protect
+
+Pelipper @ Damp Rock  
+Ability: Drizzle  
+Level: 50  
+Tera Type: Grass  
+EVs: 252 HP / 12 Def / 4 SpA / 92 SpD / 148 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Tailwind  
+- Hurricane  
+- Weather Ball  
+- Protect
+
+Rillaboom @ Clear Amulet  
+Ability: Grassy Surge  
+Level: 50  
+Tera Type: Fire  
+EVs: 212 HP / 252 Atk / 4 Def / 4 SpD / 36 Spe  
+Adamant Nature  
+- Fake Out  
+- Wood Hammer  
+- Grassy Glide  
+- Stomping Tantrum
+
+Ogerpon-Wellspring (F) @ Wellspring Mask  
+Ability: Water Absorb  
+Level: 50  
+Tera Type: Water  
+EVs: 196 HP / 252 Atk / 36 Def / 20 SpD / 4 Spe  
+Jolly Nature  
+- Ivy Cudgel  
+- Horn Leech  
+- Follow Me  
+- Spiky Shield
+
+Annihilape @ Leftovers  
+Ability: Defiant  
+Tera Type: Fire  
+EVs: 204 HP / 196 Atk / 60 Def / 48 SpD  
+Adamant Nature  
+- Rage Fist  
+- Drain Punch  
+- Bulk Up  
+- Protect

@@ -1,0 +1,65 @@
+Whimsicott @ Covert Cloak  
+Ability: Prankster  
+Level: 50  
+Tera Type: Water  
+EVs: 252 HP / 4 SpA / 252 Spe  
+Timid Nature  
+- Tailwind  
+- Moonblast  
+- Encore  
+- Beat Up
+
+Terrakion @ Life Orb  
+Ability: Justified  
+Level: 50  
+Tera Type: Grass  
+EVs: 100 HP / 84 Atk / 60 Def / 84 SpD / 180 Spe  
+Adamant Nature  
+- Rock Slide  
+- Sacred Sword  
+- Protect  
+- Quick Attack
+
+Incineroar @ Sitrus Berry  
+Ability: Intimidate  
+Level: 50  
+Tera Type: Water  
+EVs: 244 HP / 12 Atk / 76 Def / 156 SpD / 20 Spe  
+Careful Nature  
+- Flare Blitz  
+- Knock Off  
+- Parting Shot  
+- Fake Out
+
+Flutter Mane @ Choice Specs  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Fairy  
+EVs: 140 HP / 172 Def / 36 SpA / 4 SpD / 156 Spe  
+Modest Nature  
+- Moonblast  
+- Dazzling Gleam  
+- Shadow Ball  
+- Energy Ball
+
+Raging Bolt @ Booster Energy  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Steel  
+EVs: 252 HP / 132 Def / 108 SpA / 4 SpD / 12 Spe  
+Modest Nature  
+- Thunderclap  
+- Dragon Pulse  
+- Calm Mind  
+- Protect
+
+Urshifu-Rapid-Strike @ Mystic Water  
+Ability: Unseen Fist  
+Level: 50  
+Tera Type: Water  
+EVs: 44 HP / 156 Atk / 4 Def / 100 SpD / 204 Spe  
+Adamant Nature  
+- Surging Strikes  
+- Aqua Jet  
+- Close Combat  
+- Protect
