@@ -67,6 +67,10 @@ class _BattleStartTrace:
         with self._lock:
             self._marks.setdefault(key, time.perf_counter())
 
+    def has_mark(self, key: str) -> bool:
+        with self._lock:
+            return key in self._marks
+
     def snapshot(self) -> dict[str, float]:
         with self._lock:
             return dict(self._marks)
@@ -430,7 +434,29 @@ class BattleEnv:
             self._disconnect_player(self._pending_opponent, self._loop)
         self._pending_opponent = next_opponent
 
+    def stage_next_opponent_checkpoint(self, checkpoint_path: str) -> bool:
+        if self._pending_opponent is not None or not hasattr(self.opponent, "stage_checkpoint"):
+            return False
+        stage_started = time.perf_counter()
+        self.opponent.stage_checkpoint(checkpoint_path)
+        self._timing.add(
+            "env_stage_opponent_checkpoint_sec",
+            time.perf_counter() - stage_started,
+        )
+        self._timing.increment("env_stage_opponent_checkpoint_calls")
+        return True
+
     def _apply_pending_opponent(self):
+        if self._pending_opponent is None:
+            if hasattr(self.opponent, "apply_staged_checkpoint"):
+                swap_started = time.perf_counter()
+                if self.opponent.apply_staged_checkpoint():
+                    self._timing.add(
+                        "env_reset_opponent_checkpoint_swap_sec",
+                        time.perf_counter() - swap_started,
+                    )
+            return
+
         if self._pending_opponent is None:
             return
 
@@ -535,6 +561,8 @@ class BattleEnv:
 
         if role == "player":
             original_challenge = participant.ps_client.challenge
+            original_send_message = participant.ps_client.send_message
+            original_battle_callback = participant.ps_client._on_battle_message
 
             async def challenge(username: str, format_: str, packed_team: str | None):
                 trace = self._battle_start_trace
@@ -546,6 +574,35 @@ class BattleEnv:
                 return result
 
             participant.ps_client.challenge = challenge
+
+            async def send_message(message: str, room: str = "", message_2: str | None = None):
+                trace = self._battle_start_trace
+                if trace is not None and room and message.startswith("/team "):
+                    trace.mark_once("player_teampreview_send_started")
+                result = await original_send_message(message, room, message_2)
+                if trace is not None and room and message.startswith("/team "):
+                    trace.mark_once("player_teampreview_send_finished")
+                return result
+
+            participant.ps_client.send_message = send_message
+
+            async def battle_callback(split_messages: list[list[str]]) -> None:
+                trace = self._battle_start_trace
+                if (
+                    trace is not None
+                    and trace.has_mark("opponent_teampreview_send_finished")
+                    and not trace.has_mark("player_post_preview_battle_message_started")
+                ):
+                    trace.mark_once("player_post_preview_battle_message_started")
+                result = await original_battle_callback(split_messages)
+                if (
+                    trace is not None
+                    and trace.has_mark("player_post_preview_battle_message_started")
+                ):
+                    trace.mark_once("player_post_preview_battle_message_finished")
+                return result
+
+            participant.ps_client._on_battle_message = battle_callback
 
             original_create_battle = participant._create_battle
 
@@ -565,16 +622,24 @@ class BattleEnv:
             async def handle_battle_request(battle, maybe_default_order: bool = False):
                 trace = self._battle_start_trace
                 if trace is not None:
-                    trace.mark_once("player_first_request_started")
+                    if trace.has_mark("player_teampreview_send_finished"):
+                        trace.mark_once("player_post_preview_request_started")
+                    else:
+                        trace.mark_once("player_first_request_started")
                 result = await original_handle_battle_request(battle, maybe_default_order)
                 if trace is not None:
-                    trace.mark_once("player_first_request_finished")
+                    if trace.has_mark("player_post_preview_request_started"):
+                        trace.mark_once("player_post_preview_request_finished")
+                    else:
+                        trace.mark_once("player_first_request_finished")
                 return result
 
             participant._handle_battle_request = handle_battle_request
 
         elif role == "opponent":
             original_accept_challenge = participant.ps_client.accept_challenge
+            original_send_message = participant.ps_client.send_message
+            original_teampreview = participant.teampreview
 
             async def accept_challenge(username: str, packed_team: str | None):
                 trace = self._battle_start_trace
@@ -586,6 +651,28 @@ class BattleEnv:
                 return result
 
             participant.ps_client.accept_challenge = accept_challenge
+
+            def teampreview(battle: DoubleBattle) -> str:
+                trace = self._battle_start_trace
+                if trace is not None:
+                    trace.mark_once("opponent_teampreview_started")
+                result = original_teampreview(battle)
+                if trace is not None:
+                    trace.mark_once("opponent_teampreview_finished")
+                return result
+
+            participant.teampreview = teampreview
+
+            async def send_message(message: str, room: str = "", message_2: str | None = None):
+                trace = self._battle_start_trace
+                if trace is not None and room and message.startswith("/team "):
+                    trace.mark_once("opponent_teampreview_send_started")
+                result = await original_send_message(message, room, message_2)
+                if trace is not None and room and message.startswith("/team "):
+                    trace.mark_once("opponent_teampreview_send_finished")
+                return result
+
+            participant.ps_client.send_message = send_message
 
     def _record_battle_start_trace(self) -> None:
         trace = self._battle_start_trace
@@ -611,8 +698,18 @@ class BattleEnv:
         request_finished = marks.get("player_first_request_finished")
         teampreview_started = marks.get("player_teampreview_started")
         teampreview_finished = marks.get("player_teampreview_finished")
+        player_teampreview_send_started = marks.get("player_teampreview_send_started")
+        player_teampreview_send_finished = marks.get("player_teampreview_send_finished")
         emit_started = marks.get("player_first_emit_started")
         emit_finished = marks.get("player_first_emit_finished")
+        opponent_teampreview_started = marks.get("opponent_teampreview_started")
+        opponent_teampreview_finished = marks.get("opponent_teampreview_finished")
+        opponent_teampreview_send_started = marks.get("opponent_teampreview_send_started")
+        opponent_teampreview_send_finished = marks.get("opponent_teampreview_send_finished")
+        post_preview_battle_message_started = marks.get("player_post_preview_battle_message_started")
+        post_preview_battle_message_finished = marks.get("player_post_preview_battle_message_finished")
+        post_preview_request_started = marks.get("player_post_preview_request_started")
+        post_preview_request_finished = marks.get("player_post_preview_request_finished")
 
         add_interval("env_reset_to_challenge_send_sec", started_at, challenge_started)
         add_interval("env_reset_challenge_send_sec", challenge_started, challenge_finished)
@@ -624,6 +721,56 @@ class BattleEnv:
         add_interval("env_reset_first_request_total_sec", request_started, request_finished)
         add_interval("env_reset_first_request_to_teampreview_sec", request_started, teampreview_started)
         add_interval("env_reset_teampreview_compute_sec", teampreview_started, teampreview_finished)
+        add_interval(
+            "env_reset_player_preview_to_opponent_preview_sec",
+            teampreview_finished,
+            opponent_teampreview_started,
+        )
+        add_interval(
+            "env_reset_opponent_teampreview_compute_sec",
+            opponent_teampreview_started,
+            opponent_teampreview_finished,
+        )
+        add_interval(
+            "env_reset_teampreview_send_sec",
+            player_teampreview_send_started,
+            player_teampreview_send_finished,
+        )
+        add_interval(
+            "env_reset_opponent_preview_to_send_sec",
+            opponent_teampreview_finished,
+            opponent_teampreview_send_started,
+        )
+        add_interval(
+            "env_reset_opponent_teampreview_send_sec",
+            opponent_teampreview_send_started,
+            opponent_teampreview_send_finished,
+        )
+        add_interval(
+            "env_reset_opponent_preview_send_to_message_sec",
+            opponent_teampreview_send_finished,
+            post_preview_battle_message_started,
+        )
+        add_interval(
+            "env_reset_post_preview_battle_message_sec",
+            post_preview_battle_message_started,
+            post_preview_battle_message_finished,
+        )
+        add_interval(
+            "env_reset_post_preview_message_to_request_sec",
+            post_preview_battle_message_started,
+            post_preview_request_started,
+        )
+        add_interval(
+            "env_reset_post_preview_request_total_sec",
+            post_preview_request_started,
+            post_preview_request_finished,
+        )
+        add_interval(
+            "env_reset_post_preview_request_to_emit_sec",
+            post_preview_request_started,
+            emit_started,
+        )
         add_interval("env_reset_teampreview_to_first_emit_sec", teampreview_finished, emit_started)
         add_interval("env_reset_request_to_first_emit_sec", request_finished, emit_started)
         add_interval("env_reset_first_emit_total_sec", emit_started, emit_finished)

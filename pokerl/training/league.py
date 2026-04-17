@@ -262,6 +262,17 @@ class LeaguePlayer(Player):
         self.inference_service = inference_service
         self.obs_builder = obs_builder
         self._hidden: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._pending_checkpoint_path: str | None = None
+
+    def stage_checkpoint(self, checkpoint_path: str) -> None:
+        self._pending_checkpoint_path = checkpoint_path
+
+    def apply_staged_checkpoint(self) -> bool:
+        if self._pending_checkpoint_path is None:
+            return False
+        self.checkpoint_path = self._pending_checkpoint_path
+        self._pending_checkpoint_path = None
+        return True
 
     def choose_move(self, battle: DoubleBattle):
         obs = self.obs_builder.build(battle)
@@ -338,10 +349,9 @@ class League:
 
         Returns None if the league is empty.
         """
-        path = self._sample_checkpoint()
+        path = self.sample_checkpoint_path()
         if path is None:
             return None
-        self._inference.ensure_checkpoint(path)
 
         url = server_url if server_url is not None else self.env_config.server_url
         host, port = url.split(":")
@@ -361,6 +371,13 @@ class League:
             server_configuration=server_config,
             loop=loop,
         )
+
+    def sample_checkpoint_path(self) -> str | None:
+        path = self._sample_checkpoint()
+        if path is None:
+            return None
+        self._inference.ensure_checkpoint(path)
+        return path
 
     def save_state(self, path: str) -> None:
         """Persist the ordered list of checkpoint paths to disk."""

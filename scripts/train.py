@@ -244,6 +244,14 @@ def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
     get a mix of checkpoints.
     """
     for env in parallel_env.envs:
+        checkpoint_path = league.sample_checkpoint_path()
+        if checkpoint_path is None:
+            raise RuntimeError(
+                "League opponent refresh requested, but the league is empty. "
+                "This should not happen if the league was seeded before training."
+            )
+        if env.stage_next_opponent_checkpoint(checkpoint_path):
+            continue
         env.set_next_opponent(make_league_opponent_factory(env.config, league))
 
 
@@ -309,6 +317,7 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
             "Reset breakdown (avg per battle reset) | "
             f"apply pending {avg_ms(env_profile.get('env_reset_apply_pending_sec', 0.0), reset_calls):.2f}ms | "
             f"disconnect old opp {avg_ms(env_profile.get('env_reset_opponent_disconnect_sec', 0.0), reset_calls):.2f}ms | "
+            f"swap opp ckpt {avg_ms(env_profile.get('env_reset_opponent_checkpoint_swap_sec', 0.0), reset_calls):.2f}ms | "
             f"build new opp {avg_ms(env_profile.get('env_reset_opponent_build_sec', 0.0), reset_calls):.2f}ms | "
             f"assign teams {avg_ms(env_profile.get('env_reset_team_assign_sec', 0.0), reset_calls):.2f}ms | "
             f"reset hidden {avg_ms(env_profile.get('env_reset_hidden_reset_sec', 0.0), reset_calls):.2f}ms | "
@@ -330,6 +339,16 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
             f"request total {avg_ms(env_profile.get('env_reset_first_request_total_sec', 0.0), reset_calls):.2f}ms | "
             f"request->preview {avg_ms(env_profile.get('env_reset_first_request_to_teampreview_sec', 0.0), reset_calls):.2f}ms | "
             f"preview compute {avg_ms(env_profile.get('env_reset_teampreview_compute_sec', 0.0), reset_calls):.2f}ms | "
+            f"preview->opp preview {avg_ms(env_profile.get('env_reset_player_preview_to_opponent_preview_sec', 0.0), reset_calls):.2f}ms | "
+            f"opp preview compute {avg_ms(env_profile.get('env_reset_opponent_teampreview_compute_sec', 0.0), reset_calls):.2f}ms | "
+            f"preview send {avg_ms(env_profile.get('env_reset_teampreview_send_sec', 0.0), reset_calls):.2f}ms | "
+            f"opp preview->send {avg_ms(env_profile.get('env_reset_opponent_preview_to_send_sec', 0.0), reset_calls):.2f}ms | "
+            f"opp preview send {avg_ms(env_profile.get('env_reset_opponent_teampreview_send_sec', 0.0), reset_calls):.2f}ms | "
+            f"opp send->message {avg_ms(env_profile.get('env_reset_opponent_preview_send_to_message_sec', 0.0), reset_calls):.2f}ms | "
+            f"post message {avg_ms(env_profile.get('env_reset_post_preview_battle_message_sec', 0.0), reset_calls):.2f}ms | "
+            f"message->request {avg_ms(env_profile.get('env_reset_post_preview_message_to_request_sec', 0.0), reset_calls):.2f}ms | "
+            f"post request total {avg_ms(env_profile.get('env_reset_post_preview_request_total_sec', 0.0), reset_calls):.2f}ms | "
+            f"post request->emit {avg_ms(env_profile.get('env_reset_post_preview_request_to_emit_sec', 0.0), reset_calls):.2f}ms | "
             f"preview->first emit {avg_ms(env_profile.get('env_reset_teampreview_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
             f"request->first emit {avg_ms(env_profile.get('env_reset_request_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
             f"first emit total {avg_ms(env_profile.get('env_reset_first_emit_total_sec', 0.0), reset_calls):.2f}ms"
