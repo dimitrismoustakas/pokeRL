@@ -349,6 +349,7 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
             f"message->request {avg_ms(env_profile.get('env_reset_post_preview_message_to_request_sec', 0.0), reset_calls):.2f}ms | "
             f"post request total {avg_ms(env_profile.get('env_reset_post_preview_request_total_sec', 0.0), reset_calls):.2f}ms | "
             f"post request->emit {avg_ms(env_profile.get('env_reset_post_preview_request_to_emit_sec', 0.0), reset_calls):.2f}ms | "
+            f"opp preview->first emit {avg_ms(env_profile.get('env_reset_opponent_preview_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
             f"preview->first emit {avg_ms(env_profile.get('env_reset_teampreview_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
             f"request->first emit {avg_ms(env_profile.get('env_reset_request_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
             f"first emit total {avg_ms(env_profile.get('env_reset_first_emit_total_sec', 0.0), reset_calls):.2f}ms"
@@ -360,6 +361,16 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
                 f"hits {int(env_profile.get('env_precompute_preview_hits', 0.0))} | "
                 f"misses {int(env_profile.get('env_precompute_preview_misses', 0.0))} | "
                 f"fallbacks {int(env_profile.get('env_precompute_preview_fallbacks', 0.0))}"
+            )
+        if env_profile.get("opponent_teampreview_calls", 0.0):
+            print(
+                "Opponent preview | "
+                f"total {avg_ms(env_profile.get('opponent_teampreview_sec', 0.0), reset_calls):.2f}ms | "
+                f"infer {avg_ms(env_profile.get('opponent_teampreview_infer_sec', 0.0), reset_calls):.2f}ms | "
+                f"precompute submits {int(env_profile.get('opponent_precompute_preview_submit_calls', 0.0))} | "
+                f"hits {int(env_profile.get('opponent_precompute_preview_hits', 0.0))} | "
+                f"misses {int(env_profile.get('opponent_precompute_preview_misses', 0.0))} | "
+                f"fallbacks {int(env_profile.get('opponent_precompute_preview_fallbacks', 0.0))}"
             )
 
 

@@ -469,6 +469,8 @@ class BattleEnv:
     def _build_opponent(self, opponent_factory: OpponentFactory) -> Player:
         opponent = opponent_factory(self._loop)
         self._attach_choice_timer(opponent)
+        if hasattr(opponent, "set_timing"):
+            opponent.set_timing(self._timing)
         self._assert_player_loop(opponent, "opponent")
         self._install_battle_start_hooks(opponent, role="opponent")
         return opponent
@@ -497,6 +499,18 @@ class BattleEnv:
         self._prepared_preview_future = self._team_preview_batcher.submit(self._prepared_preview_obs)
         self._timing.add("env_precompute_preview_submit_sec", time.perf_counter() - submit_started)
         self._timing.increment("env_precompute_preview_submit_calls")
+
+        next_opponent = self._pending_opponent if self._pending_opponent is not None else self.opponent
+        if hasattr(next_opponent, "prepare_team_preview"):
+            opp_started = time.perf_counter()
+            next_opponent.prepare_team_preview(
+                own_packed_team=self._prepared_opponent_team,
+                opponent_packed_team=self._prepared_player_team,
+            )
+            self._timing.add(
+                "env_precompute_opponent_preview_prepare_sec",
+                time.perf_counter() - opp_started,
+            )
 
     def refresh_prepared_team_preview(self) -> None:
         if self._prepared_player_team is None or self._prepared_opponent_team is None:
@@ -651,7 +665,6 @@ class BattleEnv:
                 return result
 
             participant.ps_client.accept_challenge = accept_challenge
-
             def teampreview(battle: DoubleBattle) -> str:
                 trace = self._battle_start_trace
                 if trace is not None:
@@ -662,7 +675,6 @@ class BattleEnv:
                 return result
 
             participant.teampreview = teampreview
-
             async def send_message(message: str, room: str = "", message_2: str | None = None):
                 trace = self._battle_start_trace
                 if trace is not None and room and message.startswith("/team "):
@@ -732,6 +744,11 @@ class BattleEnv:
             opponent_teampreview_finished,
         )
         add_interval(
+            "env_reset_opponent_teampreview_sec",
+            opponent_teampreview_started,
+            opponent_teampreview_finished,
+        )
+        add_interval(
             "env_reset_teampreview_send_sec",
             player_teampreview_send_started,
             player_teampreview_send_finished,
@@ -771,6 +788,11 @@ class BattleEnv:
             post_preview_request_started,
             emit_started,
         )
+        add_interval(
+            "env_reset_opponent_preview_to_first_emit_sec",
+            opponent_teampreview_finished,
+            emit_started,
+        )
         add_interval("env_reset_teampreview_to_first_emit_sec", teampreview_finished, emit_started)
         add_interval("env_reset_request_to_first_emit_sec", request_finished, emit_started)
         add_interval("env_reset_first_emit_total_sec", emit_started, emit_finished)
@@ -786,6 +808,17 @@ class BattleEnv:
             return result
 
         opponent.choose_move = timed_choose_move
+
+        original_teampreview = opponent.teampreview
+
+        def timed_teampreview(battle):
+            started = time.perf_counter()
+            result = original_teampreview(battle)
+            self._timing.increment("opponent_teampreview_calls")
+            self._timing.add("opponent_teampreview_sec", time.perf_counter() - started)
+            return result
+
+        opponent.teampreview = timed_teampreview
 
     def snapshot_timing(self) -> dict[str, float]:
         return self._timing.snapshot_and_reset()

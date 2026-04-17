@@ -19,7 +19,7 @@ from poke_env.player import DoubleBattleOrder, PassBattleOrder, Player
 from ..model.agent import PokeAgent
 from ..data import GameData
 from ..config import TrainingConfig, EnvConfig
-from ..env.observation import ObservationBuilder
+from ..env.observation import ObservationBuilder, build_team_preview_observation
 from ..env.actions import build_action_mask, action_to_order
 from ..env.showdown_env import make_local_account_configuration
 
@@ -100,6 +100,13 @@ class _LeagueInferenceService:
         checkpoint_path: str,
         obs: dict[str, np.ndarray],
     ) -> np.ndarray:
+        return self.submit_team_preview(checkpoint_path, obs).result()
+
+    def submit_team_preview(
+        self,
+        checkpoint_path: str,
+        obs: dict[str, np.ndarray],
+    ) -> Future:
         future: Future = Future()
         self._submit(
             _InferenceRequest(
@@ -111,7 +118,7 @@ class _LeagueInferenceService:
                 future=future,
             )
         )
-        return future.result()
+        return future
 
     def close(self) -> None:
         with self._condition:
@@ -263,9 +270,14 @@ class LeaguePlayer(Player):
         self.obs_builder = obs_builder
         self._hidden: tuple[torch.Tensor, torch.Tensor] | None = None
         self._pending_checkpoint_path: str | None = None
+        self._prepared_preview_obs: dict[str, np.ndarray] | None = None
+        self._prepared_preview_future: Future | None = None
+        self._timing = None
 
     def stage_checkpoint(self, checkpoint_path: str) -> None:
         self._pending_checkpoint_path = checkpoint_path
+        self._prepared_preview_obs = None
+        self._prepared_preview_future = None
 
     def apply_staged_checkpoint(self) -> bool:
         if self._pending_checkpoint_path is None:
@@ -273,6 +285,29 @@ class LeaguePlayer(Player):
         self.checkpoint_path = self._pending_checkpoint_path
         self._pending_checkpoint_path = None
         return True
+
+    def set_timing(self, timing) -> None:
+        self._timing = timing
+
+    def prepare_team_preview(self, own_packed_team: str, opponent_packed_team: str) -> None:
+        started = time.perf_counter()
+        obs = build_team_preview_observation(
+            self.obs_builder.gd,
+            self.obs_builder.team_size,
+            own_packed_team,
+            opponent_packed_team,
+        )
+        self._add_timing("opponent_precompute_preview_obs_sec", time.perf_counter() - started)
+
+        submit_started = time.perf_counter()
+        self._prepared_preview_obs = obs
+        checkpoint_path = self._pending_checkpoint_path or self.checkpoint_path
+        self._prepared_preview_future = self.inference_service.submit_team_preview(
+            checkpoint_path,
+            obs,
+        )
+        self._add_timing("opponent_precompute_preview_submit_sec", time.perf_counter() - submit_started)
+        self._increment_timing("opponent_precompute_preview_submit_calls")
 
     def choose_move(self, battle: DoubleBattle):
         obs = self.obs_builder.build(battle)
@@ -294,12 +329,62 @@ class LeaguePlayer(Player):
 
     def teampreview(self, battle: DoubleBattle) -> str:
         obs = self.obs_builder.build(battle)
+        prepared_obs = self._prepared_preview_obs
+        prepared_future = self._prepared_preview_future
+        self._prepared_preview_obs = None
+        self._prepared_preview_future = None
+
+        if prepared_obs is not None and prepared_future is not None and self._obs_equal(obs, prepared_obs):
+            self._increment_timing("opponent_precompute_preview_hits")
+            try:
+                wait_started = time.perf_counter()
+                picks = prepared_future.result()
+                self._add_timing(
+                    "opponent_precompute_preview_hit_wait_sec",
+                    time.perf_counter() - wait_started,
+                )
+                return "/team " + "".join(str(int(p) + 1) for p in picks)
+            except Exception:
+                self._increment_timing("opponent_precompute_preview_fallbacks")
+        elif prepared_obs is not None or prepared_future is not None:
+            self._increment_timing("opponent_precompute_preview_misses")
+            if prepared_obs is not None:
+                self._record_preview_obs_mismatch(obs, prepared_obs)
+
+        infer_started = time.perf_counter()
         picks = self.inference_service.infer_team_preview(self.checkpoint_path, obs)
+        self._add_timing("opponent_teampreview_infer_sec", time.perf_counter() - infer_started)
         return "/team " + "".join(str(int(p) + 1) for p in picks)
 
     def reset_hidden(self):
         """Clear LSTM state between battles. Called by BattleEnv.reset()."""
         self._hidden = None
+
+    @staticmethod
+    def _obs_equal(left: dict[str, np.ndarray], right: dict[str, np.ndarray]) -> bool:
+        if left.keys() != right.keys():
+            return False
+        return all(np.array_equal(left[key], right[key]) for key in left)
+
+    def _record_preview_obs_mismatch(
+        self,
+        actual: dict[str, np.ndarray],
+        prepared: dict[str, np.ndarray],
+    ) -> None:
+        if actual.keys() != prepared.keys():
+            self._increment_timing("opponent_precompute_preview_keyset_mismatch")
+            return
+        for key in actual:
+            if not np.array_equal(actual[key], prepared[key]):
+                self._increment_timing(f"opponent_precompute_preview_mismatch_{key}")
+
+    def _add_timing(self, key: str, value: float) -> None:
+        if self._timing is not None:
+            self._timing.add(key, value)
+
+    def _increment_timing(self, key: str, delta: int = 1) -> None:
+        if self._timing is not None:
+            self._timing.increment(key, delta)
 
 
 class League:
