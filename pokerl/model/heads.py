@@ -2,9 +2,8 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ..env.actions import ACTIONS_PER_SLOT, PASS_ACTION, SWITCH_OFFSET
+from ..env.actions import ACTIONS_PER_SLOT, PASS_ACTION, SWITCH_OFFSET, TERA_OFFSET
 
 
 class ActionHead(nn.Module):
@@ -66,11 +65,21 @@ class ActionHead(nn.Module):
         mask2 = mask2.clone()
         switch_rows = (a1 >= SWITCH_OFFSET) & (a1 < PASS_ACTION)
         if switch_rows.any():
-            switch_indices = a1[switch_rows]
-            mask2[switch_rows, switch_indices] = False
+            switch_slots = a1[switch_rows]
+            mask2[switch_rows, switch_slots] = False
             empty_rows = switch_rows.nonzero(as_tuple=False).squeeze(1)[~mask2[switch_rows].any(dim=1)]
             if empty_rows.numel() > 0:
                 mask2[empty_rows, PASS_ACTION] = True
+
+        tera_rows = (a1 >= TERA_OFFSET) & (a1 < SWITCH_OFFSET)
+        if tera_rows.any():
+            mask2[tera_rows, TERA_OFFSET:SWITCH_OFFSET] = False
+
+        if not mask2.any(dim=1).all():
+            raise RuntimeError(
+                "ActionHead produced an empty joint action mask for pokemon 2. "
+                "This means the per-slot action masks or joint legality logic are inconsistent."
+            )
 
         a1_emb = self.action_emb(a1)
         logits2 = self.head2(torch.cat([context, rep2, rep1, a1_emb], dim=-1))
@@ -115,7 +124,6 @@ class TeamPreviewHead(nn.Module):
         picks: torch.Tensor | None = None,  # (batch, pick_size) if evaluating
     ) -> dict[str, torch.Tensor]:
         batch, team_size, pdim = pokemon_reps.shape
-        cdim = context.shape[-1]
 
         all_log_probs = []
         all_entropies = []

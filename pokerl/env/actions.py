@@ -7,18 +7,18 @@ from poke_env.player import PassBattleOrder, SingleBattleOrder
 
 # --- Action layout per active slot ---
 #
-#   0..11:  move_i * 3 + target_j        (4 moves × 3 targets, no tera)
-#  12..23:  move_i * 3 + target_j + 12   (4 moves × 3 targets, with tera)
-#  24..27:  switch to bench_k             (up to 4 bench pokemon)
-#  28:      pass                          (slot has no action this turn)
+#   0..11:  move_i * 3 + target_j        (4 moves x 3 targets, no tera)
+#  12..23:  move_i * 3 + target_j + 12   (4 moves x 3 targets, with tera)
+#  24..29:  switch to own_team_slot_k    (stable team slot, 0..5)
+#  30:      pass                         (slot has no action this turn)
 
 NUM_MOVES = 4
 NUM_TARGETS = 3   # opposing_1, opposing_2, ally
-TERA_OFFSET = NUM_MOVES * NUM_TARGETS         # 12
-SWITCH_OFFSET = 2 * NUM_MOVES * NUM_TARGETS   # 24
-MAX_SWITCHES = 4
-PASS_ACTION = SWITCH_OFFSET + MAX_SWITCHES    # 28
-ACTIONS_PER_SLOT = PASS_ACTION + 1            # 29
+MAX_TEAM_SLOTS = 6
+TERA_OFFSET = NUM_MOVES * NUM_TARGETS          # 12
+SWITCH_OFFSET = 2 * NUM_MOVES * NUM_TARGETS    # 24
+PASS_ACTION = SWITCH_OFFSET + MAX_TEAM_SLOTS   # 30
+ACTIONS_PER_SLOT = PASS_ACTION + 1             # 31
 
 
 def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
@@ -26,7 +26,7 @@ def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
 
     Returns:
         kind: "move", "switch", or "pass"
-        idx: move index (0-3) or switch index (0-3)
+        idx: move index (0-3) or stable team slot index (0-5)
         target: target index (0-2) for moves, -1 otherwise
         tera: whether to terastallize
     """
@@ -57,7 +57,23 @@ def action_to_order(
         return PassBattleOrder()
 
     if kind == "switch":
-        pokemon = battle.available_switches[slot][idx]
+        ordered_team = _ordered_own_team(battle)
+        if idx >= len(ordered_team):
+            raise RuntimeError(
+                f"Switch action referenced team slot {idx}, but ordered team has only {len(ordered_team)} entries."
+            )
+        pokemon = ordered_team[idx]
+        if pokemon is None:
+            raise RuntimeError(
+                f"Switch action referenced padded team slot {idx}. "
+                "This means build_action_mask exposed an invalid switch action."
+            )
+        if pokemon not in battle.available_switches[slot]:
+            raise RuntimeError(
+                f"Switch action referenced {pokemon.species!r} in team slot {idx}, but it is not "
+                f"available to switch for slot {slot}. This means build_action_mask or the joint "
+                "action logic allowed an illegal switch target."
+            )
         return SingleBattleOrder(pokemon)
 
     # Move order
@@ -81,12 +97,10 @@ def build_action_mask(battle: DoubleBattle, slot: int) -> np.ndarray:
         mask[PASS_ACTION] = True
         return mask
 
-    # Force switch: only switches are valid (and possibly pass if no switches)
+    # Force switch: only switches are valid (and possibly pass if no switches).
     if battle.force_switch[slot]:
-        switches = battle.available_switches[slot]
-        for k, _ in enumerate(switches):
-            mask[SWITCH_OFFSET + k] = True
-        if not switches:
+        _mark_switch_actions(mask, battle, slot)
+        if not mask[SWITCH_OFFSET:PASS_ACTION].any():
             mask[PASS_ACTION] = True
         return mask
 
@@ -107,9 +121,7 @@ def build_action_mask(battle: DoubleBattle, slot: int) -> np.ndarray:
                 mask[TERA_OFFSET + i * NUM_TARGETS + j] = True
 
     # Switches
-    switches = battle.available_switches[slot]
-    for k, _ in enumerate(switches):
-        mask[SWITCH_OFFSET + k] = True
+    _mark_switch_actions(mask, battle, slot)
 
     if not mask.any():
         # Some doubles states legitimately leave a slot with no independent action.
@@ -118,6 +130,36 @@ def build_action_mask(battle: DoubleBattle, slot: int) -> np.ndarray:
         mask[PASS_ACTION] = True
 
     return mask
+
+
+def _mark_switch_actions(mask: np.ndarray, battle: DoubleBattle, slot: int) -> None:
+    ordered_team = _ordered_own_team(battle)
+    for pokemon in battle.available_switches[slot]:
+        team_slot = _find_team_slot(ordered_team, pokemon)
+        if team_slot is None:
+            raise RuntimeError(
+                f"Available switch target {pokemon.species!r} was not found in the ordered team. "
+                "This indicates battle.team and available_switches are out of sync."
+            )
+        mask[SWITCH_OFFSET + team_slot] = True
+
+
+def _ordered_own_team(battle: DoubleBattle) -> list:
+    team = list(battle.team.values())
+    active_set = {pokemon for pokemon in battle.active_pokemon if pokemon is not None}
+    active = [pokemon for pokemon in team if pokemon in active_set]
+    bench = [pokemon for pokemon in team if pokemon not in active_set]
+    ordered = active + bench
+    while len(ordered) < MAX_TEAM_SLOTS:
+        ordered.append(None)
+    return ordered[:MAX_TEAM_SLOTS]
+
+
+def _find_team_slot(team_list: list, pokemon) -> int | None:
+    for index, team_member in enumerate(team_list):
+        if team_member is pokemon:
+            return index
+    return None
 
 
 def _valid_targets_for_move(
@@ -161,7 +203,7 @@ def _resolve_target(
     raise RuntimeError(
         f"_resolve_target: computed showdown_target={showdown_target} is not in "
         f"possible_targets={possible_targets} for move={move.id!r}, slot={slot}, "
-        f"target_idx={target_idx}. This means the action mask allowed an invalid target — "
+        f"target_idx={target_idx}. This means the action mask allowed an invalid target - "
         "check build_action_mask and _valid_targets_for_move."
     )
 

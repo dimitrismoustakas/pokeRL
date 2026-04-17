@@ -272,6 +272,14 @@ def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str,
     return {k: torch.from_numpy(v).to(device) for k, v in obs.items()}
 
 
+def clone_hidden_state(
+    hidden: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if hidden is None:
+        return None
+    return tuple(state.detach().clone() for state in hidden)
+
+
 def _league_state_path(train_config: TrainingConfig) -> str:
     return f"{train_config.checkpoint_dir}/league_state.json"
 
@@ -381,8 +389,13 @@ def train():
         initial_env_profile = parallel_env.snapshot_timing() if collect_timing else {}
         if collect_timing:
             parallel_env.reset_timing()
-        obs_keys = list(obs.keys())
-        buffer = RolloutBuffer(train_config.rollout_steps, env_config.num_envs, obs_keys)
+        buffer = RolloutBuffer(
+            train_config.rollout_steps,
+            env_config.num_envs,
+            obs,
+            masks,
+            device,
+        )
 
         hidden = agent.initial_hidden(env_config.num_envs)
         num_updates = train_config.total_timesteps // steps_per_update
@@ -405,7 +418,7 @@ def train():
 
         for update in range(updates_done + 1, num_updates + 1):
             agent.eval()
-            buffer.reset()
+            buffer.reset(initial_hidden=clone_hidden_state(hidden))
             if collect_timing:
                 parallel_env.reset_timing()
             rollout_started = time.perf_counter()
@@ -419,22 +432,20 @@ def train():
                 "policy_forward_sec": 0.0,
                 "policy_postprocess_sec": 0.0,
                 "env_step_sec": 0.0,
+                "feedback_to_device_sec": 0.0,
                 "buffer_add_sec": 0.0,
                 "hidden_reset_sec": 0.0,
             }
 
             # --- Collect rollout ---
             for step in range(train_config.rollout_steps):
-                # Store the hidden state BEFORE the forward pass so PPO
-                # can reconstruct the same computation during updates.
-                pre_hidden = hidden
                 with torch.no_grad():
                     obs_device_started = time.perf_counter()
                     obs_t = obs_to_device(obs, device)
                     rollout_profile["obs_to_device_sec"] += time.perf_counter() - obs_device_started
 
                     mask_device_started = time.perf_counter()
-                    masks_t = torch.from_numpy(masks).to(device).bool()
+                    masks_t = torch.from_numpy(masks).to(device=device, dtype=torch.bool)
                     rollout_profile["mask_to_device_sec"] += time.perf_counter() - mask_device_started
 
                     policy_started = time.perf_counter()
@@ -442,9 +453,10 @@ def train():
                     rollout_profile["policy_forward_sec"] += time.perf_counter() - policy_started
 
                     policy_post_started = time.perf_counter()
-                    actions = out["actions"].cpu().numpy()
-                    log_probs = out["log_prob"].cpu().numpy()
-                    values = out["value"].cpu().numpy()
+                    actions_t = out["actions"]
+                    log_probs_t = out["log_prob"]
+                    values_t = out["value"]
+                    actions = actions_t.cpu().numpy()
                     hidden = out["hidden"]
                     rollout_profile["policy_postprocess_sec"] += time.perf_counter() - policy_post_started
 
@@ -452,18 +464,21 @@ def train():
                 next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
                 rollout_profile["env_step_sec"] += time.perf_counter() - env_step_started
 
+                feedback_device_started = time.perf_counter()
+                rewards_t = torch.from_numpy(rewards).to(device)
+                dones_t = torch.from_numpy(dones).to(device)
+                rollout_profile["feedback_to_device_sec"] += time.perf_counter() - feedback_device_started
+
                 buffer_started = time.perf_counter()
-                buffer.add(obs, actions, masks, log_probs, values, rewards, dones, pre_hidden)
+                buffer.add(obs_t, actions_t, masks_t, log_probs_t, values_t, rewards_t, dones_t)
                 rollout_profile["buffer_add_sec"] += time.perf_counter() - buffer_started
 
                 # Reset hidden state for done environments
-                if hidden is not None and dones.any():
+                if hidden is not None:
                     hidden_reset_started = time.perf_counter()
                     h, c = hidden
-                    done_idx = torch.from_numpy(dones).to(device)
-                    h[:, done_idx] = 0
-                    c[:, done_idx] = 0
-                    hidden = (h, c)
+                    not_done = (~dones_t).to(h.dtype).view(1, dones_t.shape[0], 1)
+                    hidden = (h * not_done, c * not_done)
                     rollout_profile["hidden_reset_sec"] += time.perf_counter() - hidden_reset_started
 
                 # Track episode rewards and team preview decisions
@@ -496,7 +511,7 @@ def train():
             # --- Compute advantages ---
             with torch.no_grad():
                 obs_t = obs_to_device(obs, device)
-                last_value = agent.get_value(obs_t, hidden).cpu().numpy()
+                last_value = agent.get_value(obs_t, hidden)
 
             batch = buffer.compute_gae(last_value, train_config.gamma, train_config.gae_lambda)
 

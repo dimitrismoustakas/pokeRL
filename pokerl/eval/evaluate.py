@@ -7,8 +7,6 @@ from ..config import ModelConfig, EnvConfig
 from ..data import GameData
 from ..model.agent import PokeAgent
 from ..env.showdown_env import BattleEnv, make_local_account_configuration, make_server_configuration
-from ..env.observation import ObservationBuilder
-from ..env.actions import ACTIONS_PER_SLOT
 
 
 def evaluate(

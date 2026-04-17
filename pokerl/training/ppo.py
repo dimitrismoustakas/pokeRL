@@ -31,34 +31,40 @@ class PPOTrainer:
         """
         T = batch.num_steps
         E = batch.num_envs
-        envs_per_mb = E // self.config.num_minibatches
-        if envs_per_mb == 0:
+        if self.config.num_minibatches > E:
             raise ValueError(
                 f"num_minibatches ({self.config.num_minibatches}) cannot exceed num_envs ({E}); "
                 "reduce num_minibatches."
+            )
+        batch_device = next(iter(batch.obs.values())).device
+        if batch_device.type != self.device.type:
+            raise ValueError(
+                f"RolloutBatch is on {batch_device}, but PPOTrainer is on {self.device}. "
+                "Collect rollouts on the trainer device."
+            )
+        if self.device.index is not None and batch_device.index != self.device.index:
+            raise ValueError(
+                f"RolloutBatch is on {batch_device}, but PPOTrainer is on {self.device}. "
+                "Collect rollouts on the trainer device."
             )
 
         # Normalize advantages over the full batch once, before the update loop.
         adv = batch.advantages
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # Reshape flat (T*E, ...) tensors back to (T, E, ...) for sequence processing.
-        def seq(t: torch.Tensor) -> torch.Tensor:
-            return t.reshape(T, E, *t.shape[1:])
+        obs_seq = batch.obs
+        actions_seq = batch.actions              # (T, E, 2)
+        masks_seq = batch.action_masks           # (T, E, 2, A)
+        old_lp_seq = batch.log_probs             # (T, E)
+        adv_seq = adv                            # (T, E)
+        returns_seq = batch.returns              # (T, E)
+        values_old_seq = batch.values            # (T, E)
+        dones_seq = batch.dones                  # (T, E)
 
-        obs_seq = {k: seq(v) for k, v in batch.obs.items()}
-        actions_seq = seq(batch.actions)         # (T, E, 2)
-        masks_seq = seq(batch.action_masks)      # (T, E, 2, A)
-        old_lp_seq = seq(batch.log_probs)        # (T, E)
-        adv_seq = seq(adv)                       # (T, E)
-        returns_seq = seq(batch.returns)         # (T, E)
-        values_old_seq = seq(batch.values)       # (T, E)
-        dones_seq = seq(batch.dones)             # (T, E)
-
-        # Per-env initial hidden states: stored at rollout step 0.
-        if batch.hidden_h is not None:
-            init_h_all = seq(batch.hidden_h)[0]  # (E, hidden_dim)
-            init_c_all = seq(batch.hidden_c)[0]  # (E, hidden_dim)
+        # Per-env initial hidden states at the start of the rollout.
+        if batch.initial_hidden_h is not None:
+            init_h_all = batch.initial_hidden_h
+            init_c_all = batch.initial_hidden_c
         else:
             init_h_all = None
             init_c_all = None
@@ -67,27 +73,27 @@ class PPOTrainer:
         num_updates = 0
 
         for epoch in range(self.config.num_epochs):
-            env_order = torch.randperm(E)
+            env_order = torch.randperm(E, device=self.device)
 
-            for mb_start in range(0, E, envs_per_mb):
-                mb_envs = env_order[mb_start: mb_start + envs_per_mb]
-                E_mb = len(mb_envs)
+            for mb_envs in torch.tensor_split(env_order, self.config.num_minibatches):
+                if mb_envs.numel() == 0:
+                    continue
+                E_mb = mb_envs.numel()
 
-                # Move per-minibatch sequence data to device.
-                mb_obs_seq = {k: v[:, mb_envs].to(self.device) for k, v in obs_seq.items()}
-                mb_actions_seq = actions_seq[:, mb_envs].to(self.device)   # (T, E_mb, 2)
-                mb_masks_seq = masks_seq[:, mb_envs].to(self.device).bool()  # (T, E_mb, 2, A)
-                mb_dones_seq = dones_seq[:, mb_envs].to(self.device)          # (T, E_mb)
-                mb_old_lp = old_lp_seq[:, mb_envs].reshape(-1).to(self.device)
-                mb_adv = adv_seq[:, mb_envs].reshape(-1).to(self.device)
-                mb_returns = returns_seq[:, mb_envs].reshape(-1).to(self.device)
-                mb_values_old = values_old_seq[:, mb_envs].reshape(-1).to(self.device)
+                mb_obs_seq = {k: v[:, mb_envs] for k, v in obs_seq.items()}
+                mb_actions_seq = actions_seq[:, mb_envs]      # (T, E_mb, 2)
+                mb_masks_seq = masks_seq[:, mb_envs]          # (T, E_mb, 2, A)
+                mb_dones_seq = dones_seq[:, mb_envs]          # (T, E_mb)
+                mb_old_lp = old_lp_seq[:, mb_envs].reshape(-1)
+                mb_adv = adv_seq[:, mb_envs].reshape(-1)
+                mb_returns = returns_seq[:, mb_envs].reshape(-1)
+                mb_values_old = values_old_seq[:, mb_envs].reshape(-1)
 
                 # Initial hidden for this env subset.
                 if init_h_all is not None:
                     hidden: tuple | None = (
-                        init_h_all[mb_envs].unsqueeze(0).to(self.device),
-                        init_c_all[mb_envs].unsqueeze(0).to(self.device),
+                        init_h_all[mb_envs].unsqueeze(0),
+                        init_c_all[mb_envs].unsqueeze(0),
                     )
                 else:
                     hidden = None
@@ -124,10 +130,9 @@ class PPOTrainer:
                     all_entropies.append(action_out["entropy"])
                     all_values.append(value_t)
 
-                    # Zero hidden state for envs whose episode just ended.
-                    # Multiply by a float mask to avoid in-place ops on the graph.
-                    if hidden is not None and mb_dones_seq[t].any():
-                        not_done = (~mb_dones_seq[t]).float().unsqueeze(0).unsqueeze(-1)
+                    # Zero hidden state at episode boundaries without host-side syncs.
+                    if hidden is not None:
+                        not_done = (~mb_dones_seq[t]).to(ctx_t.dtype).view(1, E_mb, 1)
                         h, c = hidden
                         hidden = (h * not_done, c * not_done)
 
