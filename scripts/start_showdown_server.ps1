@@ -2,10 +2,16 @@ param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA "pokeRL\pokemon-showdown"),
     [int]$Port = 8000,
     [switch]$InstallOnly,
-    [switch]$Update
+    [switch]$Update,
+    [switch]$Detached,
+    [int]$ReadyTimeoutSec = 15
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($ReadyTimeoutSec -lt 1) {
+    throw "-ReadyTimeoutSec must be at least 1 second."
+}
 
 function Test-ShowdownPort {
     param(
@@ -14,6 +20,30 @@ function Test-ShowdownPort {
 
     $result = Test-NetConnection -ComputerName localhost -Port $Port -WarningAction SilentlyContinue
     return [bool]$result.TcpTestSucceeded
+}
+
+function Wait-ShowdownReady {
+    param(
+        [int]$Port,
+        [int]$TimeoutSec,
+        [int[]]$CleanupProcessIds = @()
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-ShowdownPort -Port $Port) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    foreach ($procId in $CleanupProcessIds) {
+        if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    throw "Pokemon Showdown did not become reachable on localhost:$Port within $TimeoutSec seconds."
 }
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -50,6 +80,20 @@ if ($InstallOnly) {
 
 if (Test-ShowdownPort -Port $Port) {
     Write-Output "Pokemon Showdown is already running on localhost:$Port"
+    exit 0
+}
+
+if ($Detached) {
+    $startProcessArgs = @{
+        FilePath = "node"
+        ArgumentList = @("pokemon-showdown", "start", "--no-security", $Port.ToString())
+        WorkingDirectory = $InstallDir
+        WindowStyle = "Hidden"
+        PassThru = $true
+    }
+    $process = Start-Process @startProcessArgs
+    Wait-ShowdownReady -Port $Port -TimeoutSec $ReadyTimeoutSec -CleanupProcessIds @($process.Id)
+    Write-Output "Pokemon Showdown started on localhost:$Port (pid $($process.Id))"
     exit 0
 }
 

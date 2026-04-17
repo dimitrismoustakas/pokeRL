@@ -23,6 +23,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1
 
 It serves on `localhost:8000` by default.
 
+For automation, use detached startup so the command returns after the port is reachable:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1 -Port 8000 -Detached
+```
+
 To run additional local instances on other ports:
 
 ```powershell
