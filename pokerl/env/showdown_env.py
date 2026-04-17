@@ -5,7 +5,7 @@ import itertools
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from threading import Lock, Thread
 from typing import Generic, TypeVar
 
@@ -18,7 +18,8 @@ from poke_env.player import BattleOrder, DoubleBattleOrder, ForfeitBattleOrder, 
 
 from ..config import EnvConfig
 from ..data import GameData
-from .observation import ObservationBuilder
+from ..training.preview import TeamPreviewBatcher
+from .observation import ObservationBuilder, build_team_preview_observation
 from .actions import (
     build_action_mask, action_to_order,
 )
@@ -243,6 +244,7 @@ class BattleEnv:
         game_data: GameData,
         opponent_factory: OpponentFactory,
         team_preview_fn: Callable[[dict], tuple[np.ndarray, str]] | None = None,
+        team_preview_batcher: TeamPreviewBatcher | None = None,
         team_pair_provider: TeamPairProvider | None = None,
         player_kwargs: dict | None = None,
     ):
@@ -256,7 +258,14 @@ class BattleEnv:
         self._battle_started_at: float | None = None
         self._timing = _TimingStats()
         self._ext_team_preview_fn = team_preview_fn
+        self._team_preview_batcher = team_preview_batcher
         self._team_pair_provider = team_pair_provider
+        self._prepared_player_team: str | None = None
+        self._prepared_opponent_team: str | None = None
+        self._prepared_preview_obs: dict[str, np.ndarray] | None = None
+        self._prepared_preview_future: Future | None = None
+        self._active_preview_obs: dict[str, np.ndarray] | None = None
+        self._active_preview_future: Future | None = None
         # Set at team preview time, read when the episode ends to attach to info.
         self._episode_team_preview: tuple[dict, np.ndarray] | None = None
 
@@ -285,6 +294,7 @@ class BattleEnv:
         self.player.set_battle_start_trace_getter(self._get_battle_start_trace)
         self._install_battle_start_hooks(self.player, role="player")
         self.opponent = self._build_opponent(opponent_factory)
+        self._prepare_next_battle()
 
     def reset(self) -> tuple[dict, np.ndarray]:
         """Start a new battle and return the first observation + mask."""
@@ -320,6 +330,7 @@ class BattleEnv:
         obs, mask, _, _, _ = self.player.obs_queue.get()
         self._timing.add("env_reset_wait_first_obs_sec", time.perf_counter() - wait_started)
         self._record_battle_start_trace()
+        self._prepare_next_battle()
         self._timing.increment("env_reset_calls")
         self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
         return obs, mask
@@ -371,7 +382,8 @@ class BattleEnv:
         if self._battle_start_trace is not None:
             self._battle_start_trace.mark_once("player_teampreview_started")
         obs = self.player.obs_builder.build(battle)
-        picks, team_str = self._ext_team_preview_fn(obs)
+        picks = self._choose_team_preview_picks(obs)
+        team_str = "/team " + "".join(str(int(pick) + 1) for pick in picks)
         self._episode_team_preview = (obs, picks)
         if self._battle_start_trace is not None:
             self._battle_start_trace.mark_once("player_teampreview_finished")
@@ -381,7 +393,15 @@ class BattleEnv:
         if self._team_pair_provider is None:
             return
 
-        player_team, opponent_team = self._team_pair_provider()
+        self._prepare_next_battle()
+        player_team = self._prepared_player_team
+        opponent_team = self._prepared_opponent_team
+        self._active_preview_obs = self._prepared_preview_obs
+        self._active_preview_future = self._prepared_preview_future
+        self._prepared_player_team = None
+        self._prepared_opponent_team = None
+        self._prepared_preview_obs = None
+        self._prepared_preview_future = None
         if player_team is not None:
             self.player.update_team(player_team)
         if opponent_team is not None:
@@ -426,6 +446,84 @@ class BattleEnv:
         self._assert_player_loop(opponent, "opponent")
         self._install_battle_start_hooks(opponent, role="opponent")
         return opponent
+
+    def _prepare_next_battle(self, recompute_preview: bool = False) -> None:
+        if self._team_pair_provider is None:
+            return
+
+        if self._prepared_player_team is None or self._prepared_opponent_team is None:
+            self._prepared_player_team, self._prepared_opponent_team = self._team_pair_provider()
+            recompute_preview = True
+
+        if not recompute_preview or self._team_preview_batcher is None or self._ext_team_preview_fn is None:
+            return
+
+        build_started = time.perf_counter()
+        self._prepared_preview_obs = build_team_preview_observation(
+            self.game_data,
+            self.config.team_size,
+            self._prepared_player_team,
+            self._prepared_opponent_team,
+        )
+        self._timing.add("env_precompute_preview_obs_sec", time.perf_counter() - build_started)
+
+        submit_started = time.perf_counter()
+        self._prepared_preview_future = self._team_preview_batcher.submit(self._prepared_preview_obs)
+        self._timing.add("env_precompute_preview_submit_sec", time.perf_counter() - submit_started)
+        self._timing.increment("env_precompute_preview_submit_calls")
+
+    def refresh_prepared_team_preview(self) -> None:
+        if self._prepared_player_team is None or self._prepared_opponent_team is None:
+            return
+        self._prepare_next_battle(recompute_preview=True)
+
+    def wait_for_prepared_team_preview(self) -> None:
+        if self._prepared_preview_future is None:
+            return
+        wait_started = time.perf_counter()
+        self._prepared_preview_future.result()
+        self._timing.add("env_precompute_preview_wait_sec", time.perf_counter() - wait_started)
+
+    def _choose_team_preview_picks(self, obs: dict[str, np.ndarray]) -> np.ndarray:
+        prepared_obs = self._active_preview_obs
+        prepared_future = self._active_preview_future
+        self._active_preview_obs = None
+        self._active_preview_future = None
+
+        if prepared_obs is not None and prepared_future is not None and self._obs_equal(obs, prepared_obs):
+            self._timing.increment("env_precompute_preview_hits")
+            try:
+                wait_started = time.perf_counter()
+                picks = prepared_future.result()
+                self._timing.add("env_precompute_preview_hit_wait_sec", time.perf_counter() - wait_started)
+                return picks
+            except Exception:
+                self._timing.increment("env_precompute_preview_fallbacks")
+        elif prepared_obs is not None or prepared_future is not None:
+            self._timing.increment("env_precompute_preview_misses")
+            if prepared_obs is not None:
+                self._record_preview_obs_mismatch(obs, prepared_obs)
+
+        picks, _ = self._ext_team_preview_fn(obs)
+        return picks
+
+    @staticmethod
+    def _obs_equal(left: dict[str, np.ndarray], right: dict[str, np.ndarray]) -> bool:
+        if left.keys() != right.keys():
+            return False
+        return all(np.array_equal(left[key], right[key]) for key in left)
+
+    def _record_preview_obs_mismatch(
+        self,
+        actual: dict[str, np.ndarray],
+        prepared: dict[str, np.ndarray],
+    ) -> None:
+        if actual.keys() != prepared.keys():
+            self._timing.increment("env_precompute_preview_keyset_mismatch")
+            return
+        for key in actual:
+            if not np.array_equal(actual[key], prepared[key]):
+                self._timing.increment(f"env_precompute_preview_mismatch_{key}")
 
     def _get_battle_start_trace(self) -> _BattleStartTrace | None:
         return self._battle_start_trace
@@ -585,6 +683,12 @@ class BattleEnv:
 
         self._battle_task = None
         self._pending_opponent = None
+        self._prepared_player_team = None
+        self._prepared_opponent_team = None
+        self._prepared_preview_obs = None
+        self._prepared_preview_future = None
+        self._active_preview_obs = None
+        self._active_preview_future = None
         self._closed = True
 
     def _cancel_pending_tasks(self) -> None:
@@ -695,6 +799,12 @@ class ParallelBattleEnv:
         for env in self.envs:
             env.close()
         self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def wait_for_prepared_team_previews(self) -> None:
+        list(self._executor.map(lambda env: env.wait_for_prepared_team_preview(), self.envs))
+
+    def refresh_prepared_team_previews(self) -> None:
+        list(self._executor.map(lambda env: env.refresh_prepared_team_preview(), self.envs))
 
     @staticmethod
     def _collate(

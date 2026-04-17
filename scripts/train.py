@@ -215,6 +215,7 @@ def make_envs(
     league: League,
     server_urls: list[str],
     team_preview_fn,
+    team_preview_batcher: TeamPreviewBatcher | None = None,
     team_pair_provider=None,
 ) -> ParallelBattleEnv:
     """Create parallel battle environments backed by league opponents."""
@@ -228,6 +229,7 @@ def make_envs(
             game_data,
             opponent_factory,
             team_preview_fn=team_preview_fn,
+            team_preview_batcher=team_preview_batcher,
             team_pair_provider=team_pair_provider,
         )
         envs.append(env)
@@ -332,6 +334,14 @@ def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]
             f"request->first emit {avg_ms(env_profile.get('env_reset_request_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
             f"first emit total {avg_ms(env_profile.get('env_reset_first_emit_total_sec', 0.0), reset_calls):.2f}ms"
         )
+        if env_profile.get("env_precompute_preview_submit_calls", 0.0):
+            print(
+                "Preview precompute | "
+                f"submits {int(env_profile.get('env_precompute_preview_submit_calls', 0.0))} | "
+                f"hits {int(env_profile.get('env_precompute_preview_hits', 0.0))} | "
+                f"misses {int(env_profile.get('env_precompute_preview_misses', 0.0))} | "
+                f"fallbacks {int(env_profile.get('env_precompute_preview_fallbacks', 0.0))}"
+            )
 
 
 def _league_state_path(train_config: TrainingConfig) -> str:
@@ -413,6 +423,7 @@ def train():
         league,
         server_urls,
         team_preview_fn=team_preview_fn,
+        team_preview_batcher=team_preview_batcher,
         team_pair_provider=team_pair_provider,
     )
     run_summary = {
@@ -546,6 +557,7 @@ def train():
             rollout_sec = time.perf_counter() - rollout_started
             rollout_profile["rollout_sec"] = rollout_sec
             env_profile = parallel_env.snapshot_timing() if args.profile_rollout else {}
+            parallel_env.wait_for_prepared_team_previews()
             refresh_after_update = (
                 update % train_config.league_update_interval == 0 and update < num_updates
             )
@@ -566,6 +578,7 @@ def train():
             if team_preview_data:
                 metrics["team_preview_loss"] = trainer.update_team_preview(team_preview_data)
             ppo_sec = time.perf_counter() - ppo_started
+            parallel_env.refresh_prepared_team_previews()
 
             avg_episode_sec = float(np.mean(update_episode_secs)) if update_episode_secs else 0.0
             avg_episode_turns = float(np.mean(update_episode_turns)) if update_episode_turns else 0.0

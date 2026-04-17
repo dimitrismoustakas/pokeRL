@@ -1,7 +1,10 @@
 """Converts a poke-env DoubleBattle into the tensor dict the model expects."""
 
+from collections import OrderedDict
+
 import numpy as np
 from poke_env.battle import DoubleBattle, Effect, Field, Pokemon, SideCondition, Status, Weather
+from poke_env.teambuilder.teambuilder import Teambuilder
 
 from ..data import GameData, UNKNOWN_IDX
 
@@ -323,3 +326,59 @@ class ObservationBuilder:
         offset += 1
 
         return feats
+
+
+class _SyntheticTeamPreviewBattle:
+    def __init__(self, own_team: list[Pokemon], opponent_team: list[Pokemon]):
+        self.team = OrderedDict((f"p1:{index}", pokemon) for index, pokemon in enumerate(own_team, start=1))
+        self.opponent_team = OrderedDict(
+            (f"p2:{index}", pokemon) for index, pokemon in enumerate(opponent_team, start=1)
+        )
+        self.active_pokemon = [None, None]
+        self.opponent_active_pokemon = [None, None]
+        self.fields = {}
+        self.weather = {}
+        self.side_conditions = {}
+        self.opponent_side_conditions = {}
+
+
+def build_team_preview_observation(
+    game_data: GameData,
+    team_size: int,
+    own_packed_team: str,
+    opponent_packed_team: str,
+) -> dict[str, np.ndarray]:
+    own_team = [
+        _init_team_preview_pokemon(Pokemon(gen=game_data.gen, teambuilder=tb), own_team=True)
+        for tb in Teambuilder.parse_packed_team(own_packed_team)[:team_size]
+    ]
+    opponent_team = [
+        _init_team_preview_pokemon(
+            Pokemon(gen=game_data.gen, species=_canonical_teambuilder_species(game_data.gen, tb)),
+            own_team=False,
+        )
+        for tb in Teambuilder.parse_packed_team(opponent_packed_team)[:team_size]
+    ]
+    battle = _SyntheticTeamPreviewBattle(own_team, opponent_team)
+    return ObservationBuilder(game_data, team_size).build(battle)
+
+
+def _canonical_teambuilder_species(gen: int, tb) -> str:
+    species = Pokemon(gen=gen, teambuilder=tb).species
+    if species is None:
+        raise ValueError(f"Could not infer canonical species from teambuilder pokemon: {tb}")
+    return species
+
+
+def _init_team_preview_pokemon(pokemon: Pokemon, *, own_team: bool) -> Pokemon:
+    if own_team:
+        max_hp = pokemon.stats.get("hp") if pokemon.stats else None
+        if max_hp is None or max_hp <= 0:
+            max_hp = 100
+        pokemon._max_hp = max_hp
+        pokemon._current_hp = max_hp
+        pokemon._terastallized_type = None
+    else:
+        pokemon._max_hp = 0
+        pokemon._current_hp = 0
+    return pokemon

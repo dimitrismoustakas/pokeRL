@@ -35,13 +35,16 @@ class TeamPreviewBatcher:
         self._thread.start()
 
     def choose(self, obs: dict[str, np.ndarray]) -> np.ndarray:
+        return self.submit(obs).result()
+
+    def submit(self, obs: dict[str, np.ndarray]) -> Future:
         future: Future = Future()
         with self._condition:
             if self._closed:
                 raise RuntimeError("TeamPreviewBatcher is closed.")
             self._pending.append(_PreviewRequest(obs=obs, future=future))
             self._condition.notify()
-        return future.result()
+        return future
 
     def close(self) -> None:
         with self._condition:

@@ -14,6 +14,7 @@ class GameData:
     """Builds vocab mappings and stat tables from poke-env's gen data."""
 
     def __init__(self, gen: int = 9, item_vocab_size: int = 2048):
+        self.gen = gen
         data = GenData.from_gen(gen)
 
         # Build vocabs: string id -> integer index (0 = unknown)
