@@ -354,7 +354,7 @@ def build_team_preview_observation(
     ]
     opponent_team = [
         _init_team_preview_pokemon(
-            Pokemon(gen=game_data.gen, species=_canonical_teambuilder_species(game_data.gen, tb)),
+            Pokemon(gen=game_data.gen, species=_preview_visible_species(game_data.gen, tb)),
             own_team=False,
         )
         for tb in Teambuilder.parse_packed_team(opponent_packed_team)[:team_size]
@@ -363,10 +363,13 @@ def build_team_preview_observation(
     return ObservationBuilder(game_data, team_size).build(battle)
 
 
-def _canonical_teambuilder_species(gen: int, tb) -> str:
+def _preview_visible_species(gen: int, tb) -> str:
     species = Pokemon(gen=gen, teambuilder=tb).species
     if species is None:
         raise ValueError(f"Could not infer canonical species from teambuilder pokemon: {tb}")
+    # Showdown preview hides Rapid-Strike style and exposes generic Urshifu instead.
+    if species == "urshifurapidstrike":
+        return "urshifu"
     return species
 
 
