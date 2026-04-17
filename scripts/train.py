@@ -10,6 +10,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import socket
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -88,11 +89,6 @@ def parse_args() -> argparse.Namespace:
         help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
     )
     parser.add_argument(
-        "--profile-rollout",
-        action="store_true",
-        help="Log a detailed per-update rollout timing breakdown.",
-    )
-    parser.add_argument(
         "--summary-path",
         default=None,
         help="Write a machine-readable JSON run summary to this path.",
@@ -164,6 +160,23 @@ def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
     if not server_urls:
         raise ValueError("--server-urls did not contain any valid host:port entries.")
     return server_urls
+
+
+def _port_open(server_url: str) -> bool:
+    host, port_raw = server_url.split(":", maxsplit=1)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        return sock.connect_ex((host, int(port_raw))) == 0
+
+
+def ensure_server_urls_ready(server_urls: list[str]) -> None:
+    missing = [url for url in server_urls if not _port_open(url)]
+    if missing:
+        missing_ports = ", ".join(missing)
+        raise SystemExit(
+            f"The following Showdown servers are not reachable: {missing_ports}. "
+            "Start them first with scripts/start_showdown_server.ps1 or choose active ports."
+        )
 
 
 def make_team_preview_fn(batcher: TeamPreviewBatcher):
@@ -259,121 +272,6 @@ def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str,
     return {k: torch.from_numpy(v).to(device) for k, v in obs.items()}
 
 
-def _share(part: float, whole: float) -> float:
-    return (part / whole * 100.0) if whole > 0 else 0.0
-
-
-def log_rollout_profile(profile: dict[str, float], env_profile: dict[str, float]) -> None:
-    rollout_sec = profile.get("rollout_sec", 0.0)
-    env_step_sec = profile.get("env_step_sec", 0.0)
-    print(
-        "Rollout profile | "
-        f"obs->device {profile.get('obs_to_device_sec', 0.0):.3f}s ({_share(profile.get('obs_to_device_sec', 0.0), rollout_sec):.1f}%) | "
-        f"mask->device {profile.get('mask_to_device_sec', 0.0):.3f}s ({_share(profile.get('mask_to_device_sec', 0.0), rollout_sec):.1f}%) | "
-        f"policy fwd {profile.get('policy_forward_sec', 0.0):.3f}s ({_share(profile.get('policy_forward_sec', 0.0), rollout_sec):.1f}%) | "
-        f"policy post {profile.get('policy_postprocess_sec', 0.0):.3f}s ({_share(profile.get('policy_postprocess_sec', 0.0), rollout_sec):.1f}%) | "
-        f"env wall {env_step_sec:.3f}s ({_share(env_step_sec, rollout_sec):.1f}%) | "
-        f"buffer {profile.get('buffer_add_sec', 0.0):.3f}s ({_share(profile.get('buffer_add_sec', 0.0), rollout_sec):.1f}%) | "
-        f"hidden reset {profile.get('hidden_reset_sec', 0.0):.3f}s ({_share(profile.get('hidden_reset_sec', 0.0), rollout_sec):.1f}%)"
-    )
-
-    env_steps = int(env_profile.get("env_step_calls", 0.0))
-    env_step_total = env_profile.get("env_step_total_sec", 0.0)
-    env_queue_wait = env_profile.get("env_queue_wait_sec", 0.0)
-    emit_total = env_profile.get("player_emit_total_sec", 0.0)
-    make_order_total = env_profile.get("player_make_order_sec", 0.0)
-    opponent_choice_total = env_profile.get("opponent_choice_sec", 0.0)
-    approx_other_wait = max(env_queue_wait - emit_total - make_order_total - opponent_choice_total, 0.0)
-
-    def avg_ms(total: float, count: int) -> float:
-        return (total / count * 1000.0) if count else 0.0
-
-    print(
-        "Env profile (avg per env step) | "
-        f"step total {avg_ms(env_step_total, env_steps):.2f}ms | "
-        f"queue wait {avg_ms(env_queue_wait, env_steps):.2f}ms ({_share(env_queue_wait, env_step_total):.1f}% of env step) | "
-        f"battle wait other {avg_ms(approx_other_wait, env_steps):.2f}ms | "
-        f"emit total {avg_ms(emit_total, env_steps):.2f}ms | "
-        f"obs build {avg_ms(env_profile.get('player_emit_obs_sec', 0.0), env_steps):.2f}ms | "
-        f"mask build {avg_ms(env_profile.get('player_emit_mask_sec', 0.0), env_steps):.2f}ms | "
-        f"order build {avg_ms(make_order_total, env_steps):.2f}ms | "
-        f"opponent choice {avg_ms(opponent_choice_total, env_steps):.2f}ms"
-    )
-
-    reset_calls = int(env_profile.get("env_reset_calls", 0.0))
-    parallel_step_calls = int(env_profile.get("parallel_step_calls", 0.0))
-    parallel_step_wall = env_profile.get("parallel_step_wall_sec", 0.0)
-    parallel_wait = env_profile.get("parallel_step_wait_sec", 0.0)
-    parallel_collate = env_profile.get("parallel_collate_sec", 0.0)
-    print(
-        "Parallel env wall | "
-        f"parallel step {avg_ms(parallel_step_wall, parallel_step_calls):.2f}ms | "
-        f"executor wait {avg_ms(parallel_wait, parallel_step_calls):.2f}ms | "
-        f"collate {avg_ms(parallel_collate, parallel_step_calls):.2f}ms | "
-        f"battle reset {avg_ms(env_profile.get('env_reset_total_sec', 0.0), reset_calls):.2f}ms over {reset_calls} resets"
-    )
-    if reset_calls:
-        print(
-            "Reset breakdown (avg per battle reset) | "
-            f"apply pending {avg_ms(env_profile.get('env_reset_apply_pending_sec', 0.0), reset_calls):.2f}ms | "
-            f"disconnect old opp {avg_ms(env_profile.get('env_reset_opponent_disconnect_sec', 0.0), reset_calls):.2f}ms | "
-            f"swap opp ckpt {avg_ms(env_profile.get('env_reset_opponent_checkpoint_swap_sec', 0.0), reset_calls):.2f}ms | "
-            f"build new opp {avg_ms(env_profile.get('env_reset_opponent_build_sec', 0.0), reset_calls):.2f}ms | "
-            f"assign teams {avg_ms(env_profile.get('env_reset_team_assign_sec', 0.0), reset_calls):.2f}ms | "
-            f"reset hidden {avg_ms(env_profile.get('env_reset_hidden_reset_sec', 0.0), reset_calls):.2f}ms | "
-            f"start battle {avg_ms(env_profile.get('env_reset_battle_start_sec', 0.0), reset_calls):.2f}ms | "
-            f"wait first obs {avg_ms(env_profile.get('env_reset_wait_first_obs_sec', 0.0), reset_calls):.2f}ms"
-        )
-        print(
-            "Battle start breakdown (avg per battle reset) | "
-            f"to challenge {avg_ms(env_profile.get('env_reset_to_challenge_send_sec', 0.0), reset_calls):.2f}ms | "
-            f"challenge send {avg_ms(env_profile.get('env_reset_challenge_send_sec', 0.0), reset_calls):.2f}ms | "
-            f"challenge->accept {avg_ms(env_profile.get('env_reset_challenge_to_accept_sec', 0.0), reset_calls):.2f}ms | "
-            f"accept send {avg_ms(env_profile.get('env_reset_accept_send_sec', 0.0), reset_calls):.2f}ms | "
-            f"accept->create {avg_ms(env_profile.get('env_reset_accept_to_create_sec', 0.0), reset_calls):.2f}ms | "
-            f"create battle {avg_ms(env_profile.get('env_reset_create_battle_sec', 0.0), reset_calls):.2f}ms | "
-            f"create->request {avg_ms(env_profile.get('env_reset_create_to_first_request_sec', 0.0), reset_calls):.2f}ms"
-        )
-        print(
-            "First request breakdown (avg per battle reset) | "
-            f"request total {avg_ms(env_profile.get('env_reset_first_request_total_sec', 0.0), reset_calls):.2f}ms | "
-            f"request->preview {avg_ms(env_profile.get('env_reset_first_request_to_teampreview_sec', 0.0), reset_calls):.2f}ms | "
-            f"preview compute {avg_ms(env_profile.get('env_reset_teampreview_compute_sec', 0.0), reset_calls):.2f}ms | "
-            f"preview->opp preview {avg_ms(env_profile.get('env_reset_player_preview_to_opponent_preview_sec', 0.0), reset_calls):.2f}ms | "
-            f"opp preview compute {avg_ms(env_profile.get('env_reset_opponent_teampreview_compute_sec', 0.0), reset_calls):.2f}ms | "
-            f"preview send {avg_ms(env_profile.get('env_reset_teampreview_send_sec', 0.0), reset_calls):.2f}ms | "
-            f"opp preview->send {avg_ms(env_profile.get('env_reset_opponent_preview_to_send_sec', 0.0), reset_calls):.2f}ms | "
-            f"opp preview send {avg_ms(env_profile.get('env_reset_opponent_teampreview_send_sec', 0.0), reset_calls):.2f}ms | "
-            f"opp send->message {avg_ms(env_profile.get('env_reset_opponent_preview_send_to_message_sec', 0.0), reset_calls):.2f}ms | "
-            f"post message {avg_ms(env_profile.get('env_reset_post_preview_battle_message_sec', 0.0), reset_calls):.2f}ms | "
-            f"message->request {avg_ms(env_profile.get('env_reset_post_preview_message_to_request_sec', 0.0), reset_calls):.2f}ms | "
-            f"post request total {avg_ms(env_profile.get('env_reset_post_preview_request_total_sec', 0.0), reset_calls):.2f}ms | "
-            f"post request->emit {avg_ms(env_profile.get('env_reset_post_preview_request_to_emit_sec', 0.0), reset_calls):.2f}ms | "
-            f"opp preview->first emit {avg_ms(env_profile.get('env_reset_opponent_preview_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
-            f"preview->first emit {avg_ms(env_profile.get('env_reset_teampreview_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
-            f"request->first emit {avg_ms(env_profile.get('env_reset_request_to_first_emit_sec', 0.0), reset_calls):.2f}ms | "
-            f"first emit total {avg_ms(env_profile.get('env_reset_first_emit_total_sec', 0.0), reset_calls):.2f}ms"
-        )
-        if env_profile.get("env_precompute_preview_submit_calls", 0.0):
-            print(
-                "Preview precompute | "
-                f"submits {int(env_profile.get('env_precompute_preview_submit_calls', 0.0))} | "
-                f"hits {int(env_profile.get('env_precompute_preview_hits', 0.0))} | "
-                f"misses {int(env_profile.get('env_precompute_preview_misses', 0.0))} | "
-                f"fallbacks {int(env_profile.get('env_precompute_preview_fallbacks', 0.0))}"
-            )
-        if env_profile.get("opponent_teampreview_calls", 0.0):
-            print(
-                "Opponent preview | "
-                f"total {avg_ms(env_profile.get('opponent_teampreview_sec', 0.0), reset_calls):.2f}ms | "
-                f"infer {avg_ms(env_profile.get('opponent_teampreview_infer_sec', 0.0), reset_calls):.2f}ms | "
-                f"precompute submits {int(env_profile.get('opponent_precompute_preview_submit_calls', 0.0))} | "
-                f"hits {int(env_profile.get('opponent_precompute_preview_hits', 0.0))} | "
-                f"misses {int(env_profile.get('opponent_precompute_preview_misses', 0.0))} | "
-                f"fallbacks {int(env_profile.get('opponent_precompute_preview_fallbacks', 0.0))}"
-            )
-
-
 def _league_state_path(train_config: TrainingConfig) -> str:
     return f"{train_config.checkpoint_dir}/league_state.json"
 
@@ -395,11 +293,13 @@ def train():
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
     run_started = time.perf_counter()
+    collect_timing = args.summary_path is not None
 
     print(f"Device: {device}")
 
     model_config, env_config, train_config = build_configs(args)
     server_urls = parse_server_urls(args.server_urls, env_config.server_url)
+    ensure_server_urls_ready(server_urls)
     team_pool = load_requested_team_pool(args)
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
@@ -478,8 +378,9 @@ def train():
         reset_started = time.perf_counter()
         obs, masks = parallel_env.reset()
         initial_reset_sec = time.perf_counter() - reset_started
-        initial_env_profile = parallel_env.snapshot_timing() if args.profile_rollout else {}
-        parallel_env.reset_timing()
+        initial_env_profile = parallel_env.snapshot_timing() if collect_timing else {}
+        if collect_timing:
+            parallel_env.reset_timing()
         obs_keys = list(obs.keys())
         buffer = RolloutBuffer(train_config.rollout_steps, env_config.num_envs, obs_keys)
 
@@ -496,7 +397,7 @@ def train():
         print("Starting training...")
 
         run_summary["initial_reset_sec"] = initial_reset_sec
-        if args.profile_rollout:
+        if collect_timing:
             run_summary["initial_env_profile"] = initial_env_profile
 
         episode_rewards: list[float] = []
@@ -505,7 +406,7 @@ def train():
         for update in range(updates_done + 1, num_updates + 1):
             agent.eval()
             buffer.reset()
-            if args.profile_rollout:
+            if collect_timing:
                 parallel_env.reset_timing()
             rollout_started = time.perf_counter()
             update_episode_rewards: list[float] = []
@@ -524,6 +425,9 @@ def train():
 
             # --- Collect rollout ---
             for step in range(train_config.rollout_steps):
+                # Store the hidden state BEFORE the forward pass so PPO
+                # can reconstruct the same computation during updates.
+                pre_hidden = hidden
                 with torch.no_grad():
                     obs_device_started = time.perf_counter()
                     obs_t = obs_to_device(obs, device)
@@ -532,10 +436,6 @@ def train():
                     mask_device_started = time.perf_counter()
                     masks_t = torch.from_numpy(masks).to(device).bool()
                     rollout_profile["mask_to_device_sec"] += time.perf_counter() - mask_device_started
-
-                    # Store the hidden state BEFORE the forward pass so PPO
-                    # can reconstruct the same computation during updates.
-                    pre_hidden = hidden
 
                     policy_started = time.perf_counter()
                     out = agent(obs_t, hidden, action_masks=masks_t)
@@ -548,7 +448,6 @@ def train():
                     hidden = out["hidden"]
                     rollout_profile["policy_postprocess_sec"] += time.perf_counter() - policy_post_started
 
-                # Step environments
                 env_step_started = time.perf_counter()
                 next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
                 rollout_profile["env_step_sec"] += time.perf_counter() - env_step_started
@@ -586,7 +485,7 @@ def train():
 
             rollout_sec = time.perf_counter() - rollout_started
             rollout_profile["rollout_sec"] = rollout_sec
-            env_profile = parallel_env.snapshot_timing() if args.profile_rollout else {}
+            env_profile = parallel_env.snapshot_timing() if collect_timing else {}
             parallel_env.wait_for_prepared_team_previews()
             refresh_after_update = (
                 update % train_config.league_update_interval == 0 and update < num_updates
@@ -623,7 +522,7 @@ def train():
                 "avg_episode_turns": avg_episode_turns,
                 "metrics": metrics_json,
             }
-            if args.profile_rollout:
+            if collect_timing:
                 update_summary["rollout_profile"] = rollout_profile
                 update_summary["env_profile"] = env_profile
             run_summary["updates"].append(update_summary)
@@ -650,8 +549,6 @@ def train():
                     f"Preview loss {metrics.get('team_preview_loss', float('nan')):.4f} | "
                     f"League pool {len(league.checkpoints)}"
                 )
-                if args.profile_rollout:
-                    log_rollout_profile(rollout_profile, env_profile)
 
             # --- Checkpointing ---
             if update % train_config.save_interval == 0:

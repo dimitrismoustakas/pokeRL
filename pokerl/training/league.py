@@ -232,8 +232,14 @@ class _LeagueInferenceService:
             if request.hidden is None:
                 continue
             h_req, c_req = request.hidden
-            h_batch[:, index : index + 1].copy_(h_req.to(self._device))
-            c_batch[:, index : index + 1].copy_(c_req.to(self._device))
+            if h_req.device == self._device:
+                h_batch[:, index : index + 1].copy_(h_req)
+            else:
+                h_batch[:, index : index + 1].copy_(h_req.to(self._device))
+            if c_req.device == self._device:
+                c_batch[:, index : index + 1].copy_(c_req)
+            else:
+                c_batch[:, index : index + 1].copy_(c_req.to(self._device))
         return h_batch, c_batch
 
     @staticmethod
@@ -245,8 +251,8 @@ class _LeagueInferenceService:
             return None
         h, c = hidden
         return (
-            h[:, index : index + 1].detach().cpu(),
-            c[:, index : index + 1].detach().cpu(),
+            h[:, index : index + 1].detach().clone(),
+            c[:, index : index + 1].detach().clone(),
         )
 
 

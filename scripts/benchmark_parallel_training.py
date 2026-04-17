@@ -126,7 +126,6 @@ def benchmark_config(
         ",".join(server_urls),
         "--checkpoint-dir",
         str(checkpoint_dir),
-        "--profile-rollout",
         "--summary-path",
         str(summary_path),
     ]
