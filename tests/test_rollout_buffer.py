@@ -715,7 +715,6 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
     )
     player._pending_hidden = None
     player._pending_battle_obs = None
-
     monkeypatch.setattr(
         league_module,
         "build_legal_action_state",
@@ -735,8 +734,18 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
         lambda action_idx, battle, slot, action_state=None: PassBattleOrder(),
     )
 
-    retry_battle = SimpleNamespace(state=1)
-    next_battle = SimpleNamespace(state=2)
+    battle_kwargs = dict(
+        finished=False,
+        battle_tag="battle-hidden",
+        active_pokemon=[SimpleNamespace(species="a"), SimpleNamespace(species="b")],
+        opponent_active_pokemon=[SimpleNamespace(species="c"), SimpleNamespace(species="d")],
+        force_switch=[False, False],
+        can_tera=[False, False],
+        trapped=[False, False],
+        last_request={"active": [{"moves": []}, {"moves": []}]},
+    )
+    retry_battle = SimpleNamespace(state=1, turn=1, **battle_kwargs)
+    next_battle = SimpleNamespace(state=2, turn=2, **battle_kwargs)
 
     LeaguePlayer.choose_move(player, retry_battle)
     LeaguePlayer.choose_move(player, retry_battle)

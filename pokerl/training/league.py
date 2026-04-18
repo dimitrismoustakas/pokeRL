@@ -405,12 +405,14 @@ class LeaguePlayer(Player):
                 self._increment_timing(f"opponent_precompute_preview_mismatch_{key}")
 
     def _add_timing(self, key: str, value: float) -> None:
-        if self._timing is not None:
-            self._timing.add(key, value)
+        timing = getattr(self, "_timing", None)
+        if timing is not None:
+            timing.add(key, value)
 
     def _increment_timing(self, key: str, delta: int = 1) -> None:
-        if self._timing is not None:
-            self._timing.increment(key, delta)
+        timing = getattr(self, "_timing", None)
+        if timing is not None:
+            timing.increment(key, delta)
 
 
 class League:
