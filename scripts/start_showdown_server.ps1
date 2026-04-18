@@ -4,7 +4,11 @@ param(
     [switch]$InstallOnly,
     [switch]$Update,
     [switch]$Detached,
-    [int]$ReadyTimeoutSec = 15
+    [int]$ReadyTimeoutSec = 60,
+    [int]$NetworkProcesses = 1,
+    [int]$SimulatorProcesses = 1,
+    [int]$ValidatorProcesses = 1,
+    [switch]$EnableProcessDebugging
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,6 +60,48 @@ function Wait-ShowdownReady {
     throw "Pokemon Showdown did not become reachable on localhost:$Port within $TimeoutSec seconds."
 }
 
+function Set-ShowdownTrainingConfig {
+    param(
+        [string]$InstallDir,
+        [int]$NetworkProcesses,
+        [int]$SimulatorProcesses,
+        [int]$ValidatorProcesses,
+        [bool]$EnableProcessDebugging
+    )
+
+    $configDir = Join-Path $InstallDir "config"
+    $configPath = Join-Path $configDir "config.js"
+    $backupPath = Join-Path $configDir "config.js.pokerl.bak"
+
+    if (-not (Test-Path $configPath)) {
+        throw "Could not find config.js under $configDir."
+    }
+    if (-not (Test-Path $backupPath)) {
+        Copy-Item -LiteralPath $configPath -Destination $backupPath
+    }
+
+    $content = Get-Content -Path $backupPath -Raw
+    $debugLiteral = if ($EnableProcessDebugging) { "true" } else { "false" }
+    $replacements = @(
+        @{ Pattern = '(?m)^\s*network:\s*\d+,'; Replacement = "`tnetwork: $NetworkProcesses,"; Label = "network worker count" },
+        @{ Pattern = '(?m)^\s*simulator:\s*\d+,'; Replacement = "`tsimulator: $SimulatorProcesses,"; Label = "simulator worker count" },
+        @{ Pattern = '(?m)^\s*validator:\s*\d+,'; Replacement = "`tvalidator: $ValidatorProcesses,"; Label = "validator worker count" },
+        @{ Pattern = '(?m)^exports\.debugsimprocesses = (true|false);'; Replacement = "exports.debugsimprocesses = $debugLiteral;"; Label = "simulator debug flag" },
+        @{ Pattern = '(?m)^exports\.debugvalidatorprocesses = (true|false);'; Replacement = "exports.debugvalidatorprocesses = $debugLiteral;"; Label = "validator debug flag" },
+        @{ Pattern = '(?m)^exports\.debugdexsearchprocesses = (true|false);'; Replacement = "exports.debugdexsearchprocesses = $debugLiteral;"; Label = "dexsearch debug flag" }
+    )
+
+    foreach ($replacement in $replacements) {
+        $match = [regex]::Match($content, $replacement.Pattern)
+        if (-not $match.Success) {
+            throw "Could not update $($replacement.Label) in $configPath."
+        }
+        $content = [regex]::Replace($content, $replacement.Pattern, $replacement.Replacement, 1)
+    }
+
+    Set-Content -Path $configPath -Value $content -NoNewline
+}
+
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     throw "git is required to set up Pokemon Showdown."
 }
@@ -82,6 +128,13 @@ if ($Update) {
 if (-not (Test-Path (Join-Path $InstallDir "node_modules")) -or $Update) {
     npm install
 }
+
+Set-ShowdownTrainingConfig `
+    -InstallDir $InstallDir `
+    -NetworkProcesses $NetworkProcesses `
+    -SimulatorProcesses $SimulatorProcesses `
+    -ValidatorProcesses $ValidatorProcesses `
+    -EnableProcessDebugging:$EnableProcessDebugging
 
 if ($InstallOnly) {
     Write-Output "Pokemon Showdown is installed at $InstallDir"

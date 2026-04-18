@@ -59,66 +59,47 @@ class ObservationBuilder:
         self.team_size = team_size
 
     def build(self, battle: DoubleBattle) -> dict[str, np.ndarray]:
-        """Convert a battle state to a dict of numpy arrays.
-
-        All arrays have no batch dimension (added by the env wrapper / collation).
-        """
+        """Convert a battle state to a dict of numpy arrays."""
         obs = {}
 
-        # Own team
-        own_pokemon = self._ordered_team(battle, own=True)
-        own_active_slots = self._active_slot_map(battle, own=True)
-        self._encode_team(own_pokemon, own_active_slots, obs, prefix="own", full_info=True)
+        own_pokemon, own_roles, own_active_indices = self._ordered_team_with_roles(battle, own=True)
+        self._encode_team(own_pokemon, own_roles, obs, prefix="own", full_info=True)
 
-        # Opponent team
-        opp_pokemon = self._ordered_team(battle, own=False)
-        opp_active_slots = self._active_slot_map(battle, own=False)
-        self._encode_team(opp_pokemon, opp_active_slots, obs, prefix="opp", full_info=False)
+        opp_pokemon, opp_roles, _ = self._ordered_team_with_roles(battle, own=False)
+        self._encode_team(opp_pokemon, opp_roles, obs, prefix="opp", full_info=False)
 
-        # Field conditions
         obs["field"] = self._encode_field(battle)
-
-        # Which own slots are active (indices into the team array)
-        obs["own_active_indices"] = np.array(
-            [self._find_active_index(own_pokemon, battle.active_pokemon[s]) for s in range(2)],
-            dtype=np.int64,
-        )
-
+        obs["own_active_indices"] = own_active_indices
         return obs
 
     def _encode_team(
         self,
         pokemon_list: list[Pokemon | None],
-        active_map: dict,
+        roles: np.ndarray,
         obs: dict,
         prefix: str,
         full_info: bool,
-    ):
+    ) -> None:
         """Encode a team into arrays."""
         ts = self.team_size
         species = np.zeros(ts, dtype=np.int64)
         moves = np.zeros((ts, 4), dtype=np.int64)
         ability = np.zeros(ts, dtype=np.int64)
         item = np.zeros(ts, dtype=np.int64)
-        types = np.zeros((ts, 3), dtype=np.int64)  # type_1, type_2, tera_type
+        types = np.zeros((ts, 3), dtype=np.int64)
         continuous = np.zeros((ts, CONTINUOUS_DIM), dtype=np.float32)
-        roles = np.full(ts, ROLE_BENCH, dtype=np.int64)
-        mask = np.ones(ts, dtype=bool)  # True = padding
+        mask = np.ones(ts, dtype=bool)
 
-        for i, pokemon in enumerate(pokemon_list):
-            if pokemon is None or i >= ts:
+        for index, pokemon in enumerate(pokemon_list):
+            if pokemon is None or index >= ts:
                 break
-            mask[i] = False
-            species[i] = self._species_idx(pokemon)
-            moves[i] = self._move_indices(pokemon)
-            ability[i] = self._ability_idx(pokemon)
-            item[i] = self._item_idx(pokemon)
-            types[i] = self._type_indices(pokemon)
-            continuous[i] = self._continuous_features(pokemon, full_info)
-
-            # Role
-            if pokemon in active_map:
-                roles[i] = active_map[pokemon]
+            mask[index] = False
+            species[index] = self._species_idx(pokemon)
+            ability[index] = self._ability_idx(pokemon)
+            item[index] = self._item_idx(pokemon)
+            self._fill_type_indices(types[index], pokemon)
+            self._fill_continuous_features(continuous[index], pokemon)
+            self._fill_move_features(moves[index], continuous[index, -4:], pokemon, full_info)
 
         obs[f"{prefix}_species"] = species
         obs[f"{prefix}_moves"] = moves
@@ -133,130 +114,120 @@ class ObservationBuilder:
         key = pokemon.species.lower() if pokemon.species else "<unk>"
         return self.gd.species_to_idx.get(key, UNKNOWN_IDX)
 
-    def _move_indices(self, pokemon: Pokemon) -> np.ndarray:
-        # poke-env tracks only revealed moves for the opponent; zeros = unknown
-        indices = np.zeros(4, dtype=np.int64)
-        known_moves = list(pokemon.moves.values()) if pokemon.moves else []
-        for j, move in enumerate(known_moves[:4]):
-            key = move.id.lower() if move.id else "<unk>"
-            indices[j] = self.gd.move_to_idx.get(key, UNKNOWN_IDX)
-        return indices
-
     def _ability_idx(self, pokemon: Pokemon) -> int:
-        # poke-env fills in the ability once it is revealed; None = still unknown
         ab = pokemon.ability
         if ab is None:
             return UNKNOWN_IDX
         return self.gd.abilities_to_idx.get(ab.lower(), UNKNOWN_IDX)
 
     def _item_idx(self, pokemon: Pokemon) -> int:
-        # poke-env fills in the item once it is revealed; None/empty = still unknown
         it = pokemon.item
         if it is None or it == "":
             return UNKNOWN_IDX
         return self.gd.item_index(it)
 
-    def _type_indices(self, pokemon: Pokemon) -> np.ndarray:
-        indices = np.zeros(3, dtype=np.int64)
+    def _fill_type_indices(self, indices: np.ndarray, pokemon: Pokemon) -> None:
         if pokemon.type_1:
             indices[0] = self.gd.type_to_idx.get(pokemon.type_1.name.lower(), UNKNOWN_IDX)
         if pokemon.type_2:
             indices[1] = self.gd.type_to_idx.get(pokemon.type_2.name.lower(), UNKNOWN_IDX)
         if pokemon.tera_type:
             indices[2] = self.gd.type_to_idx.get(pokemon.tera_type.name.lower(), UNKNOWN_IDX)
-        return indices
 
-    def _continuous_features(self, pokemon: Pokemon, full_info: bool) -> np.ndarray:
-        feats = np.zeros(CONTINUOUS_DIM, dtype=np.float32)
+    def _fill_move_features(
+        self,
+        move_indices: np.ndarray,
+        pp_features: np.ndarray,
+        pokemon: Pokemon,
+        full_info: bool,
+    ) -> None:
+        # poke-env tracks only revealed moves for the opponent; zeros = unknown.
+        if not pokemon.moves:
+            return
+        for move_index, move in enumerate(pokemon.moves.values()):
+            if move_index >= 4:
+                break
+            key = move.id.lower() if move.id else "<unk>"
+            move_indices[move_index] = self.gd.move_to_idx.get(key, UNKNOWN_IDX)
+            if full_info and move.max_pp and move.max_pp > 0:
+                pp_features[move_index] = move.current_pp / move.max_pp
+
+    def _fill_continuous_features(self, feats: np.ndarray, pokemon: Pokemon) -> None:
         offset = 0
 
-        # HP (normalized)
         if pokemon.max_hp and pokemon.max_hp > 0:
             feats[offset] = pokemon.current_hp / pokemon.max_hp
         elif pokemon.current_hp_fraction is not None:
             feats[offset] = pokemon.current_hp_fraction
         offset += 1
 
-        # Status one-hot (7)
-        for j, status in enumerate(STATUS_LIST):
+        for index, status in enumerate(STATUS_LIST):
             if pokemon.status == status:
-                feats[offset + j] = 1.0
+                feats[offset + index] = 1.0
                 break
         offset += 7
 
-        # Stat stages (7): atk, def, spa, spd, spe, accuracy, evasion, normalized to [-1, 1]
         boosts = pokemon.boosts if pokemon.boosts else {}
-        for j, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
-            feats[offset + j] = boosts.get(stat, 0) / 6.0
+        for index, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
+            feats[offset + index] = boosts.get(stat, 0) / 6.0
         offset += 7
 
-        # Volatile statuses (NUM_VOLATILES binary flags)
-        effects = pokemon.effects  # Dict[Effect, int]
-        for j, vol in enumerate(VOLATILES):
-            if isinstance(vol, frozenset):
-                feats[offset + j] = float(any(e in effects for e in vol))
+        effects = pokemon.effects
+        for index, volatile in enumerate(VOLATILES):
+            if isinstance(volatile, frozenset):
+                feats[offset + index] = float(any(effect in effects for effect in volatile))
             else:
-                feats[offset + j] = float(vol in effects)
-        offset += NUM_VOLATILES
+                feats[offset + index] = float(volatile in effects)
 
-        # Move PP (4), normalized by max PP, only for own pokemon (full_info)
-        if full_info and pokemon.moves:
-            for j, move in enumerate(list(pokemon.moves.values())[:4]):
-                if move.max_pp and move.max_pp > 0:
-                    feats[offset + j] = move.current_pp / move.max_pp
-        offset += 4
+    def _ordered_team_with_roles(
+        self,
+        battle: DoubleBattle,
+        own: bool,
+    ) -> tuple[list[Pokemon | None], np.ndarray, np.ndarray]:
+        """Return ordered team members plus role and active-index metadata."""
+        team = list(battle.team.values()) if own else list(battle.opponent_team.values())
+        active_list = battle.active_pokemon if own else battle.opponent_active_pokemon
+        active_lookup = {
+            id(pokemon): slot
+            for slot, pokemon in enumerate(active_list)
+            if pokemon is not None
+        }
 
-        return feats
+        ordered: list[Pokemon | None] = []
+        roles = np.full(self.team_size, ROLE_BENCH, dtype=np.int64)
+        active_indices = np.zeros(2, dtype=np.int64)
+        found_active_slots = [False, False]
 
-    def _ordered_team(self, battle: DoubleBattle, own: bool) -> list[Pokemon | None]:
-        """Get team as a list, active pokemon first, then bench."""
-        if own:
-            team = list(battle.team.values())
-        else:
-            team = list(battle.opponent_team.values())
+        for pokemon in team:
+            slot = active_lookup.get(id(pokemon))
+            if slot is None:
+                continue
+            if len(ordered) >= self.team_size:
+                break
+            ordered.append(pokemon)
+            ordered_index = len(ordered) - 1
+            roles[ordered_index] = ROLE_ACTIVE_1 if slot == 0 else ROLE_ACTIVE_2
+            active_indices[slot] = ordered_index
+            found_active_slots[slot] = True
 
-        # Sort: active first, then bench, then pad with None
-        active_set = set()
-        for p in (battle.active_pokemon if own else battle.opponent_active_pokemon):
-            if p is not None:
-                active_set.add(p)
+        for pokemon in team:
+            if id(pokemon) in active_lookup:
+                continue
+            if len(ordered) >= self.team_size:
+                break
+            ordered.append(pokemon)
 
-        active = [p for p in team if p in active_set]
-        bench = [p for p in team if p not in active_set]
-        ordered = active + bench
+        for slot, pokemon in enumerate(active_list):
+            if pokemon is not None and not found_active_slots[slot]:
+                raise ValueError(
+                    f"Active pokemon {pokemon.species!r} was not found in the ordered team list. "
+                    "This indicates a mismatch between battle.active_pokemon and battle.team - "
+                    "check poke-env battle state tracking."
+                )
 
-        # Pad to team_size
         while len(ordered) < self.team_size:
             ordered.append(None)
-        return ordered[:self.team_size]
-
-    def _active_slot_map(self, battle: DoubleBattle, own: bool) -> dict:
-        """Map active pokemon objects to their role indices."""
-        active_list = battle.active_pokemon if own else battle.opponent_active_pokemon
-        mapping = {}
-        for slot, pokemon in enumerate(active_list):
-            if pokemon is not None:
-                mapping[pokemon] = ROLE_ACTIVE_1 if slot == 0 else ROLE_ACTIVE_2
-        return mapping
-
-    @staticmethod
-    def _find_active_index(team_list: list, pokemon) -> int:
-        """Find where a specific pokemon is in the ordered team list.
-
-        Returns 0 if the slot is empty (fainted/not yet sent out) — the action
-        mask will force pass or switch for that slot so the rep value doesn't matter.
-        Raises if a non-None pokemon cannot be found, which indicates a bug.
-        """
-        if pokemon is None:
-            return 0
-        for i, p in enumerate(team_list):
-            if p is pokemon:
-                return i
-        raise ValueError(
-            f"Active pokemon {pokemon.species!r} was not found in the ordered team list. "
-            "This indicates a mismatch between battle.active_pokemon and battle.team — "
-            "check poke-env battle state tracking."
-        )
+        return ordered, roles, active_indices
 
     @staticmethod
     def _encode_field(battle: DoubleBattle) -> np.ndarray:
@@ -264,7 +235,6 @@ class ObservationBuilder:
         feats = np.zeros(31, dtype=np.float32)
         offset = 0
 
-        # Weather (9: 8 types + none). Use first slot as "no weather"
         weather_types = [
             Weather.SUNNYDAY, Weather.DESOLATELAND, Weather.RAINDANCE,
             Weather.PRIMORDIALSEA, Weather.SANDSTORM, Weather.HAIL,
@@ -273,58 +243,45 @@ class ObservationBuilder:
         if not battle.weather:
             feats[offset] = 1.0
         else:
-            for j, w in enumerate(weather_types):
-                if w in battle.weather:
-                    feats[offset + 1 + j] = 1.0
+            for index, weather in enumerate(weather_types):
+                if weather in battle.weather:
+                    feats[offset + 1 + index] = 1.0
                     break
         offset += 9
 
-        # Terrain (5: 4 types + none).
-        # Note: battle.fields also contains TRICK_ROOM and other non-terrain effects,
-        # so we must check for each terrain type explicitly rather than using `not battle.fields`.
         terrain_types = [
             Field.ELECTRIC_TERRAIN, Field.GRASSY_TERRAIN,
             Field.MISTY_TERRAIN, Field.PSYCHIC_TERRAIN,
         ]
         terrain_active = False
-        for j, t in enumerate(terrain_types):
-            if battle.fields and t in battle.fields:
-                feats[offset + 1 + j] = 1.0
+        for index, terrain in enumerate(terrain_types):
+            if battle.fields and terrain in battle.fields:
+                feats[offset + 1 + index] = 1.0
                 terrain_active = True
                 break
         if not terrain_active:
-            feats[offset] = 1.0  # no terrain
+            feats[offset] = 1.0
         offset += 5
 
-        # Side conditions, per side (own then opp)
         for side_conditions in [battle.side_conditions, battle.opponent_side_conditions]:
-            # Stealth Rock (1)
             feats[offset] = float(SideCondition.STEALTH_ROCK in side_conditions)
             offset += 1
-            # Spikes (0-3)
             feats[offset] = side_conditions.get(SideCondition.SPIKES, 0) / 3.0
             offset += 1
-            # Toxic Spikes (0-2)
             feats[offset] = side_conditions.get(SideCondition.TOXIC_SPIKES, 0) / 2.0
             offset += 1
-            # Sticky Web (1)
             feats[offset] = float(SideCondition.STICKY_WEB in side_conditions)
             offset += 1
-            # Screens
             feats[offset] = float(SideCondition.REFLECT in side_conditions)
             offset += 1
             feats[offset] = float(SideCondition.LIGHT_SCREEN in side_conditions)
             offset += 1
             feats[offset] = float(SideCondition.AURORA_VEIL in side_conditions)
             offset += 1
-            # Tailwind
             feats[offset] = float(SideCondition.TAILWIND in side_conditions)
             offset += 1
 
-        # Trick Room (global)
         feats[offset] = float(Field.TRICK_ROOM in battle.fields)
-        offset += 1
-
         return feats
 
 
@@ -367,7 +324,6 @@ def _preview_visible_species(gen: int, tb) -> str:
     species = Pokemon(gen=gen, teambuilder=tb).species
     if species is None:
         raise ValueError(f"Could not infer canonical species from teambuilder pokemon: {tb}")
-    # Showdown preview hides Rapid-Strike style and exposes generic Urshifu instead.
     if species == "urshifurapidstrike":
         return "urshifu"
     return species
