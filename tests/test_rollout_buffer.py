@@ -23,8 +23,7 @@ from pokerl.env.actions import (
     build_legal_action_state,
     build_joint_action_mask,
 )
-from pokerl.env.showdown_env import BattleEnv
-from pokerl.env.showdown_env import ShowdownPlayer
+from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
 from pokerl.model.heads import ActionHead, ValueHead
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
@@ -498,6 +497,64 @@ def test_action_mask_filters_missing_target_slots() -> None:
 
     assert not mask[0]
     assert mask[1]
+
+
+def test_parallel_battle_env_collate_reuses_batch_buffers() -> None:
+    env = object.__new__(ParallelBattleEnv)
+    env.num_envs = 2
+    env._obs_batch_buffers = None
+    env._mask_batch_buffer = None
+
+    first_obs = [
+        {
+            "a": np.array([1, 2], dtype=np.int64),
+            "b": np.array([[1.0], [2.0]], dtype=np.float32),
+        },
+        {
+            "a": np.array([3, 4], dtype=np.int64),
+            "b": np.array([[3.0], [4.0]], dtype=np.float32),
+        },
+    ]
+    first_masks = [
+        np.array([[True, False], [False, True]], dtype=bool),
+        np.array([[False, True], [True, False]], dtype=bool),
+    ]
+    batch_obs_1, batch_mask_1 = ParallelBattleEnv._collate(env, first_obs, first_masks)
+
+    second_obs = [
+        {
+            "a": np.array([5, 6], dtype=np.int64),
+            "b": np.array([[5.0], [6.0]], dtype=np.float32),
+        },
+        {
+            "a": np.array([7, 8], dtype=np.int64),
+            "b": np.array([[7.0], [8.0]], dtype=np.float32),
+        },
+    ]
+    second_masks = [
+        np.array([[False, False], [True, True]], dtype=bool),
+        np.array([[True, True], [False, False]], dtype=bool),
+    ]
+    batch_obs_2, batch_mask_2 = ParallelBattleEnv._collate(env, second_obs, second_masks)
+
+    assert batch_obs_1["a"] is batch_obs_2["a"]
+    assert batch_obs_1["b"] is batch_obs_2["b"]
+    assert batch_mask_1 is batch_mask_2
+    np.testing.assert_array_equal(batch_obs_2["a"], np.array([[5, 6], [7, 8]], dtype=np.int64))
+    np.testing.assert_array_equal(
+        batch_obs_2["b"],
+        np.array([[[5.0], [6.0]], [[7.0], [8.0]]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        batch_mask_2,
+        np.array(
+            [
+                [[False, False], [True, True]],
+                [[True, True], [False, False]],
+            ],
+            dtype=bool,
+        ),
+    )
 
 
 def test_joint_action_mask_comes_from_joined_valid_orders() -> None:

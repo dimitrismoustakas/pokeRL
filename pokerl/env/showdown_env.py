@@ -748,6 +748,8 @@ class ParallelBattleEnv:
         self.num_envs = len(envs)
         self._executor = ThreadPoolExecutor(max_workers=self.num_envs)
         self._timing = _TimingStats()
+        self._obs_batch_buffers: dict[str, np.ndarray] | None = None
+        self._mask_batch_buffer: np.ndarray | None = None
 
     def reset(self) -> tuple[dict, np.ndarray]:
         """Reset all environments and return batched obs + masks."""
@@ -819,15 +821,59 @@ class ParallelBattleEnv:
     def refresh_prepared_team_previews(self) -> None:
         list(self._executor.map(lambda env: env.refresh_prepared_team_preview(), self.envs))
 
-    @staticmethod
     def _collate(
-        obs_list: list[dict], mask_list: list[np.ndarray]
-    ) -> tuple[dict, np.ndarray]:
-        """Stack observations into batched tensors."""
-        keys = obs_list[0].keys()
-        batched = {k: np.stack([o[k] for o in obs_list]) for k in keys}
-        masks = np.stack(mask_list)
-        return batched, masks
+        self,
+        obs_list: list[dict[str, np.ndarray]],
+        mask_list: list[np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        """Copy observations into reusable batch buffers."""
+        if self._obs_batch_buffers is None or self._mask_batch_buffer is None:
+            self._init_collate_buffers(obs_list[0], mask_list[0])
+        else:
+            self._ensure_collate_buffers(obs_list[0], mask_list[0])
+
+        assert self._obs_batch_buffers is not None
+        assert self._mask_batch_buffer is not None
+        for env_index, obs in enumerate(obs_list):
+            for key, value in obs.items():
+                self._obs_batch_buffers[key][env_index] = value
+            self._mask_batch_buffer[env_index] = mask_list[env_index]
+        return self._obs_batch_buffers, self._mask_batch_buffer
+
+    def _init_collate_buffers(self, obs: dict[str, np.ndarray], mask: np.ndarray) -> None:
+        self._obs_batch_buffers = {
+            key: np.empty((self.num_envs, *value.shape), dtype=value.dtype)
+            for key, value in obs.items()
+        }
+        self._mask_batch_buffer = np.empty((self.num_envs, *mask.shape), dtype=mask.dtype)
+
+    def _ensure_collate_buffers(self, obs: dict[str, np.ndarray], mask: np.ndarray) -> None:
+        assert self._obs_batch_buffers is not None
+        assert self._mask_batch_buffer is not None
+
+        if self._obs_batch_buffers.keys() != obs.keys():
+            self._obs_batch_buffers = None
+            self._mask_batch_buffer = None
+            self._init_collate_buffers(obs, mask)
+            return
+
+        for key, value in obs.items():
+            buffer = self._obs_batch_buffers.get(key)
+            expected_shape = (self.num_envs, *value.shape)
+            if buffer is None or buffer.shape != expected_shape or buffer.dtype != value.dtype:
+                self._obs_batch_buffers = None
+                self._mask_batch_buffer = None
+                self._init_collate_buffers(obs, mask)
+                return
+
+        expected_mask_shape = (self.num_envs, *mask.shape)
+        if (
+            self._mask_batch_buffer.shape != expected_mask_shape
+            or self._mask_batch_buffer.dtype != mask.dtype
+        ):
+            self._obs_batch_buffers = None
+            self._mask_batch_buffer = None
+            self._init_collate_buffers(obs, mask)
 
     @staticmethod
     def _step_env(
