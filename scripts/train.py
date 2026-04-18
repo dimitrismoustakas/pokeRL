@@ -425,6 +425,10 @@ def train():
             update_episode_rewards: list[float] = []
             update_episode_secs: list[float] = []
             update_episode_turns: list[float] = []
+            update_episode_opponent_choice_calls: list[int] = []
+            update_episode_opponent_repeated_turn_requests: list[int] = []
+            update_episode_opponent_max_calls_same_turn: list[int] = []
+            update_pathological_episodes: list[dict[str, object]] = []
             team_preview_data: list[tuple[dict, np.ndarray, float]] = []
             rollout_profile = {
                 "obs_to_device_sec": 0.0,
@@ -495,6 +499,28 @@ def train():
                         update_episode_secs.append(info["episode_sec"])
                     if "battle_turn" in info and info.get("episode_reward") is not None:
                         update_episode_turns.append(info["battle_turn"])
+                    if "episode_opponent_choice_calls" in info:
+                        update_episode_opponent_choice_calls.append(int(info["episode_opponent_choice_calls"]))
+                    if "episode_opponent_repeated_turn_requests" in info:
+                        repeated_turn_requests = int(info["episode_opponent_repeated_turn_requests"])
+                        update_episode_opponent_repeated_turn_requests.append(repeated_turn_requests)
+                        update_episode_opponent_max_calls_same_turn.append(
+                            int(info.get("episode_opponent_max_calls_same_turn", 0))
+                        )
+                        if repeated_turn_requests > 0:
+                            update_pathological_episodes.append(
+                                {
+                                    "battle_tag": info.get("battle_tag", ""),
+                                    "battle_turn": int(info.get("battle_turn", 0)),
+                                    "episode_sec": float(info.get("episode_sec", 0.0)),
+                                    "opponent_choice_calls": int(info.get("episode_opponent_choice_calls", 0)),
+                                    "opponent_repeated_turn_requests": repeated_turn_requests,
+                                    "opponent_max_calls_same_turn": int(
+                                        info.get("episode_opponent_max_calls_same_turn", 0)
+                                    ),
+                                    "opponent_checkpoint_path": info.get("episode_opponent_checkpoint_path"),
+                                }
+                            )
 
                 obs, masks = next_obs, next_masks
 
@@ -526,6 +552,31 @@ def train():
 
             avg_episode_sec = float(np.mean(update_episode_secs)) if update_episode_secs else 0.0
             avg_episode_turns = float(np.mean(update_episode_turns)) if update_episode_turns else 0.0
+            avg_episode_opponent_choice_calls = (
+                float(np.mean(update_episode_opponent_choice_calls))
+                if update_episode_opponent_choice_calls
+                else 0.0
+            )
+            avg_episode_opponent_repeated_turn_requests = (
+                float(np.mean(update_episode_opponent_repeated_turn_requests))
+                if update_episode_opponent_repeated_turn_requests
+                else 0.0
+            )
+            max_episode_opponent_choice_calls = (
+                max(update_episode_opponent_choice_calls)
+                if update_episode_opponent_choice_calls
+                else 0
+            )
+            max_episode_opponent_repeated_turn_requests = (
+                max(update_episode_opponent_repeated_turn_requests)
+                if update_episode_opponent_repeated_turn_requests
+                else 0
+            )
+            max_episode_opponent_max_calls_same_turn = (
+                max(update_episode_opponent_max_calls_same_turn)
+                if update_episode_opponent_max_calls_same_turn
+                else 0
+            )
             metrics_json = _json_ready_metrics(metrics)
             update_summary = {
                 "update": update,
@@ -535,8 +586,22 @@ def train():
                 "ppo_sec": ppo_sec,
                 "avg_episode_sec": avg_episode_sec,
                 "avg_episode_turns": avg_episode_turns,
+                "avg_episode_opponent_choice_calls": avg_episode_opponent_choice_calls,
+                "avg_episode_opponent_repeated_turn_requests": avg_episode_opponent_repeated_turn_requests,
+                "max_episode_opponent_choice_calls": max_episode_opponent_choice_calls,
+                "max_episode_opponent_repeated_turn_requests": max_episode_opponent_repeated_turn_requests,
+                "max_episode_opponent_max_calls_same_turn": max_episode_opponent_max_calls_same_turn,
                 "metrics": metrics_json,
             }
+            if update_pathological_episodes:
+                update_summary["pathological_episodes"] = sorted(
+                    update_pathological_episodes,
+                    key=lambda item: (
+                        int(item["opponent_repeated_turn_requests"]),
+                        int(item["opponent_choice_calls"]),
+                    ),
+                    reverse=True,
+                )[:5]
             if collect_timing:
                 update_summary["rollout_profile"] = rollout_profile
                 update_summary["env_profile"] = env_profile
@@ -557,6 +622,8 @@ def train():
                     f"PPO {ppo_sec:.2f}s | "
                     f"Completed battles {len(update_episode_rewards)} | "
                     f"Avg battle {avg_episode_sec:.2f}s/{avg_episode_turns:.1f} turns | "
+                    f"Opp calls/ep {avg_episode_opponent_choice_calls:.1f} | "
+                    f"Max repeat-turn req {max_episode_opponent_repeated_turn_requests} | "
                     f"Win rate (100) {win_rate:.2%} | "
                     f"Policy loss {metrics['policy_loss']:.4f} | "
                     f"Value loss {metrics['value_loss']:.4f} | "

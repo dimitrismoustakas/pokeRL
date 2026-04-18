@@ -2,8 +2,10 @@
 
 import asyncio
 import itertools
+import os
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from threading import Lock, Thread
@@ -21,7 +23,11 @@ from ..data import GameData
 from ..training.preview import TeamPreviewBatcher
 from .observation import ObservationBuilder, build_team_preview_observation
 from .actions import (
-    build_action_mask, action_to_order,
+    ACTIONS_PER_SLOT,
+    FIRST_SLOT_MASK_ROW,
+    PASS_ACTION,
+    action_to_order,
+    build_legal_action_state,
 )
 from .rewards import sparse_reward
 
@@ -32,6 +38,13 @@ _ACCOUNT_RUN_TAG = uuid.uuid4().hex[:4]
 QueueItemT = TypeVar("QueueItemT")
 OpponentFactory = Callable[[asyncio.AbstractEventLoop], Player]
 TeamPairProvider = Callable[[], tuple[str | None, str | None]]
+
+
+def showdown_log_level() -> int | None:
+    value = os.environ.get("POKERL_SHOWDOWN_LOG_LEVEL")
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 class _TimingStats:
@@ -127,6 +140,8 @@ class ShowdownPlayer(Player):
         self._last_finished_token: tuple[str, int] | None = None
         self._closing = False
         self._team_preview_fn = None
+        self._pending_action_state = None
+        self._pending_action_battle: DoubleBattle | None = None
 
     def choose_move(self, battle: DoubleBattle) -> Awaitable[BattleOrder]:
         return self._choose_move(battle)
@@ -165,9 +180,14 @@ class ShowdownPlayer(Player):
     def _make_order(self, action: np.ndarray, battle: DoubleBattle) -> BattleOrder:
         """Convert a (2,) action array to a DoubleBattleOrder."""
         started = time.perf_counter()
+        action_state = self._pending_action_state if self._pending_action_battle is battle else None
+        self._pending_action_state = None
+        self._pending_action_battle = None
+        if action_state is None:
+            action_state = build_legal_action_state(battle)
         orders = []
         for slot in range(2):
-            order = action_to_order(int(action[slot]), battle, slot)
+            order = action_to_order(int(action[slot]), battle, slot, action_state=action_state)
             orders.append(order)
 
         self.timing.increment("player_make_order_calls")
@@ -187,7 +207,17 @@ class ShowdownPlayer(Player):
         self.timing.add("player_emit_obs_sec", time.perf_counter() - emit_started)
 
         mask_started = time.perf_counter()
-        mask = np.stack([build_action_mask(battle, s) for s in range(2)])
+        if battle.finished:
+            mask = np.zeros((ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
+            mask[FIRST_SLOT_MASK_ROW, PASS_ACTION] = True
+            mask[PASS_ACTION + 1, PASS_ACTION] = True
+            self._pending_action_state = None
+            self._pending_action_battle = None
+        else:
+            action_state = build_legal_action_state(battle)
+            mask = action_state.joint_mask
+            self._pending_action_state = action_state
+            self._pending_action_battle = battle
         self.timing.add("player_emit_mask_sec", time.perf_counter() - mask_started)
 
         reward_started = time.perf_counter()
@@ -243,6 +273,10 @@ class BattleEnv:
         self._active_preview_future: Future | None = None
         # Set at team preview time, read when the episode ends to attach to info.
         self._episode_team_preview: tuple[dict, np.ndarray] | None = None
+        self._episode_opponent_choice_calls = 0
+        self._episode_opponent_turn_calls: dict[tuple[str, int], int] = defaultdict(int)
+        self._episode_opponent_checkpoint_path: str | None = None
+        self._last_player_action: np.ndarray | None = None
 
         obs_builder = ObservationBuilder(game_data, config.team_size)
         player_options = dict(player_kwargs or {})
@@ -255,6 +289,9 @@ class BattleEnv:
             "account_configuration",
             make_local_account_configuration("agent"),
         )
+        log_level = showdown_log_level()
+        if log_level is not None:
+            player_options.setdefault("log_level", log_level)
         self.player = ShowdownPlayer(
             obs_builder,
             timing=self._timing,
@@ -276,9 +313,13 @@ class BattleEnv:
 
         reset_started = time.perf_counter()
         self._episode_team_preview = None
+        self._episode_opponent_choice_calls = 0
+        self._episode_opponent_turn_calls.clear()
+        self._episode_opponent_checkpoint_path = getattr(self.opponent, "checkpoint_path", None)
         apply_pending_started = time.perf_counter()
         self._apply_pending_opponent()
         self._timing.add("env_reset_apply_pending_sec", time.perf_counter() - apply_pending_started)
+        self._episode_opponent_checkpoint_path = getattr(self.opponent, "checkpoint_path", None)
 
         assign_teams_started = time.perf_counter()
         self._assign_teams_for_next_battle()
@@ -320,6 +361,7 @@ class BattleEnv:
 
         step_started = time.perf_counter()
         enqueue_started = time.perf_counter()
+        self._last_player_action = np.array(action, copy=True)
         self.player.action_queue.put(action)
         self._timing.add("env_action_enqueue_sec", time.perf_counter() - enqueue_started)
 
@@ -339,6 +381,16 @@ class BattleEnv:
                 obs_tp, picks_tp = self._episode_team_preview
                 info["team_preview_obs"] = obs_tp
                 info["team_preview_picks"] = picks_tp
+            info["episode_opponent_choice_calls"] = self._episode_opponent_choice_calls
+            info["episode_opponent_repeated_turn_requests"] = sum(
+                count - 1 for count in self._episode_opponent_turn_calls.values() if count > 1
+            )
+            info["episode_opponent_max_calls_same_turn"] = max(
+                self._episode_opponent_turn_calls.values(),
+                default=0,
+            )
+            if self._episode_opponent_checkpoint_path is not None:
+                info["episode_opponent_checkpoint_path"] = self._episode_opponent_checkpoint_path
         return obs, mask, reward, done, info
 
     def _do_team_preview(self, battle: DoubleBattle) -> str:
@@ -492,22 +544,24 @@ class BattleEnv:
         self._active_preview_obs = None
         self._active_preview_future = None
 
-        if prepared_obs is not None and prepared_future is not None and self._obs_equal(obs, prepared_obs):
-            self._timing.increment("env_precompute_preview_hits")
-            try:
-                wait_started = time.perf_counter()
-                picks = prepared_future.result()
-                self._timing.add("env_precompute_preview_hit_wait_sec", time.perf_counter() - wait_started)
-                return picks
-            except Exception:
-                self._timing.increment("env_precompute_preview_fallbacks")
-        elif prepared_obs is not None or prepared_future is not None:
-            self._timing.increment("env_precompute_preview_misses")
-            if prepared_obs is not None:
-                self._record_preview_obs_mismatch(obs, prepared_obs)
+        if prepared_obs is None and prepared_future is None:
+            picks, _ = self._ext_team_preview_fn(obs)
+            return picks
 
-        picks, _ = self._ext_team_preview_fn(obs)
-        return picks
+        if prepared_obs is None or prepared_future is None:
+            self._timing.increment("env_precompute_preview_missing_state")
+            raise RuntimeError("Prepared team preview state was partially missing.")
+
+        if self._obs_equal(obs, prepared_obs):
+            self._timing.increment("env_precompute_preview_hits")
+            wait_started = time.perf_counter()
+            picks = prepared_future.result()
+            self._timing.add("env_precompute_preview_hit_wait_sec", time.perf_counter() - wait_started)
+            return picks
+
+        self._timing.increment("env_precompute_preview_misses")
+        self._record_preview_obs_mismatch(obs, prepared_obs)
+        raise RuntimeError("Prepared team preview observation did not match the live battle state.")
 
     @staticmethod
     def _obs_equal(left: dict[str, np.ndarray], right: dict[str, np.ndarray]) -> bool:
@@ -535,6 +589,44 @@ class BattleEnv:
             result = original_choose_move(battle)
             self._timing.increment("opponent_choice_calls")
             self._timing.add("opponent_choice_sec", time.perf_counter() - started)
+            battle_tag = getattr(battle, "battle_tag", "")
+            turn = int(getattr(battle, "turn", 0))
+            self._episode_opponent_choice_calls += 1
+            key = (battle_tag, turn)
+            self._episode_opponent_turn_calls[key] += 1
+            repeated_calls = self._episode_opponent_turn_calls[key]
+            if repeated_calls in (10, 100, 1000):
+                own_active = [
+                    pokemon.species if pokemon is not None else None
+                    for pokemon in getattr(battle, "active_pokemon", [])
+                ]
+                opp_active = [
+                    pokemon.species if pokemon is not None else None
+                    for pokemon in getattr(battle, "opponent_active_pokemon", [])
+                ]
+                checkpoint_path = getattr(self.opponent, "checkpoint_path", None)
+                request_moves = []
+                last_request = getattr(battle, "last_request", {})
+                for active_request in last_request.get("active", []):
+                    request_moves.append(
+                        [
+                            {
+                                "id": move_request.get("id"),
+                                "target": move_request.get("target"),
+                                "disabled": move_request.get("disabled", False),
+                            }
+                            for move_request in active_request.get("moves", [])
+                        ]
+                    )
+                print(
+                    "Warning: repeated opponent choice requests "
+                    f"battle={battle_tag} turn={turn} count={repeated_calls} "
+                    f"checkpoint={checkpoint_path} own_active={own_active} opp_active={opp_active} "
+                    f"force_switch={getattr(battle, 'force_switch', None)} "
+                    f"last_player_action={self._last_player_action.tolist() if self._last_player_action is not None else None} "
+                    f"request_moves={request_moves} "
+                    f"opponent_order={getattr(result, 'message', repr(result))}"
+                )
             return result
 
         opponent.choose_move = timed_choose_move

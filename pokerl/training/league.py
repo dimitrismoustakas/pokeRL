@@ -20,8 +20,8 @@ from ..model.agent import PokeAgent
 from ..data import GameData
 from ..config import TrainingConfig, EnvConfig
 from ..env.observation import ObservationBuilder, build_team_preview_observation
-from ..env.actions import build_action_mask, action_to_order
-from ..env.showdown_env import make_local_account_configuration
+from ..env.actions import action_to_order, build_legal_action_state
+from ..env.showdown_env import make_local_account_configuration, showdown_log_level
 
 
 @dataclass
@@ -269,6 +269,8 @@ class LeaguePlayer(Player):
         self.inference_service = inference_service
         self.obs_builder = obs_builder
         self._hidden: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._pending_hidden: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._pending_battle_obs: dict[str, np.ndarray] | None = None
         self._pending_checkpoint_path: str | None = None
         self._prepared_preview_obs: dict[str, np.ndarray] | None = None
         self._prepared_preview_future: Future | None = None
@@ -311,17 +313,21 @@ class LeaguePlayer(Player):
 
     def choose_move(self, battle: DoubleBattle):
         obs = self.obs_builder.build(battle)
-        masks = np.stack([build_action_mask(battle, s) for s in range(2)])
-        actions, self._hidden = self.inference_service.infer_action(
+        self._commit_hidden_if_battle_advanced(obs)
+        action_state = build_legal_action_state(battle)
+        masks = action_state.joint_mask
+        actions, next_hidden = self.inference_service.infer_action(
             self.checkpoint_path,
             obs,
             masks,
             self._hidden,
         )
+        self._pending_battle_obs = self._clone_obs(obs)
+        self._pending_hidden = next_hidden
 
         orders = []
         for slot in range(2):
-            orders.append(action_to_order(int(actions[slot]), battle, slot))
+            orders.append(action_to_order(int(actions[slot]), battle, slot, action_state=action_state))
 
         if all(isinstance(order, PassBattleOrder) for order in orders):
             return self.choose_default_move()
@@ -334,37 +340,54 @@ class LeaguePlayer(Player):
         self._prepared_preview_obs = None
         self._prepared_preview_future = None
 
-        if prepared_obs is not None and prepared_future is not None and self._obs_equal(obs, prepared_obs):
-            self._increment_timing("opponent_precompute_preview_hits")
-            try:
-                wait_started = time.perf_counter()
-                picks = prepared_future.result()
-                self._add_timing(
-                    "opponent_precompute_preview_hit_wait_sec",
-                    time.perf_counter() - wait_started,
-                )
-                return "/team " + "".join(str(int(p) + 1) for p in picks)
-            except Exception:
-                self._increment_timing("opponent_precompute_preview_fallbacks")
-        elif prepared_obs is not None or prepared_future is not None:
-            self._increment_timing("opponent_precompute_preview_misses")
-            if prepared_obs is not None:
-                self._record_preview_obs_mismatch(obs, prepared_obs)
+        if prepared_obs is None and prepared_future is None:
+            infer_started = time.perf_counter()
+            picks = self.inference_service.infer_team_preview(self.checkpoint_path, obs)
+            self._add_timing("opponent_teampreview_infer_sec", time.perf_counter() - infer_started)
+            return "/team " + "".join(str(int(p) + 1) for p in picks)
 
-        infer_started = time.perf_counter()
-        picks = self.inference_service.infer_team_preview(self.checkpoint_path, obs)
-        self._add_timing("opponent_teampreview_infer_sec", time.perf_counter() - infer_started)
-        return "/team " + "".join(str(int(p) + 1) for p in picks)
+        if prepared_obs is None or prepared_future is None:
+            self._increment_timing("opponent_precompute_preview_missing_state")
+            raise RuntimeError("Prepared opponent team preview state was partially missing.")
+
+        if self._obs_equal(obs, prepared_obs):
+            self._increment_timing("opponent_precompute_preview_hits")
+            wait_started = time.perf_counter()
+            picks = prepared_future.result()
+            self._add_timing(
+                "opponent_precompute_preview_hit_wait_sec",
+                time.perf_counter() - wait_started,
+            )
+            return "/team " + "".join(str(int(p) + 1) for p in picks)
+
+        self._increment_timing("opponent_precompute_preview_misses")
+        self._record_preview_obs_mismatch(obs, prepared_obs)
+        raise RuntimeError("Prepared opponent team preview observation did not match the live battle state.")
 
     def reset_hidden(self):
         """Clear LSTM state between battles. Called by BattleEnv.reset()."""
         self._hidden = None
+        self._pending_hidden = None
+        self._pending_battle_obs = None
 
     @staticmethod
     def _obs_equal(left: dict[str, np.ndarray], right: dict[str, np.ndarray]) -> bool:
         if left.keys() != right.keys():
             return False
         return all(np.array_equal(left[key], right[key]) for key in left)
+
+    @staticmethod
+    def _clone_obs(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        return {key: value.copy() for key, value in obs.items()}
+
+    def _commit_hidden_if_battle_advanced(self, obs: dict[str, np.ndarray]) -> None:
+        if self._pending_battle_obs is None:
+            return
+        if self._obs_equal(obs, self._pending_battle_obs):
+            return
+        self._hidden = self._pending_hidden
+        self._pending_hidden = None
+        self._pending_battle_obs = None
 
     def _record_preview_obs_mismatch(
         self,
@@ -454,6 +477,7 @@ class League:
             account_configuration=make_local_account_configuration("league"),
             battle_format=self.env_config.battle_format,
             server_configuration=server_config,
+            log_level=showdown_log_level(),
             loop=loop,
         )
 

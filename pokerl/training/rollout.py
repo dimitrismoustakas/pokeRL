@@ -17,7 +17,7 @@ class RolloutBatch:
 
     obs: dict[str, torch.Tensor]
     actions: torch.Tensor          # (num_steps, num_envs, 2)
-    action_masks: torch.Tensor     # (num_steps, num_envs, 2, num_actions)
+    action_masks: torch.Tensor     # (num_steps, num_envs, num_actions + 1, num_actions)
     log_probs: torch.Tensor        # (num_steps, num_envs)
     values: torch.Tensor           # (num_steps, num_envs)
     rewards: torch.Tensor          # (num_steps, num_envs)

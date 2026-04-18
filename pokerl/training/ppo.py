@@ -54,7 +54,7 @@ class PPOTrainer:
 
         obs_seq = batch.obs
         actions_seq = batch.actions              # (T, E, 2)
-        masks_seq = batch.action_masks           # (T, E, 2, A)
+        masks_seq = batch.action_masks           # (T, E, A + 1, A)
         old_lp_seq = batch.log_probs             # (T, E)
         adv_seq = adv                            # (T, E)
         returns_seq = batch.returns              # (T, E)
@@ -82,7 +82,7 @@ class PPOTrainer:
 
                 mb_obs_seq = {k: v[:, mb_envs] for k, v in obs_seq.items()}
                 mb_actions_seq = actions_seq[:, mb_envs]      # (T, E_mb, 2)
-                mb_masks_seq = masks_seq[:, mb_envs]          # (T, E_mb, 2, A)
+                mb_masks_seq = masks_seq[:, mb_envs]          # (T, E_mb, A + 1, A)
                 mb_dones_seq = dones_seq[:, mb_envs]          # (T, E_mb)
                 mb_old_lp = old_lp_seq[:, mb_envs].reshape(-1)
                 mb_adv = adv_seq[:, mb_envs].reshape(-1)

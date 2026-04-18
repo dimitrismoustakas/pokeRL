@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from ..env.actions import ACTIONS_PER_SLOT, PASS_ACTION, SWITCH_OFFSET, TERA_OFFSET
+from ..env.actions import ACTIONS_PER_SLOT, FIRST_SLOT_MASK_ROW
 
 
 class ActionHead(nn.Module):
@@ -39,7 +39,7 @@ class ActionHead(nn.Module):
         self,
         context: torch.Tensor,        # (batch, context_dim)
         active_reps: torch.Tensor,     # (batch, 2, pokemon_dim)
-        masks: torch.Tensor,           # (batch, 2, num_actions) True = valid
+        masks: torch.Tensor,           # (batch, num_actions + 1, num_actions)
         actions: torch.Tensor | None = None,  # (batch, 2) if provided, evaluate these
     ) -> dict[str, torch.Tensor]:
         """
@@ -48,8 +48,7 @@ class ActionHead(nn.Module):
         """
         rep1 = active_reps[:, 0]
         rep2 = active_reps[:, 1]
-        mask1 = masks[:, 0]
-        mask2 = masks[:, 1]
+        mask1 = masks[:, FIRST_SLOT_MASK_ROW]
 
         # --- Pokemon 1 (sees both active reps for coordination) ---
         logits1 = self.head1(torch.cat([context, rep1, rep2], dim=-1))
@@ -61,24 +60,18 @@ class ActionHead(nn.Module):
         else:
             a1 = actions[:, 0]
 
+        if not mask1.gather(1, a1.unsqueeze(1)).squeeze(1).all():
+            raise RuntimeError(
+                "ActionHead received an illegal first-slot action for the current joint mask."
+            )
+
         # --- Pokemon 2 (sees both reps + pokemon 1's action) ---
-        mask2 = mask2.clone()
-        switch_rows = (a1 >= SWITCH_OFFSET) & (a1 < PASS_ACTION)
-        if switch_rows.any():
-            switch_slots = a1[switch_rows]
-            mask2[switch_rows, switch_slots] = False
-            empty_rows = switch_rows.nonzero(as_tuple=False).squeeze(1)[~mask2[switch_rows].any(dim=1)]
-            if empty_rows.numel() > 0:
-                mask2[empty_rows, PASS_ACTION] = True
-
-        tera_rows = (a1 >= TERA_OFFSET) & (a1 < SWITCH_OFFSET)
-        if tera_rows.any():
-            mask2[tera_rows, TERA_OFFSET:SWITCH_OFFSET] = False
-
+        batch_indices = torch.arange(context.shape[0], device=context.device)
+        mask2 = masks[batch_indices, a1 + 1]
         if not mask2.any(dim=1).all():
             raise RuntimeError(
-                "ActionHead produced an empty joint action mask for pokemon 2. "
-                "This means the per-slot action masks or joint legality logic are inconsistent."
+                "ActionHead received an empty conditional joint action mask for pokemon 2. "
+                "This means build_joint_action_mask() produced an inconsistent legality table."
             )
 
         a1_emb = self.action_emb(a1)
@@ -90,6 +83,11 @@ class ActionHead(nn.Module):
             a2 = dist2.sample()
         else:
             a2 = actions[:, 1]
+
+        if not mask2.gather(1, a2.unsqueeze(1)).squeeze(1).all():
+            raise RuntimeError(
+                "ActionHead received an illegal second-slot action for the current joint mask."
+            )
 
         # Joint log-prob: log P(a1, a2) = log P(a1) + log P(a2 | a1)
         log_prob = dist1.log_prob(a1) + dist2.log_prob(a2)

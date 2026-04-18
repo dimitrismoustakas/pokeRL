@@ -73,7 +73,8 @@ class PokeAgent(nn.Module):
             obs: observation dict from ObservationBuilder
             hidden: LSTM hidden state (or None)
             actions: (batch, 2) actions to evaluate, or None to sample
-            action_masks: (batch, 2, ACTIONS_PER_SLOT) boolean masks
+            action_masks: (batch, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
+                boolean joint legality tables
 
         Returns dict with: actions, log_prob, entropy, value, hidden
         """
