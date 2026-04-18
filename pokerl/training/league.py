@@ -42,7 +42,10 @@ class _LeagueInferenceService:
     tiny GPU forward per environment thread.
     """
 
-    _COALESCE_WINDOW_SEC = 0.001
+    # A short coalescing window lets more same-checkpoint requests land in the
+    # same GPU batch once the league pool grows, without changing policy
+    # semantics or opponent sampling.
+    _COALESCE_WINDOW_SEC = 0.005
 
     def __init__(self, agent_template: PokeAgent, device: torch.device):
         self._agent_template = agent_template

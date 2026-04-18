@@ -47,7 +47,16 @@ class LegalActionState:
     """Per-request legality tables derived from the live Showdown request."""
 
     slot_action_orders: tuple[dict[int, SingleBattleOrder], dict[int, SingleBattleOrder]]
+    slot_masks: tuple[np.ndarray, np.ndarray]
     joint_mask: np.ndarray
+
+
+@dataclass(frozen=True)
+class _SlotActionState:
+    action_orders: dict[int, SingleBattleOrder]
+    mask: np.ndarray
+    joined_orders: list[SingleBattleOrder]
+    action_by_order_id: dict[int, int]
 
 
 def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
@@ -68,9 +77,16 @@ def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
 
 def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
     """Build and index all legal orders for the current live request once."""
-    slot_action_orders = _build_slot_action_orders(battle)
-    joint_mask = _build_joint_mask(slot_action_orders, battle)
-    return LegalActionState(slot_action_orders=slot_action_orders, joint_mask=joint_mask)
+    slot_states = (
+        _build_slot_action_state(battle, slot=0),
+        _build_slot_action_state(battle, slot=1),
+    )
+    joint_mask = _build_joint_mask(slot_states)
+    return LegalActionState(
+        slot_action_orders=(slot_states[0].action_orders, slot_states[1].action_orders),
+        slot_masks=(slot_states[0].mask, slot_states[1].mask),
+        joint_mask=joint_mask,
+    )
 
 
 def build_action_mask(
@@ -81,10 +97,7 @@ def build_action_mask(
     """Build a slot-local mask from the current Showdown request."""
     if action_state is None:
         action_state = build_legal_action_state(battle)
-    mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
-    for action_idx in action_state.slot_action_orders[slot]:
-        mask[action_idx] = True
-    return mask
+    return action_state.slot_masks[slot]
 
 
 def build_joint_action_mask(
@@ -104,17 +117,19 @@ def build_joint_action_mask(
 
 
 def _build_joint_mask(
-    slot_action_orders: tuple[dict[int, SingleBattleOrder], dict[int, SingleBattleOrder]],
-    battle: DoubleBattle,
+    slot_states: tuple[_SlotActionState, _SlotActionState],
 ) -> np.ndarray:
     joint_mask = np.zeros((ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
 
     joined_orders = DoubleBattleOrder.join_orders(
-        list(slot_action_orders[0].values()),
-        list(slot_action_orders[1].values()),
+        slot_states[0].joined_orders,
+        slot_states[1].joined_orders,
     )
     if not joined_orders:
-        if set(slot_action_orders[0]) == {PASS_ACTION} and set(slot_action_orders[1]) == {PASS_ACTION}:
+        if (
+            set(slot_states[0].action_orders) == {PASS_ACTION}
+            and set(slot_states[1].action_orders) == {PASS_ACTION}
+        ):
             joint_mask[FIRST_SLOT_MASK_ROW, PASS_ACTION] = True
             joint_mask[PASS_ACTION + 1, PASS_ACTION] = True
             return joint_mask
@@ -124,8 +139,8 @@ def _build_joint_mask(
         )
 
     for order in joined_orders:
-        a1 = _order_to_action_idx(order.first_order, battle, slot=0)
-        a2 = _order_to_action_idx(order.second_order, battle, slot=1)
+        a1 = slot_states[0].action_by_order_id[id(order.first_order)]
+        a2 = slot_states[1].action_by_order_id[id(order.second_order)]
         joint_mask[FIRST_SLOT_MASK_ROW, a1] = True
         joint_mask[a1 + 1, a2] = True
 
@@ -150,125 +165,130 @@ def action_to_order(
         ) from exc
 
 
-def _build_slot_action_orders(
-    battle: DoubleBattle,
-) -> tuple[dict[int, SingleBattleOrder], dict[int, SingleBattleOrder]]:
-    raw_orders = (
-        _build_slot_orders(battle, slot=0),
-        _build_slot_orders(battle, slot=1),
-    )
-    return (
-        _index_orders(raw_orders[0], battle, slot=0),
-        _index_orders(raw_orders[1], battle, slot=1),
-    )
-
-
-def _build_slot_orders(battle: DoubleBattle, slot: int) -> list[SingleBattleOrder]:
+def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionState:
     trapped = getattr(battle, "trapped", [False, False])
     force_switch = battle.force_switch
-    orders: list[SingleBattleOrder] = []
+    action_orders: dict[int, SingleBattleOrder] = {}
+    joined_orders: list[SingleBattleOrder] = []
+    action_by_order_id: dict[int, int] = {}
+    mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
 
     if any(force_switch) and not force_switch[slot]:
-        return [PassBattleOrder()]
+        return _build_pass_slot_state(mask)
 
     if not trapped[slot]:
-        orders.extend(SingleBattleOrder(pokemon) for pokemon in battle.available_switches[slot])
+        ordered_team = _ordered_own_team(battle)
+        for pokemon in battle.available_switches[slot]:
+            team_slot = _find_team_slot(ordered_team, pokemon)
+            if team_slot is None:
+                raise RuntimeError(
+                    f"Available switch target {pokemon.species!r} was not found in the ordered team. "
+                    "This indicates battle.team and available_switches are out of sync."
+                )
+            _add_order(
+                action_orders=action_orders,
+                action_by_order_id=action_by_order_id,
+                joined_orders=joined_orders,
+                mask=mask,
+                action_idx=SWITCH_OFFSET + team_slot,
+                order=SingleBattleOrder(pokemon),
+                slot=slot,
+            )
 
     if all(force_switch) and len(battle.available_switches[0]) == 1:
-        orders.append(PassBattleOrder())
-        return orders
+        _add_order(
+            action_orders=action_orders,
+            action_by_order_id=action_by_order_id,
+            joined_orders=joined_orders,
+            mask=mask,
+            action_idx=PASS_ACTION,
+            order=PassBattleOrder(),
+            slot=slot,
+        )
+        return _finalize_slot_state(action_orders, mask, joined_orders, action_by_order_id)
 
     active_pokemon = battle.active_pokemon[slot]
     if active_pokemon is not None and not force_switch[slot]:
-        for move in battle.available_moves[slot]:
+        for move_idx, move in enumerate(battle.available_moves[slot]):
             hydrated_move, target_locs = _request_aware_move_targets(move, active_pokemon, battle, slot)
             for target_loc in target_locs:
-                orders.append(SingleBattleOrder(hydrated_move, move_target=target_loc))
+                target_idx = _showdown_target_to_index(target_loc, slot, battle)
+                action_idx = move_idx * NUM_TARGETS + target_idx
+                _add_order(
+                    action_orders=action_orders,
+                    action_by_order_id=action_by_order_id,
+                    joined_orders=joined_orders,
+                    mask=mask,
+                    action_idx=action_idx,
+                    order=SingleBattleOrder(hydrated_move, move_target=target_loc),
+                    slot=slot,
+                )
                 if battle.can_tera[slot]:
-                    orders.append(
-                        SingleBattleOrder(hydrated_move, move_target=target_loc, terastallize=True)
+                    _add_order(
+                        action_orders=action_orders,
+                        action_by_order_id=action_by_order_id,
+                        joined_orders=joined_orders,
+                        mask=mask,
+                        action_idx=action_idx + TERA_OFFSET,
+                        order=SingleBattleOrder(hydrated_move, move_target=target_loc, terastallize=True),
+                        slot=slot,
                     )
 
-    if not orders:
-        orders.append(PassBattleOrder())
-    return orders
+    if not action_orders:
+        return _build_pass_slot_state(mask)
+    return _finalize_slot_state(action_orders, mask, joined_orders, action_by_order_id)
 
 
-def _index_orders(
-    orders: list[SingleBattleOrder],
-    battle: DoubleBattle,
+def _build_pass_slot_state(mask: np.ndarray) -> _SlotActionState:
+    pass_order = PassBattleOrder()
+    action_orders = {PASS_ACTION: pass_order}
+    mask[PASS_ACTION] = True
+    return _SlotActionState(
+        action_orders=action_orders,
+        mask=mask,
+        joined_orders=[pass_order],
+        action_by_order_id={id(pass_order): PASS_ACTION},
+    )
+
+
+def _finalize_slot_state(
+    action_orders: dict[int, SingleBattleOrder],
+    mask: np.ndarray,
+    joined_orders: list[SingleBattleOrder],
+    action_by_order_id: dict[int, int],
+) -> _SlotActionState:
+    return _SlotActionState(
+        action_orders=action_orders,
+        mask=mask,
+        joined_orders=joined_orders,
+        action_by_order_id=action_by_order_id,
+    )
+
+
+def _add_order(
+    *,
+    action_orders: dict[int, SingleBattleOrder],
+    action_by_order_id: dict[int, int],
+    joined_orders: list[SingleBattleOrder],
+    mask: np.ndarray,
+    action_idx: int,
+    order: SingleBattleOrder,
     slot: int,
-) -> dict[int, SingleBattleOrder]:
-    indexed: dict[int, SingleBattleOrder] = {}
-    for order in orders:
-        action_idx = _order_to_action_idx(order, battle, slot)
-        existing = indexed.get(action_idx)
-        if existing is not None and existing.message != order.message:
+) -> None:
+    existing = action_orders.get(action_idx)
+    if existing is not None:
+        if existing.message != order.message:
             raise RuntimeError(
                 f"Two different legal orders mapped to the same action id {action_idx} "
                 f"for slot {slot}: {existing.message!r} vs {order.message!r}. "
                 "Expand the action encoding so these orders are distinguishable."
             )
-        indexed.setdefault(action_idx, order)
+        return
 
-    if not indexed:
-        indexed[PASS_ACTION] = PassBattleOrder()
-    return indexed
-
-
-def _order_to_action_idx(order: SingleBattleOrder, battle: DoubleBattle, slot: int) -> int:
-    if isinstance(order, PassBattleOrder) or order.message == "/choose pass":
-        return PASS_ACTION
-
-    if isinstance(order.order, str):
-        raise RuntimeError(
-            f"Unsupported string-backed battle order {order.message!r}. "
-            "Only move, switch, and pass orders should appear during training."
-        )
-
-    if isinstance(order.order, Move):
-        if order.mega or order.z_move or order.dynamax:
-            raise RuntimeError(
-                f"Unsupported special move modifier in legal order {order.message!r}. "
-                "This action space currently supports plain and terastallized moves only."
-            )
-
-        move_idx = _find_available_move_index(battle.available_moves[slot], order.order)
-        target_idx = _showdown_target_to_index(order.move_target, slot, battle)
-        action_idx = move_idx * NUM_TARGETS + target_idx
-        if order.terastallize:
-            action_idx += TERA_OFFSET
-        return action_idx
-
-    ordered_team = _ordered_own_team(battle)
-    team_slot = _find_team_slot(ordered_team, order.order)
-    if team_slot is None:
-        raise RuntimeError(
-            f"Legal switch order {order.message!r} referenced a Pokemon that is not in the "
-            "ordered team. This indicates battle.team and valid_orders are out of sync."
-        )
-    return SWITCH_OFFSET + team_slot
-
-
-def _find_available_move_index(available_moves: list[Move], selected_move: Move) -> int:
-    for move_idx, move in enumerate(available_moves):
-        if move is selected_move:
-            return move_idx
-
-    selected_id = Move.retrieve_id(selected_move.id)
-    matching_indices = [
-        move_idx
-        for move_idx, move in enumerate(available_moves)
-        if Move.retrieve_id(move.id) == selected_id
-    ]
-    if len(matching_indices) == 1:
-        return matching_indices[0]
-
-    raise RuntimeError(
-        f"Legal move order referenced {selected_move.id!r}, but it was not uniquely present in "
-        "battle.available_moves for this slot. This indicates valid_orders and available_moves "
-        "are out of sync."
-    )
+    action_orders[action_idx] = order
+    mask[action_idx] = True
+    joined_orders.append(order)
+    action_by_order_id[id(order)] = action_idx
 
 
 def _request_move_entry(move: Move, battle: DoubleBattle, slot: int) -> dict | None:

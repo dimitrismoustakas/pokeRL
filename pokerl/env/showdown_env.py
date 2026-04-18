@@ -70,6 +70,49 @@ class _TimingStats:
             self._values.clear()
 
 
+class LoopThread:
+    def __init__(self, loop: asyncio.AbstractEventLoop, thread: Thread):
+        self.loop = loop
+        self.thread = thread
+        self._closed = False
+
+    @classmethod
+    def start(cls) -> "LoopThread":
+        def run_loop(loop: asyncio.AbstractEventLoop):
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        loop = asyncio.new_event_loop()
+        thread = Thread(target=run_loop, args=(loop,), daemon=True)
+        thread.start()
+        return cls(loop, thread)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        async def _cancel_pending() -> None:
+            current_task = asyncio.current_task()
+            pending_tasks = [task for task in asyncio.all_tasks() if task is not current_task]
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            await asyncio.get_running_loop().shutdown_asyncgens()
+
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_pending(), self.loop).result(timeout=2.0)
+        except (CancelledError, TimeoutError):
+            pass
+
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if not self.loop.is_running():
+            self.loop.close()
+        self._closed = True
+
+
 class _AsyncQueue(Generic[QueueItemT]):
     def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int = 0):
         self.queue = create_in_poke_loop(asyncio.Queue, loop, maxsize)
@@ -257,7 +300,8 @@ class BattleEnv:
         self.config = config
         self.game_data = game_data
         self._battle_task = None
-        self._loop, self._thread = self._start_event_loop()
+        self._loop_thread = LoopThread.start()
+        self._loop = self._loop_thread.loop
         self._pending_opponent: Player | None = None
         self._closed = False
         self._battle_started_at: float | None = None
@@ -429,17 +473,6 @@ class BattleEnv:
     @property
     def last_battle(self) -> DoubleBattle | None:
         return self.player.last_battle
-
-    @staticmethod
-    def _start_event_loop() -> tuple[asyncio.AbstractEventLoop, Thread]:
-        def run_loop(loop):
-            asyncio.set_event_loop(loop)
-            loop.run_forever()
-
-        loop = asyncio.new_event_loop()
-        thread = Thread(target=run_loop, args=(loop,), daemon=True)
-        thread.start()
-        return loop, thread
 
     def set_next_opponent(self, opponent_factory: OpponentFactory):
         prebuild_started = time.perf_counter()
@@ -674,14 +707,9 @@ class BattleEnv:
         if self._pending_opponent is not None:
             self._disconnect_player(self._pending_opponent, self._loop)
 
-        self._cancel_pending_tasks()
         self.player.obs_queue.clear()
         self.player.action_queue.clear()
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        if not self._loop.is_running():
-            self._loop.close()
+        self._loop_thread.close()
 
         self._battle_task = None
         self._pending_opponent = None
@@ -692,21 +720,6 @@ class BattleEnv:
         self._active_preview_obs = None
         self._active_preview_future = None
         self._closed = True
-
-    def _cancel_pending_tasks(self) -> None:
-        async def _cancel_pending() -> None:
-            current_task = asyncio.current_task()
-            pending_tasks = [task for task in asyncio.all_tasks() if task is not current_task]
-            for task in pending_tasks:
-                task.cancel()
-            if pending_tasks:
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
-            await asyncio.get_running_loop().shutdown_asyncgens()
-
-        try:
-            asyncio.run_coroutine_threadsafe(_cancel_pending(), self._loop).result(timeout=2.0)
-        except (CancelledError, TimeoutError):
-            pass
 
     @staticmethod
     def _disconnect_player(player: Player, loop: asyncio.AbstractEventLoop) -> None:
