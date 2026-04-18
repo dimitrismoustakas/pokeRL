@@ -5,7 +5,7 @@ import copy
 import json
 import random
 import time
-from collections import defaultdict, deque
+from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,9 +166,10 @@ class _LeagueInferenceService:
                 batch = self._pending
                 self._pending = []
 
-            grouped: dict[tuple[str, str], list[_InferenceRequest]] = defaultdict(list)
+            grouped: dict[tuple[str, str], list[_InferenceRequest]] = {}
             for request in batch:
-                grouped[(request.checkpoint_path, request.kind)].append(request)
+                key = (request.checkpoint_path, request.kind)
+                grouped.setdefault(key, []).append(request)
 
             for (checkpoint_path, kind), requests in grouped.items():
                 try:
@@ -451,6 +452,7 @@ class League:
         self,
         loop: asyncio.AbstractEventLoop,
         server_url: str | None = None,
+        checkpoint_path: str | None = None,
     ) -> "LeaguePlayer | None":
         """Create a LeaguePlayer from a sampled checkpoint.
 
@@ -462,9 +464,10 @@ class League:
 
         Returns None if the league is empty.
         """
-        path = self.sample_checkpoint_path()
+        path = checkpoint_path if checkpoint_path is not None else self.sample_checkpoint_path()
         if path is None:
             return None
+        self._inference.ensure_checkpoint(path)
 
         url = server_url if server_url is not None else self.env_config.server_url
         host, port = url.split(":")
@@ -521,10 +524,10 @@ class League:
 
     def _sample_checkpoint(self) -> str | None:
         """Sample a checkpoint path. 70% recent half, 30% older half."""
-        if not self.checkpoints:
+        checkpoints = list(self.checkpoints)
+        if not checkpoints:
             return None
 
-        checkpoints = list(self.checkpoints)
         mid = len(checkpoints) // 2
 
         if len(checkpoints) < 2 or random.random() < 0.7:
