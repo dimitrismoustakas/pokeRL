@@ -42,14 +42,15 @@ class _LeagueInferenceService:
     tiny GPU forward per environment thread.
     """
 
-    # A short coalescing window lets more same-checkpoint requests land in the
-    # same GPU batch once the league pool grows, without changing policy
-    # semantics or opponent sampling.
-    _COALESCE_WINDOW_SEC = 0.005
-
-    def __init__(self, agent_template: PokeAgent, device: torch.device):
+    def __init__(
+        self,
+        agent_template: PokeAgent,
+        device: torch.device,
+        coalesce_window_sec: float,
+    ):
         self._agent_template = agent_template
         self._device = device
+        self._coalesce_window_sec = max(0.0, coalesce_window_sec)
         self._models: dict[str, PokeAgent] = {}
         self._pending: list[_InferenceRequest] = []
         self._closed = False
@@ -156,8 +157,8 @@ class _LeagueInferenceService:
                     self._condition.wait()
                 if self._closed and not self._pending:
                     return
-                if self._COALESCE_WINDOW_SEC > 0:
-                    deadline = time.perf_counter() + self._COALESCE_WINDOW_SEC
+                if self._coalesce_window_sec > 0:
+                    deadline = time.perf_counter() + self._coalesce_window_sec
                     while not self._closed:
                         remaining = deadline - time.perf_counter()
                         if remaining <= 0:
@@ -254,21 +255,15 @@ class _LeagueInferenceService:
         )
 
 
-class LeaguePlayer(Player):
-    """A poke-env player that uses a frozen agent checkpoint to choose moves.
-
-    This is the opponent in self-play: it loads a past version of the agent
-    and plays battles autonomously (no queue bridging needed).
-    """
+class FrozenOpponentPolicy:
+    """Checkpoint-backed opponent logic reusable across transports."""
 
     def __init__(
         self,
         checkpoint_path: str,
         inference_service: _LeagueInferenceService,
         obs_builder: ObservationBuilder,
-        **kwargs,
     ):
-        super().__init__(**kwargs)
         self.checkpoint_path = checkpoint_path
         self.inference_service = inference_service
         self.obs_builder = obs_builder
@@ -315,7 +310,7 @@ class LeaguePlayer(Player):
         self._add_timing("opponent_precompute_preview_submit_sec", time.perf_counter() - submit_started)
         self._increment_timing("opponent_precompute_preview_submit_calls")
 
-    def choose_move(self, battle: DoubleBattle):
+    def choose_move(self, battle: DoubleBattle) -> DoubleBattleOrder | PassBattleOrder:
         obs = self.obs_builder.build(battle)
         self._commit_hidden_if_battle_advanced(obs)
         action_state = build_legal_action_state(battle)
@@ -334,7 +329,7 @@ class LeaguePlayer(Player):
             orders.append(action_to_order(int(actions[slot]), battle, slot, action_state=action_state))
 
         if all(isinstance(order, PassBattleOrder) for order in orders):
-            return self.choose_default_move()
+            return PassBattleOrder()
         return DoubleBattleOrder(orders[0], orders[1])
 
     def teampreview(self, battle: DoubleBattle) -> str:
@@ -369,7 +364,6 @@ class LeaguePlayer(Player):
         raise RuntimeError("Prepared opponent team preview observation did not match the live battle state.")
 
     def reset_hidden(self):
-        """Clear LSTM state between battles. Called by BattleEnv.reset()."""
         self._hidden = None
         self._pending_hidden = None
         self._pending_battle_obs = None
@@ -416,6 +410,97 @@ class LeaguePlayer(Player):
             timing.increment(key, delta)
 
 
+class LeaguePlayer(Player):
+    """A poke-env player that uses a frozen agent checkpoint to choose moves.
+
+    This is the opponent in self-play: it loads a past version of the agent
+    and plays battles autonomously (no queue bridging needed).
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        inference_service: _LeagueInferenceService,
+        obs_builder: ObservationBuilder,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._policy = FrozenOpponentPolicy(checkpoint_path, inference_service, obs_builder)
+
+    @property
+    def checkpoint_path(self) -> str:
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            return policy.checkpoint_path
+        return self.__dict__["checkpoint_path"]
+
+    @checkpoint_path.setter
+    def checkpoint_path(self, value: str) -> None:
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            policy.checkpoint_path = value
+        else:
+            self.__dict__["checkpoint_path"] = value
+
+    def stage_checkpoint(self, checkpoint_path: str) -> None:
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            policy.stage_checkpoint(checkpoint_path)
+        else:
+            FrozenOpponentPolicy.stage_checkpoint(self, checkpoint_path)
+
+    def apply_staged_checkpoint(self) -> bool:
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            return policy.apply_staged_checkpoint()
+        return FrozenOpponentPolicy.apply_staged_checkpoint(self)
+
+    def set_timing(self, timing) -> None:
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            policy.set_timing(timing)
+        else:
+            FrozenOpponentPolicy.set_timing(self, timing)
+
+    def prepare_team_preview(self, own_packed_team: str, opponent_packed_team: str) -> None:
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            policy.prepare_team_preview(own_packed_team, opponent_packed_team)
+        else:
+            FrozenOpponentPolicy.prepare_team_preview(self, own_packed_team, opponent_packed_team)
+
+    def choose_move(self, battle: DoubleBattle):
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            order = policy.choose_move(battle)
+        else:
+            order = FrozenOpponentPolicy.choose_move(self, battle)
+        if isinstance(order, PassBattleOrder):
+            return self.choose_default_move()
+        return order
+
+    def teampreview(self, battle: DoubleBattle) -> str:
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            return policy.teampreview(battle)
+        return FrozenOpponentPolicy.teampreview(self, battle)
+
+    def reset_hidden(self):
+        """Clear LSTM state between battles. Called by BattleEnv.reset()."""
+        policy = getattr(self, "_policy", None)
+        if policy is not None:
+            policy.reset_hidden()
+        else:
+            FrozenOpponentPolicy.reset_hidden(self)
+
+    _obs_equal = staticmethod(FrozenOpponentPolicy._obs_equal)
+    _clone_obs = staticmethod(FrozenOpponentPolicy._clone_obs)
+    _commit_hidden_if_battle_advanced = FrozenOpponentPolicy._commit_hidden_if_battle_advanced
+    _record_preview_obs_mismatch = FrozenOpponentPolicy._record_preview_obs_mismatch
+    _add_timing = FrozenOpponentPolicy._add_timing
+    _increment_timing = FrozenOpponentPolicy._increment_timing
+
+
 class League:
     """Manages a pool of opponent checkpoints for self-play training.
 
@@ -438,7 +523,11 @@ class League:
         self.agent_template = agent_template
         self.device = device
         self.checkpoints: deque[str] = deque(maxlen=config.league_size)
-        self._inference = _LeagueInferenceService(agent_template, device)
+        self._inference = _LeagueInferenceService(
+            agent_template,
+            device,
+            coalesce_window_sec=config.league_coalesce_ms / 1000.0,
+        )
 
     def add_checkpoint(self, agent: PokeAgent, step: int):
         """Snapshot the current agent as a new league member."""
@@ -488,6 +577,17 @@ class League:
             log_level=showdown_log_level(),
             loop=loop,
         )
+
+    def make_local_policy(
+        self,
+        checkpoint_path: str | None = None,
+    ) -> FrozenOpponentPolicy | None:
+        path = checkpoint_path if checkpoint_path is not None else self.sample_checkpoint_path()
+        if path is None:
+            return None
+        self._inference.ensure_checkpoint(path)
+        obs_builder = ObservationBuilder(self.game_data, self.env_config.team_size)
+        return FrozenOpponentPolicy(path, self._inference, obs_builder)
 
     def sample_checkpoint_path(self) -> str | None:
         path = self._sample_checkpoint()

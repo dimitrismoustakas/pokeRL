@@ -25,6 +25,11 @@ from pokerl.env.showdown_env import (
     BattleEnv,
     ParallelBattleEnv,
 )
+from pokerl.env.local_showdown import (
+    LocalBattleEnv,
+    LocalShowdownWorkerPool,
+    default_showdown_install_dir,
+)
 from pokerl.team_pool import TeamPool, default_team_pool_manifest_path, load_team_pool
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
@@ -56,6 +61,29 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated server URLs to shard envs across, for example localhost:8000,localhost:8001.",
     )
     parser.add_argument(
+        "--showdown-transport",
+        choices=["remote", "local"],
+        default=None,
+        help="Use remote websocket servers or local BattleStream workers.",
+    )
+    parser.add_argument(
+        "--showdown-install-dir",
+        default=None,
+        help="Local Pokemon Showdown install directory used by the local worker transport.",
+    )
+    parser.add_argument(
+        "--local-workers",
+        type=int,
+        default=None,
+        help="How many local BattleStream worker processes to run when --showdown-transport=local.",
+    )
+    parser.add_argument(
+        "--local-opponent-shards",
+        type=int,
+        default=None,
+        help="How many logical opponent-refresh shards to use in local transport mode.",
+    )
+    parser.add_argument(
         "--team-pool-format",
         default=None,
         help="Load teams from data/team_pools/<format>/manifest.json.",
@@ -84,6 +112,18 @@ def parse_args() -> argparse.Namespace:
         help="Override league checkpoint and opponent refresh frequency in updates.",
     )
     parser.add_argument(
+        "--league-size",
+        type=int,
+        default=None,
+        help="Override how many frozen checkpoints are retained in the self-play league.",
+    )
+    parser.add_argument(
+        "--league-coalesce-ms",
+        type=float,
+        default=None,
+        help="Override the league-opponent inference coalescing window in milliseconds.",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
@@ -110,6 +150,18 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     if args.num_envs is not None:
         env_config.num_envs = args.num_envs
 
+    if args.showdown_transport is not None:
+        env_config.showdown_transport = args.showdown_transport
+
+    if args.showdown_install_dir is not None:
+        env_config.showdown_install_dir = args.showdown_install_dir
+
+    if args.local_workers is not None:
+        env_config.local_worker_count = args.local_workers
+
+    if args.local_opponent_shards is not None:
+        env_config.local_opponent_shards = args.local_opponent_shards
+
     if args.team_size is not None:
         env_config.team_size = args.team_size
 
@@ -125,7 +177,9 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "log_interval": args.log_interval,
         "save_interval": args.save_interval,
         "checkpoint_dir": args.checkpoint_dir,
+        "league_size": args.league_size,
         "league_update_interval": args.league_update_interval,
+        "league_coalesce_ms": args.league_coalesce_ms,
     }
     for field_name, value in overrides.items():
         if value is not None:
@@ -151,6 +205,22 @@ def make_league_opponent_factory(
             server_url=server_url,
             checkpoint_path=checkpoint_path,
         )
+        if opponent is None:
+            raise RuntimeError(
+                "League opponent requested, but the league is empty. "
+                "This should not happen if the league was seeded before training."
+            )
+        return opponent
+
+    return league_factory
+
+
+def make_local_league_opponent_factory(
+    league: League,
+    checkpoint_path: str | None = None,
+):
+    def league_factory():
+        opponent = league.make_local_policy(checkpoint_path=checkpoint_path)
         if opponent is None:
             raise RuntimeError(
                 "League opponent requested, but the league is empty. "
@@ -241,20 +311,46 @@ def make_envs(
 ) -> ParallelBattleEnv:
     """Create parallel battle environments backed by league opponents."""
     envs = []
+    close_callbacks = []
+    worker_pool = None
+    if env_config.showdown_transport == "local":
+        worker_count = env_config.local_worker_count
+        opponent_shards = env_config.local_opponent_shards
+        if opponent_shards <= 0:
+            raise ValueError("local_opponent_shards must be positive.")
+        install_dir = env_config.showdown_install_dir or default_showdown_install_dir()
+        worker_pool = LocalShowdownWorkerPool(install_dir=install_dir, worker_count=worker_count)
+        close_callbacks.append(worker_pool.close)
     for i in range(env_config.num_envs):
-        env_server_url = server_urls[i % len(server_urls)]
+        env_server_url = server_urls[i % len(server_urls)] if server_urls else env_config.server_url
         env_instance_config = replace(env_config, server_url=env_server_url)
-        opponent_factory = make_league_opponent_factory(env_instance_config, league)
-        env = BattleEnv(
-            env_instance_config,
-            game_data,
-            opponent_factory,
-            team_preview_fn=team_preview_fn,
-            team_preview_batcher=team_preview_batcher,
-            team_pair_provider=team_pair_provider,
-        )
+        if env_config.showdown_transport == "local":
+            assert worker_pool is not None
+            worker, worker_index = worker_pool.worker_for_env(i)
+            opponent_factory = make_local_league_opponent_factory(league)
+            env = LocalBattleEnv(
+                env_instance_config,
+                game_data,
+                opponent_factory,
+                worker=worker,
+                worker_index=worker_index,
+                env_index=i,
+                opponent_shard_key=f"local-shard:{i % opponent_shards}",
+                team_preview_fn=team_preview_fn,
+                team_pair_provider=team_pair_provider,
+            )
+        else:
+            opponent_factory = make_league_opponent_factory(env_instance_config, league)
+            env = BattleEnv(
+                env_instance_config,
+                game_data,
+                opponent_factory,
+                team_preview_fn=team_preview_fn,
+                team_preview_batcher=team_preview_batcher,
+                team_pair_provider=team_pair_provider,
+            )
         envs.append(env)
-    return ParallelBattleEnv(envs)
+    return ParallelBattleEnv(envs, close_callbacks=close_callbacks)
 
 
 def _sample_refresh_assignments(
@@ -264,8 +360,8 @@ def _sample_refresh_assignments(
     assignments: list[tuple[BattleEnv, str]] = []
     checkpoint_by_server: dict[str, str] = {}
     for env in parallel_env.envs:
-        server_url = env.config.server_url
-        checkpoint_path = checkpoint_by_server.get(server_url)
+        shard_key = getattr(env, "opponent_shard_key", env.config.server_url)
+        checkpoint_path = checkpoint_by_server.get(shard_key)
         if checkpoint_path is None:
             checkpoint_path = league.sample_checkpoint_path()
             if checkpoint_path is None:
@@ -273,7 +369,7 @@ def _sample_refresh_assignments(
                     "League opponent refresh requested, but the league is empty. "
                     "This should not happen if the league was seeded before training."
                 )
-            checkpoint_by_server[server_url] = checkpoint_path
+            checkpoint_by_server[shard_key] = checkpoint_path
         assignments.append((env, checkpoint_path))
     return assignments
 
@@ -289,9 +385,14 @@ def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
     for env, checkpoint_path in assignments:
         if env.stage_next_opponent_checkpoint(checkpoint_path):
             continue
-        env.set_next_opponent(
-            make_league_opponent_factory(env.config, league, checkpoint_path=checkpoint_path)
-        )
+        if env.config.showdown_transport == "local":
+            env.set_next_opponent(
+                make_local_league_opponent_factory(league, checkpoint_path=checkpoint_path)
+            )
+        else:
+            env.set_next_opponent(
+                make_league_opponent_factory(env.config, league, checkpoint_path=checkpoint_path)
+            )
 
 
 def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -308,6 +409,10 @@ def clone_hidden_state(
 
 def _league_state_path(train_config: TrainingConfig) -> str:
     return f"{train_config.checkpoint_dir}/league_state.json"
+
+
+def _league_state_path_for_resume(resume_checkpoint: str) -> Path:
+    return Path(resume_checkpoint).resolve().with_name("league_state.json")
 
 
 def _json_ready_metrics(metrics: dict[str, float]) -> dict[str, float]:
@@ -333,7 +438,17 @@ def train():
 
     model_config, env_config, train_config = build_configs(args)
     server_urls = parse_server_urls(args.server_urls, env_config.server_url)
-    ensure_server_urls_ready(server_urls)
+    transport_shard_label = "Workers" if env_config.showdown_transport == "local" else "Servers"
+    transport_shard_count = (
+        env_config.local_worker_count if env_config.showdown_transport == "local" else len(server_urls)
+    )
+    if env_config.showdown_transport == "local":
+        if args.local_workers is None:
+            env_config.local_worker_count = len(server_urls)
+        if env_config.showdown_install_dir is None:
+            env_config.showdown_install_dir = default_showdown_install_dir()
+    else:
+        ensure_server_urls_ready(server_urls)
     team_pool = load_requested_team_pool(args)
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
@@ -363,12 +478,12 @@ def train():
         trainer.load(args.resume)
         print(f"Resumed trainer from {args.resume!r} (global step {trainer.global_step:,})")
 
-        league_state = _league_state_path(train_config)
-        if Path(league_state).exists():
+        league_state = _league_state_path_for_resume(args.resume)
+        if league_state.exists():
             league.load_state(league_state)
-            print(f"Restored league: {len(league.checkpoints)} checkpoint(s)")
+            print(f"Restored league from {league_state!s}: {len(league.checkpoints)} checkpoint(s)")
         else:
-            print("Warning: no league state file found alongside checkpoint — league starts empty.")
+            print("Warning: no league state file found alongside resumed checkpoint — league starts empty.")
 
     # --- Seed league so self-play is available from update 1 ---
     # If resuming, this only runs when the league file was missing (edge case).
@@ -394,6 +509,10 @@ def train():
         "config": {
             "device": str(device),
             "battle_format": env_config.battle_format,
+            "showdown_transport": env_config.showdown_transport,
+            "showdown_install_dir": env_config.showdown_install_dir,
+            "local_worker_count": env_config.local_worker_count,
+            "local_opponent_shards": env_config.local_opponent_shards,
             "num_envs": env_config.num_envs,
             "team_size": env_config.team_size,
             "pick_size": env_config.pick_size,
@@ -429,7 +548,12 @@ def train():
 
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")
-        print(f"Server URLs: {', '.join(server_urls)}")
+        if env_config.showdown_transport == "local":
+            print(f"Local workers: {env_config.local_worker_count}")
+            print(f"Local opponent shards: {env_config.local_opponent_shards}")
+            print(f"Showdown install: {env_config.showdown_install_dir}")
+        else:
+            print(f"Server URLs: {', '.join(server_urls)}")
         print(f"Initial reset: {initial_reset_sec:.2f}s")
         if updates_done:
             print(f"Resuming from update {updates_done + 1} / {num_updates}")
@@ -489,6 +613,15 @@ def train():
                     actions = actions_t.cpu().numpy()
                     hidden = out["hidden"]
                     rollout_profile["policy_postprocess_sec"] += time.perf_counter() - policy_post_started
+                    if device.type == "cpu":
+                        obs_for_buffer = {
+                            key: value.detach().clone()
+                            for key, value in obs_t.items()
+                        }
+                        masks_for_buffer = masks_t.detach().clone()
+                    else:
+                        obs_for_buffer = obs_t
+                        masks_for_buffer = masks_t
 
                 env_step_started = time.perf_counter()
                 next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
@@ -500,7 +633,15 @@ def train():
                 rollout_profile["feedback_to_device_sec"] += time.perf_counter() - feedback_device_started
 
                 buffer_started = time.perf_counter()
-                buffer.add(obs_t, actions_t, masks_t, log_probs_t, values_t, rewards_t, dones_t)
+                buffer.add(
+                    obs_for_buffer,
+                    actions_t,
+                    masks_for_buffer,
+                    log_probs_t,
+                    values_t,
+                    rewards_t,
+                    dones_t,
+                )
                 rollout_profile["buffer_add_sec"] += time.perf_counter() - buffer_started
 
                 # Reset hidden state for done environments
@@ -646,7 +787,7 @@ def train():
                     f"Update {update}/{num_updates} | "
                     f"Step {trainer.global_step:,} | "
                     f"Envs {env_config.num_envs} | "
-                    f"Servers {len(server_urls)} | "
+                    f"{transport_shard_label} {transport_shard_count} | "
                     f"Avg SPS {sps:.0f} | "
                     f"Upd SPS {update_steps_per_second:.0f} | "
                     f"Rollout {rollout_sec:.2f}s | "

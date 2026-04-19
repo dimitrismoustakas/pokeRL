@@ -1,6 +1,11 @@
+from pathlib import Path
 from types import SimpleNamespace
 
-from scripts.train import _sample_refresh_assignments, make_league_opponent_factory
+from scripts.train import (
+    _league_state_path_for_resume,
+    _sample_refresh_assignments,
+    make_league_opponent_factory,
+)
 
 
 def test_sample_refresh_assignments_groups_by_server() -> None:
@@ -9,6 +14,39 @@ def test_sample_refresh_assignments_groups_by_server() -> None:
         SimpleNamespace(config=SimpleNamespace(server_url="localhost:8001")),
         SimpleNamespace(config=SimpleNamespace(server_url="localhost:8000")),
         SimpleNamespace(config=SimpleNamespace(server_url="localhost:8001")),
+    ]
+    parallel_env = SimpleNamespace(envs=envs)
+    samples = iter(["step_a.pt", "step_b.pt"])
+    league = SimpleNamespace(sample_checkpoint_path=lambda: next(samples))
+
+    assignments = _sample_refresh_assignments(parallel_env, league)
+
+    assert assignments == [
+        (envs[0], "step_a.pt"),
+        (envs[1], "step_b.pt"),
+        (envs[2], "step_a.pt"),
+        (envs[3], "step_b.pt"),
+    ]
+
+
+def test_sample_refresh_assignments_prefers_opponent_shard_key() -> None:
+    envs = [
+        SimpleNamespace(
+            config=SimpleNamespace(server_url="localhost:8000"),
+            opponent_shard_key="local-shard:0",
+        ),
+        SimpleNamespace(
+            config=SimpleNamespace(server_url="localhost:8000"),
+            opponent_shard_key="local-shard:1",
+        ),
+        SimpleNamespace(
+            config=SimpleNamespace(server_url="localhost:8001"),
+            opponent_shard_key="local-shard:0",
+        ),
+        SimpleNamespace(
+            config=SimpleNamespace(server_url="localhost:8001"),
+            opponent_shard_key="local-shard:1",
+        ),
     ]
     parallel_env = SimpleNamespace(envs=envs)
     samples = iter(["step_a.pt", "step_b.pt"])
@@ -38,3 +76,9 @@ def test_make_league_opponent_factory_passes_forced_checkpoint() -> None:
     factory("loop-token")
 
     assert calls == [("loop-token", "localhost:8000", "step_123.pt")]
+
+
+def test_league_state_path_for_resume_uses_checkpoint_parent() -> None:
+    resume_path = r"C:\tmp\run_a\final.pt"
+
+    assert _league_state_path_for_resume(resume_path) == Path(resume_path).with_name("league_state.json")

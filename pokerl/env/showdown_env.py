@@ -743,13 +743,14 @@ class ParallelBattleEnv:
     and collects results. Environments that finish are auto-reset.
     """
 
-    def __init__(self, envs: list[BattleEnv]):
+    def __init__(self, envs: list[BattleEnv], close_callbacks: list[Callable[[], None]] | None = None):
         self.envs = envs
         self.num_envs = len(envs)
         self._executor = ThreadPoolExecutor(max_workers=self.num_envs)
         self._timing = _TimingStats()
         self._obs_batch_buffers: dict[str, np.ndarray] | None = None
         self._mask_batch_buffer: np.ndarray | None = None
+        self._close_callbacks = list(close_callbacks or [])
 
     def reset(self) -> tuple[dict, np.ndarray]:
         """Reset all environments and return batched obs + masks."""
@@ -814,6 +815,8 @@ class ParallelBattleEnv:
         for env in self.envs:
             env.close()
         self._executor.shutdown(wait=True, cancel_futures=True)
+        for callback in self._close_callbacks:
+            callback()
 
     def wait_for_prepared_team_previews(self) -> None:
         list(self._executor.map(lambda env: env.wait_for_prepared_team_preview(), self.envs))

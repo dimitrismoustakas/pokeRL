@@ -34,6 +34,10 @@ class ModelConfig:
 class EnvConfig:
     battle_format: str = "gen9randomdoublesbattle"
     server_url: str = "localhost:8000"
+    showdown_transport: str = "remote"  # "remote" or "local"
+    showdown_install_dir: str | None = None
+    local_worker_count: int = 2
+    local_opponent_shards: int = 2
     num_envs: int = 16
     team_size: int = 6
     pick_size: int = 4  # how many pokemon to bring from team_size
@@ -62,5 +66,6 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
 
     # League
-    league_size: int = 20
-    league_update_interval: int = 50
+    league_size: int = 12
+    league_update_interval: int = 10
+    league_coalesce_ms: float = 10.0
