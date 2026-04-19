@@ -306,7 +306,7 @@ class ModelPolicyController:
         obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(self.device) for key, value in obs.items()}
 
         with torch.inference_mode():
-            context, _, own_reps, _ = self.agent.spatial(obs_t)
+            context, _, own_reps, _, _ = self.agent.spatial(obs_t)
             context, _ = self.agent.memory(context, None)
             preview_out = self._team_preview_forward(context, own_reps)
 
@@ -321,7 +321,7 @@ class ModelPolicyController:
         masks_t = torch.from_numpy(masks).unsqueeze(0).to(device=self.device, dtype=torch.bool)
 
         with torch.inference_mode():
-            context, active_reps, own_reps, opp_active_reps = self.agent.spatial(obs_t)
+            context, active_reps, own_reps, _, opp_active_reps = self.agent.spatial(obs_t)
             context, new_hidden = self.agent.memory(context, self.hidden)
             action_out = self.agent.action_head(
                 context,

@@ -281,6 +281,48 @@ class TeamPreviewHead(nn.Module):
         }
 
 
+class OpponentPreviewHead(nn.Module):
+    """Auxiliary opponent-model head used to shape preview representations."""
+
+    def __init__(self, pokemon_dim: int, context_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.bring_score = nn.Sequential(
+            nn.Linear(pokemon_dim + context_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.lead_pair_score = nn.Sequential(
+            nn.Linear(context_dim + pokemon_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        pokemon_reps: torch.Tensor,
+        context: torch.Tensor,
+        team_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        batch_size, team_size, pokemon_dim = pokemon_reps.shape
+        context_expanded = context.unsqueeze(1).expand(-1, team_size, -1)
+        bring_logits = self.bring_score(torch.cat([pokemon_reps, context_expanded], dim=-1)).squeeze(-1)
+
+        left = pokemon_reps.unsqueeze(2).expand(-1, team_size, team_size, -1)
+        right = pokemon_reps.unsqueeze(1).expand(-1, team_size, team_size, -1)
+        pair_context = context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        lead_pair_logits = self.lead_pair_score(torch.cat([left, right, pair_context], dim=-1)).squeeze(-1)
+
+        invalid_pairs = torch.eye(team_size, dtype=torch.bool, device=context.device).unsqueeze(0)
+        if team_mask is not None:
+            invalid_pairs = invalid_pairs | team_mask.unsqueeze(1) | team_mask.unsqueeze(2)
+        lead_pair_logits = lead_pair_logits.masked_fill(invalid_pairs, -1e8).reshape(batch_size, team_size * team_size)
+
+        return {
+            "opponent_bring_logits": bring_logits,
+            "opponent_lead_pair_logits": lead_pair_logits,
+        }
+
+
 class ValueHead(nn.Module):
     """Estimates V(s) -- the probability of winning from the current state."""
 

@@ -428,6 +428,8 @@ def train():
             "num_epochs": train_config.num_epochs,
             "num_minibatches": train_config.num_minibatches,
             "bptt_chunk_steps": train_config.bptt_chunk_steps,
+            "team_preview_bring_coef": train_config.team_preview_bring_coef,
+            "team_preview_lead_coef": train_config.team_preview_lead_coef,
             "total_timesteps": train_config.total_timesteps,
             "server_urls": server_urls,
             "team_pool": team_pool.describe() if team_pool is not None else None,
@@ -483,7 +485,7 @@ def train():
             update_episode_opponent_repeated_turn_requests: list[int] = []
             update_episode_opponent_max_calls_same_turn: list[int] = []
             update_pathological_episodes: list[dict[str, object]] = []
-            team_preview_data: list[tuple[dict, np.ndarray, float]] = []
+            team_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
             rollout_profile = {
                 "obs_to_device_sec": 0.0,
                 "mask_to_device_sec": 0.0,
@@ -563,8 +565,17 @@ def train():
                         episode_rewards.append(reward)
                         update_episode_rewards.append(reward)
                         if "team_preview_obs" in info:
+                            if "opponent_team_preview_picks" not in info:
+                                raise RuntimeError(
+                                    "Episode recorded a team preview decision without opponent preview labels."
+                                )
                             team_preview_data.append(
-                                (info["team_preview_obs"], info["team_preview_picks"], reward)
+                                (
+                                    info["team_preview_obs"],
+                                    info["team_preview_picks"],
+                                    reward,
+                                    info["opponent_team_preview_picks"],
+                                )
                             )
                     if "episode_sec" in info:
                         update_episode_secs.append(info["episode_sec"])
@@ -617,7 +628,7 @@ def train():
             ppo_started = time.perf_counter()
             metrics = trainer.update(batch)
             if team_preview_data:
-                metrics["team_preview_loss"] = trainer.update_team_preview(team_preview_data)
+                metrics.update(trainer.update_team_preview(team_preview_data))
             ppo_sec = time.perf_counter() - ppo_started
             parallel_env.refresh_prepared_team_previews()
 

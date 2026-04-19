@@ -9,9 +9,10 @@ from poke_env.teambuilder.teambuilder import Teambuilder
 from ..data import GameData, UNKNOWN_IDX
 
 
-# Continuous features per pokemon: hp(1) + status_one_hot(7) + stat_stages(7)
-# + volatiles(16) + move_pp(4) = 35 total. Must match PokemonEncoder continuous_dim.
-CONTINUOUS_DIM = 35
+NUM_STATUS = 7
+NUM_BOOSTS = 7
+NUM_MOVE_SLOTS = 4
+NUM_EXTRA_POKEMON_FEATURES = 9
 
 WEATHER_TYPES = [
     Weather.SUNNYDAY, Weather.DESOLATELAND, Weather.RAINDANCE,
@@ -28,7 +29,11 @@ FIELD_TIMER_CAPS = {
     "screen": 8,
     "tailwind": 4,
     "trick_room": 5,
+    "turn": 20,
 }
+
+PROTECT_COUNTER_CAP = 4
+STATUS_COUNTER_CAP = 8
 
 # Volatile effects to track as binary flags.
 # Each entry is either a single Effect or a frozenset of Effects (any match = True).
@@ -56,14 +61,48 @@ NUM_VOLATILES = len(VOLATILES)
 # Status conditions for one-hot encoding
 STATUS_LIST = [None, Status.BRN, Status.FRZ, Status.PAR, Status.PSN, Status.SLP, Status.TOX]
 
+HP_OFFSET = 0
+STATUS_OFFSET = HP_OFFSET + 1
+BOOSTS_OFFSET = STATUS_OFFSET + NUM_STATUS
+VOLATILES_OFFSET = BOOSTS_OFFSET + NUM_BOOSTS
+MOVE_PP_OFFSET = VOLATILES_OFFSET + NUM_VOLATILES
+EXTRA_FEATURES_OFFSET = MOVE_PP_OFFSET + NUM_MOVE_SLOTS
+
+PROTECT_COUNTER_OFFSET = EXTRA_FEATURES_OFFSET + 0
+STATUS_COUNTER_OFFSET = EXTRA_FEATURES_OFFSET + 1
+FIRST_TURN_OFFSET = EXTRA_FEATURES_OFFSET + 2
+REVEALED_OFFSET = EXTRA_FEATURES_OFFSET + 3
+KNOWN_MOVE_COUNT_OFFSET = EXTRA_FEATURES_OFFSET + 4
+ABILITY_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 5
+ITEM_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 6
+TERA_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 7
+TERASTALLIZED_OFFSET = EXTRA_FEATURES_OFFSET + 8
+
+# Continuous features per pokemon:
+# hp(1) + status_one_hot(7) + stat_stages(7) + volatiles(16) + move_pp(4)
+# + explicit legal state/history features(9) = 44 total.
+# Must match PokemonEncoder continuous_dim.
+CONTINUOUS_DIM = EXTRA_FEATURES_OFFSET + NUM_EXTRA_POKEMON_FEATURES
+
+FIELD_WEATHER_OFFSET = 0
+FIELD_TERRAIN_OFFSET = 10
+FIELD_OWN_SIDE_OFFSET = 16
+FIELD_OPP_SIDE_OFFSET = 24
+FIELD_TRICK_ROOM_OFFSET = 32
+FIELD_USED_TERA_OFFSET = 33
+FIELD_OPPONENT_USED_TERA_OFFSET = 34
+FIELD_TURN_OFFSET = 35
+
 # Role indices
 ROLE_ACTIVE_1 = 0
 ROLE_ACTIVE_2 = 1
 ROLE_BENCH = 2
 
-assert 1 + 7 + 7 + NUM_VOLATILES + 4 == CONTINUOUS_DIM, (
+assert 1 + NUM_STATUS + NUM_BOOSTS + NUM_VOLATILES + NUM_MOVE_SLOTS + NUM_EXTRA_POKEMON_FEATURES == CONTINUOUS_DIM, (
     f"CONTINUOUS_DIM={CONTINUOUS_DIM} does not match the actual feature count "
-    f"(1 + 7 + 7 + {NUM_VOLATILES} + 4 = {1 + 7 + 7 + NUM_VOLATILES + 4}). "
+    "(1 + "
+    f"{NUM_STATUS} + {NUM_BOOSTS} + {NUM_VOLATILES} + {NUM_MOVE_SLOTS} + {NUM_EXTRA_POKEMON_FEATURES}"
+    f" = {1 + NUM_STATUS + NUM_BOOSTS + NUM_VOLATILES + NUM_MOVE_SLOTS + NUM_EXTRA_POKEMON_FEATURES}). "
     "Update CONTINUOUS_DIM or the feature list."
 )
 
@@ -104,6 +143,7 @@ class ObservationBuilder:
         ts = self.team_size
         species = np.zeros(ts, dtype=np.int64)
         moves = np.zeros((ts, 4), dtype=np.int64)
+        last_move = np.zeros(ts, dtype=np.int64)
         ability = np.zeros(ts, dtype=np.int64)
         item = np.zeros(ts, dtype=np.int64)
         types = np.zeros((ts, 3), dtype=np.int64)
@@ -117,12 +157,19 @@ class ObservationBuilder:
             species[index] = self._species_idx(pokemon)
             ability[index] = self._ability_idx(pokemon)
             item[index] = self._item_idx(pokemon)
+            last_move[index] = self._move_idx(pokemon.last_move.id if pokemon.last_move is not None else None)
             self._fill_type_indices(types[index], pokemon)
             self._fill_continuous_features(continuous[index], pokemon)
-            self._fill_move_features(moves[index], continuous[index, -4:], pokemon, full_info)
+            self._fill_move_features(
+                moves[index],
+                continuous[index, MOVE_PP_OFFSET:MOVE_PP_OFFSET + NUM_MOVE_SLOTS],
+                pokemon,
+                full_info,
+            )
 
         obs[f"{prefix}_species"] = species
         obs[f"{prefix}_moves"] = moves
+        obs[f"{prefix}_last_move"] = last_move
         obs[f"{prefix}_ability"] = ability
         obs[f"{prefix}_item"] = item
         obs[f"{prefix}_types"] = types
@@ -133,6 +180,10 @@ class ObservationBuilder:
     def _species_idx(self, pokemon: Pokemon) -> int:
         key = pokemon.species.lower() if pokemon.species else "<unk>"
         return self.gd.species_to_idx.get(key, UNKNOWN_IDX)
+
+    def _move_idx(self, move_id: str | None) -> int:
+        key = move_id.lower() if move_id else "<unk>"
+        return self.gd.move_to_idx.get(key, UNKNOWN_IDX)
 
     def _ability_idx(self, pokemon: Pokemon) -> int:
         ab = pokemon.ability
@@ -167,8 +218,7 @@ class ObservationBuilder:
         for move_index, move in enumerate(pokemon.moves.values()):
             if move_index >= 4:
                 break
-            key = move.id.lower() if move.id else "<unk>"
-            move_indices[move_index] = self.gd.move_to_idx.get(key, UNKNOWN_IDX)
+            move_indices[move_index] = self._move_idx(move.id)
             if full_info and move.max_pp and move.max_pp > 0:
                 pp_features[move_index] = move.current_pp / move.max_pp
 
@@ -198,6 +248,18 @@ class ObservationBuilder:
                 feats[offset + index] = float(any(effect in effects for effect in volatile))
             else:
                 feats[offset + index] = float(volatile in effects)
+        offset += NUM_VOLATILES
+
+        feats[PROTECT_COUNTER_OFFSET] = self._normalized_counter(pokemon.protect_counter, PROTECT_COUNTER_CAP)
+        feats[STATUS_COUNTER_OFFSET] = self._normalized_counter(pokemon.status_counter, STATUS_COUNTER_CAP)
+        feats[FIRST_TURN_OFFSET] = float(pokemon.first_turn)
+        feats[REVEALED_OFFSET] = float(pokemon.revealed)
+        known_moves = pokemon.moves or {}
+        feats[KNOWN_MOVE_COUNT_OFFSET] = min(len(known_moves), NUM_MOVE_SLOTS) / float(NUM_MOVE_SLOTS)
+        feats[ABILITY_KNOWN_OFFSET] = float(pokemon.ability is not None)
+        feats[ITEM_KNOWN_OFFSET] = float(pokemon.item not in (None, ""))
+        feats[TERA_KNOWN_OFFSET] = float(pokemon.tera_type is not None)
+        feats[TERASTALLIZED_OFFSET] = float(pokemon.is_terastallized)
 
     def _ordered_team_with_roles(
         self,
@@ -252,7 +314,7 @@ class ObservationBuilder:
     @staticmethod
     def _encode_field(battle: DoubleBattle) -> np.ndarray:
         """Encode field conditions into a flat feature vector."""
-        feats = np.zeros(33, dtype=np.float32)
+        feats = np.zeros(FIELD_TURN_OFFSET + 1, dtype=np.float32)
         offset = 0
         current_turn = getattr(battle, "turn", 0)
 
@@ -331,6 +393,17 @@ class ObservationBuilder:
             current_turn,
             FIELD_TIMER_CAPS["trick_room"],
         )
+        offset += 1
+
+        feats[offset] = float(getattr(battle, "used_tera", False))
+        offset += 1
+        feats[offset] = float(getattr(battle, "opponent_used_tera", False))
+        offset += 1
+        feats[offset] = ObservationBuilder._normalized_timer_age(
+            current_turn,
+            0,
+            FIELD_TIMER_CAPS["turn"],
+        )
         return feats
 
     @staticmethod
@@ -350,6 +423,10 @@ class ObservationBuilder:
         turns_active = max(current_turn - started_turn, 0)
         return min(turns_active, timer_cap) / float(timer_cap)
 
+    @staticmethod
+    def _normalized_counter(value: int, cap: int) -> float:
+        return min(max(int(value), 0), cap) / float(cap)
+
 
 class _SyntheticTeamPreviewBattle:
     def __init__(self, own_team: list[Pokemon], opponent_team: list[Pokemon]):
@@ -364,6 +441,8 @@ class _SyntheticTeamPreviewBattle:
         self.side_conditions = {}
         self.opponent_side_conditions = {}
         self.turn = 0
+        self.used_tera = False
+        self.opponent_used_tera = False
 
 
 def build_team_preview_observation(

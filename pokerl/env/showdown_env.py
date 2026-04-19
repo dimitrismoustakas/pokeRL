@@ -22,6 +22,7 @@ from ..config import EnvConfig
 from ..data import GameData
 from ..training.preview import TeamPreviewBatcher
 from .observation import ObservationBuilder, build_team_preview_observation
+from .team_preview import parse_team_preview_order
 from .actions import (
     ACTIONS_PER_SLOT,
     FIRST_SLOT_MASK_ROW,
@@ -317,6 +318,7 @@ class BattleEnv:
         self._active_preview_future: Future | None = None
         # Set at team preview time, read when the episode ends to attach to info.
         self._episode_team_preview: tuple[dict, np.ndarray] | None = None
+        self._episode_opponent_preview_picks: np.ndarray | None = None
         self._episode_opponent_choice_calls = 0
         self._episode_opponent_turn_calls: dict[tuple[str, int], int] = defaultdict(int)
         self._episode_opponent_checkpoint_path: str | None = None
@@ -357,6 +359,7 @@ class BattleEnv:
 
         reset_started = time.perf_counter()
         self._episode_team_preview = None
+        self._episode_opponent_preview_picks = None
         self._episode_opponent_choice_calls = 0
         self._episode_opponent_turn_calls.clear()
         self._episode_opponent_checkpoint_path = getattr(self.opponent, "checkpoint_path", None)
@@ -425,6 +428,8 @@ class BattleEnv:
                 obs_tp, picks_tp = self._episode_team_preview
                 info["team_preview_obs"] = obs_tp
                 info["team_preview_picks"] = picks_tp
+            if self._episode_opponent_preview_picks is not None:
+                info["opponent_team_preview_picks"] = self._episode_opponent_preview_picks
             info["episode_opponent_choice_calls"] = self._episode_opponent_choice_calls
             info["episode_opponent_repeated_turn_requests"] = sum(
                 count - 1 for count in self._episode_opponent_turn_calls.values() if count > 1
@@ -671,6 +676,11 @@ class BattleEnv:
             result = original_teampreview(battle)
             self._timing.increment("opponent_teampreview_calls")
             self._timing.add("opponent_teampreview_sec", time.perf_counter() - started)
+            self._episode_opponent_preview_picks = parse_team_preview_order(
+                result,
+                team_size=self.config.team_size,
+                pick_size=self.config.pick_size,
+            )
             return result
 
         opponent.teampreview = timed_teampreview

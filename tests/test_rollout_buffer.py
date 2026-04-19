@@ -122,12 +122,12 @@ class _DummySpatial(nn.Module):
     def forward(
         self,
         obs: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         context = self.context_proj(obs["context"].float())
         active = self.active_proj(obs["active"].float())
         team = self.team_proj(obs["team"].float())
         opp_active = self.opp_proj(obs["opp_active"].float())
-        return context, active, team, opp_active
+        return context, active, team, team, opp_active
 
 
 class _DummyAgent(nn.Module):
@@ -145,7 +145,7 @@ class _DummyAgent(nn.Module):
         actions: torch.Tensor | None = None,
         action_masks: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        context, active_reps, own_reps, opp_active_reps = self.spatial(obs)
+        context, active_reps, own_reps, _, opp_active_reps = self.spatial(obs)
         context, hidden = self.memory(context, hidden)
         action_out = self.action_head(context, active_reps, own_reps, opp_active_reps, action_masks, actions)
         return {

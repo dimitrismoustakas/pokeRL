@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 
 from ..config import TrainingConfig
@@ -104,7 +105,7 @@ class PPOTrainer:
                     k: v.reshape(T * E_mb, *v.shape[2:])
                     for k, v in mb_obs_seq.items()
                 }
-                context_flat, active_reps_flat, own_reps_flat, opp_active_reps_flat = self.agent.spatial(flat_obs)
+                context_flat, active_reps_flat, own_reps_flat, _, opp_active_reps_flat = self.agent.spatial(flat_obs)
                 context_seq_mb = context_flat.reshape(T, E_mb, -1)
                 active_reps_seq_mb = active_reps_flat.reshape(T, E_mb, 2, -1)
                 own_reps_seq_mb = own_reps_flat.reshape(T, E_mb, own_reps_flat.shape[1], -1)
@@ -194,16 +195,19 @@ class PPOTrainer:
         self.global_step += T * E
         return {k: v / num_updates for k, v in metrics.items()}
 
-    def update_team_preview(self, data: list[tuple[dict, np.ndarray, float]]) -> float:
+    def update_team_preview(
+        self,
+        data: list[tuple[dict, np.ndarray, float, np.ndarray]],
+    ) -> dict[str, float]:
         """REINFORCE update for team preview decisions.
 
         Called once per PPO update cycle using all team preview decisions made
-        during the rollout. Each entry is (obs_dict, picks_np, episode_reward)
-        where episode_reward is +1 for a win and -1 for a loss.
+        during the rollout. Each entry is ``(obs_dict, picks_np, episode_reward,
+        opponent_picks_np)`` where episode_reward is +1 for a win and -1 for a loss.
 
         Uses the value function as a baseline to reduce gradient variance.
 
-        Returns the loss value for logging.
+        Returns a dict of preview-loss metrics for logging.
         """
         obs_batch = {
             k: torch.from_numpy(np.stack([d[0][k] for d in data])).to(self.device)
@@ -211,6 +215,7 @@ class PPOTrainer:
         }
         picks_batch = torch.from_numpy(np.stack([d[1] for d in data])).long().to(self.device)
         rewards_batch = torch.tensor([d[2] for d in data], dtype=torch.float32, device=self.device)
+        opponent_picks_batch = torch.from_numpy(np.stack([d[3] for d in data])).long().to(self.device)
 
         # Value baseline: no LSTM state at team preview time (start of battle).
         with torch.no_grad():
@@ -219,18 +224,44 @@ class PPOTrainer:
         out = self.agent.team_preview(obs_batch, picks=picks_batch)
         log_prob = out["log_prob"]
         entropy = out["entropy"]
+        bring_logits = out["opponent_bring_logits"]
+        lead_pair_logits = out["opponent_lead_pair_logits"]
 
         # REINFORCE with baseline: minimise -E[log_prob * (reward - baseline)].
         # The baseline does not affect the expected gradient but reduces variance.
         advantages = rewards_batch - baselines
-        loss = -(log_prob * advantages).mean() - self.config.entropy_coef * entropy.mean()
+        policy_loss = -(log_prob * advantages).mean()
+        entropy_bonus = self.config.entropy_coef * entropy.mean()
+
+        team_size = bring_logits.shape[1]
+        bring_targets = torch.zeros_like(bring_logits)
+        bring_targets.scatter_(1, opponent_picks_batch, 1.0)
+        valid_slots = (~obs_batch["opp_mask"]).to(bring_logits.dtype)
+        bring_loss_raw = F.binary_cross_entropy_with_logits(bring_logits, bring_targets, reduction="none")
+        bring_loss = (bring_loss_raw * valid_slots).sum() / valid_slots.sum().clamp(min=1.0)
+
+        lead_targets = opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
+        lead_loss = F.cross_entropy(lead_pair_logits, lead_targets)
+
+        loss = (
+            policy_loss
+            - entropy_bonus
+            + self.config.team_preview_bring_coef * bring_loss
+            + self.config.team_preview_lead_coef * lead_loss
+        )
 
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
         self.optimizer.step()
 
-        return loss.item()
+        return {
+            "team_preview_loss": loss.item(),
+            "team_preview_policy_loss": policy_loss.item(),
+            "team_preview_entropy": entropy.mean().item(),
+            "team_preview_bring_loss": bring_loss.item(),
+            "team_preview_lead_loss": lead_loss.item(),
+        }
 
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)

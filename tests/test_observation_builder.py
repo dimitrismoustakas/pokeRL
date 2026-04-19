@@ -3,10 +3,30 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from poke_env.battle import Effect, Field, SideCondition, Status, Weather
+from poke_env.battle import Effect, Field, Pokemon, SideCondition, Status, Weather
 
 from pokerl.data import GameData
-from pokerl.env.observation import ObservationBuilder, ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH
+from pokerl.env.observation import (
+    ABILITY_KNOWN_OFFSET,
+    FIELD_OPPONENT_USED_TERA_OFFSET,
+    FIELD_TRICK_ROOM_OFFSET,
+    FIELD_TURN_OFFSET,
+    FIELD_USED_TERA_OFFSET,
+    FIRST_TURN_OFFSET,
+    ITEM_KNOWN_OFFSET,
+    KNOWN_MOVE_COUNT_OFFSET,
+    MOVE_PP_OFFSET,
+    ObservationBuilder,
+    PROTECT_COUNTER_OFFSET,
+    REVEALED_OFFSET,
+    ROLE_ACTIVE_1,
+    ROLE_ACTIVE_2,
+    ROLE_BENCH,
+    STATUS_COUNTER_OFFSET,
+    TERA_KNOWN_OFFSET,
+    TERASTALLIZED_OFFSET,
+    _init_team_preview_pokemon,
+)
 
 
 def _move(move_id: str, current_pp: int, max_pp: int) -> SimpleNamespace:
@@ -27,10 +47,17 @@ def _pokemon(
     status=None,
     boosts: dict | None = None,
     effects: dict | None = None,
+    last_move: SimpleNamespace | None = None,
+    protect_counter: int = 0,
+    status_counter: int = 0,
+    first_turn: bool = False,
+    revealed: bool = True,
+    terastallized: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         species=species,
         moves=moves,
+        last_move=last_move,
         ability=ability,
         item=item,
         type_1=SimpleNamespace(name=type_1.upper()) if type_1 else None,
@@ -42,6 +69,11 @@ def _pokemon(
         status=status,
         boosts=boosts or {},
         effects=effects or {},
+        protect_counter=protect_counter,
+        status_counter=status_counter,
+        first_turn=first_turn,
+        revealed=revealed,
+        is_terastallized=terastallized,
     )
 
 
@@ -67,6 +99,11 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
         status=Status.BRN,
         boosts={"atk": -1, "spa": 2},
         effects={Effect.CONFUSION: 1, Effect.PROTECT: 1},
+        last_move=_move("partingshot", 18, 32),
+        protect_counter=2,
+        status_counter=3,
+        first_turn=True,
+        terastallized=True,
     )
     own_active_2 = _pokemon(
         species="amoonguss",
@@ -80,6 +117,7 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
         max_hp=220,
         status=None,
         effects={Effect.YAWN: 1},
+        last_move=_move("spore", 12, 24),
     )
     own_bench = _pokemon(
         species="pelipper",
@@ -102,6 +140,8 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
         tera_type=None,
         current_hp=100,
         max_hp=100,
+        last_move=_move("electroshot", 8, 16),
+        revealed=True,
     )
     opp_bench = _pokemon(
         species="urshifu",
@@ -131,6 +171,8 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
         side_conditions={SideCondition.TAILWIND: 1},
         opponent_side_conditions={SideCondition.STEALTH_ROCK: 1},
         turn=4,
+        used_tera=True,
+        opponent_used_tera=False,
     )
 
     obs = builder.build(battle)
@@ -148,8 +190,10 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
     assert obs["own_species"][2] == gd.species_to_idx["pelipper"]
     assert obs["own_moves"][0, 0] == gd.move_to_idx["fakeout"]
     assert obs["own_moves"][0, 1] == gd.move_to_idx["partingshot"]
+    assert obs["own_last_move"][0] == gd.move_to_idx["partingshot"]
+    assert obs["opp_last_move"][0] == gd.move_to_idx["electroshot"]
     assert obs["opp_moves"][0, 0] == gd.move_to_idx["electroshot"]
-    assert np.all(obs["opp_continuous"][0, -4:] == 0.0)
+    assert np.all(obs["opp_continuous"][0, MOVE_PP_OFFSET:MOVE_PP_OFFSET + 4] == 0.0)
 
     assert obs["own_ability"][0] == gd.abilities_to_idx["intimidate"]
     assert obs["own_item"][0] == gd.item_index("sitrusberry")
@@ -164,15 +208,27 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
     assert own_cont[1 + 1] == 1.0  # burned
     assert own_cont[8] == pytest.approx(-1 / 6)
     assert own_cont[10] == pytest.approx(2 / 6)
-    assert own_cont[-4] == pytest.approx(1.0)
-    assert own_cont[-3] == pytest.approx(18 / 32)
+    assert own_cont[MOVE_PP_OFFSET] == pytest.approx(1.0)
+    assert own_cont[MOVE_PP_OFFSET + 1] == pytest.approx(18 / 32)
+    assert own_cont[PROTECT_COUNTER_OFFSET] == pytest.approx(0.5)
+    assert own_cont[STATUS_COUNTER_OFFSET] == pytest.approx(3 / 8)
+    assert own_cont[FIRST_TURN_OFFSET] == 1.0
+    assert own_cont[REVEALED_OFFSET] == 1.0
+    assert own_cont[KNOWN_MOVE_COUNT_OFFSET] == pytest.approx(0.5)
+    assert own_cont[ABILITY_KNOWN_OFFSET] == 1.0
+    assert own_cont[ITEM_KNOWN_OFFSET] == 1.0
+    assert own_cont[TERA_KNOWN_OFFSET] == 1.0
+    assert own_cont[TERASTALLIZED_OFFSET] == 1.0
 
     field = obs["field"]
     assert field[0] == 0.0  # weather is active
     assert field[3] == 1.0  # rain slot
     assert field[9] == pytest.approx(3 / 8)  # weather age
     assert field[23] == pytest.approx(3 / 4)  # own tailwind age
-    assert field[-1] == pytest.approx(3 / 5)  # trick room age
+    assert field[FIELD_TRICK_ROOM_OFFSET] == pytest.approx(3 / 5)
+    assert field[FIELD_USED_TERA_OFFSET] == 1.0
+    assert field[FIELD_OPPONENT_USED_TERA_OFFSET] == 0.0
+    assert field[FIELD_TURN_OFFSET] == pytest.approx(4 / 20)
 
 
 def test_observation_builder_raises_when_active_pokemon_is_missing_from_team() -> None:
@@ -215,3 +271,19 @@ def test_observation_builder_raises_when_active_pokemon_is_missing_from_team() -
 
     with pytest.raises(ValueError, match="not found in the ordered team list"):
         builder.build(battle)
+
+
+def test_team_preview_pokemon_init_keeps_preview_revealed_flag_unset() -> None:
+    gd = GameData(gen=9)
+
+    own_preview = _init_team_preview_pokemon(
+        Pokemon(gen=gd.gen, species="incineroar"),
+        own_team=True,
+    )
+    opp_preview = _init_team_preview_pokemon(
+        Pokemon(gen=gd.gen, species="amoonguss"),
+        own_team=False,
+    )
+
+    assert own_preview.revealed is False
+    assert opp_preview.revealed is False
