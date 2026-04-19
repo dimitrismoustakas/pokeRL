@@ -42,14 +42,15 @@ class _LeagueInferenceService:
     tiny GPU forward per environment thread.
     """
 
-    # A short coalescing window lets more same-checkpoint requests land in the
-    # same GPU batch once the league pool grows, without changing policy
-    # semantics or opponent sampling.
-    _COALESCE_WINDOW_SEC = 0.005
-
-    def __init__(self, agent_template: PokeAgent, device: torch.device):
+    def __init__(
+        self,
+        agent_template: PokeAgent,
+        device: torch.device,
+        coalesce_window_sec: float,
+    ):
         self._agent_template = agent_template
         self._device = device
+        self._coalesce_window_sec = max(0.0, coalesce_window_sec)
         self._models: dict[str, PokeAgent] = {}
         self._pending: list[_InferenceRequest] = []
         self._closed = False
@@ -156,8 +157,8 @@ class _LeagueInferenceService:
                     self._condition.wait()
                 if self._closed and not self._pending:
                     return
-                if self._COALESCE_WINDOW_SEC > 0:
-                    deadline = time.perf_counter() + self._COALESCE_WINDOW_SEC
+                if self._coalesce_window_sec > 0:
+                    deadline = time.perf_counter() + self._coalesce_window_sec
                     while not self._closed:
                         remaining = deadline - time.perf_counter()
                         if remaining <= 0:
@@ -438,7 +439,11 @@ class League:
         self.agent_template = agent_template
         self.device = device
         self.checkpoints: deque[str] = deque(maxlen=config.league_size)
-        self._inference = _LeagueInferenceService(agent_template, device)
+        self._inference = _LeagueInferenceService(
+            agent_template,
+            device,
+            coalesce_window_sec=config.league_coalesce_ms / 1000.0,
+        )
 
     def add_checkpoint(self, agent: PokeAgent, step: int):
         """Snapshot the current agent as a new league member."""

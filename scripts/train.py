@@ -84,6 +84,18 @@ def parse_args() -> argparse.Namespace:
         help="Override league checkpoint and opponent refresh frequency in updates.",
     )
     parser.add_argument(
+        "--league-size",
+        type=int,
+        default=None,
+        help="Override how many frozen checkpoints are retained in the self-play league.",
+    )
+    parser.add_argument(
+        "--league-coalesce-ms",
+        type=float,
+        default=None,
+        help="Override the league-opponent inference coalescing window in milliseconds.",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
@@ -125,7 +137,9 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "log_interval": args.log_interval,
         "save_interval": args.save_interval,
         "checkpoint_dir": args.checkpoint_dir,
+        "league_size": args.league_size,
         "league_update_interval": args.league_update_interval,
+        "league_coalesce_ms": args.league_coalesce_ms,
     }
     for field_name, value in overrides.items():
         if value is not None:
@@ -310,6 +324,10 @@ def _league_state_path(train_config: TrainingConfig) -> str:
     return f"{train_config.checkpoint_dir}/league_state.json"
 
 
+def _league_state_path_for_resume(resume_checkpoint: str) -> Path:
+    return Path(resume_checkpoint).resolve().with_name("league_state.json")
+
+
 def _json_ready_metrics(metrics: dict[str, float]) -> dict[str, float]:
     return {key: float(value) for key, value in metrics.items()}
 
@@ -363,12 +381,12 @@ def train():
         trainer.load(args.resume)
         print(f"Resumed trainer from {args.resume!r} (global step {trainer.global_step:,})")
 
-        league_state = _league_state_path(train_config)
-        if Path(league_state).exists():
+        league_state = _league_state_path_for_resume(args.resume)
+        if league_state.exists():
             league.load_state(league_state)
-            print(f"Restored league: {len(league.checkpoints)} checkpoint(s)")
+            print(f"Restored league from {league_state!s}: {len(league.checkpoints)} checkpoint(s)")
         else:
-            print("Warning: no league state file found alongside checkpoint — league starts empty.")
+            print("Warning: no league state file found alongside resumed checkpoint — league starts empty.")
 
     # --- Seed league so self-play is available from update 1 ---
     # If resuming, this only runs when the league file was missing (edge case).
@@ -489,6 +507,15 @@ def train():
                     actions = actions_t.cpu().numpy()
                     hidden = out["hidden"]
                     rollout_profile["policy_postprocess_sec"] += time.perf_counter() - policy_post_started
+                    if device.type == "cpu":
+                        obs_for_buffer = {
+                            key: value.detach().clone()
+                            for key, value in obs_t.items()
+                        }
+                        masks_for_buffer = masks_t.detach().clone()
+                    else:
+                        obs_for_buffer = obs_t
+                        masks_for_buffer = masks_t
 
                 env_step_started = time.perf_counter()
                 next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
@@ -500,7 +527,15 @@ def train():
                 rollout_profile["feedback_to_device_sec"] += time.perf_counter() - feedback_device_started
 
                 buffer_started = time.perf_counter()
-                buffer.add(obs_t, actions_t, masks_t, log_probs_t, values_t, rewards_t, dones_t)
+                buffer.add(
+                    obs_for_buffer,
+                    actions_t,
+                    masks_for_buffer,
+                    log_probs_t,
+                    values_t,
+                    rewards_t,
+                    dones_t,
+                )
                 rollout_profile["buffer_add_sec"] += time.perf_counter() - buffer_started
 
                 # Reset hidden state for done environments
