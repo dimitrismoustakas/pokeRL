@@ -16,7 +16,7 @@ import torch
 from poke_env.battle import DoubleBattle
 from poke_env.player import DoubleBattleOrder, PassBattleOrder, Player
 
-from ..model.agent import PokeAgent
+from ..model.agent import PokeAgent, load_state_dict_compatible
 from ..data import GameData
 from ..config import TrainingConfig, EnvConfig
 from ..env.observation import ObservationBuilder, build_team_preview_observation
@@ -65,7 +65,7 @@ class _LeagueInferenceService:
 
         checkpoint = torch.load(checkpoint_path, map_location=self._device, weights_only=False)
         agent_copy = copy.deepcopy(self._agent_template)
-        agent_copy.load_state_dict(checkpoint["agent"])
+        load_state_dict_compatible(agent_copy, checkpoint["agent"])
         agent_copy.to(self._device)
         agent_copy.eval()
         agent_copy.requires_grad_(False)

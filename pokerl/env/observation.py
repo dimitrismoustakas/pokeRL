@@ -13,6 +13,23 @@ from ..data import GameData, UNKNOWN_IDX
 # + volatiles(16) + move_pp(4) = 35 total. Must match PokemonEncoder continuous_dim.
 CONTINUOUS_DIM = 35
 
+WEATHER_TYPES = [
+    Weather.SUNNYDAY, Weather.DESOLATELAND, Weather.RAINDANCE,
+    Weather.PRIMORDIALSEA, Weather.SANDSTORM, Weather.HAIL,
+    Weather.SNOW, Weather.DELTASTREAM,
+]
+TERRAIN_TYPES = [
+    Field.ELECTRIC_TERRAIN, Field.GRASSY_TERRAIN,
+    Field.MISTY_TERRAIN, Field.PSYCHIC_TERRAIN,
+]
+FIELD_TIMER_CAPS = {
+    "weather": 8,
+    "terrain": 8,
+    "screen": 8,
+    "tailwind": 4,
+    "trick_room": 5,
+}
+
 # Volatile effects to track as binary flags.
 # Each entry is either a single Effect or a frozenset of Effects (any match = True).
 # Perish song is tracked as any of PERISH0/1/2/3 (countdown from 3 to 0).
@@ -62,14 +79,17 @@ class ObservationBuilder:
         """Convert a battle state to a dict of numpy arrays."""
         obs = {}
 
-        own_pokemon, own_roles, own_active_indices = self._ordered_team_with_roles(battle, own=True)
+        own_pokemon, own_roles, own_active_indices, own_active_present = self._ordered_team_with_roles(battle, own=True)
         self._encode_team(own_pokemon, own_roles, obs, prefix="own", full_info=True)
 
-        opp_pokemon, opp_roles, _ = self._ordered_team_with_roles(battle, own=False)
+        opp_pokemon, opp_roles, opp_active_indices, opp_active_present = self._ordered_team_with_roles(battle, own=False)
         self._encode_team(opp_pokemon, opp_roles, obs, prefix="opp", full_info=False)
 
         obs["field"] = self._encode_field(battle)
         obs["own_active_indices"] = own_active_indices
+        obs["own_active_present"] = own_active_present
+        obs["opp_active_indices"] = opp_active_indices
+        obs["opp_active_present"] = opp_active_present
         return obs
 
     def _encode_team(
@@ -183,7 +203,7 @@ class ObservationBuilder:
         self,
         battle: DoubleBattle,
         own: bool,
-    ) -> tuple[list[Pokemon | None], np.ndarray, np.ndarray]:
+    ) -> tuple[list[Pokemon | None], np.ndarray, np.ndarray, np.ndarray]:
         """Return ordered team members plus role and active-index metadata."""
         team = list(battle.team.values()) if own else list(battle.opponent_team.values())
         active_list = battle.active_pokemon if own else battle.opponent_active_pokemon
@@ -196,7 +216,7 @@ class ObservationBuilder:
         ordered: list[Pokemon | None] = []
         roles = np.full(self.team_size, ROLE_BENCH, dtype=np.int64)
         active_indices = np.zeros(2, dtype=np.int64)
-        found_active_slots = [False, False]
+        active_present = np.zeros(2, dtype=bool)
 
         for pokemon in team:
             slot = active_lookup.get(id(pokemon))
@@ -208,7 +228,7 @@ class ObservationBuilder:
             ordered_index = len(ordered) - 1
             roles[ordered_index] = ROLE_ACTIVE_1 if slot == 0 else ROLE_ACTIVE_2
             active_indices[slot] = ordered_index
-            found_active_slots[slot] = True
+            active_present[slot] = True
 
         for pokemon in team:
             if id(pokemon) in active_lookup:
@@ -218,7 +238,7 @@ class ObservationBuilder:
             ordered.append(pokemon)
 
         for slot, pokemon in enumerate(active_list):
-            if pokemon is not None and not found_active_slots[slot]:
+            if pokemon is not None and not active_present[slot]:
                 raise ValueError(
                     f"Active pokemon {pokemon.species!r} was not found in the ordered team list. "
                     "This indicates a mismatch between battle.active_pokemon and battle.team - "
@@ -227,41 +247,45 @@ class ObservationBuilder:
 
         while len(ordered) < self.team_size:
             ordered.append(None)
-        return ordered, roles, active_indices
+        return ordered, roles, active_indices, active_present
 
     @staticmethod
     def _encode_field(battle: DoubleBattle) -> np.ndarray:
         """Encode field conditions into a flat feature vector."""
-        feats = np.zeros(31, dtype=np.float32)
+        feats = np.zeros(33, dtype=np.float32)
         offset = 0
+        current_turn = getattr(battle, "turn", 0)
 
-        weather_types = [
-            Weather.SUNNYDAY, Weather.DESOLATELAND, Weather.RAINDANCE,
-            Weather.PRIMORDIALSEA, Weather.SANDSTORM, Weather.HAIL,
-            Weather.SNOW, Weather.DELTASTREAM,
-        ]
         if not battle.weather:
             feats[offset] = 1.0
         else:
-            for index, weather in enumerate(weather_types):
-                if weather in battle.weather:
+            for index, weather in enumerate(WEATHER_TYPES):
+                started_turn = battle.weather.get(weather)
+                if started_turn is not None:
                     feats[offset + 1 + index] = 1.0
+                    feats[offset + 9] = ObservationBuilder._normalized_timer_age(
+                        current_turn,
+                        started_turn,
+                        FIELD_TIMER_CAPS["weather"],
+                    )
                     break
-        offset += 9
+        offset += 10
 
-        terrain_types = [
-            Field.ELECTRIC_TERRAIN, Field.GRASSY_TERRAIN,
-            Field.MISTY_TERRAIN, Field.PSYCHIC_TERRAIN,
-        ]
         terrain_active = False
-        for index, terrain in enumerate(terrain_types):
-            if battle.fields and terrain in battle.fields:
+        for index, terrain in enumerate(TERRAIN_TYPES):
+            started_turn = battle.fields.get(terrain)
+            if started_turn is not None:
                 feats[offset + 1 + index] = 1.0
+                feats[offset + 5] = ObservationBuilder._normalized_timer_age(
+                    current_turn,
+                    started_turn,
+                    FIELD_TIMER_CAPS["terrain"],
+                )
                 terrain_active = True
                 break
         if not terrain_active:
             feats[offset] = 1.0
-        offset += 5
+        offset += 6
 
         for side_conditions in [battle.side_conditions, battle.opponent_side_conditions]:
             feats[offset] = float(SideCondition.STEALTH_ROCK in side_conditions)
@@ -272,17 +296,59 @@ class ObservationBuilder:
             offset += 1
             feats[offset] = float(SideCondition.STICKY_WEB in side_conditions)
             offset += 1
-            feats[offset] = float(SideCondition.REFLECT in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.REFLECT,
+                current_turn,
+                FIELD_TIMER_CAPS["screen"],
+            )
             offset += 1
-            feats[offset] = float(SideCondition.LIGHT_SCREEN in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.LIGHT_SCREEN,
+                current_turn,
+                FIELD_TIMER_CAPS["screen"],
+            )
             offset += 1
-            feats[offset] = float(SideCondition.AURORA_VEIL in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.AURORA_VEIL,
+                current_turn,
+                FIELD_TIMER_CAPS["screen"],
+            )
             offset += 1
-            feats[offset] = float(SideCondition.TAILWIND in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.TAILWIND,
+                current_turn,
+                FIELD_TIMER_CAPS["tailwind"],
+            )
             offset += 1
 
-        feats[offset] = float(Field.TRICK_ROOM in battle.fields)
+        feats[offset] = ObservationBuilder._condition_age_feature(
+            battle.fields,
+            Field.TRICK_ROOM,
+            current_turn,
+            FIELD_TIMER_CAPS["trick_room"],
+        )
         return feats
+
+    @staticmethod
+    def _condition_age_feature(
+        conditions: dict,
+        condition,
+        current_turn: int,
+        timer_cap: int,
+    ) -> float:
+        started_turn = conditions.get(condition)
+        if started_turn is None or not isinstance(started_turn, int):
+            return 0.0
+        return ObservationBuilder._normalized_timer_age(current_turn, started_turn, timer_cap)
+
+    @staticmethod
+    def _normalized_timer_age(current_turn: int, started_turn: int, timer_cap: int) -> float:
+        turns_active = max(current_turn - started_turn, 0)
+        return min(turns_active, timer_cap) / float(timer_cap)
 
 
 class _SyntheticTeamPreviewBattle:
@@ -297,6 +363,7 @@ class _SyntheticTeamPreviewBattle:
         self.weather = {}
         self.side_conditions = {}
         self.opponent_side_conditions = {}
+        self.turn = 0
 
 
 def build_team_preview_observation(

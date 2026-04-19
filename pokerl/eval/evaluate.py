@@ -5,7 +5,7 @@ import torch
 
 from ..config import ModelConfig, EnvConfig
 from ..data import GameData
-from ..model.agent import PokeAgent
+from ..model.agent import PokeAgent, load_state_dict_compatible
 from ..env.showdown_env import BattleEnv, make_local_account_configuration, make_server_configuration
 
 
@@ -68,7 +68,7 @@ def load_and_evaluate(
 
     agent = PokeAgent(model_config, game_data)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    agent.load_state_dict(checkpoint["agent"])
+    load_state_dict_compatible(agent, checkpoint["agent"])
     agent.to(device)
 
     def opponent_factory(loop):

@@ -1,5 +1,7 @@
 """Full agent: spatial encoder -> memory -> action/value heads."""
 
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 
@@ -9,6 +11,30 @@ from ..env.observation import CONTINUOUS_DIM
 from .encoders import PokemonEncoder, TeamEncoder, FieldEncoder, SpatialEncoder
 from .memory import build_memory
 from .heads import ActionHead, TeamPreviewHead, ValueHead
+
+
+def load_state_dict_compatible(
+    module: nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+) -> dict[str, tuple[str, ...]]:
+    """Load the compatible subset of a checkpoint state dict into a module."""
+    current_state = module.state_dict()
+    compatible_state: dict[str, torch.Tensor] = {}
+    skipped_keys: list[str] = []
+
+    for key, value in state_dict.items():
+        current_value = current_state.get(key)
+        if current_value is None or current_value.shape != value.shape:
+            skipped_keys.append(key)
+            continue
+        compatible_state[key] = value
+
+    result = module.load_state_dict(compatible_state, strict=False)
+    return {
+        "missing_keys": tuple(sorted(result.missing_keys)),
+        "skipped_keys": tuple(sorted(skipped_keys)),
+        "unexpected_keys": tuple(sorted(result.unexpected_keys)),
+    }
 
 
 class PokeAgent(nn.Module):
@@ -78,10 +104,17 @@ class PokeAgent(nn.Module):
 
         Returns dict with: actions, log_prob, entropy, value, hidden
         """
-        context, active_reps, _ = self.spatial(obs)
+        context, active_reps, own_reps, opp_active_reps = self.spatial(obs)
         context, new_hidden = self.memory(context, hidden)
 
-        action_out = self.action_head(context, active_reps, action_masks, actions)
+        action_out = self.action_head(
+            context,
+            active_reps,
+            own_reps,
+            opp_active_reps,
+            action_masks,
+            actions,
+        )
         value = self.value_head(context)
 
         return {
@@ -102,7 +135,7 @@ class PokeAgent(nn.Module):
         preview head can score all six pokemon. The spatial encoder is called
         once; no second pass is needed.
         """
-        context, _, own_reps = self.spatial(obs)
+        context, _, own_reps, _ = self.spatial(obs)
         context, new_hidden = self.memory(context, hidden)
 
         preview_out = self.team_preview_head(own_reps, context, picks)
@@ -113,7 +146,7 @@ class PokeAgent(nn.Module):
 
     def get_value(self, obs: dict[str, torch.Tensor], hidden=None) -> torch.Tensor:
         """Just the value estimate, for GAE computation."""
-        context, _, _ = self.spatial(obs)
+        context, _, _, _ = self.spatial(obs)
         context, _ = self.memory(context, hidden)
         return self.value_head(context)
 

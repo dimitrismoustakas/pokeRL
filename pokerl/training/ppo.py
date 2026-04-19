@@ -6,7 +6,7 @@ import torch.nn as nn
 from pathlib import Path
 
 from ..config import TrainingConfig
-from ..model.agent import PokeAgent
+from ..model.agent import PokeAgent, load_state_dict_compatible
 from .rollout import RolloutBatch
 
 
@@ -104,9 +104,11 @@ class PPOTrainer:
                     k: v.reshape(T * E_mb, *v.shape[2:])
                     for k, v in mb_obs_seq.items()
                 }
-                context_flat, active_reps_flat, _ = self.agent.spatial(flat_obs)
+                context_flat, active_reps_flat, own_reps_flat, opp_active_reps_flat = self.agent.spatial(flat_obs)
                 context_seq_mb = context_flat.reshape(T, E_mb, -1)
                 active_reps_seq_mb = active_reps_flat.reshape(T, E_mb, 2, -1)
+                own_reps_seq_mb = own_reps_flat.reshape(T, E_mb, own_reps_flat.shape[1], -1)
+                opp_active_reps_seq_mb = opp_active_reps_flat.reshape(T, E_mb, 2, -1)
 
                 # LSTM + heads: step through the sequence one turn at a time.
                 # Gradients flow back through all turns within each non-terminal
@@ -121,6 +123,8 @@ class PPOTrainer:
                     action_out = self.agent.action_head(
                         ctx_t,
                         active_reps_seq_mb[t],
+                        own_reps_seq_mb[t],
+                        opp_active_reps_seq_mb[t],
                         mb_masks_seq[t],
                         mb_actions_seq[t],
                     )
@@ -135,6 +139,13 @@ class PPOTrainer:
                         not_done = (~mb_dones_seq[t]).to(ctx_t.dtype).view(1, E_mb, 1)
                         h, c = hidden
                         hidden = (h * not_done, c * not_done)
+                        if (
+                            self.config.bptt_chunk_steps is not None
+                            and self.config.bptt_chunk_steps > 0
+                            and (t + 1) % self.config.bptt_chunk_steps == 0
+                            and t + 1 < T
+                        ):
+                            hidden = tuple(state.detach() for state in hidden)
 
                 # Flatten (T, E_mb) → (T*E_mb,) for loss computation.
                 log_probs_flat = torch.stack(all_log_probs).reshape(-1)
@@ -231,6 +242,17 @@ class PPOTrainer:
 
     def load(self, path: str):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.agent.load_state_dict(checkpoint["agent"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        load_report = load_state_dict_compatible(self.agent, checkpoint["agent"])
+        optimizer_compatible = not any(load_report.values())
+        if optimizer_compatible:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        else:
+            self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=self.config.lr, eps=1e-5)
+            print(
+                "Checkpoint architecture changed; loaded compatible agent weights only. "
+                f"Skipped={len(load_report['skipped_keys'])}, "
+                f"Missing={len(load_report['missing_keys'])}, "
+                f"Unexpected={len(load_report['unexpected_keys'])}. "
+                "Optimizer state was reinitialized."
+            )
         self.global_step = checkpoint["global_step"]

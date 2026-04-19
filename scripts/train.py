@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-timesteps", type=int, default=None, help="Override the total environment steps to train for.")
     parser.add_argument("--num-epochs", type=int, default=None, help="Override PPO epochs per update.")
     parser.add_argument("--num-minibatches", type=int, default=None, help="Override PPO minibatches per update.")
+    parser.add_argument(
+        "--bptt-chunk-steps",
+        type=int,
+        default=None,
+        help="Detach recurrent state every N PPO timesteps. Use 0 to disable chunking.",
+    )
     parser.add_argument("--log-interval", type=int, default=None, help="Override logging frequency in updates.")
     parser.add_argument("--save-interval", type=int, default=None, help="Override checkpoint save frequency in updates.")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint output directory.")
@@ -134,6 +140,7 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "total_timesteps": args.total_timesteps,
         "num_epochs": args.num_epochs,
         "num_minibatches": args.num_minibatches,
+        "bptt_chunk_steps": args.bptt_chunk_steps,
         "log_interval": args.log_interval,
         "save_interval": args.save_interval,
         "checkpoint_dir": args.checkpoint_dir,
@@ -143,6 +150,8 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     }
     for field_name, value in overrides.items():
         if value is not None:
+            if field_name == "bptt_chunk_steps" and value == 0:
+                value = None
             setattr(train_config, field_name, value)
 
     if args.num_updates is not None:
@@ -418,6 +427,7 @@ def train():
             "rollout_steps": train_config.rollout_steps,
             "num_epochs": train_config.num_epochs,
             "num_minibatches": train_config.num_minibatches,
+            "bptt_chunk_steps": train_config.bptt_chunk_steps,
             "total_timesteps": train_config.total_timesteps,
             "server_urls": server_urls,
             "team_pool": team_pool.describe() if team_pool is not None else None,

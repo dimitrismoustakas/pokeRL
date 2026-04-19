@@ -116,14 +116,18 @@ class _DummySpatial(nn.Module):
         super().__init__()
         self.context_proj = nn.Linear(3, 3)
         self.active_proj = nn.Linear(2, 2)
+        self.team_proj = nn.Linear(2, 2)
+        self.opp_proj = nn.Linear(2, 2)
 
     def forward(
         self,
         obs: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         context = self.context_proj(obs["context"].float())
         active = self.active_proj(obs["active"].float())
-        return context, active, active
+        team = self.team_proj(obs["team"].float())
+        opp_active = self.opp_proj(obs["opp_active"].float())
+        return context, active, team, opp_active
 
 
 class _DummyAgent(nn.Module):
@@ -141,9 +145,9 @@ class _DummyAgent(nn.Module):
         actions: torch.Tensor | None = None,
         action_masks: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        context, active_reps, _ = self.spatial(obs)
+        context, active_reps, own_reps, opp_active_reps = self.spatial(obs)
         context, hidden = self.memory(context, hidden)
-        action_out = self.action_head(context, active_reps, action_masks, actions)
+        action_out = self.action_head(context, active_reps, own_reps, opp_active_reps, action_masks, actions)
         return {
             **action_out,
             "value": self.value_head(context),
@@ -158,6 +162,8 @@ def _ppo_obs(step: int, num_envs: int) -> dict[str, np.ndarray]:
     return {
         "context": np.full((num_envs, 3), float(step), dtype=np.float32),
         "active": np.full((num_envs, 2, 2), float(step + 1), dtype=np.float32),
+        "team": np.full((num_envs, 6, 2), float(step + 2), dtype=np.float32),
+        "opp_active": np.full((num_envs, 2, 2), float(step + 3), dtype=np.float32),
     }
 
 
@@ -194,11 +200,13 @@ def test_action_head_uses_conditional_joint_mask_to_block_double_tera() -> None:
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
     context = torch.zeros((1, 3))
     active_reps = torch.zeros((1, 2, 2))
+    own_team_reps = torch.zeros((1, 6, 2))
+    opp_active_reps = torch.zeros((1, 2, 2))
     masks = torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool)
     masks[0, FIRST_SLOT_MASK_ROW, TERA_OFFSET] = True
     masks[0, TERA_OFFSET + 1, 0] = True
 
-    out = head(context, active_reps, masks)
+    out = head(context, active_reps, own_team_reps, opp_active_reps, masks)
 
     assert out["actions"][0, 0].item() == TERA_OFFSET
     assert out["actions"][0, 1].item() == 0
@@ -209,12 +217,14 @@ def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_targe
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
     context = torch.zeros((1, 3))
     active_reps = torch.zeros((1, 2, 2))
+    own_team_reps = torch.zeros((1, 6, 2))
+    opp_active_reps = torch.zeros((1, 2, 2))
     masks = torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool)
     shared_switch = SWITCH_OFFSET + 5
     masks[0, FIRST_SLOT_MASK_ROW, shared_switch] = True
     masks[0, shared_switch + 1, 0] = True
 
-    out = head(context, active_reps, masks)
+    out = head(context, active_reps, own_team_reps, opp_active_reps, masks)
 
     assert out["actions"][0, 0].item() == shared_switch
     assert out["actions"][0, 1].item() == 0

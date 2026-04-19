@@ -54,6 +54,7 @@ class TrainingConfig:
     rollout_steps: int = 128
     num_epochs: int = 4
     num_minibatches: int = 4
+    bptt_chunk_steps: int | None = 32
 
     # Training
     total_timesteps: int = 10_000_000

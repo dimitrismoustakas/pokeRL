@@ -1,6 +1,10 @@
 """Game data: vocab lookups and optional stat-based embedding initialization."""
 
 import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
 
 import torch
 import numpy as np
@@ -24,7 +28,7 @@ class GameData:
             a for pokemon in data.pokedex.values()
             for a in (pokemon.get("abilities") or {}).values()
         )
-        self.item_to_idx = self._build_vocab(self._known_item_ids(data.pokedex.values()))
+        self.item_to_idx = self._build_vocab(self._known_item_ids(data.pokedex.values(), gen))
         self.type_to_idx = self._build_vocab(data.type_chart.keys())
         self._item_vocab_size = max(item_vocab_size, len(self.item_to_idx))
         self._item_hash_offset = len(self.item_to_idx)
@@ -118,8 +122,8 @@ class GameData:
                 vocab[key] = len(vocab)
         return vocab
 
-    @staticmethod
-    def _known_item_ids(pokedex_entries) -> list[str]:
+    @classmethod
+    def _known_item_ids(cls, pokedex_entries, gen: int) -> list[str]:
         items = {GenData.UNKNOWN_ITEM}
         for pokemon in pokedex_entries:
             required_item = pokemon.get("requiredItem")
@@ -129,4 +133,72 @@ class GameData:
             required_items = pokemon.get("requiredItems") or []
             items.update(required_items)
 
+        items.update(cls._load_showdown_item_ids(gen))
         return sorted(str(item).lower() for item in items if item)
+
+    @classmethod
+    def _load_showdown_item_ids(cls, gen: int) -> list[str]:
+        item_export_path = cls._showdown_item_export_path(gen)
+        node_script = (
+            "const path = require('path');"
+            "const exportPath = path.resolve(process.argv[1]);"
+            "const mod = require(exportPath);"
+            "const items = mod.Items || {};"
+            "const ids = Object.keys(items).filter((id) => id && id !== 'noitem');"
+            "process.stdout.write(JSON.stringify(ids));"
+        )
+        try:
+            completed = subprocess.run(
+                ["node", "-e", node_script, str(item_export_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "node is required to build the item vocabulary from the local Pokemon Showdown install."
+            ) from exc
+        except subprocess.SubprocessError as exc:
+            raise RuntimeError(
+                f"Failed to load item ids from {item_export_path}. "
+                "The local Pokemon Showdown install is required for named item embeddings."
+            ) from exc
+
+        try:
+            item_ids = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Could not decode item ids from {item_export_path}. "
+                "The local Pokemon Showdown install may be incomplete or out of date."
+            ) from exc
+        return [str(item_id).lower() for item_id in item_ids]
+
+    @staticmethod
+    def _showdown_item_export_path(gen: int) -> Path:
+        env_override = os.environ.get("POKERL_SHOWDOWN_ITEM_EXPORT")
+        if env_override:
+            path = Path(env_override)
+            if not path.exists():
+                raise RuntimeError(f"POKERL_SHOWDOWN_ITEM_EXPORT points to a missing file: {path}")
+            return path
+
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if not local_appdata:
+            raise RuntimeError(
+                "LOCALAPPDATA is not set, so the local Pokemon Showdown item export cannot be located."
+            )
+
+        base_path = Path(local_appdata) / "pokeRL" / "pokemon-showdown"
+        candidates = [
+            base_path / "dist" / "data" / "mods" / f"gen{gen}" / "items.js",
+            base_path / "dist" / "data" / "items.js",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        raise RuntimeError(
+            "Could not find Pokemon Showdown item data under the local install. "
+            f"Checked: {', '.join(str(path) for path in candidates)}"
+        )

@@ -130,11 +130,15 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
         fields={Field.TRICK_ROOM: 1},
         side_conditions={SideCondition.TAILWIND: 1},
         opponent_side_conditions={SideCondition.STEALTH_ROCK: 1},
+        turn=4,
     )
 
     obs = builder.build(battle)
 
     assert obs["own_active_indices"].tolist() == [0, 1]
+    assert obs["own_active_present"].tolist() == [True, True]
+    assert obs["opp_active_indices"].tolist() == [0, 0]
+    assert obs["opp_active_present"].tolist() == [True, False]
     assert obs["own_roles"].tolist() == [ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH]
     assert obs["opp_roles"].tolist() == [ROLE_ACTIVE_1, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH]
     assert obs["own_mask"].tolist() == [False, False, False, True, True, True]
@@ -166,7 +170,9 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
     field = obs["field"]
     assert field[0] == 0.0  # weather is active
     assert field[3] == 1.0  # rain slot
-    assert field[-1] == 1.0  # trick room
+    assert field[9] == pytest.approx(3 / 8)  # weather age
+    assert field[23] == pytest.approx(3 / 4)  # own tailwind age
+    assert field[-1] == pytest.approx(3 / 5)  # trick room age
 
 
 def test_observation_builder_raises_when_active_pokemon_is_missing_from_team() -> None:

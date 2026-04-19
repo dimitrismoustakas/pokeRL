@@ -16,8 +16,8 @@ from poke_env.teambuilder.teambuilder import Teambuilder
 
 from ..config import EnvConfig, ModelConfig
 from ..data import GameData
+from ..model.agent import load_state_dict_compatible
 from ..env.actions import (
-    FIRST_SLOT_MASK_ROW,
     TARGET_ALLY,
     TARGET_NONE,
     TARGET_OPPONENT_1,
@@ -167,39 +167,20 @@ class ModelPolicyController:
         masks_t = torch.from_numpy(masks).unsqueeze(0).to(device=self.device, dtype=torch.bool)
 
         with torch.inference_mode():
-            context, active_reps, _ = self.agent.spatial(obs_t)
+            context, active_reps, own_reps, opp_active_reps = self.agent.spatial(obs_t)
             context, new_hidden = self.agent.memory(context, self.hidden)
-
-            rep1 = active_reps[:, 0]
-            rep2 = active_reps[:, 1]
-            mask1 = masks_t[:, FIRST_SLOT_MASK_ROW]
-
-            logits1 = self.agent.action_head.head1(torch.cat([context, rep1, rep2], dim=-1))
-            logits1 = logits1.masked_fill(~mask1, -1e8)
-            dist1 = torch.distributions.Categorical(logits=logits1)
-            if self.action_mode == "sample":
-                action_1 = dist1.sample()
-            else:
-                action_1 = logits1.argmax(dim=1)
-
-            batch_indices = torch.arange(context.shape[0], device=self.device)
-            mask2 = masks_t[batch_indices, action_1 + 1]
-            if not mask2.any(dim=1).all():
-                raise RuntimeError("ModelPolicyController observed an empty second-slot mask.")
-
-            action_1_emb = self.agent.action_head.action_emb(action_1)
-            logits2 = self.agent.action_head.head2(torch.cat([context, rep2, rep1, action_1_emb], dim=-1))
-            logits2 = logits2.masked_fill(~mask2, -1e8)
-            dist2 = torch.distributions.Categorical(logits=logits2)
-            if self.action_mode == "sample":
-                action_2 = dist2.sample()
-            else:
-                action_2 = logits2.argmax(dim=1)
-
+            action_out = self.agent.action_head(
+                context,
+                active_reps,
+                own_reps,
+                opp_active_reps,
+                masks_t,
+                greedy=self.action_mode == "argmax",
+            )
             self.hidden = None if new_hidden is None else tuple(state.detach() for state in new_hidden)
-            entropy = (dist1.entropy() + dist2.entropy()).item()
-            log_prob = (dist1.log_prob(action_1) + dist2.log_prob(action_2)).item()
-            actions = torch.stack([action_1, action_2], dim=1).cpu().numpy()[0]
+            entropy = action_out["entropy"].item()
+            log_prob = action_out["log_prob"].item()
+            actions = action_out["actions"].cpu().numpy()[0]
 
         return {
             "actions": actions,
@@ -541,7 +522,7 @@ def load_agent_for_evaluation(
     agent = PokeAgent(model_config, game_data).to(device)
     if checkpoint_path is not None:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        agent.load_state_dict(checkpoint["agent"])
+        load_state_dict_compatible(agent, checkpoint["agent"])
     agent.eval()
     agent.requires_grad_(False)
     return agent

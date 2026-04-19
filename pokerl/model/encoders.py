@@ -109,14 +109,14 @@ class TeamEncoder(nn.Module):
 class FieldEncoder(nn.Module):
     """Encodes field conditions (weather, terrain, hazards, screens, etc.)."""
 
-    # Weather: 9 (8 types + none)
-    # Terrain: 5 (4 types + none)
+    # Weather: 10 (8 types + none + timer age)
+    # Terrain: 6 (4 types + none + timer age)
     # Side conditions per side: stealth_rock, spikes, toxic_spikes,
-    #   sticky_web, reflect, light_screen, aurora_veil, tailwind = 8 each
-    # Global: trick_room
+    #   sticky_web, reflect_age, light_screen_age, aurora_veil_age, tailwind_age = 8 each
+    # Global: trick_room_age
     #
-    # Total: 9 + 5 + 2*8 + 1 = 31
-    INPUT_DIM = 31
+    # Total: 10 + 6 + 2*8 + 1 = 33
+    INPUT_DIM = 33
 
     def __init__(self, out_dim: int = 64):
         super().__init__()
@@ -160,7 +160,7 @@ class SpatialEncoder(nn.Module):
 
     def forward(
         self, obs: dict[str, torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             obs: dictionary with keys for own team, opponent team, field.
@@ -168,9 +168,10 @@ class SpatialEncoder(nn.Module):
 
         Returns:
             context:     (batch, context_dim) flat battle representation
-            active_reps: (batch, 2, pokemon_dim) our active pokemon representations
-            own_reps:    (batch, team_size, pokemon_dim) full attention-processed own
-                         team, for use by the team preview head
+            active_reps:     (batch, 2, pokemon_dim) our active pokemon representations
+            own_reps:        (batch, team_size, pokemon_dim) full attention-processed own
+                             team, for use by the team preview head and switch scoring
+            opp_active_reps: (batch, 2, pokemon_dim) opponent active pokemon representations
         """
         # Encode each pokemon (own side)
         own_reps = self._encode_team(obs, prefix="own")  # (batch, 6, pokemon_dim)
@@ -192,11 +193,19 @@ class SpatialEncoder(nn.Module):
 
         # Extract our active pokemon representations by index
         active_indices = obs["own_active_indices"]  # (batch, 2)
-        active_reps = own_reps.gather(
-            1, active_indices.unsqueeze(-1).expand(-1, -1, own_reps.shape[-1])
+        active_reps = self._gather_slots(
+            own_reps,
+            active_indices,
+            obs.get("own_active_present"),
         )
 
-        return context, active_reps, own_reps
+        opp_active_reps = self._gather_slots(
+            opp_reps,
+            obs["opp_active_indices"],
+            obs.get("opp_active_present"),
+        )
+
+        return context, active_reps, own_reps, opp_active_reps
 
     def _encode_team(self, obs: dict, prefix: str) -> torch.Tensor:
         """Encode all pokemon for one side."""
@@ -225,3 +234,14 @@ class SpatialEncoder(nn.Module):
         # mask: True = padding -> invert to get valid positions
         valid = (~mask).unsqueeze(-1).float()
         return (x * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+
+    @staticmethod
+    def _gather_slots(
+        reps: torch.Tensor,
+        indices: torch.Tensor,
+        present: torch.Tensor | None,
+    ) -> torch.Tensor:
+        gathered = reps.gather(1, indices.unsqueeze(-1).expand(-1, -1, reps.shape[-1]))
+        if present is None:
+            return gathered
+        return gathered * present.unsqueeze(-1).to(gathered.dtype)
