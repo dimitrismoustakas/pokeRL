@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import queue
@@ -197,10 +196,9 @@ class LocalShowdownWorker:
         assert self._process.stdout is not None
         try:
             for raw_line in self._process.stdout:
-                line = raw_line.strip()
-                if not line:
+                if not raw_line.strip():
                     continue
-                event = json.loads(line)
+                event = orjson.loads(raw_line)
                 battle_id = event.get("battle_id")
                 if battle_id is None:
                     continue
