@@ -1,8 +1,9 @@
-"""Evaluate a policy against a fixed max-BST, max-base-power bot."""
+"""Evaluate a policy against a MaxBasePower bot with real team preview battles."""
 
 from __future__ import annotations
 
 import json
+import random
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,7 @@ from poke_env.player import MaxBasePowerPlayer
 from poke_env.teambuilder.teambuilder import Teambuilder
 
 from ..config import EnvConfig, ModelConfig
-from ..data import GameData
+from ..data import GameData, UNKNOWN_IDX
 from ..model.agent import load_state_dict_compatible
 from ..env.actions import (
     TARGET_ALLY,
@@ -59,6 +60,37 @@ def packed_team_segments(packed_team: str) -> list[str]:
     return [segment for segment in packed_team.split("]") if segment]
 
 
+def _species_idx_display_lookup(game_data: GameData) -> dict[int, str]:
+    gen_data = GenData.from_gen(game_data.gen)
+    lookup = {UNKNOWN_IDX: "<unk>"}
+    for species_id, idx in game_data.species_to_idx.items():
+        if idx == UNKNOWN_IDX:
+            continue
+        lookup[idx] = gen_data.pokedex.get(species_id, {}).get("name", species_id)
+    return lookup
+
+
+def _species_names_from_obs(obs_species: np.ndarray, idx_lookup: dict[int, str]) -> list[str]:
+    return [
+        idx_lookup.get(int(species_idx), f"<species:{int(species_idx)}>")
+        for species_idx in obs_species
+        if int(species_idx) != UNKNOWN_IDX
+    ]
+
+
+def _counter_rows(counter: Counter[str], total: int) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for label, count in sorted(counter.items(), key=lambda item: (-item[1], item[0])):
+        rows.append(
+            {
+                "label": label,
+                "count": int(count),
+                "rate": _safe_rate(int(count), total),
+            }
+        )
+    return rows
+
+
 @dataclass(frozen=True)
 class FixedTeamSpec:
     title: str
@@ -83,7 +115,7 @@ class FixedTeamSpec:
             "species": list(self.species),
             "species_bst": list(self.species_bst),
             "team_total_bst": self.team_total_bst,
-            "fixed_team_size": len(self.max_bst_pick_species),
+            "pick_size": len(self.max_bst_pick_species),
             "max_bst_pick_indices": list(self.max_bst_pick_indices),
             "max_bst_pick_species": list(self.max_bst_pick_species),
             "max_bst_pick_bst": list(self.max_bst_pick_bst),
@@ -152,6 +184,114 @@ def select_max_bst_team_spec(
     return candidates[0]
 
 
+def select_team_spec_by_title(
+    pool: TeamPool,
+    *,
+    title: str,
+    species_bst_lookup: dict[str, int],
+    pick_size: int,
+) -> FixedTeamSpec:
+    normalized_title = " ".join(title.split()).casefold()
+    matches = [
+        entry
+        for entry in pool.entries
+        if " ".join(entry.title.split()).casefold() == normalized_title
+    ]
+    if not matches:
+        raise RuntimeError(f"Could not find a team titled {title!r} in the requested pool.")
+    if len(matches) > 1:
+        raise RuntimeError(f"Team title {title!r} was ambiguous in the requested pool.")
+    return fixed_team_spec_from_entry(
+        matches[0],
+        species_bst_lookup=species_bst_lookup,
+        pick_size=pick_size,
+    )
+
+
+def plan_opponent_team_specs(
+    pool: TeamPool,
+    *,
+    model_team_spec: FixedTeamSpec,
+    species_bst_lookup: dict[str, int],
+    pick_size: int,
+    num_games: int,
+    seed: int,
+) -> list[FixedTeamSpec]:
+    if num_games <= 0:
+        return []
+
+    candidate_entries = [entry for entry in pool.entries if entry.file != model_team_spec.file]
+    if not candidate_entries:
+        candidate_entries = list(pool.entries)
+    if not candidate_entries:
+        raise RuntimeError("Opponent team planning requires at least one team in the pool.")
+
+    rng = random.Random(seed)
+    planned_entries: list[TeamPoolEntry] = []
+    while len(planned_entries) < num_games:
+        batch = list(candidate_entries)
+        rng.shuffle(batch)
+        planned_entries.extend(batch)
+
+    return [
+        fixed_team_spec_from_entry(
+            entry,
+            species_bst_lookup=species_bst_lookup,
+            pick_size=pick_size,
+        )
+        for entry in planned_entries[:num_games]
+    ]
+
+
+class PlannedMatchups:
+    def __init__(self, model_team_spec: FixedTeamSpec, opponent_specs: list[FixedTeamSpec]):
+        if not opponent_specs:
+            raise ValueError("PlannedMatchups requires at least one opponent team.")
+        self.model_team_spec = model_team_spec
+        self._prepared_specs = list(opponent_specs) + [opponent_specs[-1]]
+        self._prepared_index = 0
+        self._active_specs: list[FixedTeamSpec] = []
+
+    def team_pair_provider(self) -> tuple[str, str]:
+        if self._prepared_index >= len(self._prepared_specs):
+            raise RuntimeError("PlannedMatchups exhausted unexpectedly during evaluation.")
+        opponent_spec = self._prepared_specs[self._prepared_index]
+        self._prepared_index += 1
+        self._active_specs.append(opponent_spec)
+        return self.model_team_spec.packed_team, opponent_spec.packed_team
+
+    def consume_active_opponent(self) -> FixedTeamSpec:
+        if not self._active_specs:
+            raise RuntimeError("No active opponent was prepared for the current evaluation battle.")
+        return self._active_specs.pop(0)
+
+
+class DeterministicPreviewMaxBasePowerPlayer(MaxBasePowerPlayer):
+    def __init__(self, *, species_bst_lookup: dict[str, int], pick_size: int, **kwargs):
+        super().__init__(**kwargs)
+        self._species_bst_lookup = species_bst_lookup
+        self._pick_size = pick_size
+
+    def teampreview(self, battle) -> str:
+        members = list(battle.team.values())
+        ranked = []
+        for index, pokemon in enumerate(members):
+            species_id = normalize_species_id(getattr(pokemon, "species", "") or "")
+            bst = self._species_bst_lookup.get(species_id)
+            if bst is None:
+                raise RuntimeError(
+                    f"No BST entry found for teampreview species {pokemon.species!r} ({species_id!r})."
+                )
+            ranked.append((index, bst))
+
+        picks = sorted(
+            index for index, _ in sorted(ranked, key=lambda item: (-item[1], item[0]))[: self._pick_size]
+        )
+        for pick in picks:
+            members[pick]._selected_in_teampreview = True
+        return "/team " + "".join(str(pick + 1) for pick in picks)
+
+
 class ModelPolicyController:
     def __init__(self, agent, *, device: torch.device, action_mode: str):
         self.agent = agent
@@ -161,6 +301,20 @@ class ModelPolicyController:
 
     def reset_battle(self) -> None:
         self.hidden = self.agent.initial_hidden(1)
+
+    def choose_team_preview(self, obs: dict[str, np.ndarray]) -> dict[str, object]:
+        obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(self.device) for key, value in obs.items()}
+
+        with torch.inference_mode():
+            context, _, own_reps, _ = self.agent.spatial(obs_t)
+            context, _ = self.agent.memory(context, None)
+            preview_out = self._team_preview_forward(context, own_reps)
+
+        return {
+            "picks": preview_out["picks"].cpu().numpy()[0],
+            "entropy": float(preview_out["entropy"].item()),
+            "log_prob": float(preview_out["log_prob"].item()),
+        }
 
     def choose_action(self, obs: dict[str, np.ndarray], masks: np.ndarray) -> dict[str, object]:
         obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(self.device) for key, value in obs.items()}
@@ -186,6 +340,48 @@ class ModelPolicyController:
             "actions": actions,
             "entropy": float(entropy),
             "log_prob": float(log_prob),
+        }
+
+    def _team_preview_forward(
+        self,
+        context: torch.Tensor,
+        own_reps: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        head = self.agent.team_preview_head
+        batch, team_size, pokemon_dim = own_reps.shape
+        available = torch.ones(batch, team_size, dtype=torch.bool, device=context.device)
+        picked_sum = torch.zeros(batch, pokemon_dim, device=context.device)
+        all_picks = []
+        all_log_probs = []
+        all_entropies = []
+
+        for _ in range(head.pick_size):
+            ctx = head.context_proj(torch.cat([context, picked_sum], dim=-1))
+            ctx_expanded = ctx.unsqueeze(1).expand(-1, team_size, -1)
+            scores = head.score(torch.cat([own_reps, ctx_expanded], dim=-1)).squeeze(-1)
+            scores = scores.masked_fill(~available, -1e8)
+            dist = torch.distributions.Categorical(logits=scores)
+
+            if self.action_mode == "argmax":
+                chosen = torch.argmax(scores, dim=1)
+            else:
+                chosen = dist.sample()
+
+            all_picks.append(chosen)
+            all_log_probs.append(dist.log_prob(chosen))
+            all_entropies.append(dist.entropy())
+
+            available.scatter_(1, chosen.unsqueeze(1), False)
+            chosen_rep = own_reps.gather(
+                1,
+                chosen.unsqueeze(1).unsqueeze(2).expand(-1, -1, pokemon_dim),
+            ).squeeze(1)
+            picked_sum = picked_sum + chosen_rep
+
+        return {
+            "picks": torch.stack(all_picks, dim=1),
+            "log_prob": torch.stack(all_log_probs, dim=1).sum(1),
+            "entropy": torch.stack(all_entropies, dim=1).sum(1),
         }
 
 
@@ -354,6 +550,65 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
     }
 
 
+def _preview_pick_key(species: list[str]) -> str:
+    return " / ".join(species)
+
+
+def _summarize_preview_results(preview_results: list[dict[str, object]]) -> dict[str, object]:
+    ordered_picks = Counter()
+    unordered_picks = Counter()
+    species_counts = Counter()
+    lead_counts = Counter()
+    entropies: list[float] = []
+
+    for result in preview_results:
+        picked_species = [str(species) for species in result["picked_species_ordered"]]
+        ordered_picks[_preview_pick_key(picked_species)] += 1
+        unordered_picks[_preview_pick_key(sorted(picked_species))] += 1
+        for species in picked_species:
+            species_counts[species] += 1
+        for species in picked_species[:2]:
+            lead_counts[species] += 1
+        entropies.append(float(result["entropy"]))
+
+    total_games = len(preview_results)
+    total_slots = sum(len(result["picked_species_ordered"]) for result in preview_results)
+    total_leads = sum(min(2, len(result["picked_species_ordered"])) for result in preview_results)
+    return {
+        "games": total_games,
+        "distinct_ordered_picks": len(ordered_picks),
+        "distinct_unordered_picks": len(unordered_picks),
+        "entropy_mean": float(np.mean(entropies)) if entropies else 0.0,
+        "entropy_std": float(np.std(entropies)) if entropies else 0.0,
+        "ordered_pick_sets": _counter_rows(ordered_picks, total_games),
+        "unordered_pick_sets": _counter_rows(unordered_picks, total_games),
+        "species_pick_counts": _counter_rows(species_counts, total_slots),
+        "lead_species_counts": _counter_rows(lead_counts, total_leads),
+    }
+
+
+def _summarize_battle_behavior(battle_results: list[dict[str, object]]) -> dict[str, object]:
+    tera_used_games = [result for result in battle_results if result.get("tera_used")]
+    tera_unused_games = [result for result in battle_results if not result.get("tera_used")]
+    tera_turns = [float(result["first_tera_turn"]) for result in tera_used_games if result.get("first_tera_turn")]
+    switch_counts = [int(result.get("switch_actions", 0)) for result in battle_results]
+
+    return {
+        "games_with_tera": len(tera_used_games),
+        "tera_game_rate": _safe_rate(len(tera_used_games), len(battle_results)),
+        "win_rate_when_tera_used": _safe_rate(
+            sum(1 for result in tera_used_games if result.get("won")),
+            len(tera_used_games),
+        ),
+        "win_rate_when_tera_unused": _safe_rate(
+            sum(1 for result in tera_unused_games if result.get("won")),
+            len(tera_unused_games),
+        ),
+        "avg_first_tera_turn": float(np.mean(tera_turns)) if tera_turns else 0.0,
+        "avg_switch_actions_per_game": float(np.mean(switch_counts)) if switch_counts else 0.0,
+    }
+
+
 def _battle_tag_slug(battle: DoubleBattle) -> str:
     return battle.battle_tag.replace("[", "").replace("]", "").replace(" ", "_")
 
@@ -368,35 +623,66 @@ def evaluate_policy_vs_fixed_bot(
     agent,
     device: torch.device,
     env_config: EnvConfig,
-    team_spec: FixedTeamSpec,
+    model_team_spec: FixedTeamSpec,
+    opponent_team_pool: TeamPool,
+    species_bst_lookup: dict[str, int],
     num_games: int,
     action_mode: str,
+    seed: int,
     max_turns: int,
     replay_dir: str | None = None,
     replay_count: int = 1,
 ) -> dict[str, object]:
-    policy = ModelPolicyController(agent, device=device, action_mode=action_mode)
+    if env_config.team_size <= env_config.pick_size:
+        raise ValueError(
+            "Fixed-bot evaluation now expects real preview semantics: team_size must be greater than pick_size."
+        )
 
-    def fixed_team_preview(_obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
-        return np.arange(env_config.team_size, dtype=np.int64), ""
+    policy = ModelPolicyController(agent, device=device, action_mode=action_mode)
+    game_data = GameData(gen=9)
+    species_idx_lookup = _species_idx_display_lookup(game_data)
+    opponent_specs = plan_opponent_team_specs(
+        opponent_team_pool,
+        model_team_spec=model_team_spec,
+        species_bst_lookup=species_bst_lookup,
+        pick_size=env_config.pick_size,
+        num_games=num_games,
+        seed=seed,
+    )
+    matchups = PlannedMatchups(model_team_spec, opponent_specs)
+    preview_records: list[dict[str, object]] = []
+
+    def live_team_preview(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
+        preview_out = policy.choose_team_preview(obs)
+        picks = np.asarray(preview_out["picks"], dtype=np.int64)
+        preview_records.append(
+            {
+                "picks": picks.copy(),
+                "entropy": float(preview_out["entropy"]),
+                "log_prob": float(preview_out["log_prob"]),
+            }
+        )
+        return picks, "/team " + "".join(str(int(pick) + 1) for pick in picks)
 
     def team_pair_provider() -> tuple[str, str]:
-        return team_spec.max_bst_packed_team, team_spec.max_bst_packed_team
+        return matchups.team_pair_provider()
 
     def opponent_factory(loop):
-        return MaxBasePowerPlayer(
+        return DeterministicPreviewMaxBasePowerPlayer(
             account_configuration=make_local_account_configuration("fixedbot"),
             battle_format=env_config.battle_format,
             server_configuration=make_server_configuration(env_config),
             loop=loop,
-            team=team_spec.max_bst_packed_team,
+            team=model_team_spec.packed_team,
+            species_bst_lookup=species_bst_lookup,
+            pick_size=env_config.pick_size,
         )
 
     env = BattleEnv(
         env_config,
-        GameData(gen=9),
+        game_data,
         opponent_factory,
-        team_preview_fn=fixed_team_preview,
+        team_preview_fn=live_team_preview,
         team_pair_provider=team_pair_provider,
         player_kwargs={
             "account_configuration": make_local_account_configuration("evalagent"),
@@ -408,6 +694,7 @@ def evaluate_policy_vs_fixed_bot(
     decision_steps: list[int] = []
     entropies: list[float] = []
     action_stats: Counter[str] = Counter()
+    preview_results: list[dict[str, object]] = []
     battle_results: list[dict[str, object]] = []
     replay_artifacts: list[dict[str, str]] = []
 
@@ -417,10 +704,17 @@ def evaluate_policy_vs_fixed_bot(
         for game_index in range(num_games):
             policy.reset_battle()
             obs, masks = env.reset()
+            opponent_spec = matchups.consume_active_opponent()
+            if not preview_records:
+                raise RuntimeError("Model team preview did not run before the first observation arrived.")
+            preview_record = preview_records.pop(0)
             done = False
             reward = 0.0
             step_count = 0
             trace: list[dict[str, object]] = []
+            battle_action_stats: Counter[str] = Counter()
+            first_tera_turn: int | None = None
+            first_tera_step: int | None = None
 
             while not done:
                 if max_turns > 0 and step_count >= max_turns:
@@ -435,17 +729,23 @@ def evaluate_policy_vs_fixed_bot(
                 actions = np.asarray(action_out["actions"], dtype=np.int64)
                 entropies.append(float(action_out["entropy"]))
                 for slot, action_idx in enumerate(actions):
-                    action_stats.update(_classify_slot_action(battle, slot, int(action_idx)))
+                    slot_stats = _classify_slot_action(battle, slot, int(action_idx))
+                    action_stats.update(slot_stats)
+                    battle_action_stats.update(slot_stats)
 
+                action_descriptions = [
+                    _describe_slot_action(battle, 0, int(actions[0])),
+                    _describe_slot_action(battle, 1, int(actions[1])),
+                ]
+                if first_tera_turn is None and any(description["tera"] for description in action_descriptions):
+                    first_tera_turn = int(getattr(battle, "turn", 0))
+                    first_tera_step = step_count + 1
                 trace.append(
                     {
                         "decision_step": step_count + 1,
                         "battle_turn": int(getattr(battle, "turn", 0)),
                         "entropy": float(action_out["entropy"]),
-                        "actions": [
-                            _describe_slot_action(battle, 0, int(actions[0])),
-                            _describe_slot_action(battle, 1, int(actions[1])),
-                        ],
+                        "actions": action_descriptions,
                     }
                 )
 
@@ -457,6 +757,27 @@ def evaluate_policy_vs_fixed_bot(
             battle_turn = int(info.get("battle_turn", getattr(env.last_battle, "turn", 0)))
             battle_turns.append(battle_turn)
             decision_steps.append(step_count)
+
+            if "team_preview_obs" not in info or "team_preview_picks" not in info:
+                raise RuntimeError("Evaluation battle finished without team preview metadata.")
+            preview_obs = info["team_preview_obs"]
+            preview_picks = np.asarray(info["team_preview_picks"], dtype=np.int64)
+            if not np.array_equal(preview_picks, preview_record["picks"]):
+                raise RuntimeError("Recorded model team preview picks disagreed with the episode summary.")
+
+            own_preview_species = _species_names_from_obs(preview_obs["own_species"], species_idx_lookup)
+            opponent_preview_species = _species_names_from_obs(preview_obs["opp_species"], species_idx_lookup)
+            picked_species_ordered = [own_preview_species[int(index)] for index in preview_picks]
+            preview_result = {
+                "pick_indices": [int(index) for index in preview_picks.tolist()],
+                "picked_species_ordered": picked_species_ordered,
+                "picked_species_sorted": sorted(picked_species_ordered),
+                "entropy": float(preview_record["entropy"]),
+                "log_prob": float(preview_record["log_prob"]),
+                "opponent_preview_species": opponent_preview_species,
+            }
+            preview_results.append(preview_result)
+
             battle_result = {
                 "game": game_index + 1,
                 "won": bool(won),
@@ -464,6 +785,14 @@ def evaluate_policy_vs_fixed_bot(
                 "battle_turn": battle_turn,
                 "decision_steps": step_count,
                 "battle_tag": info.get("battle_tag", ""),
+                "opponent_title": opponent_spec.title,
+                "opponent_file": opponent_spec.file,
+                "opponent_species": list(opponent_spec.species),
+                "preview": preview_result,
+                "tera_used": first_tera_turn is not None,
+                "first_tera_turn": first_tera_turn,
+                "first_tera_decision_step": first_tera_step,
+                "switch_actions": int(battle_action_stats.get("switch_actions", 0)),
             }
             battle_results.append(battle_result)
 
@@ -477,7 +806,9 @@ def evaluate_policy_vs_fixed_bot(
                 _write_json(
                     trace_path,
                     {
-                        "team": team_spec.to_summary(),
+                        "model_team": model_team_spec.to_summary(),
+                        "opponent_team": opponent_spec.to_summary(),
+                        "preview": preview_result,
                         "result": battle_result,
                         "trace": trace,
                     },
@@ -494,7 +825,9 @@ def evaluate_policy_vs_fixed_bot(
         return {
             "games": num_games,
             "opponent_kind": "max-base-power",
-            "fixed_team_size": env_config.team_size,
+            "team_size": env_config.team_size,
+            "pick_size": env_config.pick_size,
+            "distinct_opponent_teams": len({result["opponent_title"] for result in battle_results}),
             "wins": wins,
             "losses": losses,
             "win_rate": float(wins / num_games) if num_games else 0.0,
@@ -502,7 +835,9 @@ def evaluate_policy_vs_fixed_bot(
             "avg_decision_steps": float(np.mean(decision_steps)) if decision_steps else 0.0,
             "action_entropy_mean": float(np.mean(entropies)) if entropies else 0.0,
             "action_entropy_std": float(np.std(entropies)) if entropies else 0.0,
+            "preview_summary": _summarize_preview_results(preview_results),
             "action_breakdown": _summarize_action_stats(action_stats),
+            "battle_behavior": _summarize_battle_behavior(battle_results),
             "battle_results": battle_results,
             "replays": replay_artifacts,
         }

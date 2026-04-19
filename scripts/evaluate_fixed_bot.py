@@ -17,6 +17,7 @@ from pokerl.eval.fixed_bot import (
     evaluate_policy_vs_fixed_bot,
     load_agent_for_evaluation,
     select_max_bst_team_spec,
+    select_team_spec_by_title,
 )
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
 
@@ -26,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate pokeRL against a fixed 4-mon max-BST MaxBasePowerPlayer."
+        description="Evaluate pokeRL against a MaxBasePowerPlayer using real 6-to-4 team preview battles."
     )
     parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path; omit for random initialization.")
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
@@ -41,14 +42,19 @@ def parse_args() -> argparse.Namespace:
         "--team-pool-subset",
         choices=["curated", "generated", "pool"],
         default="pool",
-        help="Which manifest subset to search for the fixed 4-mon max-BST team.",
+        help="Which manifest subset to use for both the fixed model roster and the varied opponent teams.",
     )
     parser.add_argument("--team-pool-seed", type=int, default=0, help="Seed used when loading the team pool.")
+    parser.add_argument(
+        "--model-team-title",
+        default=None,
+        help="Optional exact team title to use as the model's fixed 6-mon roster. Defaults to the strongest pool team.",
+    )
     parser.add_argument("--games", type=int, default=32, help="Number of evaluation battles.")
     parser.add_argument(
         "--action-mode",
         choices=["sample", "argmax"],
-        default="sample",
+        default="argmax",
         help="Whether to sample from the policy or play greedily.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Torch/numpy seed for evaluation reproducibility.")
@@ -104,7 +110,7 @@ def main() -> None:
         battle_format=args.battle_format,
         server_url=args.server_url,
         num_envs=1,
-        team_size=4,
+        team_size=6,
         pick_size=4,
     )
     model_config = ModelConfig(pick_size=env_config.pick_size)
@@ -117,11 +123,19 @@ def main() -> None:
         subset=args.team_pool_subset,
         seed=args.team_pool_seed,
     )
-    team_spec = select_max_bst_team_spec(
-        team_pool,
-        species_bst_lookup=species_bst_lookup,
-        pick_size=env_config.pick_size,
-    )
+    if args.model_team_title:
+        model_team_spec = select_team_spec_by_title(
+            team_pool,
+            title=args.model_team_title,
+            species_bst_lookup=species_bst_lookup,
+            pick_size=env_config.pick_size,
+        )
+    else:
+        model_team_spec = select_max_bst_team_spec(
+            team_pool,
+            species_bst_lookup=species_bst_lookup,
+            pick_size=env_config.pick_size,
+        )
     agent = load_agent_for_evaluation(
         checkpoint_path=args.checkpoint,
         device=device,
@@ -138,20 +152,25 @@ def main() -> None:
             "games": args.games,
             "action_mode": args.action_mode,
             "opponent": "max-base-power",
-            "fixed_team_size": env_config.team_size,
+            "team_size": env_config.team_size,
+            "pick_size": env_config.pick_size,
             "seed": args.seed,
             "team_pool_format": args.team_pool_format,
             "team_pool_subset": args.team_pool_subset,
             "team_pool_size": team_pool.size,
+            "model_team_title": model_team_spec.title,
         },
-        "fixed_team": team_spec.to_summary(),
+        "model_team": model_team_spec.to_summary(),
         "results": evaluate_policy_vs_fixed_bot(
             agent=agent,
             device=device,
             env_config=env_config,
-            team_spec=team_spec,
+            model_team_spec=model_team_spec,
+            opponent_team_pool=team_pool,
+            species_bst_lookup=species_bst_lookup,
             num_games=args.games,
             action_mode=args.action_mode,
+            seed=args.seed,
             max_turns=args.max_turns,
             replay_dir=args.replay_dir,
             replay_count=args.replay_count,
