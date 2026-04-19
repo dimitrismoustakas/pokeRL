@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from pathlib import Path
 
 from ..config import TrainingConfig
+from ..env.observation import ROLE_BENCH
 from ..model.agent import PokeAgent, load_state_dict_compatible
 from .rollout import RolloutBatch
 
@@ -105,11 +106,14 @@ class PPOTrainer:
                     k: v.reshape(T * E_mb, *v.shape[2:])
                     for k, v in mb_obs_seq.items()
                 }
-                context_flat, active_reps_flat, own_reps_flat, _, opp_active_reps_flat = self.agent.spatial(flat_obs)
+                context_flat, active_reps_flat, own_reps_flat, opp_reps_flat, opp_active_reps_flat = self.agent.spatial(flat_obs)
                 context_seq_mb = context_flat.reshape(T, E_mb, -1)
                 active_reps_seq_mb = active_reps_flat.reshape(T, E_mb, 2, -1)
                 own_reps_seq_mb = own_reps_flat.reshape(T, E_mb, own_reps_flat.shape[1], -1)
+                opp_reps_seq_mb = opp_reps_flat.reshape(T, E_mb, opp_reps_flat.shape[1], -1)
                 opp_active_reps_seq_mb = opp_active_reps_flat.reshape(T, E_mb, 2, -1)
+                own_bench_mask_seq_mb = (mb_obs_seq["own_roles"] != ROLE_BENCH) | mb_obs_seq["own_mask"]
+                opp_bench_mask_seq_mb = (mb_obs_seq["opp_roles"] != ROLE_BENCH) | mb_obs_seq["opp_mask"]
 
                 # LSTM + heads: step through the sequence one turn at a time.
                 # Gradients flow back through all turns within each non-terminal
@@ -125,11 +129,19 @@ class PPOTrainer:
                         ctx_t,
                         active_reps_seq_mb[t],
                         own_reps_seq_mb[t],
+                        opp_reps_seq_mb[t],
+                        opp_bench_mask_seq_mb[t],
                         opp_active_reps_seq_mb[t],
                         mb_masks_seq[t],
                         mb_actions_seq[t],
                     )
-                    value_t = self.agent.value_head(ctx_t)
+                    value_t = self.agent.value_head(
+                        ctx_t,
+                        own_reps_seq_mb[t],
+                        opp_reps_seq_mb[t],
+                        own_bench_mask_seq_mb[t],
+                        opp_bench_mask_seq_mb[t],
+                    )
 
                     all_log_probs.append(action_out["log_prob"])
                     all_entropies.append(action_out["entropy"])

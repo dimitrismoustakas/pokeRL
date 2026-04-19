@@ -1,5 +1,7 @@
 """Action head (autoregressive for doubles) and value head."""
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -12,6 +14,50 @@ from ..env.actions import (
     TARGET_NONE,
     decode_action,
 )
+
+
+class MaskedSetAttention(nn.Module):
+    """Query-conditioned pooling over a masked set of pokemon representations."""
+
+    def __init__(self, query_dim: int, item_dim: int, hidden_dim: int):
+        super().__init__()
+        self.query_proj = nn.Linear(query_dim, hidden_dim)
+        self.key_proj = nn.Linear(item_dim, hidden_dim)
+        self.value_proj = nn.Linear(item_dim, item_dim)
+        self.scale = math.sqrt(hidden_dim)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        items: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size, num_items, _ = items.shape
+        if query.shape[0] != batch_size:
+            raise ValueError(
+                f"MaskedSetAttention expected batch-aligned query/items, got "
+                f"{query.shape[0]} queries for {batch_size} item sets."
+            )
+        if mask is not None and mask.shape != (batch_size, num_items):
+            raise ValueError(
+                f"MaskedSetAttention expected mask shape {(batch_size, num_items)}, got {tuple(mask.shape)}."
+            )
+
+        query_proj = self.query_proj(query).unsqueeze(1)
+        key_proj = self.key_proj(items)
+        scores = (query_proj * key_proj).sum(dim=-1) / self.scale
+
+        if mask is not None:
+            scores = scores.masked_fill(mask, -1e8)
+
+        weights = torch.softmax(scores, dim=1)
+        if mask is not None:
+            weights = weights.masked_fill(mask, 0.0)
+        weights_sum = weights.sum(dim=1, keepdim=True)
+        weights = torch.where(weights_sum > 0, weights / weights_sum.clamp(min=1e-8), weights)
+
+        values = self.value_proj(items)
+        return torch.bmm(weights.unsqueeze(1), values).squeeze(1)
 
 
 class ActionHead(nn.Module):
@@ -42,6 +88,15 @@ class ActionHead(nn.Module):
             nn.Linear(context_dim + pokemon_dim * 4 + hidden_dim, hidden_dim),
             nn.ReLU(),
         )
+        self.reserve_attention = MaskedSetAttention(hidden_dim, pokemon_dim, hidden_dim)
+        self.query1_fuse = nn.Sequential(
+            nn.Linear(hidden_dim + pokemon_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.query2_fuse = nn.Sequential(
+            nn.Linear(hidden_dim + pokemon_dim, hidden_dim),
+            nn.ReLU(),
+        )
         self.entity_proj = nn.Sequential(
             nn.Linear(pokemon_dim, hidden_dim),
             nn.ReLU(),
@@ -65,6 +120,8 @@ class ActionHead(nn.Module):
         context: torch.Tensor,
         active_reps: torch.Tensor,
         own_team_reps: torch.Tensor,
+        opp_team_reps: torch.Tensor,
+        opp_reserve_mask: torch.Tensor,
         opp_active_reps: torch.Tensor,
         masks: torch.Tensor,
         actions: torch.Tensor | None = None,
@@ -76,7 +133,9 @@ class ActionHead(nn.Module):
         opp2 = opp_active_reps[:, 1]
         mask1 = masks[:, FIRST_SLOT_MASK_ROW]
 
-        query1 = self.query1(torch.cat([context, rep1, rep2, opp1, opp2], dim=-1))
+        base_query1 = self.query1(torch.cat([context, rep1, rep2, opp1, opp2], dim=-1))
+        reserve_summary1 = self.reserve_attention(base_query1, opp_team_reps, opp_reserve_mask)
+        query1 = self.query1_fuse(torch.cat([base_query1, reserve_summary1], dim=-1))
         logits1 = self._score_actions(query1, rep1, rep2, own_team_reps, opp_active_reps)
         logits1 = logits1.masked_fill(~mask1, -1e8)
         dist1 = torch.distributions.Categorical(logits=logits1)
@@ -100,7 +159,9 @@ class ActionHead(nn.Module):
             )
 
         a1_emb = self.action_id_emb(a1)
-        query2 = self.query2(torch.cat([context, rep2, rep1, opp1, opp2, a1_emb], dim=-1))
+        base_query2 = self.query2(torch.cat([context, rep2, rep1, opp1, opp2, a1_emb], dim=-1))
+        reserve_summary2 = self.reserve_attention(base_query2, opp_team_reps, opp_reserve_mask)
+        query2 = self.query2_fuse(torch.cat([base_query2, reserve_summary2], dim=-1))
         logits2 = self._score_actions(query2, rep2, rep1, own_team_reps, opp_active_reps)
         logits2 = logits2.masked_fill(~mask2, -1e8)
         dist2 = torch.distributions.Categorical(logits=logits2)
@@ -228,8 +289,9 @@ class TeamPreviewHead(nn.Module):
     def __init__(self, pokemon_dim: int, context_dim: int, pick_size: int = 4):
         super().__init__()
         self.pick_size = pick_size
+        self.opponent_attention = MaskedSetAttention(context_dim, pokemon_dim, 128)
         self.score = nn.Sequential(
-            nn.Linear(pokemon_dim + context_dim, 128),
+            nn.Linear(pokemon_dim * 2 + context_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
         )
@@ -238,29 +300,42 @@ class TeamPreviewHead(nn.Module):
     def forward(
         self,
         pokemon_reps: torch.Tensor,
+        opponent_reps: torch.Tensor,
         context: torch.Tensor,
+        team_mask: torch.Tensor | None = None,
+        opponent_mask: torch.Tensor | None = None,
         picks: torch.Tensor | None = None,
+        greedy: bool = False,
     ) -> dict[str, torch.Tensor]:
         batch, team_size, pdim = pokemon_reps.shape
 
         all_log_probs = []
         all_entropies = []
         all_picks = []
-        available = torch.ones(batch, team_size, dtype=torch.bool, device=context.device)
+        if team_mask is None:
+            available = torch.ones(batch, team_size, dtype=torch.bool, device=context.device)
+        else:
+            available = ~team_mask.clone()
+        if (available.sum(dim=1) < self.pick_size).any():
+            raise ValueError(
+                f"TeamPreviewHead needs at least {self.pick_size} available pokemon per batch item."
+            )
         picked_sum = torch.zeros(batch, pdim, device=context.device)
 
         for step in range(self.pick_size):
             ctx = self.context_proj(torch.cat([context, picked_sum], dim=-1))
+            opponent_summary = self.opponent_attention(ctx, opponent_reps, opponent_mask)
 
             ctx_expanded = ctx.unsqueeze(1).expand(-1, team_size, -1)
-            inputs = torch.cat([pokemon_reps, ctx_expanded], dim=-1)
+            opponent_expanded = opponent_summary.unsqueeze(1).expand(-1, team_size, -1)
+            inputs = torch.cat([pokemon_reps, ctx_expanded, opponent_expanded], dim=-1)
             scores = self.score(inputs).squeeze(-1)
             scores = scores.masked_fill(~available, -1e8)
 
             dist = torch.distributions.Categorical(logits=scores)
 
             if picks is None:
-                chosen = dist.sample()
+                chosen = scores.argmax(dim=1) if greedy else dist.sample()
             else:
                 chosen = picks[:, step]
 
@@ -326,13 +401,24 @@ class OpponentPreviewHead(nn.Module):
 class ValueHead(nn.Module):
     """Estimates V(s) -- the probability of winning from the current state."""
 
-    def __init__(self, context_dim: int, hidden_dim: int = 256):
+    def __init__(self, context_dim: int, pokemon_dim: int, hidden_dim: int = 256):
         super().__init__()
+        self.own_bench_attention = MaskedSetAttention(context_dim, pokemon_dim, hidden_dim)
+        self.opp_bench_attention = MaskedSetAttention(context_dim, pokemon_dim, hidden_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(context_dim, hidden_dim),
+            nn.Linear(context_dim + 2 * pokemon_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, context: torch.Tensor) -> torch.Tensor:
-        return self.mlp(context).squeeze(-1)
+    def forward(
+        self,
+        context: torch.Tensor,
+        own_team_reps: torch.Tensor,
+        opp_team_reps: torch.Tensor,
+        own_bench_mask: torch.Tensor,
+        opp_bench_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        own_bench = self.own_bench_attention(context, own_team_reps, own_bench_mask)
+        opp_bench = self.opp_bench_attention(context, opp_team_reps, opp_bench_mask)
+        return self.mlp(torch.cat([context, own_bench, opp_bench], dim=-1)).squeeze(-1)

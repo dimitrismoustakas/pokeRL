@@ -306,9 +306,10 @@ class ModelPolicyController:
         obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(self.device) for key, value in obs.items()}
 
         with torch.inference_mode():
-            context, _, own_reps, _, _ = self.agent.spatial(obs_t)
-            context, _ = self.agent.memory(context, None)
-            preview_out = self._team_preview_forward(context, own_reps)
+            preview_out = self.agent.team_preview(
+                obs_t,
+                greedy=self.action_mode == "argmax",
+            )
 
         return {
             "picks": preview_out["picks"].cpu().numpy()[0],
@@ -321,12 +322,15 @@ class ModelPolicyController:
         masks_t = torch.from_numpy(masks).unsqueeze(0).to(device=self.device, dtype=torch.bool)
 
         with torch.inference_mode():
-            context, active_reps, own_reps, _, opp_active_reps = self.agent.spatial(obs_t)
+            context, active_reps, own_reps, opp_reps, opp_active_reps = self.agent.spatial(obs_t)
             context, new_hidden = self.agent.memory(context, self.hidden)
+            opp_bench_mask = self.agent._bench_mask(obs_t.get("opp_mask"), obs_t["opp_roles"])
             action_out = self.agent.action_head(
                 context,
                 active_reps,
                 own_reps,
+                opp_reps,
+                opp_bench_mask,
                 opp_active_reps,
                 masks_t,
                 greedy=self.action_mode == "argmax",
@@ -340,48 +344,6 @@ class ModelPolicyController:
             "actions": actions,
             "entropy": float(entropy),
             "log_prob": float(log_prob),
-        }
-
-    def _team_preview_forward(
-        self,
-        context: torch.Tensor,
-        own_reps: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        head = self.agent.team_preview_head
-        batch, team_size, pokemon_dim = own_reps.shape
-        available = torch.ones(batch, team_size, dtype=torch.bool, device=context.device)
-        picked_sum = torch.zeros(batch, pokemon_dim, device=context.device)
-        all_picks = []
-        all_log_probs = []
-        all_entropies = []
-
-        for _ in range(head.pick_size):
-            ctx = head.context_proj(torch.cat([context, picked_sum], dim=-1))
-            ctx_expanded = ctx.unsqueeze(1).expand(-1, team_size, -1)
-            scores = head.score(torch.cat([own_reps, ctx_expanded], dim=-1)).squeeze(-1)
-            scores = scores.masked_fill(~available, -1e8)
-            dist = torch.distributions.Categorical(logits=scores)
-
-            if self.action_mode == "argmax":
-                chosen = torch.argmax(scores, dim=1)
-            else:
-                chosen = dist.sample()
-
-            all_picks.append(chosen)
-            all_log_probs.append(dist.log_prob(chosen))
-            all_entropies.append(dist.entropy())
-
-            available.scatter_(1, chosen.unsqueeze(1), False)
-            chosen_rep = own_reps.gather(
-                1,
-                chosen.unsqueeze(1).unsqueeze(2).expand(-1, -1, pokemon_dim),
-            ).squeeze(1)
-            picked_sum = picked_sum + chosen_rep
-
-        return {
-            "picks": torch.stack(all_picks, dim=1),
-            "log_prob": torch.stack(all_log_probs, dim=1).sum(1),
-            "entropy": torch.stack(all_entropies, dim=1).sum(1),
         }
 
 

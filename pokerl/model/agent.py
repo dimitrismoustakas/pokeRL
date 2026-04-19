@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from ..config import ModelConfig
 from ..data import GameData
-from ..env.observation import CONTINUOUS_DIM
+from ..env.observation import CONTINUOUS_DIM, ROLE_BENCH
 from .encoders import PokemonEncoder, TeamEncoder, FieldEncoder, SpatialEncoder
 from .memory import build_memory
 from .heads import ActionHead, OpponentPreviewHead, TeamPreviewHead, ValueHead
@@ -80,7 +80,7 @@ class PokeAgent(nn.Module):
         self.action_head = ActionHead(memory_out, config.pokemon_out, config.action_hidden)
         self.team_preview_head = TeamPreviewHead(config.pokemon_out, memory_out, config.pick_size)
         self.opponent_preview_head = OpponentPreviewHead(config.pokemon_out, memory_out)
-        self.value_head = ValueHead(memory_out, config.value_hidden)
+        self.value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)
 
         # Optional: stat-based embedding init
         if config.init_embeddings_from_stats:
@@ -105,18 +105,22 @@ class PokeAgent(nn.Module):
 
         Returns dict with: actions, log_prob, entropy, value, hidden
         """
-        context, active_reps, own_reps, _, opp_active_reps = self.spatial(obs)
+        context, active_reps, own_reps, opp_reps, opp_active_reps = self.spatial(obs)
         context, new_hidden = self.memory(context, hidden)
+        own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
+        opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
 
         action_out = self.action_head(
             context,
             active_reps,
             own_reps,
+            opp_reps,
+            opp_bench_mask,
             opp_active_reps,
             action_masks,
             actions,
         )
-        value = self.value_head(context)
+        value = self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 
         return {
             **action_out,
@@ -129,6 +133,7 @@ class PokeAgent(nn.Module):
         obs: dict[str, torch.Tensor],
         hidden=None,
         picks: torch.Tensor | None = None,
+        greedy: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for team preview (selecting 4 from 6).
 
@@ -139,7 +144,15 @@ class PokeAgent(nn.Module):
         context, _, own_reps, opp_reps, _ = self.spatial(obs)
         context, new_hidden = self.memory(context, hidden)
 
-        preview_out = self.team_preview_head(own_reps, context, picks)
+        preview_out = self.team_preview_head(
+            own_reps,
+            opp_reps,
+            context,
+            obs.get("own_mask"),
+            obs.get("opp_mask"),
+            picks,
+            greedy,
+        )
         opponent_out = self.opponent_preview_head(opp_reps, context, obs.get("opp_mask"))
         return {
             **preview_out,
@@ -149,9 +162,18 @@ class PokeAgent(nn.Module):
 
     def get_value(self, obs: dict[str, torch.Tensor], hidden=None) -> torch.Tensor:
         """Just the value estimate, for GAE computation."""
-        context, _, _, _, _ = self.spatial(obs)
+        context, _, own_reps, opp_reps, _ = self.spatial(obs)
         context, _ = self.memory(context, hidden)
-        return self.value_head(context)
+        own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
+        opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
+        return self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 
     def initial_hidden(self, batch_size: int):
         return self.memory.initial_hidden(batch_size)
+
+    @staticmethod
+    def _bench_mask(mask: torch.Tensor | None, roles: torch.Tensor) -> torch.Tensor:
+        bench_mask = roles != ROLE_BENCH
+        if mask is None:
+            return bench_mask
+        return mask | bench_mask

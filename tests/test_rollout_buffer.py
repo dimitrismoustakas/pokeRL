@@ -24,7 +24,8 @@ from pokerl.env.actions import (
     build_joint_action_mask,
 )
 from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
-from pokerl.model.heads import ActionHead, ValueHead
+from pokerl.env.observation import ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH
+from pokerl.model.heads import ActionHead, MaskedSetAttention, TeamPreviewHead, ValueHead
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
 from pokerl.training.ppo import PPOTrainer
@@ -126,8 +127,9 @@ class _DummySpatial(nn.Module):
         context = self.context_proj(obs["context"].float())
         active = self.active_proj(obs["active"].float())
         team = self.team_proj(obs["team"].float())
+        opp_team = self.opp_proj(obs["opp_team"].float())
         opp_active = self.opp_proj(obs["opp_active"].float())
-        return context, active, team, team, opp_active
+        return context, active, team, opp_team, opp_active
 
 
 class _DummyAgent(nn.Module):
@@ -136,7 +138,7 @@ class _DummyAgent(nn.Module):
         self.spatial = _DummySpatial()
         self.memory = IdentityMemory(input_dim=3, hidden_dim=3)
         self.action_head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
-        self.value_head = ValueHead(context_dim=3, hidden_dim=8)
+        self.value_head = ValueHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
 
     def forward(
         self,
@@ -145,12 +147,23 @@ class _DummyAgent(nn.Module):
         actions: torch.Tensor | None = None,
         action_masks: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        context, active_reps, own_reps, _, opp_active_reps = self.spatial(obs)
+        context, active_reps, own_reps, opp_reps, opp_active_reps = self.spatial(obs)
         context, hidden = self.memory(context, hidden)
-        action_out = self.action_head(context, active_reps, own_reps, opp_active_reps, action_masks, actions)
+        own_bench_mask = (obs["own_roles"] != ROLE_BENCH) | obs["own_mask"]
+        opp_bench_mask = (obs["opp_roles"] != ROLE_BENCH) | obs["opp_mask"]
+        action_out = self.action_head(
+            context,
+            active_reps,
+            own_reps,
+            opp_reps,
+            opp_bench_mask,
+            opp_active_reps,
+            action_masks,
+            actions,
+        )
         return {
             **action_out,
-            "value": self.value_head(context),
+            "value": self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask),
             "hidden": hidden,
         }
 
@@ -159,11 +172,25 @@ class _DummyAgent(nn.Module):
 
 
 def _ppo_obs(step: int, num_envs: int) -> dict[str, np.ndarray]:
+    own_roles = np.tile(
+        np.array([ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH], dtype=np.int64),
+        (num_envs, 1),
+    )
+    opp_roles = np.tile(
+        np.array([ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH], dtype=np.int64),
+        (num_envs, 1),
+    )
+    mask = np.zeros((num_envs, 6), dtype=bool)
     return {
         "context": np.full((num_envs, 3), float(step), dtype=np.float32),
         "active": np.full((num_envs, 2, 2), float(step + 1), dtype=np.float32),
         "team": np.full((num_envs, 6, 2), float(step + 2), dtype=np.float32),
+        "opp_team": np.full((num_envs, 6, 2), float(step + 2.5), dtype=np.float32),
         "opp_active": np.full((num_envs, 2, 2), float(step + 3), dtype=np.float32),
+        "own_roles": own_roles,
+        "opp_roles": opp_roles,
+        "own_mask": mask.copy(),
+        "opp_mask": mask.copy(),
     }
 
 
@@ -201,12 +228,14 @@ def test_action_head_uses_conditional_joint_mask_to_block_double_tera() -> None:
     context = torch.zeros((1, 3))
     active_reps = torch.zeros((1, 2, 2))
     own_team_reps = torch.zeros((1, 6, 2))
+    opp_team_reps = torch.zeros((1, 6, 2))
+    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
     opp_active_reps = torch.zeros((1, 2, 2))
     masks = torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool)
     masks[0, FIRST_SLOT_MASK_ROW, TERA_OFFSET] = True
     masks[0, TERA_OFFSET + 1, 0] = True
 
-    out = head(context, active_reps, own_team_reps, opp_active_reps, masks)
+    out = head(context, active_reps, own_team_reps, opp_team_reps, opp_reserve_mask, opp_active_reps, masks)
 
     assert out["actions"][0, 0].item() == TERA_OFFSET
     assert out["actions"][0, 1].item() == 0
@@ -218,16 +247,58 @@ def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_targe
     context = torch.zeros((1, 3))
     active_reps = torch.zeros((1, 2, 2))
     own_team_reps = torch.zeros((1, 6, 2))
+    opp_team_reps = torch.zeros((1, 6, 2))
+    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
     opp_active_reps = torch.zeros((1, 2, 2))
     masks = torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool)
     shared_switch = SWITCH_OFFSET + 5
     masks[0, FIRST_SLOT_MASK_ROW, shared_switch] = True
     masks[0, shared_switch + 1, 0] = True
 
-    out = head(context, active_reps, own_team_reps, opp_active_reps, masks)
+    out = head(context, active_reps, own_team_reps, opp_team_reps, opp_reserve_mask, opp_active_reps, masks)
 
     assert out["actions"][0, 0].item() == shared_switch
     assert out["actions"][0, 1].item() == 0
+
+
+def test_masked_set_attention_returns_zero_when_every_item_is_masked() -> None:
+    attention = MaskedSetAttention(query_dim=3, item_dim=2, hidden_dim=4)
+    query = torch.randn(2, 3)
+    items = torch.randn(2, 4, 2)
+    mask = torch.ones((2, 4), dtype=torch.bool)
+
+    summary = attention(query, items, mask)
+
+    assert torch.equal(summary, torch.zeros_like(summary))
+
+
+def test_team_preview_head_accepts_opponent_structure_and_greedy_mode() -> None:
+    torch.manual_seed(0)
+    head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=3)
+    own_reps = torch.randn(2, 6, 4)
+    opp_reps = torch.randn(2, 6, 4)
+    context = torch.randn(2, 6)
+    own_mask = torch.tensor(
+        [
+            [False, False, False, False, False, True],
+            [False, False, False, False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    opponent_mask = torch.tensor(
+        [
+            [False, False, False, False, True, True],
+            [False, False, False, False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+
+    out = head(own_reps, opp_reps, context, team_mask=own_mask, opponent_mask=opponent_mask, greedy=True)
+
+    assert out["picks"].shape == (2, 3)
+    assert out["log_prob"].shape == (2,)
+    assert out["entropy"].shape == (2,)
+    assert torch.all(out["picks"][0] != 5)
 
 
 class _FakePokemon:
