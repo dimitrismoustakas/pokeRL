@@ -137,12 +137,20 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     return model_config, env_config, train_config
 
 
-def make_league_opponent_factory(env_config: EnvConfig, league: League):
+def make_league_opponent_factory(
+    env_config: EnvConfig,
+    league: League,
+    checkpoint_path: str | None = None,
+):
     """Create a league opponent factory bound to a specific env's server URL."""
     server_url = env_config.server_url
 
     def league_factory(loop: asyncio.AbstractEventLoop):
-        opponent = league.make_opponent(loop, server_url=server_url)
+        opponent = league.make_opponent(
+            loop,
+            server_url=server_url,
+            checkpoint_path=checkpoint_path,
+        )
         if opponent is None:
             raise RuntimeError(
                 "League opponent requested, but the league is empty. "
@@ -249,23 +257,41 @@ def make_envs(
     return ParallelBattleEnv(envs)
 
 
+def _sample_refresh_assignments(
+    parallel_env: ParallelBattleEnv,
+    league: League,
+) -> list[tuple[BattleEnv, str]]:
+    assignments: list[tuple[BattleEnv, str]] = []
+    checkpoint_by_server: dict[str, str] = {}
+    for env in parallel_env.envs:
+        server_url = env.config.server_url
+        checkpoint_path = checkpoint_by_server.get(server_url)
+        if checkpoint_path is None:
+            checkpoint_path = league.sample_checkpoint_path()
+            if checkpoint_path is None:
+                raise RuntimeError(
+                    "League opponent refresh requested, but the league is empty. "
+                    "This should not happen if the league was seeded before training."
+                )
+            checkpoint_by_server[server_url] = checkpoint_path
+        assignments.append((env, checkpoint_path))
+    return assignments
+
+
 def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
     """Swap out opponents in existing environments.
 
     Called periodically so the agent faces a freshly sampled set of past
-    selves. Each env independently samples from the league, so they naturally
-    get a mix of checkpoints.
+    selves. All envs on the same Showdown server share one sampled checkpoint,
+    which keeps opponent inference batches large on small local setups.
     """
-    for env in parallel_env.envs:
-        checkpoint_path = league.sample_checkpoint_path()
-        if checkpoint_path is None:
-            raise RuntimeError(
-                "League opponent refresh requested, but the league is empty. "
-                "This should not happen if the league was seeded before training."
-            )
+    assignments = _sample_refresh_assignments(parallel_env, league)
+    for env, checkpoint_path in assignments:
         if env.stage_next_opponent_checkpoint(checkpoint_path):
             continue
-        env.set_next_opponent(make_league_opponent_factory(env.config, league))
+        env.set_next_opponent(
+            make_league_opponent_factory(env.config, league, checkpoint_path=checkpoint_path)
+        )
 
 
 def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -578,12 +604,16 @@ def train():
                 else 0
             )
             metrics_json = _json_ready_metrics(metrics)
+            update_steps_per_second = (
+                steps_per_update / (rollout_sec + ppo_sec) if (rollout_sec + ppo_sec) > 0 else 0.0
+            )
             update_summary = {
                 "update": update,
                 "global_step": trainer.global_step,
                 "completed_battles": len(update_episode_rewards),
                 "rollout_sec": rollout_sec,
                 "ppo_sec": ppo_sec,
+                "update_steps_per_second": update_steps_per_second,
                 "avg_episode_sec": avg_episode_sec,
                 "avg_episode_turns": avg_episode_turns,
                 "avg_episode_opponent_choice_calls": avg_episode_opponent_choice_calls,
@@ -617,7 +647,8 @@ def train():
                     f"Step {trainer.global_step:,} | "
                     f"Envs {env_config.num_envs} | "
                     f"Servers {len(server_urls)} | "
-                    f"SPS {sps:.0f} | "
+                    f"Avg SPS {sps:.0f} | "
+                    f"Upd SPS {update_steps_per_second:.0f} | "
                     f"Rollout {rollout_sec:.2f}s | "
                     f"PPO {ppo_sec:.2f}s | "
                     f"Completed battles {len(update_episode_rewards)} | "
