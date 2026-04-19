@@ -1,6 +1,11 @@
+from pathlib import Path
 from types import SimpleNamespace
 
-from scripts.train import _sample_refresh_assignments, make_league_opponent_factory
+from scripts.train import (
+    _league_state_path_for_resume,
+    _sample_refresh_assignments,
+    make_league_opponent_factory,
+)
 
 
 def test_sample_refresh_assignments_groups_by_server() -> None:
@@ -38,3 +43,9 @@ def test_make_league_opponent_factory_passes_forced_checkpoint() -> None:
     factory("loop-token")
 
     assert calls == [("loop-token", "localhost:8000", "step_123.pt")]
+
+
+def test_league_state_path_for_resume_uses_checkpoint_parent() -> None:
+    resume_path = r"C:\tmp\run_a\final.pt"
+
+    assert _league_state_path_for_resume(resume_path) == Path(resume_path).with_name("league_state.json")

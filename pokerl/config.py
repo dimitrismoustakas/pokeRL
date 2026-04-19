@@ -62,5 +62,6 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
 
     # League
-    league_size: int = 20
-    league_update_interval: int = 50
+    league_size: int = 12
+    league_update_interval: int = 10
+    league_coalesce_ms: float = 10.0
