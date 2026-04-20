@@ -1,14 +1,15 @@
 """Action space helpers for doubles battles.
 
 The model acts in a fixed discrete space. Single-slot move targets come from
-``poke-env``'s request-aware Showdown target resolver, and joint legality is
-still delegated to ``DoubleBattleOrder.join_orders``.
+``poke-env``'s request-aware Showdown target resolver. Joint legality is
+computed directly from SingleBattleOrder attributes without allocating
+DoubleBattleOrder objects.
 """
 
 from dataclasses import dataclass
 
-from poke_env.battle import DoubleBattle, Move
-from poke_env.player import DoubleBattleOrder, PassBattleOrder, SingleBattleOrder
+from poke_env.battle import DoubleBattle, Move, Pokemon
+from poke_env.player import PassBattleOrder, SingleBattleOrder
 
 import numpy as np
 
@@ -121,31 +122,53 @@ def _build_joint_mask(
     slot_states: tuple[_SlotActionState, _SlotActionState],
 ) -> np.ndarray:
     joint_mask = np.zeros((ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
+    orders0 = slot_states[0].action_orders
+    orders1 = slot_states[1].action_orders
+    any_compatible = False
 
-    joined_orders = DoubleBattleOrder.join_orders(
-        slot_states[0].joined_orders,
-        slot_states[1].joined_orders,
-    )
-    if not joined_orders:
-        if (
-            set(slot_states[0].action_orders) == {PASS_ACTION}
-            and set(slot_states[1].action_orders) == {PASS_ACTION}
-        ):
+    for a1, o1 in orders0.items():
+        for a2, o2 in orders1.items():
+            if _orders_compatible(o1, o2):
+                joint_mask[FIRST_SLOT_MASK_ROW, a1] = True
+                joint_mask[a1 + 1, a2] = True
+                any_compatible = True
+
+    if not any_compatible:
+        if set(orders0) == {PASS_ACTION} and set(orders1) == {PASS_ACTION}:
+            # Both slots are forced to pass — allow the double-pass combination.
             joint_mask[FIRST_SLOT_MASK_ROW, PASS_ACTION] = True
             joint_mask[PASS_ACTION + 1, PASS_ACTION] = True
             return joint_mask
         raise RuntimeError(
-            "poke-env produced no legal joined doubles orders for the current request. "
+            "No legal paired doubles orders for the current request. "
             "This indicates the request state and action mapping are inconsistent."
         )
 
-    for order in joined_orders:
-        a1 = slot_states[0].action_by_order_id[id(order.first_order)]
-        a2 = slot_states[1].action_by_order_id[id(order.second_order)]
-        joint_mask[FIRST_SLOT_MASK_ROW, a1] = True
-        joint_mask[a1 + 1, a2] = True
-
     return joint_mask
+
+
+def _orders_compatible(o1: SingleBattleOrder, o2: SingleBattleOrder) -> bool:
+    """Return True if o1 and o2 can be combined into a legal DoubleBattleOrder.
+
+    Replicates all filters from DoubleBattleOrder.join_orders without allocating
+    DoubleBattleOrder objects or formatting message strings.
+    """
+    if o1.mega and o2.mega:
+        return False
+    if o1.z_move and o2.z_move:
+        return False
+    if o1.dynamax and o2.dynamax:
+        return False
+    if o1.terastallize and o2.terastallize:
+        return False
+    # Switch conflict: same Pokemon object means the same switch target.
+    # Using identity (is) instead of str() because available_switches always
+    # yields the canonical Pokemon object from battle.team — no string formatting needed.
+    if isinstance(o1.order, Pokemon) and isinstance(o2.order, Pokemon) and o1.order is o2.order:
+        return False
+    if isinstance(o1, PassBattleOrder) and isinstance(o2, PassBattleOrder):
+        return False
+    return True
 
 
 def action_to_order(
