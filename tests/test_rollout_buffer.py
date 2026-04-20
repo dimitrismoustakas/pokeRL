@@ -350,10 +350,10 @@ def test_legal_action_state_reuses_slot_orders(monkeypatch: pytest.MonkeyPatch) 
     original = actions_module._build_slot_action_state
     calls = 0
 
-    def counted_slot_action_state(current_battle, slot, ordered_team):
+    def counted_slot_action_state(current_battle, slot, team_slot_by_id):
         nonlocal calls
         calls += 1
-        return original(current_battle, slot, ordered_team=ordered_team)
+        return original(current_battle, slot, team_slot_by_id=team_slot_by_id)
 
     monkeypatch.setattr(actions_module, "_build_slot_action_state", counted_slot_action_state)
 

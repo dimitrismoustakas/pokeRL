@@ -56,8 +56,6 @@ class LegalActionState:
 class _SlotActionState:
     action_orders: dict[int, SingleBattleOrder]
     mask: np.ndarray
-    joined_orders: list[SingleBattleOrder]
-    action_by_order_id: dict[int, int]
 
 
 def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
@@ -79,9 +77,10 @@ def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
 def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
     """Build and index all legal orders for the current live request once."""
     ordered_team = _ordered_own_team(battle)
+    team_slot_by_id = {id(p): i for i, p in enumerate(ordered_team) if p is not None}
     slot_states = (
-        _build_slot_action_state(battle, slot=0, ordered_team=ordered_team),
-        _build_slot_action_state(battle, slot=1, ordered_team=ordered_team),
+        _build_slot_action_state(battle, slot=0, team_slot_by_id=team_slot_by_id),
+        _build_slot_action_state(battle, slot=1, team_slot_by_id=team_slot_by_id),
     )
     joint_mask = _build_joint_mask(slot_states)
     return LegalActionState(
@@ -192,21 +191,17 @@ def action_to_order(
 def _build_slot_action_state(
     battle: DoubleBattle,
     slot: int,
-    ordered_team: list,
+    team_slot_by_id: dict[int, int],
 ) -> _SlotActionState:
     trapped = getattr(battle, "trapped", [False, False])
     force_switch = battle.force_switch
     action_orders: dict[int, SingleBattleOrder] = {}
-    joined_orders: list[SingleBattleOrder] = []
-    action_by_order_id: dict[int, int] = {}
     mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
 
     if any(force_switch) and not force_switch[slot]:
         return _build_pass_slot_state(mask)
 
     if not trapped[slot]:
-        # O(1) lookup per switch instead of O(team_size) linear search.
-        team_slot_by_id = {id(p): i for i, p in enumerate(ordered_team) if p is not None}
         for pokemon in battle.available_switches[slot]:
             team_slot = team_slot_by_id.get(id(pokemon))
             if team_slot is None:
@@ -216,8 +211,6 @@ def _build_slot_action_state(
                 )
             _add_order(
                 action_orders=action_orders,
-                action_by_order_id=action_by_order_id,
-                joined_orders=joined_orders,
                 mask=mask,
                 action_idx=SWITCH_OFFSET + team_slot,
                 order=SingleBattleOrder(pokemon),
@@ -227,18 +220,15 @@ def _build_slot_action_state(
     if all(force_switch) and len(battle.available_switches[0]) == 1:
         _add_order(
             action_orders=action_orders,
-            action_by_order_id=action_by_order_id,
-            joined_orders=joined_orders,
             mask=mask,
             action_idx=PASS_ACTION,
             order=PassBattleOrder(),
             slot=slot,
         )
-        return _finalize_slot_state(action_orders, mask, joined_orders, action_by_order_id)
+        return _SlotActionState(action_orders=action_orders, mask=mask)
 
     active_pokemon = battle.active_pokemon[slot]
     if active_pokemon is not None and not force_switch[slot]:
-        # Build target mapping once per slot instead of once per (move, target) call.
         target_mapping = _build_target_mapping(slot, battle)
         for move_idx, move in enumerate(battle.available_moves[slot]):
             hydrated_move, target_locs = _request_aware_move_targets(move, active_pokemon, battle, slot)
@@ -252,8 +242,6 @@ def _build_slot_action_state(
                 action_idx = move_idx * NUM_TARGETS + target_idx
                 _add_order(
                     action_orders=action_orders,
-                    action_by_order_id=action_by_order_id,
-                    joined_orders=joined_orders,
                     mask=mask,
                     action_idx=action_idx,
                     order=SingleBattleOrder(hydrated_move, move_target=target_loc),
@@ -262,8 +250,6 @@ def _build_slot_action_state(
                 if battle.can_tera[slot]:
                     _add_order(
                         action_orders=action_orders,
-                        action_by_order_id=action_by_order_id,
-                        joined_orders=joined_orders,
                         mask=mask,
                         action_idx=action_idx + TERA_OFFSET,
                         order=SingleBattleOrder(hydrated_move, move_target=target_loc, terastallize=True),
@@ -272,40 +258,18 @@ def _build_slot_action_state(
 
     if not action_orders:
         return _build_pass_slot_state(mask)
-    return _finalize_slot_state(action_orders, mask, joined_orders, action_by_order_id)
+    return _SlotActionState(action_orders=action_orders, mask=mask)
 
 
 def _build_pass_slot_state(mask: np.ndarray) -> _SlotActionState:
-    pass_order = PassBattleOrder()
-    action_orders = {PASS_ACTION: pass_order}
+    action_orders = {PASS_ACTION: PassBattleOrder()}
     mask[PASS_ACTION] = True
-    return _SlotActionState(
-        action_orders=action_orders,
-        mask=mask,
-        joined_orders=[pass_order],
-        action_by_order_id={id(pass_order): PASS_ACTION},
-    )
-
-
-def _finalize_slot_state(
-    action_orders: dict[int, SingleBattleOrder],
-    mask: np.ndarray,
-    joined_orders: list[SingleBattleOrder],
-    action_by_order_id: dict[int, int],
-) -> _SlotActionState:
-    return _SlotActionState(
-        action_orders=action_orders,
-        mask=mask,
-        joined_orders=joined_orders,
-        action_by_order_id=action_by_order_id,
-    )
+    return _SlotActionState(action_orders=action_orders, mask=mask)
 
 
 def _add_order(
     *,
     action_orders: dict[int, SingleBattleOrder],
-    action_by_order_id: dict[int, int],
-    joined_orders: list[SingleBattleOrder],
     mask: np.ndarray,
     action_idx: int,
     order: SingleBattleOrder,
@@ -323,8 +287,6 @@ def _add_order(
 
     action_orders[action_idx] = order
     mask[action_idx] = True
-    joined_orders.append(order)
-    action_by_order_id[id(order)] = action_idx
 
 
 def _request_move_entry(move: Move, battle: DoubleBattle, slot: int) -> dict | None:
