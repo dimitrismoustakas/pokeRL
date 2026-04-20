@@ -61,6 +61,30 @@ NUM_VOLATILES = len(VOLATILES)
 # Status conditions for one-hot encoding
 STATUS_LIST = [None, Status.BRN, Status.FRZ, Status.PAR, Status.PSN, Status.SLP, Status.TOX]
 
+# --- Hot-path lookup tables (built once at module load) ---
+
+# O(1) status → one-hot index. Unknown statuses default to 0 (no status bit set).
+_STATUS_TO_ONEHOT_INDEX: dict = {s: i for i, s in enumerate(STATUS_LIST)}
+
+_BOOST_STAT_NAMES = ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
+
+# Inverted VOLATILES map: Effect → feature-vector index.
+# Frozenset entries map every member effect to the same index so that iterating
+# pokemon.effects (typically 0-4 active effects) suffices instead of scanning
+# all 16 VOLATILES slots per pokemon.
+def _build_effect_to_volatile_idx() -> dict:
+    result = {}
+    for i, v in enumerate(VOLATILES):
+        if isinstance(v, frozenset):
+            for e in v:
+                result[e] = i
+        else:
+            result[v] = i
+    return result
+
+_EFFECT_TO_VOLATILE_IDX: dict = _build_effect_to_volatile_idx()
+del _build_effect_to_volatile_idx
+
 HP_OFFSET = 0
 STATUS_OFFSET = HP_OFFSET + 1
 BOOSTS_OFFSET = STATUS_OFFSET + NUM_STATUS
@@ -223,32 +247,26 @@ class ObservationBuilder:
                 pp_features[move_index] = move.current_pp / move.max_pp
 
     def _fill_continuous_features(self, feats: np.ndarray, pokemon: Pokemon) -> None:
-        offset = 0
-
+        # HP
         if pokemon.max_hp and pokemon.max_hp > 0:
-            feats[offset] = pokemon.current_hp / pokemon.max_hp
+            feats[HP_OFFSET] = pokemon.current_hp / pokemon.max_hp
         elif pokemon.current_hp_fraction is not None:
-            feats[offset] = pokemon.current_hp_fraction
-        offset += 1
+            feats[HP_OFFSET] = pokemon.current_hp_fraction
 
-        for index, status in enumerate(STATUS_LIST):
-            if pokemon.status == status:
-                feats[offset + index] = 1.0
-                break
-        offset += 7
+        # Status: O(1) dict lookup instead of a 7-item linear scan.
+        feats[STATUS_OFFSET + _STATUS_TO_ONEHOT_INDEX.get(pokemon.status, 0)] = 1.0
 
+        # Stat boosts
         boosts = pokemon.boosts if pokemon.boosts else {}
-        for index, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
-            feats[offset + index] = boosts.get(stat, 0) / 6.0
-        offset += 7
+        for index, stat in enumerate(_BOOST_STAT_NAMES):
+            feats[BOOSTS_OFFSET + index] = boosts.get(stat, 0) / 6.0
 
-        effects = pokemon.effects
-        for index, volatile in enumerate(VOLATILES):
-            if isinstance(volatile, frozenset):
-                feats[offset + index] = float(any(effect in effects for effect in volatile))
-            else:
-                feats[offset + index] = float(volatile in effects)
-        offset += NUM_VOLATILES
+        # Volatile effects: iterate the active effects dict (typically 0-4 entries)
+        # instead of scanning all 16 VOLATILES slots per pokemon.
+        for effect in pokemon.effects:
+            volatile_idx = _EFFECT_TO_VOLATILE_IDX.get(effect)
+            if volatile_idx is not None:
+                feats[VOLATILES_OFFSET + volatile_idx] = 1.0
 
         feats[PROTECT_COUNTER_OFFSET] = self._normalized_counter(pokemon.protect_counter, PROTECT_COUNTER_CAP)
         feats[STATUS_COUNTER_OFFSET] = self._normalized_counter(pokemon.status_counter, STATUS_COUNTER_CAP)

@@ -77,9 +77,10 @@ def decode_action(action_idx: int) -> tuple[str, int, int, bool]:
 
 def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
     """Build and index all legal orders for the current live request once."""
+    ordered_team = _ordered_own_team(battle)
     slot_states = (
-        _build_slot_action_state(battle, slot=0),
-        _build_slot_action_state(battle, slot=1),
+        _build_slot_action_state(battle, slot=0, ordered_team=ordered_team),
+        _build_slot_action_state(battle, slot=1, ordered_team=ordered_team),
     )
     joint_mask = _build_joint_mask(slot_states)
     return LegalActionState(
@@ -165,7 +166,11 @@ def action_to_order(
         ) from exc
 
 
-def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionState:
+def _build_slot_action_state(
+    battle: DoubleBattle,
+    slot: int,
+    ordered_team: list,
+) -> _SlotActionState:
     trapped = getattr(battle, "trapped", [False, False])
     force_switch = battle.force_switch
     action_orders: dict[int, SingleBattleOrder] = {}
@@ -177,9 +182,10 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
         return _build_pass_slot_state(mask)
 
     if not trapped[slot]:
-        ordered_team = _ordered_own_team(battle)
+        # O(1) lookup per switch instead of O(team_size) linear search.
+        team_slot_by_id = {id(p): i for i, p in enumerate(ordered_team) if p is not None}
         for pokemon in battle.available_switches[slot]:
-            team_slot = _find_team_slot(ordered_team, pokemon)
+            team_slot = team_slot_by_id.get(id(pokemon))
             if team_slot is None:
                 raise RuntimeError(
                     f"Available switch target {pokemon.species!r} was not found in the ordered team. "
@@ -209,10 +215,17 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
 
     active_pokemon = battle.active_pokemon[slot]
     if active_pokemon is not None and not force_switch[slot]:
+        # Build target mapping once per slot instead of once per (move, target) call.
+        target_mapping = _build_target_mapping(slot, battle)
         for move_idx, move in enumerate(battle.available_moves[slot]):
             hydrated_move, target_locs = _request_aware_move_targets(move, active_pokemon, battle, slot)
             for target_loc in target_locs:
-                target_idx = _showdown_target_to_index(target_loc, slot, battle)
+                target_idx = target_mapping.get(target_loc)
+                if target_idx is None:
+                    raise RuntimeError(
+                        f"Unsupported showdown target {target_loc} for slot {slot}. "
+                        "Expand the action encoding to represent this target."
+                    )
                 action_idx = move_idx * NUM_TARGETS + target_idx
                 _add_order(
                     action_orders=action_orders,
@@ -313,34 +326,19 @@ def _request_move_entry(move: Move, battle: DoubleBattle, slot: int) -> dict | N
     return None
 
 
-def _hydrate_move_for_request(move: Move, battle: DoubleBattle, slot: int) -> Move:
-    """Copy a move and attach the current request target, if any.
-
-    ``poke-env`` uses ``Move.request_target`` to disambiguate target classes such
-    as ``randomNormal``. Cloning avoids leaking per-turn request state across
-    reused move objects.
-    """
-    hydrated = Move(move.id, gen=move.gen)
-    move_request = _request_move_entry(move, battle, slot)
-    target = None if move_request is None else move_request.get("target")
-    if target is not None:
-        hydrated.request_target = target
-    return hydrated
-
-
 def _request_aware_move_targets(
     move: Move,
     active_pokemon,
     battle: DoubleBattle,
     slot: int,
 ) -> tuple[Move, list[int]]:
-    hydrated_move = _hydrate_move_for_request(move, battle, slot)
+    # Fetch the request entry once; pass it to the hydrator to avoid a second lookup.
     move_request = _request_move_entry(move, battle, slot)
-    if (
-        move_request is not None
-        and move_request.get("target") is None
-        and _is_random_normal_move(move)
-    ):
+    hydrated_move = Move(move.id, gen=move.gen)
+    target = None if move_request is None else move_request.get("target")
+    if target is not None:
+        hydrated_move.request_target = target
+    elif move_request is not None and _is_random_normal_move(move):
         # Showdown sometimes omits a request target for initial Outrage/Thrash-style
         # selections even though a foe target is still required. Preserve poke-env's
         # occupancy filtering by reusing its adjacent-foe resolver.
@@ -359,35 +357,17 @@ def _ordered_own_team(battle: DoubleBattle) -> list:
     return ordered[:MAX_TEAM_SLOTS]
 
 
-def _find_team_slot(team_list: list, pokemon) -> int | None:
-    for index, team_member in enumerate(team_list):
-        if team_member is pokemon:
-            return index
-    return None
-
-
-def _showdown_target_to_index(
-    showdown_target: int,
-    slot: int,
-    battle: DoubleBattle,
-) -> int:
+def _build_target_mapping(slot: int, battle: DoubleBattle) -> dict[int, int]:
+    """Build the showdown-position → action-index map once per slot per step."""
     ally_position = battle.POKEMON_2_POSITION if slot == 0 else battle.POKEMON_1_POSITION
     self_position = battle.POKEMON_1_POSITION if slot == 0 else battle.POKEMON_2_POSITION
-
-    mapping = {
+    return {
         battle.OPPONENT_1_POSITION: TARGET_OPPONENT_1,
         battle.OPPONENT_2_POSITION: TARGET_OPPONENT_2,
         ally_position: TARGET_ALLY,
         self_position: TARGET_SELF,
         battle.EMPTY_TARGET_POSITION: TARGET_NONE,
     }
-    try:
-        return mapping[showdown_target]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"Unsupported showdown target {showdown_target} for slot {slot}. "
-            "Expand the action encoding to represent this target."
-        ) from exc
 
 
 def _legal_target_locs(move: Move, active_pokemon, battle: DoubleBattle) -> list[int]:
