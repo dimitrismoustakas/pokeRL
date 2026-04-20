@@ -434,38 +434,6 @@
       "seeds": []
     },
     {
-      "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of UTRECHT WINNING TEAM",
-      "subset": "curated",
-      "file": "data/team_pools/gen9vgc2026regf/curated/014_copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-utrecht-winning-team_2bb60816.txt",
-      "packed_sha1": "2bb60816d354e5a54f72cca3514fc57366ed1da9",
-      "source_links": [
-        "https://pokepast.es/24dcf5e568ffa85e"
-      ],
-      "sources": [
-        {
-          "section": "Other teams in top cuts of large tournaments",
-          "country": "",
-          "player": "Teemu Mankinen ( Derith96 )",
-          "result": "EUIC Top 32 (5 Apr 2024)",
-          "team_summary": "",
-          "export_links": [
-            "https://pokepast.es/24dcf5e568ffa85e"
-          ],
-          "source_page": "https://victoryroad.pro/sv-rental-teams-reg-set-f/",
-          "raw_cells": [
-            "",
-            "Teemu Mankinen ( Derith96 )",
-            "EUIC Top 32 (5 Apr 2024)",
-            "",
-            "",
-            "",
-            ""
-          ]
-        }
-      ],
-      "seeds": []
-    },
-    {
       "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Testing Liverpoolada",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/015_copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-testing-liverpoolada_b10211d2.txt",
@@ -2898,7 +2866,7 @@
     {
       "title": "Copy of Chien-Pao Torn",
       "subset": "curated",
-      "file": "data/team_pools/gen9vgc2026regf/pool/013_copy-of-chien-pao-torn_04996cb1.txt",
+      "file": "data\\team_pools\\gen9vgc2026regf\\pool\\013_chien-pao-torn_04996cb1.txt",
       "packed_sha1": "04996cb113e965c407c572f53f68be9bc087d62a",
       "source_links": [
         "https://pokepast.es/1b71291956611fa8"
@@ -2930,7 +2898,7 @@
     {
       "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of UTRECHT WINNING TEAM",
       "subset": "curated",
-      "file": "data/team_pools/gen9vgc2026regf/pool/014_copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-utrecht-winning-team_2bb60816.txt",
+      "file": "data\\team_pools\\gen9vgc2026regf\\pool\\014_utrecht-winning-team_2bb60816.txt",
       "packed_sha1": "2bb60816d354e5a54f72cca3514fc57366ed1da9",
       "source_links": [
         "https://pokepast.es/24dcf5e568ffa85e"
@@ -2962,7 +2930,7 @@
     {
       "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Testing Liverpoolada",
       "subset": "curated",
-      "file": "data/team_pools/gen9vgc2026regf/pool/015_copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-testing-liverpoolada_b10211d2.txt",
+      "file": "data\\team_pools\\gen9vgc2026regf\\pool\\015_testing-liverpoolada_b10211d2.txt",
       "packed_sha1": "b10211d255de682bb7c3ce110c834115ad7213b8",
       "source_links": [
         "https://pokepast.es/a4926977eadb521c"
@@ -2994,7 +2962,7 @@
     {
       "title": "Copy of Untitled 1089",
       "subset": "curated",
-      "file": "data/team_pools/gen9vgc2026regf/pool/016_copy-of-untitled-1089_4f69cbdc.txt",
+      "file": "data\\team_pools\\gen9vgc2026regf\\pool\\016_untitled-1089_4f69cbdc.txt",
       "packed_sha1": "4f69cbdca591d763c6a72a573c75d7dce7801920",
       "source_links": [
         "https://pokepast.es/92cd2d135946bd95"
