@@ -24,11 +24,11 @@ from ..training.preview import TeamPreviewBatcher
 from .observation import ObservationBuilder, build_team_preview_observation
 from .team_preview import parse_team_preview_order
 from .actions import (
-    ACTIONS_PER_SLOT,
-    FIRST_SLOT_MASK_ROW,
-    PASS_ACTION,
     action_to_order,
     build_legal_action_state,
+    build_policy_action_masks,
+    decode_tera_choice,
+    empty_action_masks,
 )
 from .rewards import sparse_reward
 
@@ -178,7 +178,7 @@ class ShowdownPlayer(Player):
         super().__init__(**kwargs)
         self.obs_builder = obs_builder
         self.timing = timing
-        self.obs_queue: _AsyncQueue[tuple[dict, np.ndarray, float, bool, DoubleBattle]] = _AsyncQueue(self.ps_client.loop)
+        self.obs_queue: _AsyncQueue[tuple[dict, dict[str, np.ndarray], float, bool, DoubleBattle]] = _AsyncQueue(self.ps_client.loop)
         self.action_queue: _AsyncQueue[np.ndarray | None] = _AsyncQueue(self.ps_client.loop)
         self.last_battle: DoubleBattle | None = None
         self._last_finished_token: tuple[str, int] | None = None
@@ -222,7 +222,7 @@ class ShowdownPlayer(Player):
         self.action_queue.put(None)
 
     def _make_order(self, action: np.ndarray, battle: DoubleBattle) -> BattleOrder:
-        """Convert a (2,) action array to a DoubleBattleOrder."""
+        """Convert a (3,) action array to a DoubleBattleOrder."""
         started = time.perf_counter()
         action_state = self._pending_action_state if self._pending_action_battle is battle else None
         self._pending_action_state = None
@@ -230,8 +230,15 @@ class ShowdownPlayer(Player):
         if action_state is None:
             action_state = build_legal_action_state(battle)
         orders = []
+        tera_slot_1, tera_slot_2 = decode_tera_choice(int(action[2]))
         for slot in range(2):
-            order = action_to_order(int(action[slot]), battle, slot, action_state=action_state)
+            order = action_to_order(
+                int(action[slot]),
+                battle,
+                slot,
+                terastallize=tera_slot_1 if slot == 0 else tera_slot_2,
+                action_state=action_state,
+            )
             orders.append(order)
 
         self.timing.increment("player_make_order_calls")
@@ -252,14 +259,12 @@ class ShowdownPlayer(Player):
 
         mask_started = time.perf_counter()
         if battle.finished:
-            mask = np.zeros((ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
-            mask[FIRST_SLOT_MASK_ROW, PASS_ACTION] = True
-            mask[PASS_ACTION + 1, PASS_ACTION] = True
+            mask = empty_action_masks()
             self._pending_action_state = None
             self._pending_action_battle = None
         else:
             action_state = build_legal_action_state(battle)
-            mask = action_state.joint_mask
+            mask = build_policy_action_masks(battle, action_state=action_state)
             self._pending_action_state = action_state
             self._pending_action_battle = battle
         self.timing.add("player_emit_mask_sec", time.perf_counter() - mask_started)
@@ -352,7 +357,7 @@ class BattleEnv:
         self.opponent = self._build_opponent(opponent_factory)
         self._prepare_next_battle()
 
-    def reset(self) -> tuple[dict, np.ndarray]:
+    def reset(self) -> tuple[dict, dict[str, np.ndarray]]:
         """Start a new battle and return the first observation + mask."""
         if self._closed:
             raise RuntimeError("BattleEnv.reset() called after the environment was closed.")
@@ -394,11 +399,11 @@ class BattleEnv:
         self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
         return obs, mask
 
-    def step(self, action: np.ndarray) -> tuple[dict, np.ndarray, float, bool, dict]:
+    def step(self, action: np.ndarray) -> tuple[dict, dict[str, np.ndarray], float, bool, dict]:
         """Send an action and get the next observation.
 
         Args:
-            action: (2,) int array of action indices for each active slot.
+            action: (3,) int array of [slot_1_action, slot_2_action, tera_choice].
 
         Returns:
             obs, mask, reward, done, info
@@ -759,9 +764,9 @@ class ParallelBattleEnv:
         self._executor = ThreadPoolExecutor(max_workers=self.num_envs)
         self._timing = _TimingStats()
         self._obs_batch_buffers: dict[str, np.ndarray] | None = None
-        self._mask_batch_buffer: np.ndarray | None = None
+        self._mask_batch_buffers: dict[str, np.ndarray] | None = None
 
-    def reset(self) -> tuple[dict, np.ndarray]:
+    def reset(self) -> tuple[dict, dict[str, np.ndarray]]:
         """Reset all environments and return batched obs + masks."""
         started = time.perf_counter()
         results = list(self._executor.map(lambda env: env.reset(), self.envs))
@@ -771,11 +776,11 @@ class ParallelBattleEnv:
 
     def step(
         self, actions: np.ndarray
-    ) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+    ) -> tuple[dict, dict[str, np.ndarray], np.ndarray, np.ndarray, list[dict]]:
         """Step all environments.
 
         Args:
-            actions: (num_envs, 2) action array.
+            actions: (num_envs, 3) action array.
 
         Returns:
             obs_batch, mask_batch, rewards, dones, infos
@@ -834,36 +839,40 @@ class ParallelBattleEnv:
     def _collate(
         self,
         obs_list: list[dict[str, np.ndarray]],
-        mask_list: list[np.ndarray],
-    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        mask_list: list[dict[str, np.ndarray]],
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """Copy observations into reusable batch buffers."""
-        if self._obs_batch_buffers is None or self._mask_batch_buffer is None:
+        if self._obs_batch_buffers is None or self._mask_batch_buffers is None:
             self._init_collate_buffers(obs_list[0], mask_list[0])
         else:
             self._ensure_collate_buffers(obs_list[0], mask_list[0])
 
         assert self._obs_batch_buffers is not None
-        assert self._mask_batch_buffer is not None
+        assert self._mask_batch_buffers is not None
         for env_index, obs in enumerate(obs_list):
             for key, value in obs.items():
                 self._obs_batch_buffers[key][env_index] = value
-            self._mask_batch_buffer[env_index] = mask_list[env_index]
-        return self._obs_batch_buffers, self._mask_batch_buffer
+            for key, value in mask_list[env_index].items():
+                self._mask_batch_buffers[key][env_index] = value
+        return self._obs_batch_buffers, self._mask_batch_buffers
 
-    def _init_collate_buffers(self, obs: dict[str, np.ndarray], mask: np.ndarray) -> None:
+    def _init_collate_buffers(self, obs: dict[str, np.ndarray], mask: dict[str, np.ndarray]) -> None:
         self._obs_batch_buffers = {
             key: np.empty((self.num_envs, *value.shape), dtype=value.dtype)
             for key, value in obs.items()
         }
-        self._mask_batch_buffer = np.empty((self.num_envs, *mask.shape), dtype=mask.dtype)
+        self._mask_batch_buffers = {
+            key: np.empty((self.num_envs, *value.shape), dtype=value.dtype)
+            for key, value in mask.items()
+        }
 
-    def _ensure_collate_buffers(self, obs: dict[str, np.ndarray], mask: np.ndarray) -> None:
+    def _ensure_collate_buffers(self, obs: dict[str, np.ndarray], mask: dict[str, np.ndarray]) -> None:
         assert self._obs_batch_buffers is not None
-        assert self._mask_batch_buffer is not None
+        assert self._mask_batch_buffers is not None
 
         if self._obs_batch_buffers.keys() != obs.keys():
             self._obs_batch_buffers = None
-            self._mask_batch_buffer = None
+            self._mask_batch_buffers = None
             self._init_collate_buffers(obs, mask)
             return
 
@@ -872,23 +881,29 @@ class ParallelBattleEnv:
             expected_shape = (self.num_envs, *value.shape)
             if buffer is None or buffer.shape != expected_shape or buffer.dtype != value.dtype:
                 self._obs_batch_buffers = None
-                self._mask_batch_buffer = None
+                self._mask_batch_buffers = None
                 self._init_collate_buffers(obs, mask)
                 return
 
-        expected_mask_shape = (self.num_envs, *mask.shape)
-        if (
-            self._mask_batch_buffer.shape != expected_mask_shape
-            or self._mask_batch_buffer.dtype != mask.dtype
-        ):
+        if self._mask_batch_buffers.keys() != mask.keys():
             self._obs_batch_buffers = None
-            self._mask_batch_buffer = None
+            self._mask_batch_buffers = None
             self._init_collate_buffers(obs, mask)
+            return
+
+        for key, value in mask.items():
+            buffer = self._mask_batch_buffers.get(key)
+            expected_shape = (self.num_envs, *value.shape)
+            if buffer is None or buffer.shape != expected_shape or buffer.dtype != value.dtype:
+                self._obs_batch_buffers = None
+                self._mask_batch_buffers = None
+                self._init_collate_buffers(obs, mask)
+                return
 
     @staticmethod
     def _step_env(
         env: BattleEnv, action: np.ndarray
-    ) -> tuple[dict, np.ndarray, float, bool, dict]:
+    ) -> tuple[dict, dict[str, np.ndarray], float, bool, dict]:
         obs, mask, reward, done, info = env.step(action)
         if done:
             obs, mask = env.reset()

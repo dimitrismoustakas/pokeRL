@@ -29,7 +29,10 @@ def evaluate(
         while not done:
             with torch.no_grad():
                 obs_t = {k: torch.from_numpy(v).unsqueeze(0).to(device) for k, v in obs.items()}
-                masks_t = torch.from_numpy(masks).unsqueeze(0).to(device).bool()
+                masks_t = {
+                    key: torch.from_numpy(value).unsqueeze(0).to(device).bool()
+                    for key, value in masks.items()
+                }
 
                 out = agent(obs_t, hidden, action_masks=masks_t)
                 action = out["actions"].cpu().numpy()[0]

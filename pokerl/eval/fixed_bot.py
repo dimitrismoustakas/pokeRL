@@ -25,6 +25,7 @@ from ..env.actions import (
     TARGET_OPPONENT_2,
     TARGET_SELF,
     decode_action,
+    decode_tera_choice,
 )
 from ..env.showdown_env import BattleEnv, make_local_account_configuration, make_server_configuration
 from ..team_pool import TeamPool, TeamPoolEntry
@@ -317,9 +318,12 @@ class ModelPolicyController:
             "log_prob": float(preview_out["log_prob"].item()),
         }
 
-    def choose_action(self, obs: dict[str, np.ndarray], masks: np.ndarray) -> dict[str, object]:
+    def choose_action(self, obs: dict[str, np.ndarray], masks: dict[str, np.ndarray]) -> dict[str, object]:
         obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(self.device) for key, value in obs.items()}
-        masks_t = torch.from_numpy(masks).unsqueeze(0).to(device=self.device, dtype=torch.bool)
+        masks_t = {
+            key: torch.from_numpy(value).unsqueeze(0).to(device=self.device, dtype=torch.bool)
+            for key, value in masks.items()
+        }
 
         with torch.inference_mode():
             context, active_reps, own_reps, opp_reps, opp_active_reps = self.agent.spatial(obs_t)
@@ -353,8 +357,15 @@ def _max_legal_damaging_base_power(battle: DoubleBattle, slot: int) -> int:
     return max((int(move.base_power or 0) for move in battle.available_moves[slot]), default=0)
 
 
-def _classify_slot_action(battle: DoubleBattle, slot: int, action_idx: int) -> Counter[str]:
-    kind, move_idx, target_idx, tera = decode_action(int(action_idx))
+def _classify_slot_action(
+    battle: DoubleBattle,
+    slot: int,
+    action_idx: int,
+    tera_choice: int,
+) -> Counter[str]:
+    kind, move_idx, target_idx = decode_action(int(action_idx))
+    tera_slot_1, tera_slot_2 = decode_tera_choice(int(tera_choice))
+    tera = tera_slot_1 if slot == 0 else tera_slot_2
     stats: Counter[str] = Counter()
     stats["slot_decisions"] += 1
 
@@ -429,8 +440,15 @@ def _classify_slot_action(battle: DoubleBattle, slot: int, action_idx: int) -> C
     return stats
 
 
-def _describe_slot_action(battle: DoubleBattle, slot: int, action_idx: int) -> dict[str, object]:
-    kind, move_idx, target_idx, tera = decode_action(int(action_idx))
+def _describe_slot_action(
+    battle: DoubleBattle,
+    slot: int,
+    action_idx: int,
+    tera_choice: int,
+) -> dict[str, object]:
+    kind, move_idx, target_idx = decode_action(int(action_idx))
+    tera_slot_1, tera_slot_2 = decode_tera_choice(int(tera_choice))
+    tera = tera_slot_1 if slot == 0 else tera_slot_2
     description: dict[str, object] = {
         "slot": slot,
         "action_idx": int(action_idx),
@@ -689,15 +707,16 @@ def evaluate_policy_vs_fixed_bot(
 
                 action_out = policy.choose_action(obs, masks)
                 actions = np.asarray(action_out["actions"], dtype=np.int64)
+                tera_choice = int(actions[2])
                 entropies.append(float(action_out["entropy"]))
-                for slot, action_idx in enumerate(actions):
-                    slot_stats = _classify_slot_action(battle, slot, int(action_idx))
+                for slot, action_idx in enumerate(actions[:2]):
+                    slot_stats = _classify_slot_action(battle, slot, int(action_idx), tera_choice)
                     action_stats.update(slot_stats)
                     battle_action_stats.update(slot_stats)
 
                 action_descriptions = [
-                    _describe_slot_action(battle, 0, int(actions[0])),
-                    _describe_slot_action(battle, 1, int(actions[1])),
+                    _describe_slot_action(battle, 0, int(actions[0]), tera_choice),
+                    _describe_slot_action(battle, 1, int(actions[1]), tera_choice),
                 ]
                 if first_tera_turn is None and any(description["tera"] for description in action_descriptions):
                     first_tera_turn = int(getattr(battle, "turn", 0))

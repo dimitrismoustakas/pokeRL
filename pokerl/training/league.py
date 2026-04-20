@@ -20,7 +20,12 @@ from ..model.agent import PokeAgent, load_state_dict_compatible
 from ..data import GameData
 from ..config import TrainingConfig, EnvConfig
 from ..env.observation import ObservationBuilder, build_team_preview_observation
-from ..env.actions import action_to_order, build_legal_action_state
+from ..env.actions import (
+    action_to_order,
+    build_legal_action_state,
+    build_policy_action_masks,
+    decode_tera_choice,
+)
 from ..env.showdown_env import make_local_account_configuration, showdown_log_level
 
 
@@ -29,7 +34,7 @@ class _InferenceRequest:
     checkpoint_path: str
     kind: str
     obs: dict[str, np.ndarray]
-    masks: np.ndarray | None
+    masks: dict[str, np.ndarray] | None
     hidden: tuple[torch.Tensor, torch.Tensor] | None
     future: Future
 
@@ -83,7 +88,7 @@ class _LeagueInferenceService:
         self,
         checkpoint_path: str,
         obs: dict[str, np.ndarray],
-        masks: np.ndarray,
+        masks: dict[str, np.ndarray],
         hidden: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[np.ndarray, tuple[torch.Tensor, torch.Tensor] | None]:
         future: Future = Future()
@@ -190,7 +195,12 @@ class _LeagueInferenceService:
             key: torch.from_numpy(np.stack([request.obs[key] for request in requests])).to(self._device)
             for key in requests[0].obs
         }
-        masks_batch = torch.from_numpy(np.stack([request.masks for request in requests])).to(self._device).bool()
+        if requests[0].masks is None:
+            raise RuntimeError("Battle inference request was missing action masks.")
+        masks_batch = {
+            key: torch.from_numpy(np.stack([request.masks[key] for request in requests])).to(self._device).bool()
+            for key in requests[0].masks
+        }
         hidden_batch = self._build_hidden_batch(agent, requests)
 
         with torch.inference_mode():
@@ -320,7 +330,7 @@ class LeaguePlayer(Player):
         obs = self.obs_builder.build(battle)
         self._commit_hidden_if_battle_advanced(obs)
         action_state = build_legal_action_state(battle)
-        masks = action_state.joint_mask
+        masks = build_policy_action_masks(battle, action_state=action_state)
         actions, next_hidden = self.inference_service.infer_action(
             self.checkpoint_path,
             obs,
@@ -331,8 +341,17 @@ class LeaguePlayer(Player):
         self._pending_hidden = next_hidden
 
         orders = []
+        tera_slot_1, tera_slot_2 = decode_tera_choice(int(actions[2]))
         for slot in range(2):
-            orders.append(action_to_order(int(actions[slot]), battle, slot, action_state=action_state))
+            orders.append(
+                action_to_order(
+                    int(actions[slot]),
+                    battle,
+                    slot,
+                    terastallize=tera_slot_1 if slot == 0 else tera_slot_2,
+                    action_state=action_state,
+                )
+            )
 
         if all(isinstance(order, PassBattleOrder) for order in orders):
             return self.choose_default_move()

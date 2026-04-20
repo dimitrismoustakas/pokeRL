@@ -13,15 +13,19 @@ from pokerl.config import TrainingConfig
 from pokerl.env.actions import (
     ACTIONS_PER_SLOT,
     FIRST_SLOT_MASK_ROW,
+    NUM_TERA_CHOICES,
     PASS_ACTION,
     SWITCH_OFFSET,
+    TERA_NONE,
+    TERA_SLOT_1,
+    TERA_SLOT_2,
     TARGET_NONE,
     TARGET_SELF,
-    TERA_OFFSET,
     action_to_order,
     build_action_mask,
     build_legal_action_state,
     build_joint_action_mask,
+    build_tera_action_mask,
 )
 from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
 from pokerl.env.observation import ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH
@@ -43,11 +47,14 @@ def _obs(step: int, num_envs: int) -> dict[str, np.ndarray]:
     }
 
 
-def _mask(num_envs: int) -> np.ndarray:
-    mask = np.zeros((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
-    mask[:, FIRST_SLOT_MASK_ROW, 0] = True
-    mask[:, 1, 0] = True
-    return mask
+def _mask(num_envs: int) -> dict[str, np.ndarray]:
+    joint = np.zeros((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
+    joint[:, FIRST_SLOT_MASK_ROW, 0] = True
+    joint[:, 1, 0] = True
+    return {
+        "joint": joint,
+        "can_tera": np.zeros((num_envs, 2), dtype=bool),
+    }
 
 
 def _obs_to_tensor(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -71,8 +78,15 @@ def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidd
 
     for step in range(num_steps):
         obs_t = _obs_to_tensor(_obs(step, num_envs), device)
-        actions_t = torch.tensor([[step, step + 1], [step + 2, step + 3]], dtype=torch.long, device=device)
-        masks_t = torch.from_numpy(_mask(num_envs)).to(device)
+        actions_t = torch.tensor(
+            [[step, step + 1, TERA_NONE], [step + 2, step + 3, TERA_NONE]],
+            dtype=torch.long,
+            device=device,
+        )
+        masks_t = {
+            key: torch.from_numpy(value).to(device)
+            for key, value in _mask(num_envs).items()
+        }
         log_probs_t = torch.full((num_envs,), float(step), dtype=torch.float32, device=device)
         values_t = torch.full((num_envs,), float(step) + 0.5, dtype=torch.float32, device=device)
         rewards_t = torch.tensor([1.0, -1.0], dtype=torch.float32, device=device)
@@ -83,8 +97,9 @@ def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidd
 
     assert batch.obs["float_obs"].shape == (num_steps, num_envs, 3)
     assert batch.obs["index_obs"].shape == (num_steps, num_envs, 2)
-    assert batch.actions.shape == (num_steps, num_envs, 2)
-    assert batch.action_masks.shape == (num_steps, num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
+    assert batch.actions.shape == (num_steps, num_envs, 3)
+    assert batch.action_masks["joint"].shape == (num_steps, num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
+    assert batch.action_masks["can_tera"].shape == (num_steps, num_envs, 2)
     assert batch.advantages.shape == (num_steps, num_envs)
     assert batch.obs["float_obs"].device == device
     assert torch.equal(batch.initial_hidden_h, expected_h)
@@ -100,8 +115,11 @@ def test_rollout_buffer_requires_a_complete_rollout_before_gae() -> None:
 
     buffer.add(
         _obs_to_tensor(_obs(0, num_envs), device),
-        torch.zeros((num_envs, 2), dtype=torch.long, device=device),
-        torch.from_numpy(_mask(num_envs)).to(device),
+        torch.zeros((num_envs, 3), dtype=torch.long, device=device),
+        {
+            key: torch.from_numpy(value).to(device)
+            for key, value in _mask(num_envs).items()
+        },
         torch.zeros(num_envs, dtype=torch.float32, device=device),
         torch.zeros(num_envs, dtype=torch.float32, device=device),
         torch.zeros(num_envs, dtype=torch.float32, device=device),
@@ -145,7 +163,7 @@ class _DummyAgent(nn.Module):
         obs: dict[str, torch.Tensor],
         hidden=None,
         actions: torch.Tensor | None = None,
-        action_masks: torch.Tensor | None = None,
+        action_masks: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         context, active_reps, own_reps, opp_reps, opp_active_reps = self.spatial(obs)
         context, hidden = self.memory(context, hidden)
@@ -198,7 +216,10 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
     device = torch.device("cpu")
     num_steps = 2
     num_envs = 2
-    action_mask = np.ones((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
+    action_mask = {
+        "joint": np.ones((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool),
+        "can_tera": np.ones((num_envs, 2), dtype=bool),
+    }
     agent = _DummyAgent().to(device)
     config = TrainingConfig(num_epochs=1, num_minibatches=2)
     trainer = PPOTrainer(agent, config, device)
@@ -207,7 +228,10 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
 
     for step in range(num_steps):
         obs_t = _obs_to_tensor(_ppo_obs(step, num_envs), device)
-        masks_t = torch.from_numpy(action_mask).to(device)
+        masks_t = {
+            key: torch.from_numpy(value).to(device)
+            for key, value in action_mask.items()
+        }
         with torch.no_grad():
             out = agent(obs_t, action_masks=masks_t)
 
@@ -222,7 +246,7 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
     assert set(metrics) == {"policy_loss", "value_loss", "entropy", "approx_kl"}
 
 
-def test_action_head_uses_conditional_joint_mask_to_block_double_tera() -> None:
+def test_action_head_uses_joint_and_tera_masks_to_coordinate_actions() -> None:
     torch.manual_seed(0)
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
     context = torch.zeros((1, 3))
@@ -231,14 +255,29 @@ def test_action_head_uses_conditional_joint_mask_to_block_double_tera() -> None:
     opp_team_reps = torch.zeros((1, 6, 2))
     opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
     opp_active_reps = torch.zeros((1, 2, 2))
-    masks = torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool)
-    masks[0, FIRST_SLOT_MASK_ROW, TERA_OFFSET] = True
-    masks[0, TERA_OFFSET + 1, 0] = True
+    masks = {
+        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "can_tera": torch.zeros((1, 2), dtype=torch.bool),
+    }
+    masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
+    masks["joint"][0, 1, 0] = True
+    masks["can_tera"][0, 0] = True
 
-    out = head(context, active_reps, own_team_reps, opp_team_reps, opp_reserve_mask, opp_active_reps, masks)
+    chosen_actions = torch.tensor([[0, 0, TERA_SLOT_1]], dtype=torch.long)
+    out = head(
+        context,
+        active_reps,
+        own_team_reps,
+        opp_team_reps,
+        opp_reserve_mask,
+        opp_active_reps,
+        masks,
+        actions=chosen_actions,
+    )
 
-    assert out["actions"][0, 0].item() == TERA_OFFSET
+    assert out["actions"][0, 0].item() == 0
     assert out["actions"][0, 1].item() == 0
+    assert out["actions"][0, 2].item() == TERA_SLOT_1
 
 
 def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_target() -> None:
@@ -250,15 +289,19 @@ def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_targe
     opp_team_reps = torch.zeros((1, 6, 2))
     opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
     opp_active_reps = torch.zeros((1, 2, 2))
-    masks = torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool)
+    masks = {
+        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "can_tera": torch.zeros((1, 2), dtype=torch.bool),
+    }
     shared_switch = SWITCH_OFFSET + 5
-    masks[0, FIRST_SLOT_MASK_ROW, shared_switch] = True
-    masks[0, shared_switch + 1, 0] = True
+    masks["joint"][0, FIRST_SLOT_MASK_ROW, shared_switch] = True
+    masks["joint"][0, shared_switch + 1, 0] = True
 
     out = head(context, active_reps, own_team_reps, opp_team_reps, opp_reserve_mask, opp_active_reps, masks)
 
     assert out["actions"][0, 0].item() == shared_switch
     assert out["actions"][0, 1].item() == 0
+    assert out["actions"][0, 2].item() == TERA_NONE
 
 
 def test_masked_set_attention_returns_zero_when_every_item_is_masked() -> None:
@@ -317,6 +360,7 @@ class _FakeBattle:
 
     def __init__(self) -> None:
         self.force_switch = [True, False]
+        self.can_tera = [False, False]
         self.active_pokemon = [_FakePokemon("lead-one"), _FakePokemon("lead-two")]
         bench_one = _FakePokemon("bench-one")
         bench_two = _FakePokemon("bench-two")
@@ -584,7 +628,7 @@ def test_parallel_battle_env_collate_reuses_batch_buffers() -> None:
     env = object.__new__(ParallelBattleEnv)
     env.num_envs = 2
     env._obs_batch_buffers = None
-    env._mask_batch_buffer = None
+    env._mask_batch_buffers = None
 
     first_obs = [
         {
@@ -597,8 +641,14 @@ def test_parallel_battle_env_collate_reuses_batch_buffers() -> None:
         },
     ]
     first_masks = [
-        np.array([[True, False], [False, True]], dtype=bool),
-        np.array([[False, True], [True, False]], dtype=bool),
+        {
+            "joint": np.array([[True, False], [False, True]], dtype=bool),
+            "can_tera": np.array([True, False], dtype=bool),
+        },
+        {
+            "joint": np.array([[False, True], [True, False]], dtype=bool),
+            "can_tera": np.array([False, True], dtype=bool),
+        },
     ]
     batch_obs_1, batch_mask_1 = ParallelBattleEnv._collate(env, first_obs, first_masks)
 
@@ -613,21 +663,28 @@ def test_parallel_battle_env_collate_reuses_batch_buffers() -> None:
         },
     ]
     second_masks = [
-        np.array([[False, False], [True, True]], dtype=bool),
-        np.array([[True, True], [False, False]], dtype=bool),
+        {
+            "joint": np.array([[False, False], [True, True]], dtype=bool),
+            "can_tera": np.array([False, False], dtype=bool),
+        },
+        {
+            "joint": np.array([[True, True], [False, False]], dtype=bool),
+            "can_tera": np.array([True, True], dtype=bool),
+        },
     ]
     batch_obs_2, batch_mask_2 = ParallelBattleEnv._collate(env, second_obs, second_masks)
 
     assert batch_obs_1["a"] is batch_obs_2["a"]
     assert batch_obs_1["b"] is batch_obs_2["b"]
-    assert batch_mask_1 is batch_mask_2
+    assert batch_mask_1["joint"] is batch_mask_2["joint"]
+    assert batch_mask_1["can_tera"] is batch_mask_2["can_tera"]
     np.testing.assert_array_equal(batch_obs_2["a"], np.array([[5, 6], [7, 8]], dtype=np.int64))
     np.testing.assert_array_equal(
         batch_obs_2["b"],
         np.array([[[5.0], [6.0]], [[7.0], [8.0]]], dtype=np.float32),
     )
     np.testing.assert_array_equal(
-        batch_mask_2,
+        batch_mask_2["joint"],
         np.array(
             [
                 [[False, False], [True, True]],
@@ -680,14 +737,19 @@ def test_joint_action_mask_comes_from_joined_valid_orders() -> None:
     )
 
     joint_mask = build_joint_action_mask(battle)
+    tera_mask = build_tera_action_mask(battle)
     shared_switch_action = SWITCH_OFFSET + 2
 
-    assert joint_mask[FIRST_SLOT_MASK_ROW, TERA_OFFSET]
-    assert joint_mask[TERA_OFFSET + 1, 0]
-    assert not joint_mask[TERA_OFFSET + 1, TERA_OFFSET + 1]
+    assert joint_mask[FIRST_SLOT_MASK_ROW, 0]
+    assert joint_mask[1, 0]
     assert joint_mask[FIRST_SLOT_MASK_ROW, shared_switch_action]
     assert joint_mask[shared_switch_action + 1, 0]
     assert not joint_mask[shared_switch_action + 1, shared_switch_action]
+    assert tera_mask[0, 0, TERA_NONE]
+    assert tera_mask[0, 0, TERA_SLOT_1]
+    assert tera_mask[0, 0, TERA_SLOT_2]
+    assert tera_mask[shared_switch_action, 0, TERA_NONE]
+    assert not tera_mask[shared_switch_action, 0, TERA_SLOT_1]
 
 
 def test_battle_env_team_preview_propagates_precompute_failure() -> None:
@@ -737,8 +799,9 @@ def test_finished_battle_update_skips_legality_rebuild(monkeypatch: pytest.Monke
     _, mask, _, done, queued_battle = queued[0]
     assert done is True
     assert queued_battle is battle
-    assert mask[FIRST_SLOT_MASK_ROW, PASS_ACTION]
-    assert mask[PASS_ACTION + 1, PASS_ACTION]
+    assert mask["joint"][FIRST_SLOT_MASK_ROW, PASS_ACTION]
+    assert mask["joint"][PASS_ACTION + 1, PASS_ACTION]
+    np.testing.assert_array_equal(mask["can_tera"], np.array([False, False], dtype=bool))
 
 
 def test_league_player_team_preview_propagates_precompute_failure() -> None:
@@ -781,7 +844,7 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
                 torch.full((1, 1, 1), next_value),
                 torch.full((1, 1, 1), next_value + 100),
             )
-            return np.array([PASS_ACTION, PASS_ACTION], dtype=np.int64), next_hidden
+            return np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden
 
     fake_service = _FakeInferenceService()
     player = LeaguePlayer.__new__(LeaguePlayer)
@@ -805,6 +868,7 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
                 ((0, ACTIONS_PER_SLOT), (0, 0)),
                 constant_values=False,
             ),
+            can_tera=np.array([False, False], dtype=bool),
             slot_action_orders=({}, {}),
             slot_masks=(np.zeros(ACTIONS_PER_SLOT, dtype=bool), np.zeros(ACTIONS_PER_SLOT, dtype=bool)),
         ),
@@ -812,7 +876,7 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
     monkeypatch.setattr(
         league_module,
         "action_to_order",
-        lambda action_idx, battle, slot, action_state=None: PassBattleOrder(),
+        lambda action_idx, battle, slot, terastallize=False, action_state=None: PassBattleOrder(),
     )
 
     battle_kwargs = dict(

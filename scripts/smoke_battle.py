@@ -15,7 +15,7 @@ from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPl
 
 from pokerl.config import EnvConfig, ModelConfig
 from pokerl.data import GameData
-from pokerl.env.actions import NUM_TARGETS, PASS_ACTION, SWITCH_OFFSET, TERA_OFFSET
+from pokerl.env.actions import FIRST_SLOT_MASK_ROW, NUM_TARGETS, PASS_ACTION, SWITCH_OFFSET
 from pokerl.env.showdown_env import BattleEnv, make_local_account_configuration
 from pokerl.model.agent import PokeAgent
 
@@ -53,35 +53,41 @@ def server_config(env_config: EnvConfig) -> ServerConfiguration:
 def choose_action(
     policy: str,
     obs: dict[str, np.ndarray],
-    masks: np.ndarray,
+    masks: dict[str, np.ndarray],
     agent: PokeAgent,
     hidden,
     device: torch.device,
     rng: np.random.Generator,
     battle: DoubleBattle | None,
 ) -> tuple[np.ndarray, tuple[torch.Tensor, torch.Tensor] | None]:
+    joint_masks = masks["joint"]
+    can_tera = masks["can_tera"]
+
     if policy == "max-power":
         if battle is None:
             raise RuntimeError("Smoke battle policy requires an active battle state.")
-        action = np.array(
-            [_max_power_action(battle, slot, slot_mask, rng) for slot, slot_mask in enumerate(masks)],
-            dtype=np.int64,
-        )
+        action_1 = _max_power_action(battle, 0, joint_masks[FIRST_SLOT_MASK_ROW], rng)
+        action_2 = _max_power_action(battle, 1, joint_masks[action_1 + 1], rng)
+        action = np.array([action_1, action_2, _first_legal_tera_choice(can_tera, action_1, action_2)], dtype=np.int64)
         return action, hidden
 
     if policy == "random-legal":
-        action = np.array(
-            [_preferred_legal_action(slot_mask, rng) for slot_mask in masks],
-            dtype=np.int64,
-        )
+        action_1 = _preferred_legal_action(joint_masks[FIRST_SLOT_MASK_ROW], rng)
+        action_2 = _preferred_legal_action(joint_masks[action_1 + 1], rng)
+        action = np.array([action_1, action_2, _random_legal_tera_choice(can_tera, action_1, action_2, rng)], dtype=np.int64)
         return action, hidden
 
     if policy == "legal-first":
-        action = np.array([int(slot_mask.argmax()) for slot_mask in masks], dtype=np.int64)
+        action_1 = int(joint_masks[FIRST_SLOT_MASK_ROW].argmax())
+        action_2 = int(joint_masks[action_1 + 1].argmax())
+        action = np.array([action_1, action_2, _first_legal_tera_choice(can_tera, action_1, action_2)], dtype=np.int64)
         return action, hidden
 
     obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(device) for key, value in obs.items()}
-    masks_t = torch.from_numpy(masks).unsqueeze(0).to(device).bool()
+    masks_t = {
+        key: torch.from_numpy(value).unsqueeze(0).to(device).bool()
+        for key, value in masks.items()
+    }
     with torch.no_grad():
         out = agent(obs_t, hidden, action_masks=masks_t)
     return out["actions"].cpu().numpy()[0], out["hidden"]
@@ -90,8 +96,7 @@ def choose_action(
 def _preferred_legal_action(slot_mask: np.ndarray, rng: np.random.Generator) -> int:
     legal_actions = np.flatnonzero(slot_mask)
     preference_buckets = (
-        legal_actions[legal_actions < TERA_OFFSET],
-        legal_actions[(legal_actions >= TERA_OFFSET) & (legal_actions < SWITCH_OFFSET)],
+        legal_actions[legal_actions < SWITCH_OFFSET],
         legal_actions[(legal_actions >= SWITCH_OFFSET) & (legal_actions < PASS_ACTION)],
         legal_actions[legal_actions == PASS_ACTION],
     )
@@ -108,7 +113,7 @@ def _max_power_action(
     rng: np.random.Generator,
 ) -> int:
     legal_actions = np.flatnonzero(slot_mask)
-    regular_moves = legal_actions[legal_actions < TERA_OFFSET]
+    regular_moves = legal_actions[legal_actions < SWITCH_OFFSET]
     if regular_moves.size:
         def move_power(action: int) -> int:
             return battle.available_moves[slot][action // NUM_TARGETS].base_power or 0
@@ -117,6 +122,34 @@ def _max_power_action(
         strongest = [int(action) for action in regular_moves if move_power(action) == best_power]
         return int(rng.choice(strongest))
     return _preferred_legal_action(slot_mask, rng)
+
+
+def _legal_tera_choices(can_tera: np.ndarray, action_1: int, action_2: int) -> np.ndarray:
+    legal = [0]
+    if can_tera[0] and action_1 < SWITCH_OFFSET:
+        legal.append(1)
+    if can_tera[1] and action_2 < SWITCH_OFFSET:
+        legal.append(2)
+    return np.array(legal, dtype=np.int64)
+
+
+def _first_legal_tera_choice(can_tera: np.ndarray, action_1: int, action_2: int) -> int:
+    legal = _legal_tera_choices(can_tera, action_1, action_2)
+    if legal.size == 0:
+        raise RuntimeError("Smoke battle found no legal tera choice for the selected joint action.")
+    return int(legal[0])
+
+
+def _random_legal_tera_choice(
+    can_tera: np.ndarray,
+    action_1: int,
+    action_2: int,
+    rng: np.random.Generator,
+) -> int:
+    legal = _legal_tera_choices(can_tera, action_1, action_2)
+    if legal.size == 0:
+        raise RuntimeError("Smoke battle found no legal tera choice for the selected joint action.")
+    return int(rng.choice(legal))
 
 
 def _attach_choice_timer(player, timing: dict[str, float | int], key_prefix: str) -> None:

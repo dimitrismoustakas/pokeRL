@@ -317,8 +317,79 @@ def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
         )
 
 
-def obs_to_device(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
-    return {k: torch.from_numpy(v).to(device) for k, v in obs.items()}
+def obs_to_device(
+    obs: dict[str, np.ndarray],
+    device: torch.device,
+    buffers: dict[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    if buffers is None:
+        buffers = {}
+
+    for key, value in obs.items():
+        source = torch.from_numpy(value)
+        buffer = buffers.get(key)
+        if (
+            buffer is None
+            or buffer.shape != source.shape
+            or buffer.dtype != source.dtype
+            or buffer.device != device
+        ):
+            buffer = torch.empty(source.shape, dtype=source.dtype, device=device)
+            buffers[key] = buffer
+        buffer.copy_(source)
+
+    stale_keys = [key for key in buffers if key not in obs]
+    for key in stale_keys:
+        del buffers[key]
+
+    return buffers
+
+
+def action_masks_to_device(
+    masks: dict[str, np.ndarray],
+    device: torch.device,
+    buffers: dict[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    if buffers is None:
+        buffers = {}
+
+    for key, value in masks.items():
+        buffer = buffers.get(key)
+        expected_shape = value.shape
+        if (
+            buffer is None
+            or buffer.shape != expected_shape
+            or buffer.dtype != torch.bool
+            or buffer.device != device
+        ):
+            buffer = torch.empty(expected_shape, dtype=torch.bool, device=device)
+            buffers[key] = buffer
+        buffer.copy_(torch.from_numpy(value))
+
+    stale_keys = [key for key in buffers if key not in masks]
+    for key in stale_keys:
+        del buffers[key]
+
+    return buffers
+
+
+def array_to_device(
+    array: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+    buffer: torch.Tensor | None = None,
+) -> torch.Tensor:
+    source = torch.from_numpy(array)
+    target_dtype = source.dtype if dtype is None else dtype
+    if (
+        buffer is None
+        or buffer.shape != source.shape
+        or buffer.dtype != target_dtype
+        or buffer.device != device
+    ):
+        buffer = torch.empty(source.shape, dtype=target_dtype, device=device)
+    buffer.copy_(source)
+    return buffer
 
 
 def clone_hidden_state(
@@ -454,6 +525,10 @@ def train():
         )
 
         hidden = agent.initial_hidden(env_config.num_envs)
+        obs_device_buffers: dict[str, torch.Tensor] | None = None
+        mask_device_buffers: dict[str, torch.Tensor] | None = None
+        rewards_device_buffer: torch.Tensor | None = None
+        dones_device_buffer: torch.Tensor | None = None
         num_updates = train_config.total_timesteps // steps_per_update
         updates_done = trainer.global_step // steps_per_update
 
@@ -501,11 +576,13 @@ def train():
             for step in range(train_config.rollout_steps):
                 with torch.no_grad():
                     obs_device_started = time.perf_counter()
-                    obs_t = obs_to_device(obs, device)
+                    obs_t = obs_to_device(obs, device, buffers=obs_device_buffers)
+                    obs_device_buffers = obs_t
                     rollout_profile["obs_to_device_sec"] += time.perf_counter() - obs_device_started
 
                     mask_device_started = time.perf_counter()
-                    masks_t = torch.from_numpy(masks).to(device=device, dtype=torch.bool)
+                    masks_t = action_masks_to_device(masks, device, buffers=mask_device_buffers)
+                    mask_device_buffers = masks_t
                     rollout_profile["mask_to_device_sec"] += time.perf_counter() - mask_device_started
 
                     policy_started = time.perf_counter()
@@ -524,7 +601,10 @@ def train():
                             key: value.detach().clone()
                             for key, value in obs_t.items()
                         }
-                        masks_for_buffer = masks_t.detach().clone()
+                        masks_for_buffer = {
+                            key: value.detach().clone()
+                            for key, value in masks_t.items()
+                        }
                     else:
                         obs_for_buffer = obs_t
                         masks_for_buffer = masks_t
@@ -534,8 +614,20 @@ def train():
                 rollout_profile["env_step_sec"] += time.perf_counter() - env_step_started
 
                 feedback_device_started = time.perf_counter()
-                rewards_t = torch.from_numpy(rewards).to(device)
-                dones_t = torch.from_numpy(dones).to(device)
+                rewards_t = array_to_device(
+                    rewards,
+                    device,
+                    dtype=torch.float32,
+                    buffer=rewards_device_buffer,
+                )
+                dones_t = array_to_device(
+                    dones,
+                    device,
+                    dtype=torch.bool,
+                    buffer=dones_device_buffer,
+                )
+                rewards_device_buffer = rewards_t
+                dones_device_buffer = dones_t
                 rollout_profile["feedback_to_device_sec"] += time.perf_counter() - feedback_device_started
 
                 buffer_started = time.perf_counter()

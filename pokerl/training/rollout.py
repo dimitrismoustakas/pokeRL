@@ -16,8 +16,8 @@ class RolloutBatch:
     """
 
     obs: dict[str, torch.Tensor]
-    actions: torch.Tensor          # (num_steps, num_envs, 2)
-    action_masks: torch.Tensor     # (num_steps, num_envs, num_actions + 1, num_actions)
+    actions: torch.Tensor          # (num_steps, num_envs, 3)
+    action_masks: dict[str, torch.Tensor]
     log_probs: torch.Tensor        # (num_steps, num_envs)
     values: torch.Tensor           # (num_steps, num_envs)
     rewards: torch.Tensor          # (num_steps, num_envs)
@@ -43,7 +43,7 @@ class RolloutBuffer:
         num_steps: int,
         num_envs: int,
         obs_example: dict[str, np.ndarray],
-        action_mask_example: np.ndarray,
+        action_mask_example: dict[str, np.ndarray],
         device: torch.device,
     ):
         self.num_steps = num_steps
@@ -60,12 +60,15 @@ class RolloutBuffer:
             )
             for key, value in obs_example.items()
         }
-        self._actions = torch.empty((num_steps, num_envs, 2), dtype=torch.long, device=device)
-        self._action_masks = torch.empty(
-            (num_steps, num_envs, *action_mask_example.shape[1:]),
-            dtype=torch.bool,
-            device=device,
-        )
+        self._actions = torch.empty((num_steps, num_envs, 3), dtype=torch.long, device=device)
+        self._action_masks = {
+            key: torch.empty(
+                (num_steps, num_envs, *value.shape[1:]),
+                dtype=torch.from_numpy(value).dtype,
+                device=device,
+            )
+            for key, value in action_mask_example.items()
+        }
         self._log_probs = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
         self._values = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
         self._rewards = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
@@ -79,7 +82,7 @@ class RolloutBuffer:
         self,
         obs: dict[str, torch.Tensor],
         actions: torch.Tensor,
-        action_masks: torch.Tensor,
+        action_masks: dict[str, torch.Tensor],
         log_probs: torch.Tensor,
         values: torch.Tensor,
         rewards: torch.Tensor,
@@ -94,7 +97,8 @@ class RolloutBuffer:
         for key in self.obs_keys:
             self._obs[key][slot].copy_(obs[key].detach())
         self._actions[slot].copy_(actions.detach())
-        self._action_masks[slot].copy_(action_masks.detach())
+        for key in self._action_masks:
+            self._action_masks[key][slot].copy_(action_masks[key].detach())
         self._log_probs[slot].copy_(log_probs.detach())
         self._values[slot].copy_(values.detach())
         self._rewards[slot].copy_(rewards.detach())

@@ -92,16 +92,17 @@ class PokeAgent(nn.Module):
         obs: dict[str, torch.Tensor],
         hidden=None,
         actions: torch.Tensor | None = None,
-        action_masks: torch.Tensor | None = None,
+        action_masks: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for battle turns.
 
         Args:
             obs: observation dict from ObservationBuilder
             hidden: LSTM hidden state (or None)
-            actions: (batch, 2) actions to evaluate, or None to sample
-            action_masks: (batch, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
-                boolean joint legality tables
+            actions: (batch, 3) actions to evaluate, or None to sample
+            action_masks: dict with boolean legality tables:
+                ``joint`` has shape (batch, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
+                ``can_tera`` has shape (batch, 2)
 
         Returns dict with: actions, log_prob, entropy, value, hidden
         """

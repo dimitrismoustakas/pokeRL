@@ -11,6 +11,7 @@ from ..env.actions import (
     MAX_TEAM_SLOTS,
     NUM_MOVES,
     NUM_TARGETS,
+    NUM_TERA_CHOICES,
     TARGET_NONE,
     decode_action,
 )
@@ -67,7 +68,8 @@ class ActionHead(nn.Module):
     the acting pokemon, its partner, both opponent actives, and the action's
     explicit target or switch destination. The second slot additionally sees
     the first slot's chosen action embedding so the joint decision remains
-    coordinated.
+    coordinated. Terastallization is modeled as a third conditional decision
+    over {no tera, tera slot 0, tera slot 1}.
     """
 
     def __init__(self, context_dim: int, pokemon_dim: int, hidden_dim: int = 256):
@@ -75,7 +77,7 @@ class ActionHead(nn.Module):
         self.num_actions = ACTIONS_PER_SLOT
 
         self.action_id_emb = nn.Embedding(self.num_actions, hidden_dim)
-        self.kind_emb = nn.Embedding(4, hidden_dim)
+        self.kind_emb = nn.Embedding(3, hidden_dim)
         self.move_slot_emb = nn.Embedding(NUM_MOVES + 1, hidden_dim)
         self.target_emb = nn.Embedding(NUM_TARGETS + 1, hidden_dim)
         self.switch_slot_emb = nn.Embedding(MAX_TEAM_SLOTS + 1, hidden_dim)
@@ -97,6 +99,10 @@ class ActionHead(nn.Module):
             nn.Linear(hidden_dim + pokemon_dim, hidden_dim),
             nn.ReLU(),
         )
+        self.tera_query = nn.Sequential(
+            nn.Linear(context_dim + pokemon_dim * 4 + hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+        )
         self.entity_proj = nn.Sequential(
             nn.Linear(pokemon_dim, hidden_dim),
             nn.ReLU(),
@@ -106,6 +112,11 @@ class ActionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.tera_score = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, NUM_TERA_CHOICES),
+        )
 
         metadata = self._build_action_metadata()
         self.register_buffer("_action_ids", metadata["action_ids"], persistent=False)
@@ -114,6 +125,7 @@ class ActionHead(nn.Module):
         self.register_buffer("_action_target_slot", metadata["target_slot"], persistent=False)
         self.register_buffer("_action_switch_slot", metadata["switch_slot"], persistent=False)
         self.register_buffer("_action_is_switch", metadata["is_switch"], persistent=False)
+        self.register_buffer("_action_is_move", metadata["is_move"], persistent=False)
 
     def forward(
         self,
@@ -123,15 +135,24 @@ class ActionHead(nn.Module):
         opp_team_reps: torch.Tensor,
         opp_reserve_mask: torch.Tensor,
         opp_active_reps: torch.Tensor,
-        masks: torch.Tensor,
+        masks: dict[str, torch.Tensor],
         actions: torch.Tensor | None = None,
         greedy: bool = False,
     ) -> dict[str, torch.Tensor]:
+        if "joint" not in masks or "can_tera" not in masks:
+            raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
+        if actions is not None and actions.shape[1] != 3:
+            raise ValueError(
+                f"ActionHead expected actions with shape (batch, 3), got {tuple(actions.shape)}."
+            )
+
         rep1 = active_reps[:, 0]
         rep2 = active_reps[:, 1]
         opp1 = opp_active_reps[:, 0]
         opp2 = opp_active_reps[:, 1]
-        mask1 = masks[:, FIRST_SLOT_MASK_ROW]
+        joint_masks = masks["joint"]
+        can_tera = masks["can_tera"]
+        mask1 = joint_masks[:, FIRST_SLOT_MASK_ROW]
 
         base_query1 = self.query1(torch.cat([context, rep1, rep2, opp1, opp2], dim=-1))
         reserve_summary1 = self.reserve_attention(base_query1, opp_team_reps, opp_reserve_mask)
@@ -151,7 +172,7 @@ class ActionHead(nn.Module):
             )
 
         batch_indices = torch.arange(context.shape[0], device=context.device)
-        mask2 = masks[batch_indices, a1 + 1]
+        mask2 = joint_masks[batch_indices, a1 + 1]
         if not mask2.any(dim=1).all():
             raise RuntimeError(
                 "ActionHead received an empty conditional joint action mask for pokemon 2. "
@@ -176,11 +197,38 @@ class ActionHead(nn.Module):
                 "ActionHead received an illegal second-slot action for the current joint mask."
             )
 
-        log_prob = dist1.log_prob(a1) + dist2.log_prob(a2)
-        entropy = dist1.entropy() + dist2.entropy()
+        a2_emb = self.action_id_emb(a2)
+        a1_is_move = self._action_is_move[a1]
+        a2_is_move = self._action_is_move[a2]
+        tera_mask = torch.stack(
+            [
+                torch.ones_like(a1_is_move, dtype=torch.bool),
+                can_tera[:, 0] & a1_is_move,
+                can_tera[:, 1] & a2_is_move,
+            ],
+            dim=1,
+        )
+        tera_query = self.tera_query(
+            torch.cat([context, rep1, rep2, opp1, opp2, a1_emb, a2_emb], dim=-1)
+        )
+        tera_logits = self.tera_score(tera_query).masked_fill(~tera_mask, -1e8)
+        tera_dist = torch.distributions.Categorical(logits=tera_logits)
+
+        if actions is None:
+            tera_choice = tera_logits.argmax(dim=1) if greedy else tera_dist.sample()
+        else:
+            tera_choice = actions[:, 2]
+
+        if not tera_mask.gather(1, tera_choice.unsqueeze(1)).squeeze(1).all():
+            raise RuntimeError(
+                "ActionHead received an illegal tera choice for the current joint action pair."
+            )
+
+        log_prob = dist1.log_prob(a1) + dist2.log_prob(a2) + tera_dist.log_prob(tera_choice)
+        entropy = dist1.entropy() + dist2.entropy() + tera_dist.entropy()
 
         return {
-            "actions": torch.stack([a1, a2], dim=1),
+            "actions": torch.stack([a1, a2, tera_choice], dim=1),
             "log_prob": log_prob,
             "entropy": entropy,
         }
@@ -253,25 +301,26 @@ class ActionHead(nn.Module):
         target_slots = []
         switch_slots = []
         is_switch = []
+        is_move = []
 
         move_none_slot = NUM_MOVES
         target_none_slot = NUM_TARGETS
         switch_none_slot = MAX_TEAM_SLOTS
         kind_lookup = {
-            ("move", False): 0,
-            ("move", True): 1,
-            ("switch", False): 2,
-            ("pass", False): 3,
+            "move": 0,
+            "switch": 1,
+            "pass": 2,
         }
 
         for action_idx in range(ACTIONS_PER_SLOT):
-            kind, slot_idx, target_idx, tera = decode_action(action_idx)
+            kind, slot_idx, target_idx = decode_action(action_idx)
             action_ids.append(action_idx)
-            kinds.append(kind_lookup[(kind, tera if kind == "move" else False)])
+            kinds.append(kind_lookup[kind])
             move_slots.append(slot_idx if kind == "move" else move_none_slot)
             target_slots.append(target_idx if kind == "move" else (TARGET_NONE if kind == "pass" else target_none_slot))
             switch_slots.append(slot_idx if kind == "switch" else switch_none_slot)
             is_switch.append(kind == "switch")
+            is_move.append(kind == "move")
 
         return {
             "action_ids": torch.tensor(action_ids, dtype=torch.long),
@@ -280,6 +329,7 @@ class ActionHead(nn.Module):
             "target_slot": torch.tensor(target_slots, dtype=torch.long),
             "switch_slot": torch.tensor(switch_slots, dtype=torch.long),
             "is_switch": torch.tensor(is_switch, dtype=torch.bool),
+            "is_move": torch.tensor(is_move, dtype=torch.bool),
         }
 
 

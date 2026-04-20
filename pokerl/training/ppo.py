@@ -55,8 +55,8 @@ class PPOTrainer:
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         obs_seq = batch.obs
-        actions_seq = batch.actions              # (T, E, 2)
-        masks_seq = batch.action_masks           # (T, E, A + 1, A)
+        actions_seq = batch.actions              # (T, E, 3)
+        masks_seq = batch.action_masks
         old_lp_seq = batch.log_probs             # (T, E)
         adv_seq = adv                            # (T, E)
         returns_seq = batch.returns              # (T, E)
@@ -83,8 +83,8 @@ class PPOTrainer:
                 E_mb = mb_envs.numel()
 
                 mb_obs_seq = {k: v[:, mb_envs] for k, v in obs_seq.items()}
-                mb_actions_seq = actions_seq[:, mb_envs]      # (T, E_mb, 2)
-                mb_masks_seq = masks_seq[:, mb_envs]          # (T, E_mb, A + 1, A)
+                mb_actions_seq = actions_seq[:, mb_envs]      # (T, E_mb, 3)
+                mb_masks_seq = {key: value[:, mb_envs] for key, value in masks_seq.items()}
                 mb_dones_seq = dones_seq[:, mb_envs]          # (T, E_mb)
                 mb_old_lp = old_lp_seq[:, mb_envs].reshape(-1)
                 mb_adv = adv_seq[:, mb_envs].reshape(-1)
@@ -132,7 +132,7 @@ class PPOTrainer:
                         opp_reps_seq_mb[t],
                         opp_bench_mask_seq_mb[t],
                         opp_active_reps_seq_mb[t],
-                        mb_masks_seq[t],
+                        {key: value[t] for key, value in mb_masks_seq.items()},
                         mb_actions_seq[t],
                     )
                     value_t = self.agent.value_head(
