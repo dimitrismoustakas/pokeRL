@@ -1,710 +1,714 @@
-# pokeRL: Model Architecture & Training Semantics
+# pokeRL Model Architecture Reference
 
-This document is a detailed reference for how the model works, what design decisions were made, and where the system has room to improve. It is intended both as an onboarding guide for people unfamiliar with the codebase and as an analytical reference for future development.
+This document describes the current model and training stack implemented in:
 
----
+- `pokerl/model/agent.py`
+- `pokerl/model/encoders.py`
+- `pokerl/model/memory.py`
+- `pokerl/model/heads.py`
+- `pokerl/env/observation.py`
+- `pokerl/env/actions.py`
+- `pokerl/training/rollout.py`
+- `pokerl/training/ppo.py`
+- `pokerl/training/league.py`
+- `scripts/train.py`
 
-## Table of Contents
-
-1. [High-Level Overview](#1-high-level-overview)
-2. [State Representation: What the Model Sees](#2-state-representation-what-the-model-sees)
-3. [Model Architecture](#3-model-architecture)
-4. [Action Space](#4-action-space)
-5. [Training Algorithm](#5-training-algorithm)
-6. [Reward Structure](#6-reward-structure)
-7. [Team Preview](#7-team-preview)
-8. [League Self-Play](#8-league-self-play)
-9. [Configuration Reference](#9-configuration-reference)
-10. [Known Limitations & Improvement Opportunities](#10-known-limitations--improvement-opportunities)
-
----
+If this document and the code ever disagree, the code is authoritative.
 
 ## 1. High-Level Overview
 
-The agent is trained to play **VGC doubles battles** (and random doubles) via **Proximal Policy Optimization (PPO)** against opponents sampled from a **league of past checkpoints**. The environment is a real [Pokemon Showdown](https://pokemonshowdown.com/) server running locally, bridged into Gymnasium via the [poke-env](https://github.com/hsahovic/poke-env) library.
+`PokeAgent` is a recurrent actor-critic for doubles battles. The policy is trained with PPO against opponents sampled from a self-play league of frozen checkpoints. Team preview is trained separately with REINFORCE plus opponent-model auxiliary losses.
 
-The core loop is:
+Battle-turn pipeline:
 
+```text
+observation
+  -> spatial encoder
+  -> memory (LSTM or identity)
+  -> action head
+       slot 1 action
+       -> slot 2 action conditioned on slot 1
+       -> tera choice conditioned on both slot actions
+  -> value head
 ```
-Reset → Observe Battle State → Encode State → LSTM Memory → Choose Actions → Step → Collect Reward → Update Policy
+
+Preview pipeline:
+
+```text
+synthetic preview observation
+  -> same spatial encoder
+  -> same memory module
+  -> team preview head (pick 4 of 6 autoregressively)
+  -> opponent preview head (auxiliary only)
 ```
 
-**Key properties:**
-- **Doubles battle**: two active pokemon per side simultaneously
-- **Sparse reward**: only +1 win / -1 loss at battle end; no intermediate shaping
-- **Recurrent policy**: LSTM carries information across turns
-- **League self-play**: trained against a rotating pool of frozen past checkpoints
-- **Autoregressive actions**: slot 1 is chosen first, slot 2 is conditioned on slot 1
-- **Team preview**: separate policy for picking and ordering which 4 of 6 pokemon to bring
+Core properties:
 
----
+- Doubles action selection is autoregressive across the two active slots.
+- Terastallization is a separate third decision, not folded into the per-slot action IDs.
+- The critic is recurrent: it consumes the memory output, not the raw spatial context.
+- Team preview shares the same spatial encoder and memory stack as battle turns.
+- Opponent selection at team preview is supervised with auxiliary heads for "bring" and "lead pair" prediction.
 
-## 2. State Representation: What the Model Sees
+## 2. Observation Structure
 
-Implemented in [pokerl/env/observation.py](pokerl/env/observation.py).
+Observation building lives in `pokerl/env/observation.py`.
 
-### 2.1 Pokemon Features
+### 2.1 Per-Pokemon Inputs
 
-Each pokemon (own team 6 + opponent team 6) is encoded with two types of features:
+Each side contributes up to 6 Pokemon. For each Pokemon, the encoder receives:
 
-#### Categorical features (looked up as learned embeddings)
+Categorical tensors:
 
 | Feature | Shape | Notes |
 |---|---|---|
-| `species` | `(6,)` int | Index into species vocabulary |
-| `moves` | `(6, 4)` int | 4 move slots; unknown moves → UNKNOWN index |
-| `last_move` | `(6,)` int | Last revealed or used move |
-| `ability` | `(6,)` int | Ability index |
-| `item` | `(6,)` int | Named item vocab + hash-bucketed fallback |
-| `types` | `(6, 3)` int | `[type_1, type_2, tera_type]` |
+| `species` | `(6,)` | species vocab index |
+| `moves` | `(6, 4)` | revealed/known moves |
+| `last_move` | `(6,)` | most recent revealed or used move |
+| `ability` | `(6,)` | ability vocab index |
+| `item` | `(6,)` | named item or hash-bucketed fallback |
+| `types` | `(6, 3)` | type 1, type 2, tera type |
 
-#### Continuous features (44 dimensions per pokemon)
+Continuous features: `44` floats per Pokemon.
 
-| Feature | Dims | Notes |
+| Group | Dims | Details |
 |---|---|---|
-| HP fraction | 1 | `current_hp / max_hp` |
-| Status condition | 7 | One-hot: {none, BRN, FRZ, PAR, PSN, SLP, TOX} |
-| Stat boosts | 7 | {ATK, DEF, SPA, SPD, SPE, ACC, EVA} normalized by ÷6 |
-| Volatile effects | 16 | Binary: confusion, substitute, leech seed, taunt, encore, torment, disable, yawn, perish song, protect, endure, focus energy, attract, curse, nightmare, flash fire |
-| Move PP remaining | 4 | `current_pp / max_pp` per move slot; **always zero for opponent pokemon** |
-| Protect counter | 1 | Normalized to [0, 4] |
-| Status counter | 1 | Sleep turns / toxic turns; normalized to [0, 8] |
-| First turn | 1 | True if pokemon just switched in |
-| Revealed | 1 | True if opponent pokemon has been seen in battle |
-| Known move count | 1 | `num_known_moves / 4` |
-| Ability known | 1 | True if revealed |
-| Item known | 1 | True if revealed |
-| Tera type known | 1 | True if revealed |
-| Terastallized | 1 | True if currently in tera form |
+| HP fraction | 1 | current HP / max HP |
+| Status one-hot | 7 | none, BRN, FRZ, PAR, PSN, SLP, TOX |
+| Boost stages | 7 | atk, def, spa, spd, spe, accuracy, evasion; divided by 6 |
+| Volatiles | 16 | confusion, substitute, leech seed, taunt, encore, torment, disable, yawn, perish song, protect, endure, focus energy, attract, curse, nightmare, flash fire |
+| Move PP fractions | 4 | own side only; opponent entries stay zero |
+| Extra features | 9 | protect counter, status counter, first turn, revealed, known move count, ability known, item known, tera known, is terastallized |
 
-**Important asymmetry:** PP features are populated for own pokemon but zero for opponent pokemon. This is intentional: the model learns this as an implicit "is own" signal. See [Section 10](#10-known-limitations--improvement-opportunities) for the planned fix.
+Important asymmetries:
 
-### 2.2 Field Features (36 dimensions)
+- Opponent move PP is not tracked; those 4 values remain zero.
+- Unknown categorical values are mapped to `UNKNOWN_IDX`.
+- Own preview observations are built from the packed team; opponent preview observations expose visible species only.
 
-| Feature | Dims | Notes |
+### 2.2 Field Features
+
+`FieldEncoder.INPUT_DIM = 36`.
+
+| Group | Dims | Details |
 |---|---|---|
-| Weather type | 9 | One-hot over 8 weather types + none |
-| Weather age | 1 | Normalized to [0, 8] |
-| Terrain type | 5 | One-hot over 4 terrain types + none |
-| Terrain age | 1 | Normalized |
-| Own side conditions | 8 | Stealth Rock (bool), Spikes (0-3), Toxic Spikes (0-2), Sticky Web (bool), Reflect age, Light Screen age, Aurora Veil age, Tailwind age |
-| Opponent side conditions | 8 | Same as own |
-| Trick Room age | 1 | Normalized |
-| Tera used (own) | 1 | Bool: own tera already consumed this battle |
-| Tera used (opponent) | 1 | Bool |
-| Turn counter | 1 | Normalized to [0, 20] |
+| Weather | 10 | none flag, 8 weather types, normalized weather age |
+| Terrain | 6 | none flag, 4 terrain types, normalized terrain age |
+| Own side conditions | 8 | stealth rock, spikes, toxic spikes, sticky web, reflect age, light screen age, aurora veil age, tailwind age |
+| Opp side conditions | 8 | same layout as own side |
+| Global | 4 | trick room age, own tera used, opp tera used, normalized turn |
 
-### 2.3 Battle Metadata (passed separately as tensors)
+### 2.3 Team Metadata
 
-- `own_roles / opp_roles`: `(6,)` int — assigns each team slot a role: `ACTIVE_SLOT_1`, `ACTIVE_SLOT_2`, or `BENCH`
-- `own_mask / opp_mask`: `(6,)` bool — padding mask for unused slots
-- `own_active_indices / opp_active_indices`: `(2,)` int — which team slots are currently active
-- `own_active_present / opp_active_present`: `(2,)` bool — whether each active slot is actually present (handles faints)
+Additional tensors passed outside the per-Pokemon feature blocks:
+
+- `own_roles`, `opp_roles`: `(6,)`, values in `{ACTIVE_1, ACTIVE_2, BENCH}`
+- `own_mask`, `opp_mask`: `(6,)`, padding mask (`True` means unused slot)
+- `own_active_indices`, `opp_active_indices`: `(2,)`, indices of the currently active Pokemon within the ordered team list
+- `own_active_present`, `opp_active_present`: `(2,)`, whether each active slot exists
+
+The team ordering puts active Pokemon first and keeps stable team-slot identity for switches. Missing actives are gathered and then zeroed by `SpatialEncoder._gather_slots`.
 
 ### 2.4 Item Vocabulary
 
-The item vocabulary uses a two-tier system implemented in [pokerl/data.py](pokerl/data.py):
+Item indexing is handled in `pokerl/data.py`:
 
-1. **Named tier**: items harvested from the Showdown Pokedex `requiredItem`/`requiredItems` fields — forms with held item requirements like Giratina-Origin, Arceus types, etc.
-2. **Hash bucket tier**: all other items are mapped via `blake2b(item_id) % num_hash_buckets` into a fixed pool. Most competitive items (Choice Band, Life Orb, Leftovers, etc.) currently land here.
+- A small named-item tier is built from required-form items in the Showdown Pokedex.
+- Everything else falls into hash buckets via `item_index(...)`.
 
-This means most battle-relevant items share embedding buckets and cannot be individually learned. This is a known limitation described in [Section 10](#10-known-limitations--improvement-opportunities).
-
----
+That means many competitive items still collide in the embedding table.
 
 ## 3. Model Architecture
 
-Entry point: [pokerl/model/agent.py](pokerl/model/agent.py). The `PokeAgent` composes four sub-modules in sequence.
+Entry point: `pokerl/model/agent.py`.
+
+`PokeAgent` owns:
+
+- `spatial`: `SpatialEncoder`
+- `memory`: `LSTMMemory` or `IdentityMemory`
+- `action_head`: `ActionHead`
+- `team_preview_head`: `TeamPreviewHead`
+- `opponent_preview_head`: `OpponentPreviewHead`
+- `value_head`: `ValueHead`
+
+If `ModelConfig.init_embeddings_from_stats` is enabled, `GameData` initializes species and move embeddings from stats before training.
 
 ### 3.1 PokemonEncoder
 
-**File:** [pokerl/model/encoders.py](pokerl/model/encoders.py)
+Implemented in `pokerl/model/encoders.py`.
 
-Shared weights encode each individual pokemon into a fixed-size vector. The same `PokemonEncoder` is applied to all 12 pokemon (own team + opponent team).
+Per-Pokemon input width:
 
-**Input per pokemon:**
+- species embedding: `64`
+- 4 move embeddings: `4 * 32 = 128`
+- last-move embedding: `32`
+- ability embedding: `32`
+- item embedding: `32`
+- 3 type embeddings: `3 * 16 = 48`
+- continuous features: `44`
 
-| Component | Source | Dims |
-|---|---|---|
-| Species embedding | `species_to_idx` lookup | 64 |
-| Move embeddings (×4) | `move_to_idx` lookup, concatenated | 128 |
-| Last-move embedding | `move_to_idx` lookup | 32 |
-| Ability embedding | `ability_to_idx` lookup | 32 |
-| Item embedding | named + hash bucket lookup | 32 |
-| Type embeddings (×3) | `type_to_idx` lookup, concatenated | 48 |
-| Continuous features | raw float vector | 44 |
-| **Total input** | | **380** |
+Total input width: `380`
 
-**MLP:**
-```
-380 → Linear(256) → ReLU → Linear(128) → ReLU → output: 128
+Network:
+
+```text
+380 -> Linear(256) -> ReLU -> Linear(128) -> ReLU
 ```
 
-**Output:** `(batch, pokemon_out=128)` per pokemon.
+Output: `(batch, 128)` per Pokemon.
 
-The species and move embeddings can optionally be initialized from base stats (see [Section 3.6](#36-stat-based-embedding-initialization)).
+The same encoder is reused for all own and opponent Pokemon.
 
 ### 3.2 TeamEncoder
 
-**File:** [pokerl/model/encoders.py](pokerl/model/encoders.py)
+Also in `pokerl/model/encoders.py`.
 
-Two separate `TeamEncoder` instances (one for own team, one for opponent team) apply order-invariant attention over the 6 per-pokemon representations.
+There are two separate instances:
 
-**Input:**
-- Per-pokemon reps: `(batch, 6, 128)` from `PokemonEncoder`
-- Role indices: `(batch, 6)` — role embedding added to each pokemon representation
+- `team_own`
+- `team_opp`
 
-**Role embedding:** 3 roles (active slot 1, active slot 2, bench) → `role_dim=128`
+Each one:
 
-**Architecture:**
+- adds a learned role embedding with 3 roles and width `128`
+- runs a `TransformerEncoder` over the 6-Pokemon set
+
+Default layer shape:
+
+```text
+d_model = 128
+nhead = 4
+num_layers = 2
+dim_feedforward = 256
+dropout = 0.0
+norm_first = True
 ```
-(pokemon_rep + role_emb) → TransformerEncoder(nhead=4, num_layers=2, dim_feedforward=256)
-```
 
-The Transformer operates on the 6-pokemon sequence with no positional bias — the attention is **order-invariant** (only role matters, not team slot order). Padding mask is applied for unused team slots.
-
-**Output:** `(batch, 6, 128)` attended pokemon representations.
+The module is permutation-equivariant with respect to team order. The model gets role information, but there is no slot-position embedding.
 
 ### 3.3 FieldEncoder
 
-**File:** [pokerl/model/encoders.py](pokerl/model/encoders.py)
+`FieldEncoder` is a one-layer MLP:
 
-A simple MLP over the 36-dimensional field feature vector:
-
-```
-36 → Linear(64) → ReLU → output: 64
+```text
+36 -> Linear(64) -> ReLU
 ```
 
-### 3.4 SpatialEncoder (Combines the Above)
+Output: `(batch, 64)`.
 
-**File:** [pokerl/model/encoders.py](pokerl/model/encoders.py)
+### 3.4 SpatialEncoder
 
-Runs `PokemonEncoder` on all pokemon, passes them through `TeamEncoder` for each team, runs `FieldEncoder`, and produces:
+`SpatialEncoder` combines the Pokemon, team, and field encoders.
 
-| Output | Shape | Description |
+Outputs:
+
+| Name | Shape | Meaning |
 |---|---|---|
-| `context` | `(batch, 320)` | Global battle context: `mean(own_reps) ∥ mean(opp_reps) ∥ field` |
-| `active_reps` | `(batch, 2, 128)` | Own two active pokemon representations |
-| `own_reps` | `(batch, 6, 128)` | Full own team (post-attention) |
-| `opp_reps` | `(batch, 6, 128)` | Full opponent team (post-attention) |
-| `opp_active_reps` | `(batch, 2, 128)` | Opponent's two active pokemon |
+| `context` | `(batch, 320)` | mean-pooled own team `(128)` + mean-pooled opp team `(128)` + field `(64)` |
+| `active_reps` | `(batch, 2, 128)` | own active pair |
+| `own_reps` | `(batch, 6, 128)` | full own team after attention |
+| `opp_reps` | `(batch, 6, 128)` | full opponent team after attention |
+| `opp_active_reps` | `(batch, 2, 128)` | opponent active pair |
 
-The `context` vector is the "global summary" used by the LSTM and action head. It concatenates the mean-pooled own team, mean-pooled opponent team, and field encoding — so it collapses team order entirely.
+Important details:
 
-### 3.5 Memory Module
+- Team means are mask-aware; padded slots are ignored.
+- Active reps are gathered by stable team index, then multiplied by `*_active_present`.
+- The global `context` is purely spatial. Temporal state is added later by `memory`.
 
-**File:** [pokerl/model/memory.py](pokerl/model/memory.py)
+### 3.5 Memory
 
-Two interchangeable implementations:
+Implemented in `pokerl/model/memory.py`.
 
-**IdentityMemory** (feedforward baseline):
-- Projects context through a linear layer: `input_dim → hidden_dim`
-- No temporal state; each turn is independent
-- Useful for ablation
+Two options exist:
 
-**LSTMMemory** (default):
-- Standard `nn.LSTM(input_dim=320, hidden_dim=256, batch_first=True)`
-- Maintains `(h, c)` hidden state across turns
-- At episode boundaries (`done=True`), hidden state is zeroed: `h = h * not_done`
-- Supports **truncated BPTT**: optionally detaches hidden state every `bptt_chunk_steps` timesteps to reduce memory during training
+`IdentityMemory`
 
-**Output:** `(batch, 256)` memory output, updated hidden state.
+- single linear projection `input_dim -> hidden_dim`
+- no recurrent state
 
-The LSTM gives the policy its "memory" of the battle — how HP has changed, what moves have been revealed, what the flow of the battle has been. Without it the model would need to infer all of this purely from current observation features.
+`LSTMMemory`
 
-### 3.6 Stat-Based Embedding Initialization
+- `nn.LSTM(input_dim=320, hidden_dim=256, batch_first=True)`
+- accepts either `(batch, 320)` or `(batch, seq, 320)`
+- returns the LSTM output plus `(h, c)`
 
-**File:** [pokerl/config.py](pokerl/config.py), [pokerl/data.py](pokerl/data.py)
+Important implementation detail:
 
-When `init_embeddings_from_stats=True` (the default), species and move embeddings are initialized as linear projections of base stats rather than random:
+- The memory module does not reset hidden state on `done` and does not perform truncated BPTT by itself.
+- Hidden-state zeroing and optional detaching are handled by the rollout loop and PPO trainer.
 
-- **Species**: `(HP, Atk, Def, SpA, SpD, Spe)` normalized by ÷255 → linear projection → embedding
-- **Moves**: `(power/250, accuracy/100, pp/64)` → linear projection → embedding
+### 3.6 ActionHead
 
-This gives the model a warm start that encodes known structure: e.g., fast pokemon start with high Spe embeddings, strong attackers start with high Atk embeddings. In practice this improves early training significantly.
+Implemented in `pokerl/model/heads.py`.
 
-### 3.7 Action Head
+The battle policy makes three sequential decisions:
 
-**File:** [pokerl/model/heads.py](pokerl/model/heads.py)
+1. slot-1 action
+2. slot-2 action conditioned on slot 1
+3. tera choice conditioned on both slot actions
 
-**Autoregressive doubles selection.** Slot 1 is chosen first; slot 2 is chosen conditioned on what slot 1 chose.
+#### Per-slot action universe
 
-#### MaskedSetAttention (building block)
+`ACTIONS_PER_SLOT = 27`:
 
-A learned attention pooling operation used inside the action head:
+- `0..19`: move index `0..3` crossed with target index `0..4`
+- `20..25`: switch to stable own team slot `0..5`
+- `26`: pass
 
-```
-Query (batch, q_dim) × Items (batch, N, d) → (batch, d)
-```
+Tera is separate:
 
-Computes scaled dot-product attention weights over the items given the query, applies the mask (to ignore illegal/unavailable items), and returns a weighted sum. Used to summarize the opponent bench conditioned on the current action context.
+- `0`: no tera
+- `1`: tera slot 0
+- `2`: tera slot 1
 
-#### Slot 1 Selection
+#### Static action features
 
-1. **Query construction:**
-   - Concatenate: `context (320) ∥ active[0] (128) ∥ active[1] (128) ∥ opp_active[0] (128) ∥ opp_active[1] (128)` → 832 dims
-   - MLP: `832 → Linear(256) → ReLU` → `query1 (256)`
+For each of the 27 per-slot actions, the head builds a static embedding by summing:
 
-2. **Opponent bench summary:**
-   - `MaskedSetAttention(query1, opp_bench_reps, opp_bench_mask)` → `opp_bench_summary (128)`
-   - Fuse: `[query1 (256) ∥ opp_bench_summary (128)] → Linear(256) → ReLU` → `query1_fused (256)`
+- action ID embedding
+- action kind embedding (`move`, `switch`, `pass`)
+- move-slot embedding
+- target embedding
+- switch-slot embedding
 
-3. **Action scoring:**
-   Each of the 47 possible actions gets a scalar score from three components:
-   - **Static features**: per-action embeddings for move slot, target, switch slot, action kind, tera flag, action ID → projected to 256 dims
-   - **Dynamic entity features**: the pokemon representation most relevant to this action (own pokemon for moves, switch target for switches) → projected to 256 dims
-   - **Score network**: `[query (256) ∥ static (256) ∥ entity (256)] → Linear(256) → ReLU → Linear(1)`
+All of these live in the `action_hidden` width (`256` by default).
 
-4. Apply action mask (illegal actions → -inf), softmax, sample (or argmax in greedy mode) → `a1`
+#### Dynamic action entity features
 
-#### Slot 2 Selection
+Each candidate action also gets a dynamic entity representation:
 
-Same pipeline, but query is augmented with the slot 1 action embedding:
+- move actions gather a target-side entity from `[opp0, opp1, partner, self, zero, zero]`
+- switch actions gather the destination team slot from `own_team_reps`
+- pass resolves to a zero vector
 
-```
-context ∥ active[0] ∥ active[1] ∥ opp_active[0] ∥ opp_active[1] ∥ a1_emb
-```
+That entity is projected through:
 
-This conditioning allows slot 2 to reason about what slot 1 will do — e.g., don't protect with both pokemon, don't use two moves that both require the same target.
-
-**Output of ActionHead:**
-- `actions: (batch, 2)` — chosen slot 1 and slot 2 action indices
-- `log_prob: (batch,)` — `log π(a1) + log π(a2)` (sum of both log probs)
-- `entropy: (batch,)` — `H(π1) + H(π2)` (sum of both entropies)
-
-### 3.8 Value Head
-
-**File:** [pokerl/model/heads.py](pokerl/model/heads.py)
-
-Estimates V(s) for Generalized Advantage Estimation (GAE):
-
-1. **Bench attention:** `MaskedSetAttention(context, own_bench, bench_mask)` → `(batch, 128)`
-2. **Opponent bench attention:** `MaskedSetAttention(context, opp_bench, bench_mask)` → `(batch, 128)`
-3. **MLP:** `[context (320) ∥ own_bench_summary (128) ∥ opp_bench_summary (128)] → Linear(256) → ReLU → Linear(1)`
-
-The bench summaries allow the value function to consider the depth of both teams (not just what's active), which matters a lot for predicting win probability in doubles.
-
-### 3.9 Complete Forward Pass
-
-For a single battle turn:
-
-```
-obs dict
-  → PokemonEncoder (all 12 pokemon, shared weights)
-  → TeamEncoder (own team) + TeamEncoder (opponent team)
-  → FieldEncoder
-  → SpatialEncoder output: {context (320), active_reps, own_reps, opp_reps, opp_active_reps}
-  → LSTMMemory: context → (memory_out (256), new_hidden)
-  → ActionHead: (memory_out, active_reps, opp_reps) → {actions (2,), log_prob, entropy}
-  → ValueHead: (context, own_reps, opp_reps) → value (scalar)
+```text
+128 -> Linear(256) -> ReLU
 ```
 
-Note: The LSTM receives the `context` (spatial summary) and produces `memory_out`. Action head uses `memory_out` as its query foundation; value head uses raw `context`. This means the value function is not recurrent — it sees the current frame's spatial summary directly, while the policy's decisions are informed by the LSTM's accumulated history.
+#### Slot 1
 
----
+Base query:
 
-## 4. Action Space
-
-**File:** [pokerl/env/actions.py](pokerl/env/actions.py)
-
-47 actions per slot (`ACTIONS_PER_SLOT`):
-
-```
-0–19:   Move 0–3 × Target 0–4 (no tera)
-20–39:  Move 0–3 × Target 0–4 (with terastallization)
-40–45:  Switch to team slot 0–5
-46:     Pass (no action for this slot)
+```text
+[memory_out, own_active_0, own_active_1, opp_active_0, opp_active_1]
+-> Linear(256) -> ReLU
 ```
 
-**Target encoding:**
+Opponent reserve summary:
+
+- `MaskedSetAttention(query1, opp_team_reps, opp_bench_mask)`
+- the mask excludes padded slots and non-bench roles, so this attends over opponent bench only
+
+Fused query:
+
+```text
+[base_query1, reserve_summary] -> Linear(256) -> ReLU
 ```
-0: Opponent slot 1
-1: Opponent slot 2
-2: Ally (partner)
-3: Self
-4: No target (field/all-target moves)
+
+Scoring:
+
+```text
+[query, static_action_features, dynamic_entity_features]
+-> Linear(256) -> ReLU -> Linear(1)
 ```
 
-### 4.1 Action Masking
+Illegal actions from `masks["joint"][0]` are set to `-1e8` before the categorical distribution is formed.
 
-The action mask has shape `(ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT) = (48, 47)`:
+#### Slot 2
 
-- **Row 0**: legal slot-1 actions
-- **Row 1 + a1**: legal slot-2 actions **conditioned on** slot-1 choice `a1`
+Slot 2 repeats the same scoring pipeline, but its query also includes the chosen slot-1 action embedding:
 
-This joint masking prevents physically impossible combinations (e.g., both pokemon switching to the same slot, or illegal move targets given the opponent's active lineup).
+```text
+[memory_out, own_active_1, own_active_0, opp_active_0, opp_active_1, a1_emb]
+-> Linear(256) -> ReLU
+```
 
-During inference, illegal actions are masked to `-inf` before softmax, making them probability 0. This is a hard constraint, not a soft one.
+Legality comes from row `a1 + 1` of the joint mask.
 
----
+#### Tera decision
 
-## 5. Training Algorithm
+After `a1` and `a2` are chosen, the model makes a third categorical choice:
 
-**File:** [pokerl/training/ppo.py](pokerl/training/ppo.py), [pokerl/training/rollout.py](pokerl/training/rollout.py)
+```text
+[memory_out, own_active_0, own_active_1, opp_active_0, opp_active_1, a1_emb, a2_emb]
+-> Linear(256) -> ReLU
+-> Linear(3)
+```
+
+The tera mask is derived inside `ActionHead.forward(...)` from:
+
+- `masks["can_tera"]`
+- whether the chosen slot action is a move
+
+So the policy does not consume a precomputed `(a1, a2, tera)` legality tensor during normal inference.
+
+#### ActionHead outputs
+
+`ActionHead.forward(...)` returns:
+
+- `actions`: `(batch, 3)` with `[a1, a2, tera_choice]`
+- `log_prob`: `(batch,)`, sum of the three categorical log-prob terms
+- `entropy`: `(batch,)`, sum of the three entropies
+
+### 3.7 ValueHead
+
+The critic is implemented in `pokerl/model/heads.py` and is recurrent in the current code.
+
+Inputs:
+
+- `context`: the output of `memory`, not the raw `SpatialEncoder` context
+- `own_team_reps`
+- `opp_team_reps`
+- `own_bench_mask`
+- `opp_bench_mask`
+
+Structure:
+
+1. `MaskedSetAttention(context, own_team_reps, own_bench_mask)` -> own bench summary
+2. `MaskedSetAttention(context, opp_team_reps, opp_bench_mask)` -> opponent bench summary
+3. MLP over `[memory_out, own_bench_summary, opp_bench_summary]`
+
+MLP:
+
+```text
+(256 + 128 + 128) -> Linear(256) -> ReLU -> Linear(1)
+```
+
+If a side has no valid bench targets, the corresponding attention summary collapses to zeros.
+
+### 3.8 TeamPreviewHead
+
+`TeamPreviewHead` selects `pick_size` unique Pokemon from the full own team.
+
+At each pick step:
+
+1. accumulate the sum of already-picked own representations
+2. project `[memory_out, picked_sum] -> context_dim`
+3. attend over opponent reps with `MaskedSetAttention`
+4. score each still-available own Pokemon from `[pokemon_rep, projected_context, opponent_summary]`
+5. sample or argmax one choice
+
+Outputs:
+
+- `picks`: `(batch, pick_size)`
+- `log_prob`: summed across pick steps
+- `entropy`: summed across pick steps
+
+Lead ordering is implicit: picks `0` and `1` become the lead pair because Showdown preview commands preserve order.
+
+### 3.9 OpponentPreviewHead
+
+This head is only used for auxiliary training signal during team preview.
+
+It predicts:
+
+- `opponent_bring_logits`: `(batch, team_size)` independent bring scores
+- `opponent_lead_pair_logits`: `(batch, team_size * team_size)` ordered lead-pair scores
+
+Details:
+
+- self-pairs are masked out
+- padded slots are masked out
+- logits are flattened after masking
+
+### 3.10 Forward Paths
+
+Battle turn:
+
+```text
+obs
+  -> spatial(obs)
+  -> memory(context, hidden)
+  -> action_head(...)
+  -> value_head(memory_out, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
+```
+
+Team preview:
+
+```text
+obs
+  -> spatial(obs)
+  -> memory(context, hidden=None at preview time in current training flow)
+  -> team_preview_head(...)
+  -> opponent_preview_head(...)
+```
+
+Value-only bootstrap:
+
+```text
+obs
+  -> spatial(obs)
+  -> memory(context, hidden)
+  -> value_head(...)
+```
+
+## 4. Action Masking and Legality
+
+Action helpers live in `pokerl/env/actions.py`.
+
+The policy consumes:
+
+- `joint`: shape `(ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT) = (28, 27)`
+- `can_tera`: shape `(2,)`
+
+Interpretation of `joint`:
+
+- row `0`: legal slot-1 actions
+- row `1 + a1`: legal slot-2 actions conditioned on chosen `a1`
+
+This structure enforces constraints such as:
+
+- both Pokemon cannot switch into the same reserve slot
+- illegal move targets are removed
+- pass-only states are still representable
+
+There is also a helper `build_tera_action_mask(...)`, but the model currently derives tera legality internally from `can_tera` plus the selected slot actions.
+
+## 5. Training Semantics
 
 ### 5.1 Rollout Collection
 
-`RolloutBuffer` pre-allocates tensors of shape `(rollout_steps=128, num_envs=8, ...)` on the GPU.
+Rollout collection is orchestrated in `scripts/train.py` and stored in `pokerl/training/rollout.py`.
 
-At each timestep:
-1. All environments step in parallel (via poke-env async loop)
-2. Agent batches all observations: `(num_envs, ...)` → forward pass → `(num_envs, 2)` actions
-3. Actions sent back to environments
-4. Collect `(obs, action, action_mask, log_prob, value, reward, done)` tuples into buffer
+Default high-level settings:
 
-After `rollout_steps` steps:
-- Call `get_value()` on the final observation to get the bootstrap value `V(s_T)`
-- Compute **GAE (Generalized Advantage Estimation)**:
+- `EnvConfig.num_envs = 16`
+- `TrainingConfig.rollout_steps = 128`
 
-```python
-for t in reversed(range(T)):
-    next_value = last_value if t == T-1 else values[t+1]
-    next_non_terminal = (~dones[t]).float()
-    delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
-    gae = delta + gamma * gae_lambda * next_non_terminal * gae
-    advantages[t] = gae
-returns = advantages + values
+For each environment step:
+
+1. observations and action masks are copied to the training device
+2. `agent(obs_t, hidden, action_masks=masks_t)` runs one policy step
+3. actions, log-probs, and values are stored in `RolloutBuffer`
+4. environments are stepped
+5. rewards and dones are written back to the buffer
+6. recurrent state for finished envs is zeroed in the rollout loop
+
+`RolloutBuffer` stores:
+
+- sequence-layout observations and masks
+- actions shaped `(T, E, 3)`
+- log-probs, values, rewards, dones
+- advantages and returns
+- the recurrent hidden state at the start of the rollout
+
+GAE is computed after the rollout using a bootstrap value from:
+
+```text
+last_value = agent.get_value(final_obs, hidden)
 ```
-
-With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towards actual returns while reducing variance.
 
 ### 5.2 PPO Update
 
-Called once per rollout. Runs `num_epochs=4` passes over the data.
+Implemented in `pokerl/training/ppo.py`.
 
-**Critical design: minibatches slice environments, not timesteps.** With `num_minibatches=4` and `num_envs=8`, each minibatch contains 2 environments × all 128 timesteps. This preserves the full temporal sequence for each environment so the LSTM can be unrolled correctly.
+Important detail: minibatches split over environments, not timesteps. Each minibatch keeps full time sequences so the recurrent state stays valid.
 
-If minibatches sliced timesteps instead, LSTM hidden states would be incorrect at minibatch boundaries, breaking the gradient flow through episode boundaries.
+Per minibatch:
 
-**Per-minibatch update:**
+1. slice a subset of environments
+2. flatten the spatial encoder work over `T * E_mb`
+3. reshape back to `(T, E_mb, ...)`
+4. unroll memory and heads one timestep at a time
+5. zero hidden state at episode boundaries
+6. detach hidden state every `bptt_chunk_steps` steps if chunking is enabled
+7. compute PPO losses and update once
 
-1. **Normalize advantages** (across the full batch, once, before epochs):
-   ```python
-   adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-   ```
+Losses:
 
-2. **Spatial encoder pass** (batched over all T×E_mb timesteps at once for efficiency)
+- clipped policy loss
+- clipped value loss
+- entropy bonus
 
-3. **Sequential LSTM pass** (loop over timesteps to maintain hidden state):
-   - Zero hidden at `done` boundaries: `h = h * (~done).float()`
-   - Optional truncated BPTT: detach hidden every `bptt_chunk_steps` steps
+Defaults:
 
-4. **Losses:**
+- `clip_eps = 0.2`
+- `value_coef = 0.5`
+- `entropy_coef = 0.01`
+- `max_grad_norm = 0.5`
+- `bptt_chunk_steps = 32`
 
-   **Policy loss (clipped surrogate):**
-   ```python
-   ratio = exp(new_log_prob - old_log_prob)
-   policy_loss = -min(ratio * adv, clamp(ratio, 1-eps, 1+eps) * adv).mean()
-   ```
-   With `clip_eps=0.2`, ratios are clamped to [0.8, 1.2].
+So truncated BPTT is on by default in the current config.
 
-   **Value loss (clipped):**
-   ```python
-   v_clipped = old_value + clamp(new_value - old_value, -eps, eps)
-   value_loss = max((new_value - returns)^2, (v_clipped - returns)^2).mean()
-   ```
+### 5.3 Team Preview Update
 
-   **Entropy bonus:**
-   ```python
-   entropy_loss = -entropy.mean()
-   ```
-   With `entropy_coef=0.01`, encourages exploration.
+Also implemented in `pokerl/training/ppo.py` via `PPOTrainer.update_team_preview(...)`.
 
-   **Total:**
-   ```python
-   loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss
-   ```
-   With `value_coef=0.5`.
+This update uses end-of-battle preview examples captured during rollout:
 
-5. **Gradient update:**
-   ```python
-   loss.backward()
-   clip_grad_norm(parameters, max_norm=0.5)
-   optimizer.step()
-   ```
-   Adam with `lr=2.5e-4`, `eps=1e-5`.
-
-**Diagnostic tracked:** Approximate KL divergence `((ratio - 1) - log_ratio).mean()` — useful for monitoring if the policy is updating too aggressively.
-
-### 5.3 Team Preview Update (REINFORCE)
-
-**File:** [pokerl/training/preview.py](pokerl/training/preview.py)
-
-Team preview decisions cannot be handled with PPO directly because:
-- They happen once per battle (not once per turn)
-- The reward signal is the final battle outcome (+1/-1), received much later
-
-Instead, team preview uses **REINFORCE with a baseline**:
-
-```python
-advantage = episode_reward - value_baseline
-policy_loss = -log_prob * advantage
+```text
+(preview_obs, own_picks, final_reward, opponent_picks)
 ```
 
-Where `value_baseline` is the value estimate at the start of the battle (before any turns are played).
+The training rule is REINFORCE with a learned baseline:
 
-**Auxiliary losses for opponent modeling:**
-
-The `OpponentPreviewHead` predicts what the opponent will bring and who they'll lead:
-
-- `bring_loss`: Binary cross-entropy predicting which 4 of 6 opponent pokemon were actually brought
-- `lead_loss`: Cross-entropy predicting the opponent's lead pair
-
-These don't affect the team selection policy but improve the representations in `opp_reps`, helping downstream reasoning.
-
-```python
-total = -policy_loss - entropy_bonus + bring_coef * bring_loss + lead_coef * lead_loss
+```text
+advantage = final_reward - baseline
+policy_loss = -(log_prob * advantage).mean()
 ```
 
-With `bring_coef=0.1` and `lead_coef=0.05`.
+Baseline details:
 
----
+- the baseline is `agent.get_value(preview_obs)` with no carried battle hidden state
+- this corresponds to the start-of-battle value estimate
 
-## 6. Reward Structure
+Auxiliary losses:
 
-**File:** [pokerl/env/rewards.py](pokerl/env/rewards.py)
+- bring prediction BCE over opponent chosen 4
+- ordered lead-pair cross-entropy over opponent picks `0` and `1`
 
-```python
-def sparse_reward(battle):
-    if battle.won:   return +1.0
-    if battle.lost:  return -1.0
-    return 0.0
+Those losses update the shared encoder stack and the opponent-preview head through the same optimizer step.
+
+### 5.4 Inference Batchers
+
+There are two batching helpers:
+
+- `TeamPreviewBatcher` batches live policy preview inference for rollout collection
+- `_LeagueInferenceService` batches frozen league checkpoint inference for both battle turns and preview
+
+Both exist to avoid many tiny forward passes from separate environment threads.
+
+## 6. League Self-Play
+
+League code lives in `pokerl/training/league.py`.
+
+Current behavior:
+
+- the league stores up to `league_size` frozen checkpoints
+- `add_checkpoint(...)` snapshots the current policy to `checkpoint_dir/league/step_<global_step>.pt`
+- opponents are sampled with a `70%` bias to the recent half and `30%` to the older half
+- `_LeagueInferenceService` groups requests by `(checkpoint_path, kind)` before running batched inference
+
+`LeaguePlayer` specifics:
+
+- keeps its own recurrent hidden state across battle turns
+- stages hidden updates until the battle observation advances
+- prepares preview inference ahead of time when possible
+- converts sampled actions into legal Showdown orders through `action_to_order(...)`
+
+## 7. Default Configuration Reference
+
+Source: `pokerl/config.py`.
+
+### 7.1 ModelConfig
+
+| Parameter | Default |
+|---|---|
+| `species_dim` | `64` |
+| `move_dim` | `32` |
+| `ability_dim` | `32` |
+| `item_dim` | `32` |
+| `type_dim` | `16` |
+| `pokemon_hidden` | `256` |
+| `pokemon_out` | `128` |
+| `team_attention_heads` | `4` |
+| `team_attention_layers` | `2` |
+| `field_out` | `64` |
+| `memory_type` | `"lstm"` |
+| `memory_hidden` | `256` |
+| `action_hidden` | `256` |
+| `value_hidden` | `256` |
+| `pick_size` | `4` |
+| `init_embeddings_from_stats` | `True` |
+
+### 7.2 EnvConfig
+
+| Parameter | Default |
+|---|---|
+| `battle_format` | `"gen9randomdoublesbattle"` |
+| `server_url` | `"localhost:8000"` |
+| `num_envs` | `16` |
+| `team_size` | `6` |
+| `pick_size` | `4` |
+
+### 7.3 TrainingConfig
+
+| Parameter | Default |
+|---|---|
+| `lr` | `2.5e-4` |
+| `gamma` | `0.99` |
+| `gae_lambda` | `0.95` |
+| `clip_eps` | `0.2` |
+| `entropy_coef` | `0.01` |
+| `value_coef` | `0.5` |
+| `max_grad_norm` | `0.5` |
+| `team_preview_bring_coef` | `0.1` |
+| `team_preview_lead_coef` | `0.05` |
+| `rollout_steps` | `128` |
+| `num_epochs` | `4` |
+| `num_minibatches` | `4` |
+| `bptt_chunk_steps` | `32` |
+| `total_timesteps` | `10_000_000` |
+| `log_interval` | `10` |
+| `save_interval` | `100` |
+| `checkpoint_dir` | `"checkpoints"` |
+| `league_size` | `12` |
+| `league_update_interval` | `10` |
+| `league_coalesce_ms` | `10.0` |
+
+## 8. Current Limitations
+
+These are real limitations of the current implementation, not leftovers from an older architecture.
+
+### 8.1 Item embeddings are still mostly hash-bucketed
+
+Most competitive items do not get their own dedicated embedding entry.
+
+### 8.2 Opponent PP is still unobserved
+
+Opponent PP fractions remain all-zero in the continuous feature block.
+
+### 8.3 Reward is purely terminal
+
+The battle reward function is sparse: win `+1`, loss `-1`, otherwise `0`.
+
+### 8.4 Team preview lead structure is implicit
+
+The preview head chooses an ordered 4-Pokemon list, but there is no separate lead-selection head.
+
+### 8.5 There is no explicit opponent belief model
+
+The network sees revealed moves/items/abilities as they appear, but it does not maintain a structured latent belief over unrevealed sets.
+
+### 8.6 Long-range gradients are intentionally truncated
+
+Because `bptt_chunk_steps = 32` by default, PPO does not backpropagate through arbitrarily long battle histories in one graph.
+
+### 8.7 Simulator latency remains a throughput bottleneck
+
+Even with batching and multiple environments, Showdown battle latency dominates wall-clock training speed.
+
+### 8.8 League diversity is bounded by a small rolling window
+
+With the default `league_size = 12`, the opponent distribution can still become narrow if successive checkpoints are too similar.
+
+## 9. One-Screen Summary
+
+```text
+Battle turn:
+  obs
+    -> SpatialEncoder
+    -> Memory
+    -> ActionHead:
+         a1
+         -> a2 | a1
+         -> tera | a1, a2
+    -> ValueHead(memory_out, own_bench, opp_bench)
+
+Team preview:
+  synthetic obs
+    -> SpatialEncoder
+    -> Memory
+    -> TeamPreviewHead (pick 4 of 6)
+    -> OpponentPreviewHead (auxiliary)
+
+Training:
+  rollout collection
+    -> GAE
+    -> PPO update on battle turns
+    -> REINFORCE update on preview decisions
+    -> periodic league checkpoint snapshotting
 ```
-
-**Purely sparse terminal rewards.** The agent receives no signal during the battle — only at the very end.
-
-This means:
-- The value function must learn to predict win probability from state alone
-- The LSTM must learn to track relevant battle dynamics (HP, KOs, field control) without any shaping
-- Credit assignment is hard: a mistake on turn 3 that causes a loss on turn 15 must still be attributed
-
-There are **no intermediate rewards** for: knocking out opponent pokemon, dealing damage, preserving own pokemon, or executing type-effective moves.
-
-This is intentional: reward shaping can introduce unintended biases (e.g., a bot that maximizes damage dealt but ignores winning). The sparse setup forces the agent to actually learn to win. The cost is slower learning.
-
----
-
-## 7. Team Preview
-
-**Files:** [pokerl/model/heads.py](pokerl/model/heads.py), [pokerl/env/team_preview.py](pokerl/env/team_preview.py)
-
-### 7.1 What happens at team preview
-
-At the start of each VGC battle, both players see each other's **full 6-pokemon roster** (species only — moves/items/abilities are hidden). Each player must:
-
-1. Choose which **4 of 6** pokemon to bring
-2. Choose the **order** they'll appear in (leading with 2, bench of 2)
-
-### 7.2 TeamPreviewHead
-
-**Autoregressive 4-of-6 selection:**
-
-For each pick position `i` in {1, 2, 3, 4}:
-1. Build context from: global context + accumulated representation of already-picked pokemon
-2. Attend over opponent team to get opponent summary
-3. Score each remaining (not yet picked) own pokemon: `[context ∥ opp_summary ∥ pokemon_rep] → score`
-4. Mask already-picked, softmax, sample
-5. Add picked pokemon rep to accumulator
-
-This is autoregressive: pick 2 is conditioned on pick 1, pick 3 on picks 1 and 2, etc. The model can learn "if I'm bringing Incineroar, I should also bring a pokemon that covers its weaknesses."
-
-### 7.3 OpponentPreviewHead (auxiliary)
-
-Predicts opponent behavior:
-- `bring_score`: per-opponent-pokemon sigmoid score for whether it'll be brought
-- `lead_pair_score`: score for each pair of opponent pokemon as potential leads
-
-These predictions are **not used at inference** — they're purely for training signal to improve the learned `opp_reps`.
-
-### 7.4 Team preview observation
-
-A synthetic battle state is constructed with all pokemon at full HP, no status, no field conditions. This gives the agent a clean "initial snapshot" before the battle begins.
-
----
-
-## 8. League Self-Play
-
-**File:** [pokerl/training/league.py](pokerl/training/league.py)
-
-### 8.1 Why self-play?
-
-Training against a fixed opponent (random, greedy max-power) produces a policy that exploits that specific opponent's weaknesses. League self-play trains against a distribution of past selves, creating pressure to generalize.
-
-### 8.2 League Structure
-
-A pool of up to `league_size=12` frozen past checkpoints. Every `league_update_interval=10` PPO updates, the current agent is saved and added to the pool. When the pool is full, the oldest checkpoint is evicted.
-
-**Sampling policy:** 70% chance to sample from the most recent half of the pool, 30% from the older half. This balances:
-- **Exploitation**: playing against strong, recent opponents (improves skill)
-- **Exploration**: playing against diverse, older opponents (avoids exploitation holes)
-
-### 8.3 Inference Architecture
-
-`_LeagueInferenceService` runs in a background thread and batches inference requests:
-
-- Multiple parallel `LeaguePlayer` instances (one per concurrent battle) submit inference requests
-- Requests are batched per checkpoint over a `coalesce_window_ms=10ms` window
-- Batched forward passes run on the service device, responses returned via `Future`
-
-This is necessary because each `LeaguePlayer` drives a separate poke-env async player, and naively running each separately would be extremely slow.
-
-### 8.4 LeaguePlayer
-
-Wraps a frozen checkpoint into a poke-env `Player` interface:
-- Maintains its own LSTM hidden state across battle turns
-- Supports mid-battle checkpoint staging (for updating opponents without interrupting battles)
-- Produces legal poke-env orders from raw action indices
-
----
-
-## 9. Configuration Reference
-
-**File:** [pokerl/config.py](pokerl/config.py)
-
-### ModelConfig (default values)
-
-| Parameter | Default | Effect |
-|---|---|---|
-| `species_dim` | 64 | Species embedding size |
-| `move_dim` | 32 | Move embedding size |
-| `ability_dim` | 32 | Ability embedding size |
-| `item_dim` | 32 | Item embedding size |
-| `type_dim` | 16 | Type embedding size |
-| `pokemon_hidden` | 256 | PokemonEncoder MLP hidden size |
-| `pokemon_out` | 128 | PokemonEncoder output size |
-| `team_attention_heads` | 4 | TeamEncoder attention heads |
-| `team_attention_layers` | 2 | TeamEncoder Transformer depth |
-| `field_out` | 64 | FieldEncoder output size |
-| `memory_type` | `"lstm"` | `"lstm"` or `"identity"` |
-| `memory_hidden` | 256 | LSTM hidden size |
-| `action_hidden` | 256 | ActionHead MLP hidden size |
-| `value_hidden` | 256 | ValueHead MLP hidden size |
-| `pick_size` | 4 | Team preview: bring N of 6 |
-| `init_embeddings_from_stats` | `True` | Warm-start embeddings from base stats |
-
-### TrainingConfig (default values)
-
-| Parameter | Default | Effect |
-|---|---|---|
-| `lr` | 2.5e-4 | Adam learning rate |
-| `gamma` | 0.99 | Discount factor |
-| `gae_lambda` | 0.95 | GAE smoothing parameter |
-| `clip_eps` | 0.2 | PPO clipping range |
-| `entropy_coef` | 0.01 | Entropy bonus weight |
-| `value_coef` | 0.5 | Value loss weight |
-| `max_grad_norm` | 0.5 | Gradient clipping |
-| `rollout_steps` | 128 | Steps per env before update |
-| `num_epochs` | 4 | PPO epochs per rollout |
-| `num_minibatches` | 4 | Env minibatches per epoch |
-| `bptt_chunk_steps` | `None` | Truncated BPTT chunk size (None = full) |
-| `total_timesteps` | 10M | Training budget |
-| `save_interval` | 100 | Save checkpoint every N updates |
-| `league_size` | 12 | Max past checkpoints |
-| `league_update_interval` | 10 | Save to league every N updates |
-| `team_preview_bring_coef` | 0.1 | Bring-prediction auxiliary loss weight |
-| `team_preview_lead_coef` | 0.05 | Lead-prediction auxiliary loss weight |
-
----
-
-## 10. Known Limitations & Improvement Opportunities
-
-### 10.1 Item Vocabulary — Most Items Are Hash-Bucketed
-
-**Problem:** The named item vocabulary (`GameData._known_item_ids`) only captures items from the Showdown Pokedex's `requiredItem`/`requiredItems` fields — essentially form-locked items like Giratina-Origin's Griseous Orb. Virtually all competitive items (Choice Band, Assault Vest, Leftovers, Life Orb, Safety Goggles, etc.) fall into hash buckets.
-
-Hash buckets collide: multiple items share the same embedding, so the model cannot distinguish Life Orb from Choice Specs if they hash to the same bucket. There is also no stat-based initialization for items.
-
-**Fix:** Build a proper competitive item vocabulary from actual VGC usage data (or the full Showdown items database), not just the Pokedex. Add stat-like features for items (power boost amount, residual %, speed mod, etc.) to enable stat-based init.
-
-### 10.2 Opponent PP Features Always Zero
-
-**Problem:** The 4 PP dimensions in the continuous feature vector are set to zero for all opponent pokemon. The model can learn that "zero PP = opponent" but cannot learn to track opponent PP depletion (e.g., knowing an opponent's Fake Out can't be used again).
-
-**Fix:** Give opponent pokemon their own `continuous_dim` without PP features, and explicitly separate the encoding: the model then can't confuse "no PP info" with "full PP." Alternatively, expose a "PP remaining" signal derived from move use counts (inferred from battle log).
-
-### 10.3 Value Function Is Not Recurrent
-
-**Problem:** The value head receives `context` (the current-frame spatial summary) rather than `memory_out` (the LSTM output). This means the value estimate doesn't benefit from the LSTM's accumulated history of the battle.
-
-This is a subtle asymmetry: the policy uses memory to decide actions, but the value function is essentially Markovian. In practice, the value function must infer battle history from the current observation (e.g., HP changes, known moves), but this is a harder task.
-
-**Fix:** Pass `memory_out` into the value head as an additional input, or use a separate LSTM for the value function (asymmetric actor-critic). This should improve value estimates and therefore advantage quality.
-
-### 10.4 Sparse Reward Is Hard
-
-**Problem:** +1/-1 terminal rewards with no intermediate shaping means:
-- Slow credit assignment across long battles (15–20 turns)
-- The value function learns slowly (no dense signal)
-- Team preview decisions are especially hard to learn (very delayed reward)
-
-**Potential improvements:**
-- **Win probability shaping**: train a separate win-probability predictor on game states and use its delta as reward. Self-supervised and neutral to reward hacking.
-
-### 10.5 Full BPTT Over Long Rollouts Is Memory-Intensive
-
-**Problem:** When `bptt_chunk_steps=None` (default), the entire 128-step LSTM unroll is kept in the computation graph for backprop. With larger rollouts or bigger models, this can exhaust GPU memory.
-
-**Fix:** `bptt_chunk_steps=32` is already implemented but not the default. Setting it truncates backprop every 32 steps, trading some gradient quality for memory. For very long rollouts, this becomes necessary.
-
-### 10.6 Lead Ordering Not Explicitly Learned
-
-**Problem:** The `TeamPreviewHead` picks 4 pokemon but the **order** of picks determines the lead (picks 1 and 2 are the lead). The model is not explicitly trained to optimize lead selection separately from bring selection — it must implicitly learn that "pick first = lead slot 1."
-
-**Fix:** A dedicated `LeadHead` that selects the lead pair from the 4 already-chosen pokemon as a separate decision, with its own reasoning over opponent team composition.
-
-### 10.7 No Opponent Move/Item Inference
-
-**Problem:** When an opponent uses a move, the model observes that move in `last_move` but there is no mechanism to update a probabilistic belief over the opponent's full moveset. Similarly, opponent items are unknown.
-
-**Fix:** An auxiliary prediction head for opponent moves (multi-label classification), trained on revealed moves as supervision. The learned beliefs could be fed as additional features into the action head. This is a significant architectural addition.
-
-### 10.8 Single Battle Latency Limits Throughput
-
-**Problem:** Even with many parallel environments, the per-battle latency through the Showdown server (async, network overhead) is the bottleneck. Individual battles can take minutes. With sparse rewards this means few reward signals per wall-clock hour.
-
-**Potential improvements:**
-- Faster Showdown server (raw node.js, not electron)
-- Multiple Showdown instances (already supported via `--server-urls`)
-- Batching inference for all envs together (already done via `ParallelBattleEnv`)
-- A faster Python-native battle simulator (significant engineering work)
-
-### 10.9 No Explicit Hazard/Weather Strategy
-
-The agent must discover hazard, weather, and terrain strategies entirely from scratch via sparse rewards. This is learnable but very slow. Curriculum approaches — starting with simpler battle formats and increasing complexity — could accelerate this.
-
-### 10.10 League Pool May Not Be Diverse Enough
-
-With `league_size=12` and `league_update_interval=10`, the pool spans at most 120 updates back. If the policy is converging slowly (as expected in a hard env), the pool might contain policies that are all very similar — no diversity benefit.
-
-**Fix:** Larger `league_size`, or a priority replay that maintains diverse checkpoints (e.g., at different ELO levels or trained on different opponent distributions).
-
----
-
-## Summary: The Full Training Loop in One Picture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           TRAINING LOOP                             │
-│                                                                     │
-│  ┌─────────────┐     128 steps     ┌──────────────────────────┐   │
-│  │ 8 parallel  │ ──────────────→   │     RolloutBuffer        │   │
-│  │ Showdown    │  obs/action/rew   │  (T=128, E=8, ...)       │   │
-│  │ battles     │ ←──────────────   │  → compute GAE           │   │
-│  └─────────────┘   agent actions   └──────────────────────────┘   │
-│         ↑                                        │                  │
-│         │  league opponents                      │ RolloutBatch     │
-│  ┌──────────────┐                               ↓                  │
-│  │  League      │              ┌─────────────────────────────────┐ │
-│  │  (12 frozen  │              │     PPOTrainer.update()         │ │
-│  │  checkpoints)│              │  4 epochs × 4 env-minibatches   │ │
-│  └──────────────┘              │  → policy loss (clipped ratio)  │ │
-│         ↑                      │  → value loss (clipped)         │ │
-│         │ every 10 updates     │  → entropy bonus                │ │
-│  ┌──────────────┐              │  → Adam step + grad clip        │ │
-│  │  PokeAgent   │←─────────────└─────────────────────────────────┘ │
-│  │  (trained)   │                                                   │
-│  └──────────────┘                                                   │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-The agent sees battle state → encodes it spatially → passes through LSTM → chooses two actions autoregressively → receives sparse reward at battle end → PPO updates policy and value function → repeat.
