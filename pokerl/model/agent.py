@@ -11,6 +11,7 @@ from ..env.observation import CONTINUOUS_DIM, ROLE_BENCH
 from ..env.actions import ACTIONS_PER_SLOT, NUM_TERA_CHOICES
 from .encoders import PokemonEncoder, TeamEncoder, FieldEncoder, SpatialEncoder
 from .memory import build_memory
+from .nash import solve_matrix_game_cfr_plus
 from .heads import (
     ActionHead,
     HiddenInfoHead,
@@ -164,17 +165,30 @@ class PokeAgent(nn.Module):
         own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
         opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
 
-        # Compute per-slot joint Q and the opp action distribution, then fold
-        # E[Q|a_us] into the ActionHead scorers. Everything fed into the policy
-        # is detached so Q is trained only by its MSE-to-returns loss (see
-        # PPOTrainer.update), not by the policy gradient.
+        # Compute per-slot joint Q and the opp action distribution, then fold a
+        # belief-weighted feature into the ActionHead scorers. Mode selection
+        # (integrate vs nash) lives in ``self.belief_logits``. All inputs to
+        # the policy path are detached so Q is trained only by its MSE-to-
+        # returns loss (see PPOTrainer.update), not by the policy gradient.
         q_slot1_matrix = self.q_head_slot1(context, active_reps[:, 0], opp_active_reps[:, 0])
         q_slot2_matrix = self.q_head_slot2(context, active_reps[:, 1], opp_active_reps[:, 1])
         opp_action_out = self.opponent_action_head(context, opp_active_reps, active_reps)
-        opp_a1_probs = torch.softmax(opp_action_out["opp_a1_logits"].detach(), dim=-1)
-        opp_a2_probs = torch.softmax(opp_action_out["opp_a2_logits"].detach(), dim=-1)
-        belief_q_slot1 = self.q_head_slot1.expected_q(q_slot1_matrix.detach(), opp_a1_probs)
-        belief_q_slot2 = self.q_head_slot2.expected_q(q_slot2_matrix.detach(), opp_a2_probs)
+        joint_mask = action_masks["joint"]
+        row_legal_slot1 = joint_mask[:, 0, :]
+        # Slot-2 legality varies with the chosen slot-1 action; use the union
+        # over conditional rows as an overapproximation. The action head's
+        # post-belief mask enforces exact conditional legality at sample time.
+        row_legal_slot2 = joint_mask[:, 1:, :].any(dim=1)
+        belief_q_slot1 = self.belief_logits(
+            q_slot1_matrix.detach(),
+            opp_action_out["opp_a1_logits"].detach(),
+            row_legal_slot1,
+        )
+        belief_q_slot2 = self.belief_logits(
+            q_slot2_matrix.detach(),
+            opp_action_out["opp_a2_logits"].detach(),
+            row_legal_slot2,
+        )
 
         action_out = self.action_head(
             context,
@@ -260,6 +274,40 @@ class PokeAgent(nn.Module):
 
     def initial_hidden(self, batch_size: int):
         return self.memory.initial_hidden(batch_size)
+
+    def belief_logits(
+        self,
+        q_matrix: torch.Tensor,
+        opp_action_logits: torch.Tensor,
+        row_legal: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-slot belief-weighted additive logit fed into ActionHead.
+
+        Shape: ``(batch, num_actions)``. Dispatches on
+        ``ModelConfig.belief_mode``:
+
+        - ``"integrate"`` (Option B): ``E_opp[Q | a_us]`` under the softmax
+          of ``opp_action_logits``. Returns values in return-scale.
+        - ``"nash"`` (Option D): ``log(p_nash[a_us] + eps)`` where
+          ``p_nash`` is the row-player's Nash mixed strategy of the stage
+          game. Returns values in log-prob scale (non-positive).
+
+        Both inputs should already be detached by the caller; this method
+        only contains inference-time aggregation.
+        """
+        if self.config.belief_mode == "integrate":
+            opp_probs = torch.softmax(opp_action_logits, dim=-1)
+            return torch.bmm(q_matrix, opp_probs.unsqueeze(-1)).squeeze(-1)
+        if self.config.belief_mode == "nash":
+            row_mix, _ = solve_matrix_game_cfr_plus(
+                q_matrix,
+                row_legal,
+                num_iters=self.config.nash_num_iters,
+            )
+            return torch.log(row_mix + 1e-8)
+        raise ValueError(
+            f"Unknown belief_mode={self.config.belief_mode!r}; expected 'integrate' or 'nash'."
+        )
 
     @staticmethod
     def _bench_mask(mask: torch.Tensor | None, roles: torch.Tensor) -> torch.Tensor:

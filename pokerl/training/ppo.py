@@ -173,13 +173,25 @@ class PPOTrainer:
                             opp_active_reps_seq_mb[t],
                             active_reps_seq_mb[t],
                         )
-                        # Detach the Q matrix and opp probs before integrating;
-                        # the policy uses E[Q|a] as an input feature but Q is
-                        # trained only by its MSE-to-returns loss below.
-                        opp_a1_probs = torch.softmax(opp_action_t["opp_a1_logits"].detach(), dim=-1)
-                        opp_a2_probs = torch.softmax(opp_action_t["opp_a2_logits"].detach(), dim=-1)
-                        belief_q1_t = self.agent.q_head_slot1.expected_q(q1_matrix_t.detach(), opp_a1_probs)
-                        belief_q2_t = self.agent.q_head_slot2.expected_q(q2_matrix_t.detach(), opp_a2_probs)
+                        # Dispatch on belief_mode: "integrate" is Option B's
+                        # E_opp[Q|a], "nash" is Option D's CFR+ solve of the
+                        # 27x27 matrix. Both detach Q and the opp logits so
+                        # the policy gradient cannot reach them — Q is trained
+                        # only by its MSE-to-returns loss, and the opp-action
+                        # head only by its CE aux loss.
+                        joint_mask_t = mb_masks_seq["joint"][t]
+                        row_legal_slot1_t = joint_mask_t[:, 0, :]
+                        row_legal_slot2_t = joint_mask_t[:, 1:, :].any(dim=1)
+                        belief_q1_t = self.agent.belief_logits(
+                            q1_matrix_t.detach(),
+                            opp_action_t["opp_a1_logits"].detach(),
+                            row_legal_slot1_t,
+                        )
+                        belief_q2_t = self.agent.belief_logits(
+                            q2_matrix_t.detach(),
+                            opp_action_t["opp_a2_logits"].detach(),
+                            row_legal_slot2_t,
+                        )
                         all_q1_matrix.append(q1_matrix_t)
                         all_q2_matrix.append(q2_matrix_t)
                         all_opp_action_logits.append(opp_action_t)

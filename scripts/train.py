@@ -144,6 +144,18 @@ def parse_args() -> argparse.Namespace:
         help="Coefficient on the joint-action Q MSE loss. Set 0 to disable Q training while keeping inference-time integration.",
     )
     parser.add_argument(
+        "--belief-mode",
+        choices=["integrate", "nash"],
+        default=None,
+        help="How ActionHead consumes the joint Q. 'integrate' (default) = E_opp[Q|a] under the opp-action prior; 'nash' = log(p_nash[a]) from a CFR+ solve of the 27x27 stage game.",
+    )
+    parser.add_argument(
+        "--nash-num-iters",
+        type=int,
+        default=None,
+        help="CFR+ iterations when --belief-mode=nash.",
+    )
+    parser.add_argument(
         "--league-coalesce-ms",
         type=float,
         default=None,
@@ -182,6 +194,11 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     if args.pick_size is not None:
         env_config.pick_size = args.pick_size
         model_config.pick_size = args.pick_size
+
+    if args.belief_mode is not None:
+        model_config.belief_mode = args.belief_mode
+    if args.nash_num_iters is not None:
+        model_config.nash_num_iters = args.nash_num_iters
 
     overrides = {
         "rollout_steps": args.rollout_steps,
@@ -566,6 +583,8 @@ def train():
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
             "joint_q_coef": train_config.joint_q_coef,
+            "belief_mode": model_config.belief_mode,
+            "nash_num_iters": model_config.nash_num_iters,
             "total_timesteps": train_config.total_timesteps,
             "server_urls": server_urls,
             "team_pool": team_pool.describe() if team_pool is not None else None,

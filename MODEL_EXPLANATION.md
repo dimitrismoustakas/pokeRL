@@ -515,25 +515,44 @@ modeled at this stage.
 
 Two things are produced:
 
-1. **Belief-weighted expected Q** fed into `ActionHead`:
-   `E[Q|a_us] = Σ_a_opp P(a_opp | s) · Q(s, a_us, a_opp)`, where
-   `P(a_opp | s)` comes from the softmax of `OpponentActionHead`'s logits
-   for the matching slot. This is detached and added to the slot's logits
-   via a learnable scalar gate (`belief_q_gate`, init 1.0):
-   `logits[a] += belief_q_gate · E[Q|a]`. The policy's action selection
-   becomes best-response-to-belief rather than argmax over a point
-   estimate.
+1. **Belief-weighted additive logit** fed into `ActionHead`. This is a
+   `(batch, num_actions)` tensor added to the slot's pre-mask logits via
+   a learnable scalar gate (`belief_q_gate`, init 1.0):
+   `logits[a] += belief_q_gate · belief_logit[a]`. How the belief logit
+   itself is built depends on `ModelConfig.belief_mode`:
+
+   - **`"integrate"`** (Option B, default):
+     `belief_logit[a] = E_opp[Q | a_us] = Σ_a_opp P(a_opp | s) · Q(s, a_us, a_opp)`,
+     where `P(a_opp | s)` is the softmax of `OpponentActionHead`'s logits
+     for the matching slot. Best-response-to-belief reasoning.
+
+   - **`"nash"`** (Option D): solve the zero-sum 27×27 stage game with
+     payoff `Q(s, ·, ·)` via batched CFR+ (`solve_matrix_game_cfr_plus` in
+     `pokerl/model/nash.py`), take the row player's average mixed strategy
+     `p_nash`, and use `belief_logit[a] = log(p_nash[a] + eps)`. Stage-game
+     Nash reasoning — unexploitable given Q, regardless of the opponent's
+     actual policy.
+
+   Row-legal actions: for slot 1, the `joint` mask's first row; for slot 2,
+   the union over conditional rows (an overapproximation; the action head's
+   post-belief mask enforces exact conditional legality at sample time).
 
 2. **Training signal** for Q itself: MSE against the GAE return using the
    observed pair `(our, opp)` at each slot,
    `loss = (Q_slot1(s, our_a1, opp_a1) + Q_slot2(s, our_a2, opp_a2) − return)^2`,
    masked by `opp_actions_valid`. Q is trained only by this loss; the
-   policy gradient is blocked from flowing into Q by the detach on
-   `E[Q|a]`.
+   policy gradient is blocked from flowing into Q by the detach on the
+   belief logit.
 
-This is Option B. Commit 6 may swap the Σ-under-belief integration for a
-per-turn LP / CFR solve on the 27×27 matrix (Option D / Nash); the Q head
-itself and its training remain the same.
+The Nash mode's theoretical property is **stage-game Nash under the learned
+Q**, not Nash of the true POMG. The approximations:
+
+- Point-estimate belief (no range structure). Proper POMG treatment would
+  operate on ranges like DeepStack.
+- Q is trained under GAE-regressed semantics, not Nash-Q. Closer to Nash
+  than argmax but not a fixed point of the game.
+- Opponent action legality is not masked; CFR relies on Q to downweight
+  dominated opp actions.
 
 ### 3.9 OpponentPreviewHead
 
@@ -813,15 +832,15 @@ The battle reward function is sparse: win `+1`, loss `-1`, otherwise `0`.
 
 Bring choice and lead ordering are now separated, but the two non-lead brought Pokemon are still emitted in canonical team-slot order rather than from a separate bench-order policy.
 
-### 8.5 Opponent belief modeling is consumed via Option B, not yet full Nash
+### 8.5 Stage-game Nash, not full POMG Nash
 
-`OpponentActionHead`'s softmax over opp actions is consumed by Option B:
-the policy's per-slot logits are augmented by `E_opp[Q|a_us]`, making it a
-best-response to the belief distribution. This is *level-1* game-theoretic
-reasoning (best-response to belief), not Nash (unexploitable against any
-opponent). A later change may swap the Σ integration for a stage-game Nash
-solve on the 27×27 Q matrix (Option D); the Q head itself is unchanged in
-that transition.
+Both belief modes (integrate/nash) are *stage-game* approximations of the
+true partially observable Markov game. They operate on the currently-
+observed state with a point-estimate belief, not on ranges over opponent
+private info (the DeepStack / Libratus style). They also solve for Nash of
+the *learned Q*, which is trained under standard RL value-backup
+semantics, not Nash-Q — so the learned Q is not a fixed point of the true
+game even if CFR converges cleanly on the 27×27 matrix.
 
 `HiddenInfoHead` still only trains the shared encoder; the policy does not
 yet explicitly condition on inferred item / ability / tera type /

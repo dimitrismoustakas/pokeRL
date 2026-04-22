@@ -29,6 +29,16 @@ class ModelConfig:
     # Stat-based embedding init
     init_embeddings_from_stats: bool = True
 
+    # How to aggregate the joint Q head into a per-action scoring feature for
+    # ActionHead. "integrate" (Option B) feeds E_opp[Q|a_us] under the opp
+    # action distribution; "nash" (Option D) feeds log(p_nash[a_us]) where
+    # p_nash is the row-player's Nash mixed strategy of the stage-game matrix.
+    # Both share the same Q head and training signal.
+    belief_mode: str = "integrate"
+    # CFR+ iterations when belief_mode == "nash". 200 is well past convergence
+    # for a 27x27 zero-sum game.
+    nash_num_iters: int = 200
+
 
 @dataclass
 class EnvConfig:
