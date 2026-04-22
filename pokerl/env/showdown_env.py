@@ -426,6 +426,13 @@ class BattleEnv:
             "battle_tag": battle.battle_tag if battle else "",
             "battle_turn": getattr(battle, "turn", 0),
         }
+
+        # Capture the opponent's most recent (a1, a2, tera) for the aux
+        # opponent-action head. Only LeaguePlayer exposes this; other opponents
+        # leave it None and the PPO update masks the sample.
+        opp_actions = getattr(self.opponent, "_last_actions", None)
+        if opp_actions is not None:
+            info["opp_actions"] = np.asarray(opp_actions, dtype=np.int64).copy()
         if done:
             if self._battle_started_at is not None:
                 info["episode_sec"] = time.perf_counter() - self._battle_started_at

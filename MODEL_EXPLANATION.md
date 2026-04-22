@@ -134,6 +134,8 @@ Entry point: `pokerl/model/agent.py`.
 - `opponent_preview_head`: `OpponentPreviewHead`
 - `value_head`: `ValueHead`
 - `preview_value_head`: `ValueHead`
+- `hidden_info_head`: `HiddenInfoHead` — auxiliary; predicts end-of-episode opponent item / ability / tera type / move set per pokemon
+- `opponent_action_head`: `OpponentActionHead` — auxiliary; predicts the opponent's chosen (a1, a2, tera) this turn
 
 If `ModelConfig.init_embeddings_from_stats` is enabled, `GameData` initializes species and move embeddings from stats before training.
 
@@ -452,6 +454,45 @@ Outputs:
 - `log_prob`: bring-set log-prob plus lead-pair log-prob
 - `entropy`: bring entropy plus lead-pair entropy
 
+### 3.8b HiddenInfoHead (auxiliary)
+
+Auxiliary head that runs only during the PPO update, not during rollout. For
+each opponent pokemon it emits four heads fed from the same `opp_reps` tensor
+used by the value and action heads:
+
+- `item_logits: (batch, 6, num_items)` — cross-entropy label is the opponent's
+  item at end-of-episode, masked by `ITEM_KNOWN_OFFSET` at end-of-episode.
+- `ability_logits: (batch, 6, num_abilities)` — analogous to item.
+- `tera_type_logits: (batch, 6, num_types)` — `opp_types[..., 2]` at
+  end-of-episode, masked by `TERA_KNOWN_OFFSET`.
+- `move_logits: (batch, 6, num_moves)` — multi-label BCE, target is the
+  multi-hot of moves revealed by end-of-episode (slot 0 aka "no move" is
+  explicitly excluded). Per-pokemon mean across the vocab.
+
+Labels come from the rollout buffer's retroactive fill: when an env reports
+`done` at step `t`, the buffer copies obs[t]'s opp_* features onto every
+timestep from the episode's start through `t`, and marks
+`aux_label_valid=True` for that slice.
+
+### 3.8c OpponentActionHead (auxiliary)
+
+Auxiliary head predicting the opponent's chosen action this turn from
+`[memory_out, opp_active_0, opp_active_1, own_active_0, own_active_1]`.
+Factorized into three independent categorical outputs:
+
+- `opp_a1_logits: (batch, ACTIONS_PER_SLOT)` — CE against the observed `a1`
+- `opp_a2_logits: (batch, ACTIONS_PER_SLOT)` — CE against observed `a2`
+- `opp_tera_logits: (batch, NUM_TERA_CHOICES)` — CE against observed tera
+
+Labels come from the env: `LeaguePlayer` exposes its chosen `(a1, a2, tera)`
+array as `_last_actions` after each `choose_move`, and `BattleEnv.step`
+propagates it on the per-step `info` dict under the key `opp_actions`. The
+rollout buffer stores these with an `opp_actions_valid` flag; non-league
+opponents leave the flag False and the loss masks them out.
+
+Only the CE signal is used for now; commit 5 (Option B) will reuse the
+distribution over opponent actions as an input to the policy.
+
 ### 3.9 OpponentPreviewHead
 
 This head is only used for auxiliary training signal during team preview.
@@ -575,6 +616,8 @@ Losses:
 - clipped policy loss
 - clipped value loss
 - entropy bonus
+- `aux_hidden_info_coef *` (item + ability + tera + moves losses) — auxiliary
+- `aux_opp_action_coef *` (a1 + a2 + tera CE) — auxiliary
 
 Defaults:
 
@@ -727,9 +770,13 @@ The battle reward function is sparse: win `+1`, loss `-1`, otherwise `0`.
 
 Bring choice and lead ordering are now separated, but the two non-lead brought Pokemon are still emitted in canonical team-slot order rather than from a separate bench-order policy.
 
-### 8.5 There is no explicit opponent belief model
+### 8.5 Opponent belief modeling is supervised only, not yet consumed
 
-The network sees revealed moves/items/abilities as they appear, but it does not maintain a structured latent belief over unrevealed sets.
+The `HiddenInfoHead` and `OpponentActionHead` train the shared encoder to
+predict unrevealed opponent attributes and the opponent's next action, but
+the policy does not yet consume those distributions. A future change (Option
+B / commit 5) will feed the opponent-action distribution into the action
+head so the policy best-responds to the *distribution*, not the argmax.
 
 ### 8.6 Long-range gradients are bounded by rollout length
 

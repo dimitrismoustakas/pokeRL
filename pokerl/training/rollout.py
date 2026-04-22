@@ -24,6 +24,15 @@ class RolloutBatch:
     dones: torch.Tensor            # (num_steps, num_envs)
     advantages: torch.Tensor       # (num_steps, num_envs)
     returns: torch.Tensor          # (num_steps, num_envs)
+    # Aux labels for hidden-info prediction. Each tensor holds the end-of-episode
+    # opponent observation copied onto every timestep of that episode. Unfinished
+    # episodes at rollout boundary leave aux_label_valid=False for that slice.
+    aux_labels: dict[str, torch.Tensor]
+    aux_label_valid: torch.Tensor  # (num_steps, num_envs) bool
+    # Observed opponent actions for the aux opponent-action head. Entries where
+    # the env did not expose them carry opp_actions_valid=False.
+    opp_actions: torch.Tensor      # (num_steps, num_envs, 3) long; -1 when invalid
+    opp_actions_valid: torch.Tensor  # (num_steps, num_envs) bool
     num_steps: int
     num_envs: int
     initial_hidden_h: torch.Tensor | None = None  # (num_envs, hidden_dim)
@@ -37,6 +46,16 @@ class RolloutBuffer:
     can reuse the same storage across updates and PPO can train directly from
     the collected sequences without copying the full batch back to the device.
     """
+
+    # Obs keys whose end-of-episode value is stored as an aux label.
+    AUX_LABEL_KEYS: tuple[str, ...] = (
+        "opp_item",
+        "opp_ability",
+        "opp_types",
+        "opp_moves",
+        "opp_continuous",
+        "opp_mask",
+    )
 
     def __init__(
         self,
@@ -78,6 +97,33 @@ class RolloutBuffer:
         self._initial_hidden_h: torch.Tensor | None = None
         self._initial_hidden_c: torch.Tensor | None = None
 
+        # Aux labels require a Pokemon-shaped observation. Tests that pass a
+        # minimal obs dict without these keys simply get empty aux buffers and
+        # aux_label_valid=False everywhere; no label-tracking work is done.
+        self._aux_enabled = all(key in obs_example for key in self.AUX_LABEL_KEYS)
+        if self._aux_enabled:
+            self._aux_labels = {
+                key: torch.empty(
+                    (num_steps, num_envs, *obs_example[key].shape[1:]),
+                    dtype=torch.from_numpy(obs_example[key]).dtype,
+                    device=device,
+                )
+                for key in self.AUX_LABEL_KEYS
+            }
+        else:
+            self._aux_labels = {}
+        self._aux_label_valid = torch.zeros((num_steps, num_envs), dtype=torch.bool, device=device)
+        self._opp_actions = torch.full(
+            (num_steps, num_envs, 3),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+        self._opp_actions_valid = torch.zeros((num_steps, num_envs), dtype=torch.bool, device=device)
+        # Tracks the timestep within the current rollout at which each env's
+        # active episode began. Used to retroactively fill aux labels on done.
+        self._episode_start = torch.zeros(num_envs, dtype=torch.long, device=device)
+
     def add(
         self,
         obs: dict[str, torch.Tensor],
@@ -87,6 +133,8 @@ class RolloutBuffer:
         values: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
+        opp_actions: torch.Tensor | None = None,
+        opp_actions_valid: torch.Tensor | None = None,
     ) -> None:
         if self.step >= self.num_steps:
             raise IndexError(
@@ -103,6 +151,31 @@ class RolloutBuffer:
         self._values[slot].copy_(values.detach())
         self._rewards[slot].copy_(rewards.detach())
         self._dones[slot].copy_(dones.detach())
+
+        if opp_actions is not None:
+            self._opp_actions[slot].copy_(opp_actions.detach())
+        else:
+            self._opp_actions[slot].fill_(-1)
+        if opp_actions_valid is not None:
+            self._opp_actions_valid[slot].copy_(opp_actions_valid.detach())
+        else:
+            self._opp_actions_valid[slot].fill_(False)
+
+        # Retroactively fill aux labels: every env whose episode ended at this
+        # step gets the current obs's opponent state copied into every timestep
+        # from episode start through the done step.
+        if self._aux_enabled:
+            done_envs = dones.detach().nonzero(as_tuple=False).squeeze(-1)
+            if done_envs.numel() > 0:
+                for env_idx in done_envs.tolist():
+                    start = int(self._episode_start[env_idx].item())
+                    for key in self.AUX_LABEL_KEYS:
+                        label_value = obs[key][env_idx].detach()
+                        self._aux_labels[key][start : slot + 1, env_idx].copy_(
+                            label_value.unsqueeze(0).expand(slot + 1 - start, *label_value.shape)
+                        )
+                    self._aux_label_valid[start : slot + 1, env_idx] = True
+                    self._episode_start[env_idx] = slot + 1
 
         self.step += 1
 
@@ -142,6 +215,10 @@ class RolloutBuffer:
             dones=self._dones,
             advantages=self._advantages,
             returns=self._returns,
+            aux_labels=self._aux_labels,
+            aux_label_valid=self._aux_label_valid,
+            opp_actions=self._opp_actions,
+            opp_actions_valid=self._opp_actions_valid,
             num_steps=self.num_steps,
             num_envs=self.num_envs,
             initial_hidden_h=self._initial_hidden_h,
@@ -155,6 +232,11 @@ class RolloutBuffer:
         self.step = 0
         self._initial_hidden_h = None
         self._initial_hidden_c = None
+        self._aux_label_valid.fill_(False)
+        self._opp_actions.fill_(-1)
+        self._opp_actions_valid.fill_(False)
+        # New rollout starts a fresh episode-start tracker for every env.
+        self._episode_start.zero_()
 
         if initial_hidden is None:
             return

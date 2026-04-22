@@ -936,6 +936,106 @@ class OpponentPreviewHead(nn.Module):
         }
 
 
+class HiddenInfoHead(nn.Module):
+    """Auxiliary heads that predict hidden opponent attributes from its team reps.
+
+    These are pure training-signal heads: they only run during PPO update and
+    do not participate in the rollout/action path. Labels come from the
+    end-of-episode observation (the "eventually revealed" state), so a turn-1
+    prediction is trained to anticipate what will be known by battle's end.
+    """
+
+    def __init__(
+        self,
+        pokemon_dim: int,
+        num_items: int,
+        num_abilities: int,
+        num_types: int,
+        num_moves: int,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.item_mlp = nn.Sequential(
+            nn.Linear(pokemon_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_items),
+        )
+        self.ability_mlp = nn.Sequential(
+            nn.Linear(pokemon_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_abilities),
+        )
+        self.tera_type_mlp = nn.Sequential(
+            nn.Linear(pokemon_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_types),
+        )
+        self.move_mlp = nn.Sequential(
+            nn.Linear(pokemon_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_moves),
+        )
+
+    def forward(self, opp_reps: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {
+            "item_logits": self.item_mlp(opp_reps),
+            "ability_logits": self.ability_mlp(opp_reps),
+            "tera_type_logits": self.tera_type_mlp(opp_reps),
+            "move_logits": self.move_mlp(opp_reps),
+        }
+
+
+class OpponentActionHead(nn.Module):
+    """Predicts the opponent's joint (a1, a2, tera) action for the current turn.
+
+    Factorized as three independent categorical distributions for simplicity;
+    the autoregressive form can be introduced in commit 5 if Option B's
+    expectation over opp actions requires it. Labels come from the opponent's
+    actually-chosen actions captured in the env.
+    """
+
+    def __init__(
+        self,
+        context_dim: int,
+        pokemon_dim: int,
+        num_actions: int,
+        num_tera_choices: int,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        self.query = nn.Sequential(
+            nn.Linear(context_dim + pokemon_dim * 4, hidden_dim),
+            nn.ReLU(),
+        )
+        self.a1_head = nn.Linear(hidden_dim, num_actions)
+        self.a2_head = nn.Linear(hidden_dim, num_actions)
+        self.tera_head = nn.Linear(hidden_dim, num_tera_choices)
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        opp_active_reps: torch.Tensor,
+        own_active_reps: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        query = self.query(
+            torch.cat(
+                [
+                    context,
+                    opp_active_reps[:, 0],
+                    opp_active_reps[:, 1],
+                    own_active_reps[:, 0],
+                    own_active_reps[:, 1],
+                ],
+                dim=-1,
+            )
+        )
+        return {
+            "opp_a1_logits": self.a1_head(query),
+            "opp_a2_logits": self.a2_head(query),
+            "opp_tera_logits": self.tera_head(query),
+        }
+
+
 class ValueHead(nn.Module):
     """Estimates V(s) -- the probability of winning from the current state."""
 

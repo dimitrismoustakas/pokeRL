@@ -54,6 +54,12 @@ class TrainingConfig:
     team_preview_lead_coef: float = 0.05
     team_preview_update_interval: int = 8  # flush the preview accumulator every N PPO updates
     team_preview_max_samples: int = 1024    # cap the accumulator; oldest entries are dropped first
+    # Auxiliary prediction losses. These do not modify the reward or the
+    # action/value path; they add dense gradient to the shared encoder by
+    # predicting opponent hidden info (end-of-episode labels) and the
+    # opponent's observed action this turn.
+    aux_hidden_info_coef: float = 0.25
+    aux_opp_action_coef: float = 0.25
 
     # Batching
     rollout_steps: int = 128
