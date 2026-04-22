@@ -138,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         help="Coefficient on the opponent-action prediction loss (a1/a2/tera).",
     )
     parser.add_argument(
+        "--joint-q-coef",
+        type=float,
+        default=None,
+        help="Coefficient on the joint-action Q MSE loss. Set 0 to disable Q training while keeping inference-time integration.",
+    )
+    parser.add_argument(
         "--league-coalesce-ms",
         type=float,
         default=None,
@@ -196,6 +202,7 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "tera_exploration_decay_updates": args.tera_exploration_decay_updates,
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
         "aux_opp_action_coef": args.aux_opp_action_coef,
+        "joint_q_coef": args.joint_q_coef,
     }
     for field_name, value in overrides.items():
         if value is not None:
@@ -558,6 +565,7 @@ def train():
             "tera_exploration_decay_updates": train_config.tera_exploration_decay_updates,
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
+            "joint_q_coef": train_config.joint_q_coef,
             "total_timesteps": train_config.total_timesteps,
             "server_urls": server_urls,
             "team_pool": team_pool.describe() if team_pool is not None else None,

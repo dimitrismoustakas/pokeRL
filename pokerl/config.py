@@ -60,6 +60,12 @@ class TrainingConfig:
     # opponent's observed action this turn.
     aux_hidden_info_coef: float = 0.25
     aux_opp_action_coef: float = 0.25
+    # Joint-action Q head (Option B): Q(s, our_slot_a, opp_slot_a) per slot,
+    # trained by MSE against the GAE return on the observed (our, opp) action
+    # pair. The policy consumes E_opp[Q|a_us] as an additive logit via a
+    # learned gate in ActionHead, so the policy's action selection becomes
+    # best-response-to-belief rather than argmax over a point estimate.
+    joint_q_coef: float = 0.1
 
     # Batching
     rollout_steps: int = 128

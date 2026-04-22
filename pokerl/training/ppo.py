@@ -92,9 +92,12 @@ class PPOTrainer:
         # agent has the aux heads attached. The test doubles ship a minimal
         # agent without aux heads.
         aux_enabled = bool(aux_labels_all) and hasattr(self.agent, "hidden_info_head") and hasattr(self.agent, "opponent_action_head")
+        q_enabled = aux_enabled and hasattr(self.agent, "q_head_slot1") and hasattr(self.agent, "q_head_slot2")
         if aux_enabled:
             metrics["aux_hidden_info_loss"] = 0.0
             metrics["aux_opp_action_loss"] = 0.0
+        if q_enabled:
+            metrics["joint_q_loss"] = 0.0
 
         for epoch in range(self.config.num_epochs):
             env_order = torch.randperm(E, device=self.device)
@@ -144,10 +147,42 @@ class PPOTrainer:
                 all_entropies: list[torch.Tensor] = []
                 all_values: list[torch.Tensor] = []
                 all_ctx: list[torch.Tensor] = []
+                all_q1_matrix: list[torch.Tensor] = []
+                all_q2_matrix: list[torch.Tensor] = []
+                all_opp_action_logits: list[dict[str, torch.Tensor]] = []
 
                 for t in range(T):
                     ctx_t, hidden = self.agent.memory(context_seq_mb[t], hidden)
                     all_ctx.append(ctx_t)
+
+                    belief_q1_t = None
+                    belief_q2_t = None
+                    if q_enabled:
+                        q1_matrix_t = self.agent.q_head_slot1(
+                            ctx_t,
+                            active_reps_seq_mb[t, :, 0],
+                            opp_active_reps_seq_mb[t, :, 0],
+                        )
+                        q2_matrix_t = self.agent.q_head_slot2(
+                            ctx_t,
+                            active_reps_seq_mb[t, :, 1],
+                            opp_active_reps_seq_mb[t, :, 1],
+                        )
+                        opp_action_t = self.agent.opponent_action_head(
+                            ctx_t,
+                            opp_active_reps_seq_mb[t],
+                            active_reps_seq_mb[t],
+                        )
+                        # Detach the Q matrix and opp probs before integrating;
+                        # the policy uses E[Q|a] as an input feature but Q is
+                        # trained only by its MSE-to-returns loss below.
+                        opp_a1_probs = torch.softmax(opp_action_t["opp_a1_logits"].detach(), dim=-1)
+                        opp_a2_probs = torch.softmax(opp_action_t["opp_a2_logits"].detach(), dim=-1)
+                        belief_q1_t = self.agent.q_head_slot1.expected_q(q1_matrix_t.detach(), opp_a1_probs)
+                        belief_q2_t = self.agent.q_head_slot2.expected_q(q2_matrix_t.detach(), opp_a2_probs)
+                        all_q1_matrix.append(q1_matrix_t)
+                        all_q2_matrix.append(q2_matrix_t)
+                        all_opp_action_logits.append(opp_action_t)
 
                     action_out = self.agent.action_head(
                         ctx_t,
@@ -159,6 +194,8 @@ class PPOTrainer:
                         {key: value[t] for key, value in mb_masks_seq.items()},
                         mb_actions_seq[t],
                         battle_obs={key: value[t] for key, value in mb_obs_seq.items()},
+                        belief_q_slot1=belief_q1_t,
+                        belief_q_slot2=belief_q2_t,
                     )
                     value_t = self.agent.value_head(
                         ctx_t,
@@ -223,6 +260,7 @@ class PPOTrainer:
                 # Labels come from the buffer's retroactive fill on done.
                 hidden_info_loss = None
                 opp_action_loss = None
+                joint_q_loss = None
                 if aux_enabled:
                     aux_labels_mb = {key: value[:, mb_envs] for key, value in aux_labels_all.items()}
                     aux_label_valid_mb = aux_label_valid_all[:, mb_envs]
@@ -233,14 +271,24 @@ class PPOTrainer:
                         label_valid=aux_label_valid_mb,
                     )
 
-                    ctx_seq_mb = torch.stack(all_ctx, dim=0)  # (T, E_mb, mem_dim)
-                    opp_action_out = self.agent.opponent_action_head(
-                        ctx_seq_mb.reshape(T * E_mb, -1),
-                        opp_active_reps_seq_mb.reshape(T * E_mb, 2, -1),
-                        active_reps_seq_mb.reshape(T * E_mb, 2, -1),
-                    )
                     opp_actions_mb = opp_actions_all[:, mb_envs]
                     opp_actions_valid_mb = opp_actions_valid_all[:, mb_envs]
+                    if q_enabled:
+                        # Opp action logits were already computed per-timestep
+                        # inside the loop for belief-Q integration. Stack them
+                        # here to reuse for the CE aux loss.
+                        opp_action_out = {
+                            key: torch.stack(
+                                [step[key] for step in all_opp_action_logits], dim=0
+                            ).reshape(T * E_mb, -1)
+                            for key in ("opp_a1_logits", "opp_a2_logits", "opp_tera_logits")
+                        }
+                    else:
+                        opp_action_out = self.agent.opponent_action_head(
+                            torch.stack(all_ctx, dim=0).reshape(T * E_mb, -1),
+                            opp_active_reps_seq_mb.reshape(T * E_mb, 2, -1),
+                            active_reps_seq_mb.reshape(T * E_mb, 2, -1),
+                        )
                     opp_action_loss = self._opp_action_loss(
                         logits=opp_action_out,
                         labels=opp_actions_mb,
@@ -252,6 +300,41 @@ class PPOTrainer:
                         + self.config.aux_hidden_info_coef * hidden_info_loss
                         + self.config.aux_opp_action_coef * opp_action_loss
                     )
+
+                # --- Joint Q loss ---
+                # Train Q_slot1 + Q_slot2 to match the GAE return given the
+                # observed (our, opp) action pair at each slot. Requires
+                # opp_actions_valid so we have labels; entries without labels
+                # (non-league opponents) are masked out.
+                if q_enabled:
+                    q1_matrices = torch.stack(all_q1_matrix, dim=0)  # (T, E_mb, A, A)
+                    q2_matrices = torch.stack(all_q2_matrix, dim=0)
+                    num_actions = q1_matrices.shape[-1]
+                    our_a1 = mb_actions_seq[..., 0]  # (T, E_mb)
+                    our_a2 = mb_actions_seq[..., 1]
+                    opp_a1 = opp_actions_mb[..., 0]
+                    opp_a2 = opp_actions_mb[..., 1]
+                    # Clamp invalid indices so the gather itself is well-defined;
+                    # the mask below drops those entries from the loss.
+                    safe_opp_a1 = opp_a1.clamp(min=0, max=num_actions - 1)
+                    safe_opp_a2 = opp_a2.clamp(min=0, max=num_actions - 1)
+                    flat_idx_1 = our_a1 * num_actions + safe_opp_a1
+                    flat_idx_2 = our_a2 * num_actions + safe_opp_a2
+                    q1_for_pair = q1_matrices.reshape(T, E_mb, num_actions * num_actions).gather(
+                        -1, flat_idx_1.unsqueeze(-1)
+                    ).squeeze(-1)
+                    q2_for_pair = q2_matrices.reshape(T, E_mb, num_actions * num_actions).gather(
+                        -1, flat_idx_2.unsqueeze(-1)
+                    ).squeeze(-1)
+                    q_total = q1_for_pair + q2_for_pair
+                    returns_seq = mb_returns.reshape(T, E_mb)
+                    q_mask = opp_actions_valid_mb & (opp_a1 >= 0) & (opp_a2 >= 0)
+                    if q_mask.any():
+                        q_diff = (q_total - returns_seq) * q_mask.float()
+                        joint_q_loss = q_diff.pow(2).sum() / q_mask.float().sum().clamp(min=1.0)
+                    else:
+                        joint_q_loss = torch.zeros((), device=q_total.device)
+                    loss = loss + self.config.joint_q_coef * joint_q_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -267,6 +350,8 @@ class PPOTrainer:
                 if aux_enabled:
                     metrics["aux_hidden_info_loss"] += hidden_info_loss.item()
                     metrics["aux_opp_action_loss"] += opp_action_loss.item()
+                if q_enabled:
+                    metrics["joint_q_loss"] += joint_q_loss.item()
                 num_updates += 1
 
         self.global_step += T * E

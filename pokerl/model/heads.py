@@ -136,6 +136,10 @@ class ActionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        # Learnable gate for the belief-weighted Q additive score. Starts at 1.0
+        # so that E[Q|a] is given ~1:1 weight initially; the policy can scale it
+        # down if it proves noisy.
+        self.belief_q_gate = nn.Parameter(torch.ones(1))
         self.tera_score = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -212,6 +216,8 @@ class ActionHead(nn.Module):
         greedy: bool = False,
         battle_obs: dict[str, torch.Tensor] | None = None,
         tera_exploration_prob: float = 0.0,
+        belief_q_slot1: torch.Tensor | None = None,
+        belief_q_slot2: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if "joint" not in masks or "can_tera" not in masks:
             raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
@@ -253,6 +259,8 @@ class ActionHead(nn.Module):
             opp_active_reps,
             matchup_features_1,
         )
+        if belief_q_slot1 is not None:
+            logits1 = logits1 + self.belief_q_gate * belief_q_slot1
         logits1 = logits1.masked_fill(~mask1, -1e8)
         dist1 = torch.distributions.Categorical(logits=logits1)
 
@@ -287,6 +295,8 @@ class ActionHead(nn.Module):
             opp_active_reps,
             matchup_features_2,
         )
+        if belief_q_slot2 is not None:
+            logits2 = logits2 + self.belief_q_gate * belief_q_slot2
         logits2 = logits2.masked_fill(~mask2, -1e8)
         dist2 = torch.distributions.Categorical(logits=logits2)
 
@@ -1034,6 +1044,103 @@ class OpponentActionHead(nn.Module):
             "opp_a2_logits": self.a2_head(query),
             "opp_tera_logits": self.tera_head(query),
         }
+
+
+class JointQHead(nn.Module):
+    """Per-slot joint-action Q head: Q(s, our_slot_action, opp_slot_action).
+
+    Factored bilinear form keeps the forward cheap:
+
+        Q(c, a_us, a_opp) =
+            f_us(c, a_us) · f_opp(c, a_opp)
+          + bias_us(a_us) + bias_opp(a_opp)
+          + base(c)
+
+    Two instances (slot 1, slot 2) are composed additively into the joint Q:
+    ``Q_joint ≈ Q_slot1 + Q_slot2``. This ignores cross-slot interactions but
+    keeps the supervised target small (two 27x27 matrices per state instead of
+    one 729x729 monster). Training target is the GAE return, so the factored
+    sum learns a value decomposition.
+
+    Outputs a ``(batch, num_actions, num_actions)`` matrix indexed
+    ``[our_action, opp_action]``.
+    """
+
+    def __init__(
+        self,
+        context_dim: int,
+        pokemon_dim: int,
+        num_actions: int,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.num_actions = num_actions
+        # Static action embeddings; shared across the two perspectives because
+        # the structural encoding (kind, move slot, target, switch) is
+        # perspective-invariant. Perspective is captured by the side-specific
+        # projection MLPs below.
+        self.action_emb = nn.Embedding(num_actions, hidden_dim)
+        self.f_us = nn.Sequential(
+            nn.Linear(context_dim + pokemon_dim * 2 + hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.f_opp = nn.Sequential(
+            nn.Linear(context_dim + pokemon_dim * 2 + hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.bias_us = nn.Linear(context_dim, num_actions)
+        self.bias_opp = nn.Linear(context_dim, num_actions)
+        self.base = nn.Linear(context_dim, 1)
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        our_slot_rep: torch.Tensor,
+        opp_slot_rep: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = context.shape[0]
+        action_ids = torch.arange(self.num_actions, device=context.device)
+        action_emb = self.action_emb(action_ids)  # (num_actions, hidden)
+        action_emb = action_emb.unsqueeze(0).expand(batch_size, -1, -1)
+
+        us_ctx = torch.cat([context, our_slot_rep, opp_slot_rep], dim=-1)
+        opp_ctx = torch.cat([context, opp_slot_rep, our_slot_rep], dim=-1)
+        us_ctx = us_ctx.unsqueeze(1).expand(-1, self.num_actions, -1)
+        opp_ctx = opp_ctx.unsqueeze(1).expand(-1, self.num_actions, -1)
+
+        us_features = self.f_us(torch.cat([us_ctx, action_emb], dim=-1))   # (B, A, H)
+        opp_features = self.f_opp(torch.cat([opp_ctx, action_emb], dim=-1))  # (B, A, H)
+        bilinear = torch.bmm(us_features, opp_features.transpose(1, 2))  # (B, A, A)
+
+        bias_us = self.bias_us(context).unsqueeze(-1)   # (B, A, 1)
+        bias_opp = self.bias_opp(context).unsqueeze(1)  # (B, 1, A)
+        base = self.base(context).unsqueeze(-1)          # (B, 1, 1)
+        return bilinear + bias_us + bias_opp + base
+
+    def expected_q(
+        self,
+        q_matrix: torch.Tensor,
+        opp_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute E_opp[Q(s, a_us, a_opp)] under ``opp_probs``.
+
+        ``q_matrix``: (batch, num_actions, num_actions), axes [our, opp].
+        ``opp_probs``: (batch, num_actions), a probability distribution.
+        Returns ``(batch, num_actions)``.
+        """
+        return torch.bmm(q_matrix, opp_probs.unsqueeze(-1)).squeeze(-1)
+
+    def q_for_pair(
+        self,
+        q_matrix: torch.Tensor,
+        our_actions: torch.Tensor,
+        opp_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather ``Q(s, our_actions[b], opp_actions[b])`` per batch item."""
+        batch_idx = torch.arange(q_matrix.shape[0], device=q_matrix.device)
+        return q_matrix[batch_idx, our_actions, opp_actions]
 
 
 class ValueHead(nn.Module):

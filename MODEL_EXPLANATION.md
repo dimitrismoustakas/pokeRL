@@ -136,6 +136,7 @@ Entry point: `pokerl/model/agent.py`.
 - `preview_value_head`: `ValueHead`
 - `hidden_info_head`: `HiddenInfoHead` — auxiliary; predicts end-of-episode opponent item / ability / tera type / move set per pokemon
 - `opponent_action_head`: `OpponentActionHead` — auxiliary; predicts the opponent's chosen (a1, a2, tera) this turn
+- `q_head_slot1`, `q_head_slot2`: `JointQHead` — per-slot joint-action Q head whose expected value under the opp action distribution is fed back into `ActionHead` as an additive logit
 
 If `ModelConfig.init_embeddings_from_stats` is enabled, `GameData` initializes species and move embeddings from stats before training.
 
@@ -490,8 +491,49 @@ propagates it on the per-step `info` dict under the key `opp_actions`. The
 rollout buffer stores these with an `opp_actions_valid` flag; non-league
 opponents leave the flag False and the loss masks them out.
 
-Only the CE signal is used for now; commit 5 (Option B) will reuse the
-distribution over opponent actions as an input to the policy.
+The softmax of `opp_a1_logits` / `opp_a2_logits` is also consumed by the
+belief-weighted Q integration described in 3.8d (detached, so only the CE
+signal trains this head).
+
+### 3.8d JointQHead (Option B: belief-weighted best-response)
+
+Two per-slot `JointQHead` instances (slot 1, slot 2). Each produces a
+`(batch, ACTIONS_PER_SLOT, ACTIONS_PER_SLOT)` matrix indexed
+`Q_slot[our, opp]` via a bilinear factored form:
+
+```
+Q(c, a_us, a_opp) =
+    f_us(c, a_us) · f_opp(c, a_opp)
+  + bias_us(a_us) + bias_opp(a_opp)
+  + base(c)
+```
+
+where `f_us`, `f_opp` are small MLPs over the memory output plus both
+actives' reps. The joint Q over the full turn decision is approximated as
+`Q_joint ≈ Q_slot1 + Q_slot2`; cross-slot interactions are deliberately not
+modeled at this stage.
+
+Two things are produced:
+
+1. **Belief-weighted expected Q** fed into `ActionHead`:
+   `E[Q|a_us] = Σ_a_opp P(a_opp | s) · Q(s, a_us, a_opp)`, where
+   `P(a_opp | s)` comes from the softmax of `OpponentActionHead`'s logits
+   for the matching slot. This is detached and added to the slot's logits
+   via a learnable scalar gate (`belief_q_gate`, init 1.0):
+   `logits[a] += belief_q_gate · E[Q|a]`. The policy's action selection
+   becomes best-response-to-belief rather than argmax over a point
+   estimate.
+
+2. **Training signal** for Q itself: MSE against the GAE return using the
+   observed pair `(our, opp)` at each slot,
+   `loss = (Q_slot1(s, our_a1, opp_a1) + Q_slot2(s, our_a2, opp_a2) − return)^2`,
+   masked by `opp_actions_valid`. Q is trained only by this loss; the
+   policy gradient is blocked from flowing into Q by the detach on
+   `E[Q|a]`.
+
+This is Option B. Commit 6 may swap the Σ-under-belief integration for a
+per-turn LP / CFR solve on the 27×27 matrix (Option D / Nash); the Q head
+itself and its training remain the same.
 
 ### 3.9 OpponentPreviewHead
 
@@ -618,6 +660,7 @@ Losses:
 - entropy bonus
 - `aux_hidden_info_coef *` (item + ability + tera + moves losses) — auxiliary
 - `aux_opp_action_coef *` (a1 + a2 + tera CE) — auxiliary
+- `joint_q_coef *` MSE of `Q_slot1 + Q_slot2` against GAE return — Option B
 
 Defaults:
 
@@ -770,13 +813,19 @@ The battle reward function is sparse: win `+1`, loss `-1`, otherwise `0`.
 
 Bring choice and lead ordering are now separated, but the two non-lead brought Pokemon are still emitted in canonical team-slot order rather than from a separate bench-order policy.
 
-### 8.5 Opponent belief modeling is supervised only, not yet consumed
+### 8.5 Opponent belief modeling is consumed via Option B, not yet full Nash
 
-The `HiddenInfoHead` and `OpponentActionHead` train the shared encoder to
-predict unrevealed opponent attributes and the opponent's next action, but
-the policy does not yet consume those distributions. A future change (Option
-B / commit 5) will feed the opponent-action distribution into the action
-head so the policy best-responds to the *distribution*, not the argmax.
+`OpponentActionHead`'s softmax over opp actions is consumed by Option B:
+the policy's per-slot logits are augmented by `E_opp[Q|a_us]`, making it a
+best-response to the belief distribution. This is *level-1* game-theoretic
+reasoning (best-response to belief), not Nash (unexploitable against any
+opponent). A later change may swap the Σ integration for a stage-game Nash
+solve on the 27×27 Q matrix (Option D); the Q head itself is unchanged in
+that transition.
+
+`HiddenInfoHead` still only trains the shared encoder; the policy does not
+yet explicitly condition on inferred item / ability / tera type /
+unrevealed moves beyond what the encoder already represents.
 
 ### 8.6 Long-range gradients are bounded by rollout length
 

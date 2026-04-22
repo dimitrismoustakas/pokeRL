@@ -14,6 +14,7 @@ from .memory import build_memory
 from .heads import (
     ActionHead,
     HiddenInfoHead,
+    JointQHead,
     OpponentActionHead,
     OpponentPreviewHead,
     TeamPreviewHead,
@@ -117,6 +118,18 @@ class PokeAgent(nn.Module):
             num_actions=ACTIONS_PER_SLOT,
             num_tera_choices=NUM_TERA_CHOICES,
         )
+        # Per-slot joint-action Q. Sum of slot1 and slot2 approximates the joint
+        # Q; trained via MSE against the same GAE return as the value head.
+        self.q_head_slot1 = JointQHead(
+            context_dim=memory_out,
+            pokemon_dim=config.pokemon_out,
+            num_actions=ACTIONS_PER_SLOT,
+        )
+        self.q_head_slot2 = JointQHead(
+            context_dim=memory_out,
+            pokemon_dim=config.pokemon_out,
+            num_actions=ACTIONS_PER_SLOT,
+        )
 
         # Optional: stat-based embedding init
         if config.init_embeddings_from_stats:
@@ -151,6 +164,18 @@ class PokeAgent(nn.Module):
         own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
         opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
 
+        # Compute per-slot joint Q and the opp action distribution, then fold
+        # E[Q|a_us] into the ActionHead scorers. Everything fed into the policy
+        # is detached so Q is trained only by its MSE-to-returns loss (see
+        # PPOTrainer.update), not by the policy gradient.
+        q_slot1_matrix = self.q_head_slot1(context, active_reps[:, 0], opp_active_reps[:, 0])
+        q_slot2_matrix = self.q_head_slot2(context, active_reps[:, 1], opp_active_reps[:, 1])
+        opp_action_out = self.opponent_action_head(context, opp_active_reps, active_reps)
+        opp_a1_probs = torch.softmax(opp_action_out["opp_a1_logits"].detach(), dim=-1)
+        opp_a2_probs = torch.softmax(opp_action_out["opp_a2_logits"].detach(), dim=-1)
+        belief_q_slot1 = self.q_head_slot1.expected_q(q_slot1_matrix.detach(), opp_a1_probs)
+        belief_q_slot2 = self.q_head_slot2.expected_q(q_slot2_matrix.detach(), opp_a2_probs)
+
         action_out = self.action_head(
             context,
             active_reps,
@@ -162,6 +187,8 @@ class PokeAgent(nn.Module):
             actions,
             battle_obs=obs,
             tera_exploration_prob=tera_exploration_prob,
+            belief_q_slot1=belief_q_slot1,
+            belief_q_slot2=belief_q_slot2,
         )
         value = self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 
