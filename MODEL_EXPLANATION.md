@@ -346,6 +346,28 @@ Slot 2 repeats the same scoring pipeline, but its query also includes the chosen
 
 Legality comes from row `a1 + 1` of the joint mask.
 
+#### Tera exploration during rollout
+
+Turn-level tera sampling supports optional uniform-over-valid exploration,
+controlled by `ActionHead.forward(..., tera_exploration_prob=epsilon)`. When
+`epsilon > 0` and there are at least two valid tera options for a batch item,
+the policy's tera sample is replaced with a uniform draw with probability
+`epsilon`. This intentionally breaks the "tera always on turn 1" attractor:
+once the policy tera's turn 1, `can_tera` is False for every later turn in
+the episode, so without exploration the policy never observes the
+counterfactual trajectory where it saved tera.
+
+The stored log-prob for the taken action is always computed under the
+policy distribution (not the mixed behavior distribution), so PPO's
+importance ratio is a slightly off-policy approximation. For small
+`epsilon` this is well within the clip window. Exploration is only active
+when `actions is None` (rollout path) — the PPO update path passes stored
+actions and is unaffected.
+
+The rollout loop in `scripts/train.py` linearly decays epsilon from
+`tera_exploration_start` to `tera_exploration_end` across
+`tera_exploration_decay_updates` PPO updates.
+
 #### Tera decision
 
 After `a1` and `a2` are chosen, the model makes a third categorical choice:

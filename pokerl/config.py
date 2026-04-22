@@ -67,6 +67,17 @@ class TrainingConfig:
     save_interval: int = 100
     checkpoint_dir: str = "checkpoints"
 
+    # Tera exploration: with probability epsilon on each turn that has a real
+    # tera choice (>= 2 valid options), override the policy's tera sample with a
+    # uniform draw over valid options. Breaks the "tera always turn 1" attractor
+    # by forcing the policy to observe outcomes from saving tera. Log-probs are
+    # stored under the policy (not behavior), so PPO's clip absorbs the mild
+    # off-policy bias for small epsilon. Linear decay from start to end across
+    # tera_exploration_decay_updates PPO updates.
+    tera_exploration_start: float = 0.15
+    tera_exploration_end: float = 0.02
+    tera_exploration_decay_updates: int = 2000
+
     # League
     league_size: int = 12
     league_update_interval: int = 10
