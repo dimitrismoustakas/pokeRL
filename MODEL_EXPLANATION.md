@@ -560,9 +560,9 @@ Defaults:
 - `value_coef = 0.5`
 - `entropy_coef = 0.01`
 - `max_grad_norm = 0.5`
-- `bptt_chunk_steps = 32`
+- `bptt_chunk_steps = None`
 
-So truncated BPTT is on by default in the current config.
+Full BPTT across the rollout is the default; truncation via `bptt_chunk_steps` is an OOM fallback only.
 
 ### 5.3 Team Preview Update
 
@@ -674,7 +674,7 @@ Source: `pokerl/config.py`.
 | `rollout_steps` | `128` |
 | `num_epochs` | `4` |
 | `num_minibatches` | `4` |
-| `bptt_chunk_steps` | `32` |
+| `bptt_chunk_steps` | `None` |
 | `total_timesteps` | `10_000_000` |
 | `log_interval` | `10` |
 | `save_interval` | `100` |
@@ -707,9 +707,9 @@ Bring choice and lead ordering are now separated, but the two non-lead brought P
 
 The network sees revealed moves/items/abilities as they appear, but it does not maintain a structured latent belief over unrevealed sets.
 
-### 8.6 Long-range gradients are intentionally truncated
+### 8.6 Long-range gradients are bounded by rollout length
 
-Because `bptt_chunk_steps = 32` by default, PPO does not backpropagate through arbitrarily long battle histories in one graph.
+The default is full BPTT across the rollout (`bptt_chunk_steps = None`), so gradients flow across an entire rollout chunk. Battles that span multiple rollouts still see a detach at the rollout boundary, and `bptt_chunk_steps` remains available as an OOM fallback.
 
 ### 8.7 Simulator latency remains a throughput bottleneck
 
