@@ -51,18 +51,6 @@ class PPOTrainer:
         self.optimizer.step()
         return True
 
-    @staticmethod
-    def _skipped_preview_metrics() -> dict[str, float]:
-        return {
-            "team_preview_loss": 0.0,
-            "team_preview_policy_loss": 0.0,
-            "team_preview_value_loss": 0.0,
-            "team_preview_entropy": 0.0,
-            "team_preview_bring_loss": 0.0,
-            "team_preview_lead_loss": 0.0,
-            "team_preview_skipped_nonfinite": 1.0,
-        }
-
     def update(self, batch: RolloutBatch) -> dict[str, float]:
         """Run PPO update epochs on a rollout batch.
 
@@ -292,24 +280,6 @@ class PPOTrainer:
         bring_logits = out["opponent_bring_logits"]
         lead_pair_logits = out["opponent_lead_pair_logits"]
 
-        invalid_tensor_names = [
-            name
-            for name, tensor in {
-                "log_prob": log_prob,
-                "entropy": entropy,
-                "preview_value": baselines,
-                "opponent_bring_logits": bring_logits,
-                "opponent_lead_pair_logits": lead_pair_logits,
-            }.items()
-            if not torch.isfinite(tensor).all()
-        ]
-        if invalid_tensor_names:
-            print(
-                "Warning: skipped team preview update due to non-finite tensors: "
-                + ", ".join(invalid_tensor_names)
-            )
-            return self._skipped_preview_metrics()
-
         # Preview actor-critic: use a dedicated preview value head as the baseline.
         advantages = rewards_batch - baselines.detach()
         policy_loss = -(log_prob * advantages).mean()
@@ -334,28 +304,8 @@ class PPOTrainer:
             + self.config.team_preview_lead_coef * lead_loss
         )
 
-        invalid_loss_names = [
-            name
-            for name, tensor in {
-                "team_preview_loss": loss,
-                "team_preview_policy_loss": policy_loss,
-                "team_preview_value_loss": value_loss,
-                "team_preview_entropy": entropy.mean(),
-                "team_preview_bring_loss": bring_loss,
-                "team_preview_lead_loss": lead_loss,
-            }.items()
-            if not torch.isfinite(tensor).all()
-        ]
-        if invalid_loss_names:
-            print(
-                "Warning: skipped team preview update due to non-finite losses: "
-                + ", ".join(invalid_loss_names)
-            )
-            return self._skipped_preview_metrics()
-
         if not self._apply_update_step(loss):
-            print("Warning: skipped team preview update due to non-finite loss or gradients.")
-            return self._skipped_preview_metrics()
+            return {"team_preview_skipped_nonfinite": 1.0}
 
         return {
             "team_preview_loss": loss.item(),
@@ -364,7 +314,6 @@ class PPOTrainer:
             "team_preview_entropy": entropy.mean().item(),
             "team_preview_bring_loss": bring_loss.item(),
             "team_preview_lead_loss": lead_loss.item(),
-            "team_preview_skipped_nonfinite": 0.0,
         }
 
     def save(self, path: str):
