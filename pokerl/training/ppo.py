@@ -134,6 +134,7 @@ class PPOTrainer:
                         opp_active_reps_seq_mb[t],
                         {key: value[t] for key, value in mb_masks_seq.items()},
                         mb_actions_seq[t],
+                        battle_obs={key: value[t] for key, value in mb_obs_seq.items()},
                     )
                     value_t = self.agent.value_head(
                         ctx_t,
@@ -229,21 +230,18 @@ class PPOTrainer:
         rewards_batch = torch.tensor([d[2] for d in data], dtype=torch.float32, device=self.device)
         opponent_picks_batch = torch.from_numpy(np.stack([d[3] for d in data])).long().to(self.device)
 
-        # Value baseline: no LSTM state at team preview time (start of battle).
-        with torch.no_grad():
-            baselines = self.agent.get_value(obs_batch)
-
         out = self.agent.team_preview(obs_batch, picks=picks_batch)
         log_prob = out["log_prob"]
         entropy = out["entropy"]
+        baselines = out["preview_value"]
         bring_logits = out["opponent_bring_logits"]
         lead_pair_logits = out["opponent_lead_pair_logits"]
 
-        # REINFORCE with baseline: minimise -E[log_prob * (reward - baseline)].
-        # The baseline does not affect the expected gradient but reduces variance.
-        advantages = rewards_batch - baselines
+        # Preview actor-critic: use a dedicated preview value head as the baseline.
+        advantages = rewards_batch - baselines.detach()
         policy_loss = -(log_prob * advantages).mean()
         entropy_bonus = self.config.entropy_coef * entropy.mean()
+        value_loss = 0.5 * (baselines - rewards_batch).pow(2).mean()
 
         team_size = bring_logits.shape[1]
         bring_targets = torch.zeros_like(bring_logits)
@@ -258,6 +256,7 @@ class PPOTrainer:
         loss = (
             policy_loss
             - entropy_bonus
+            + self.config.team_preview_value_coef * value_loss
             + self.config.team_preview_bring_coef * bring_loss
             + self.config.team_preview_lead_coef * lead_loss
         )
@@ -270,6 +269,7 @@ class PPOTrainer:
         return {
             "team_preview_loss": loss.item(),
             "team_preview_policy_loss": policy_loss.item(),
+            "team_preview_value_loss": value_loss.item(),
             "team_preview_entropy": entropy.mean().item(),
             "team_preview_bring_loss": bring_loss.item(),
             "team_preview_lead_loss": lead_loss.item(),

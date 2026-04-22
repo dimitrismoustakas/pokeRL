@@ -304,6 +304,51 @@ def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_targe
     assert out["actions"][0, 2].item() == TERA_NONE
 
 
+def test_action_head_matchup_features_distinguish_super_effective_and_resisted_targets() -> None:
+    head = ActionHead(
+        context_dim=3,
+        pokemon_dim=2,
+        hidden_dim=8,
+        move_type_lookup=torch.tensor([0, 1], dtype=torch.long),
+        move_base_power_lookup=torch.tensor([0.0, 1.0], dtype=torch.float32),
+        move_accuracy_lookup=torch.tensor([0.0, 1.0], dtype=torch.float32),
+        move_priority_lookup=torch.tensor([0.0, 0.0], dtype=torch.float32),
+        move_category_lookup=torch.tensor([0, 1], dtype=torch.long),
+        move_target_flags=torch.zeros((2, 6), dtype=torch.float32),
+        type_effectiveness=torch.tensor(
+            [
+                [1.0, 1.0, 1.0, 1.0],
+                [1.0, 1.0, 2.0, 0.5],
+                [1.0, 0.5, 1.0, 2.0],
+                [1.0, 2.0, 0.5, 1.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+    battle_obs = {
+        "own_moves": torch.tensor([[[1, 0, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "own_types": torch.tensor([[[1, 0, 0], [2, 0, 0]]], dtype=torch.long),
+        "own_continuous": torch.zeros((1, 2, 44), dtype=torch.float32),
+        "own_active_indices": torch.tensor([[0, 1]], dtype=torch.long),
+        "own_active_present": torch.tensor([[True, True]], dtype=torch.bool),
+        "opp_types": torch.tensor([[[2, 0, 0], [3, 0, 0]]], dtype=torch.long),
+        "opp_continuous": torch.zeros((1, 2, 44), dtype=torch.float32),
+        "opp_active_indices": torch.tensor([[0, 1]], dtype=torch.long),
+        "opp_active_present": torch.tensor([[True, True]], dtype=torch.bool),
+    }
+
+    features = head._candidate_action_features(
+        battle_obs=battle_obs,
+        actor_slot=0,
+        can_tera_slot=torch.tensor([True], dtype=torch.bool),
+        batch_size=1,
+        device=torch.device("cpu"),
+    )
+
+    target_eff_feature = 14
+    assert features[0, 0, target_eff_feature] > features[0, 1, target_eff_feature]
+
+
 def test_masked_set_attention_returns_zero_when_every_item_is_masked() -> None:
     attention = MaskedSetAttention(query_dim=3, item_dim=2, hidden_dim=4)
     query = torch.randn(2, 3)
@@ -342,6 +387,23 @@ def test_team_preview_head_accepts_opponent_structure_and_greedy_mode() -> None:
     assert out["log_prob"].shape == (2,)
     assert out["entropy"].shape == (2,)
     assert torch.all(out["picks"][0] != 5)
+    assert torch.all(out["bring_picks"][:, 1:] > out["bring_picks"][:, :-1])
+    assert torch.all(out["picks"][:, 2:] == out["picks"][:, 2:].sort(dim=1).values)
+
+
+def test_team_preview_head_preserves_lead_order_while_canonicalizing_bench_tail() -> None:
+    torch.manual_seed(0)
+    head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=4)
+    own_reps = torch.randn(1, 6, 4)
+    opp_reps = torch.randn(1, 6, 4)
+    context = torch.randn(1, 6)
+    provided_picks = torch.tensor([[4, 1, 5, 0]], dtype=torch.long)
+
+    out = head(own_reps, opp_reps, context, picks=provided_picks)
+
+    assert torch.equal(out["lead_pair"], torch.tensor([[4, 1]], dtype=torch.long))
+    assert torch.equal(out["bring_picks"], torch.tensor([[0, 1, 4, 5]], dtype=torch.long))
+    assert torch.equal(out["picks"], torch.tensor([[4, 1, 0, 5]], dtype=torch.long))
 
 
 class _FakePokemon:

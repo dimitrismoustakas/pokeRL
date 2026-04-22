@@ -15,6 +15,7 @@ from ..env.actions import (
     TARGET_NONE,
     decode_action,
 )
+from ..env.observation import TERASTALLIZED_OFFSET
 
 
 class MaskedSetAttention(nn.Module):
@@ -72,7 +73,23 @@ class ActionHead(nn.Module):
     over {no tera, tera slot 0, tera slot 1}.
     """
 
-    def __init__(self, context_dim: int, pokemon_dim: int, hidden_dim: int = 256):
+    _MATCHUP_FEATURE_DIM = 22
+    _TARGET_FLAG_DIM = 6
+
+    def __init__(
+        self,
+        context_dim: int,
+        pokemon_dim: int,
+        hidden_dim: int = 256,
+        *,
+        move_type_lookup: torch.Tensor | None = None,
+        move_base_power_lookup: torch.Tensor | None = None,
+        move_accuracy_lookup: torch.Tensor | None = None,
+        move_priority_lookup: torch.Tensor | None = None,
+        move_category_lookup: torch.Tensor | None = None,
+        move_target_flags: torch.Tensor | None = None,
+        type_effectiveness: torch.Tensor | None = None,
+    ):
         super().__init__()
         self.num_actions = ACTIONS_PER_SLOT
 
@@ -100,15 +117,22 @@ class ActionHead(nn.Module):
             nn.ReLU(),
         )
         self.tera_query = nn.Sequential(
-            nn.Linear(context_dim + pokemon_dim * 4 + hidden_dim * 2, hidden_dim),
+            nn.Linear(
+                context_dim + pokemon_dim * 4 + hidden_dim * 2 + self._MATCHUP_FEATURE_DIM * 2,
+                hidden_dim,
+            ),
             nn.ReLU(),
         )
         self.entity_proj = nn.Sequential(
             nn.Linear(pokemon_dim, hidden_dim),
             nn.ReLU(),
         )
+        self.matchup_proj = nn.Sequential(
+            nn.Linear(self._MATCHUP_FEATURE_DIM, hidden_dim),
+            nn.ReLU(),
+        )
         self.score = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -127,6 +151,54 @@ class ActionHead(nn.Module):
         self.register_buffer("_action_is_switch", metadata["is_switch"], persistent=False)
         self.register_buffer("_action_is_move", metadata["is_move"], persistent=False)
 
+        self._has_explicit_metadata = all(
+            tensor is not None
+            for tensor in (
+                move_type_lookup,
+                move_base_power_lookup,
+                move_accuracy_lookup,
+                move_priority_lookup,
+                move_category_lookup,
+                move_target_flags,
+                type_effectiveness,
+            )
+        )
+        self.register_buffer(
+            "_move_type_lookup",
+            self._ensure_long_buffer(move_type_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_base_power_lookup",
+            self._ensure_float_buffer(move_base_power_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_accuracy_lookup",
+            self._ensure_float_buffer(move_accuracy_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_priority_lookup",
+            self._ensure_float_buffer(move_priority_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_category_lookup",
+            self._ensure_long_buffer(move_category_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_target_flags",
+            self._ensure_float_buffer(move_target_flags, dims=2, width=self._TARGET_FLAG_DIM),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_type_effectiveness_lookup",
+            self._ensure_float_buffer(type_effectiveness, dims=2, width=1),
+            persistent=False,
+        )
+
     def forward(
         self,
         context: torch.Tensor,
@@ -138,6 +210,7 @@ class ActionHead(nn.Module):
         masks: dict[str, torch.Tensor],
         actions: torch.Tensor | None = None,
         greedy: bool = False,
+        battle_obs: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         if "joint" not in masks or "can_tera" not in masks:
             raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
@@ -153,11 +226,32 @@ class ActionHead(nn.Module):
         joint_masks = masks["joint"]
         can_tera = masks["can_tera"]
         mask1 = joint_masks[:, FIRST_SLOT_MASK_ROW]
+        matchup_features_1 = self._candidate_action_features(
+            battle_obs=battle_obs,
+            actor_slot=0,
+            can_tera_slot=can_tera[:, 0],
+            batch_size=context.shape[0],
+            device=context.device,
+        )
+        matchup_features_2 = self._candidate_action_features(
+            battle_obs=battle_obs,
+            actor_slot=1,
+            can_tera_slot=can_tera[:, 1],
+            batch_size=context.shape[0],
+            device=context.device,
+        )
 
         base_query1 = self.query1(torch.cat([context, rep1, rep2, opp1, opp2], dim=-1))
         reserve_summary1 = self.reserve_attention(base_query1, opp_team_reps, opp_reserve_mask)
         query1 = self.query1_fuse(torch.cat([base_query1, reserve_summary1], dim=-1))
-        logits1 = self._score_actions(query1, rep1, rep2, own_team_reps, opp_active_reps)
+        logits1 = self._score_actions(
+            query1,
+            rep1,
+            rep2,
+            own_team_reps,
+            opp_active_reps,
+            matchup_features_1,
+        )
         logits1 = logits1.masked_fill(~mask1, -1e8)
         dist1 = torch.distributions.Categorical(logits=logits1)
 
@@ -180,10 +274,18 @@ class ActionHead(nn.Module):
             )
 
         a1_emb = self.action_id_emb(a1)
+        chosen_features_1 = matchup_features_1[batch_indices, a1]
         base_query2 = self.query2(torch.cat([context, rep2, rep1, opp1, opp2, a1_emb], dim=-1))
         reserve_summary2 = self.reserve_attention(base_query2, opp_team_reps, opp_reserve_mask)
         query2 = self.query2_fuse(torch.cat([base_query2, reserve_summary2], dim=-1))
-        logits2 = self._score_actions(query2, rep2, rep1, own_team_reps, opp_active_reps)
+        logits2 = self._score_actions(
+            query2,
+            rep2,
+            rep1,
+            own_team_reps,
+            opp_active_reps,
+            matchup_features_2,
+        )
         logits2 = logits2.masked_fill(~mask2, -1e8)
         dist2 = torch.distributions.Categorical(logits=logits2)
 
@@ -198,6 +300,7 @@ class ActionHead(nn.Module):
             )
 
         a2_emb = self.action_id_emb(a2)
+        chosen_features_2 = matchup_features_2[batch_indices, a2]
         a1_is_move = self._action_is_move[a1]
         a2_is_move = self._action_is_move[a2]
         tera_mask = torch.stack(
@@ -209,7 +312,10 @@ class ActionHead(nn.Module):
             dim=1,
         )
         tera_query = self.tera_query(
-            torch.cat([context, rep1, rep2, opp1, opp2, a1_emb, a2_emb], dim=-1)
+            torch.cat(
+                [context, rep1, rep2, opp1, opp2, a1_emb, a2_emb, chosen_features_1, chosen_features_2],
+                dim=-1,
+            )
         )
         tera_logits = self.tera_score(tera_query).masked_fill(~tera_mask, -1e8)
         tera_dist = torch.distributions.Categorical(logits=tera_logits)
@@ -240,13 +346,17 @@ class ActionHead(nn.Module):
         partner_rep: torch.Tensor,
         own_team_reps: torch.Tensor,
         opp_active_reps: torch.Tensor,
+        matchup_features: torch.Tensor,
     ) -> torch.Tensor:
         query_features = query.unsqueeze(1).expand(-1, self.num_actions, -1)
         action_features = self._static_action_features(query.device).unsqueeze(0).expand(query.shape[0], -1, -1)
         entity_features = self.entity_proj(
             self._dynamic_action_entities(actor_rep, partner_rep, own_team_reps, opp_active_reps)
         )
-        return self.score(torch.cat([query_features, action_features, entity_features], dim=-1)).squeeze(-1)
+        matchup_emb = self.matchup_proj(matchup_features)
+        return self.score(
+            torch.cat([query_features, action_features, entity_features, matchup_emb], dim=-1)
+        ).squeeze(-1)
 
     def _static_action_features(self, device: torch.device) -> torch.Tensor:
         action_ids = self._action_ids.to(device)
@@ -293,6 +403,301 @@ class ActionHead(nn.Module):
         is_switch = self._action_is_switch.view(1, self.num_actions, 1).to(device=actor_rep.device)
         return torch.where(is_switch, switch_entities, target_entities)
 
+    def _candidate_action_features(
+        self,
+        *,
+        battle_obs: dict[str, torch.Tensor] | None,
+        actor_slot: int,
+        can_tera_slot: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if (
+            not self._has_explicit_metadata
+            or battle_obs is None
+            or any(
+                key not in battle_obs
+                for key in (
+                    "own_moves",
+                    "own_types",
+                    "own_continuous",
+                    "own_active_indices",
+                    "opp_types",
+                    "opp_continuous",
+                    "opp_active_indices",
+                    "opp_active_present",
+                )
+            )
+        ):
+            return torch.zeros(
+                (batch_size, self.num_actions, self._MATCHUP_FEATURE_DIM),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        own_active_indices = battle_obs["own_active_indices"]
+        opp_active_indices = battle_obs["opp_active_indices"]
+        own_types_active = self._gather_team_slots(battle_obs["own_types"], own_active_indices)
+        own_cont_active = self._gather_team_slots(battle_obs["own_continuous"], own_active_indices)
+        opp_types_active = self._gather_team_slots(battle_obs["opp_types"], opp_active_indices)
+        opp_cont_active = self._gather_team_slots(battle_obs["opp_continuous"], opp_active_indices)
+
+        actor_indices = own_active_indices[:, actor_slot]
+        actor_moves = self._gather_team_rows(battle_obs["own_moves"], actor_indices)
+        actor_types = own_types_active[:, actor_slot]
+        actor_continuous = own_cont_active[:, actor_slot]
+        actor_present = self._active_slot_present(battle_obs, "own", actor_slot)
+
+        partner_slot = 1 - actor_slot
+        partner_types = own_types_active[:, partner_slot]
+        partner_continuous = own_cont_active[:, partner_slot]
+        partner_present = self._active_slot_present(battle_obs, "own", partner_slot)
+
+        actor_def_type_1, actor_def_type_2 = self._defensive_type_pair(actor_types, actor_continuous)
+        partner_def_type_1, partner_def_type_2 = self._defensive_type_pair(partner_types, partner_continuous)
+        opp_def_type_1, opp_def_type_2 = self._defensive_type_pair(opp_types_active, opp_cont_active)
+        opp_present = battle_obs["opp_active_present"].to(dtype=torch.bool)
+
+        move_slots = self._action_move_slot.clamp(max=NUM_MOVES - 1).view(1, self.num_actions).expand(batch_size, -1)
+        action_move_ids = actor_moves.gather(1, move_slots)
+        action_move_ids = torch.where(
+            self._action_is_move.view(1, self.num_actions),
+            action_move_ids,
+            torch.zeros_like(action_move_ids),
+        )
+        action_move_ids = action_move_ids.clamp(max=self._move_type_lookup.shape[0] - 1)
+        move_types = self._move_type_lookup[action_move_ids]
+        base_power = self._move_base_power_lookup[action_move_ids]
+        accuracy = self._move_accuracy_lookup[action_move_ids]
+        priority = self._move_priority_lookup[action_move_ids]
+        categories = self._move_category_lookup[action_move_ids]
+        target_flags = self._move_target_flags[action_move_ids]
+        is_move = self._action_is_move.view(1, self.num_actions).to(device=device, dtype=torch.float32).expand(batch_size, -1)
+        is_switch = self._action_is_switch.view(1, self.num_actions).to(device=device, dtype=torch.float32).expand(batch_size, -1)
+        is_pass = 1.0 - is_move - is_switch
+
+        current_stab, post_tera_stab = self._stab_multipliers(
+            move_types=move_types,
+            actor_types=actor_types,
+            actor_continuous=actor_continuous,
+            can_tera_slot=can_tera_slot,
+        )
+
+        opp1_eff = self._type_effectiveness(move_types, opp_def_type_1[:, 0:1], opp_def_type_2[:, 0:1])
+        opp2_eff = self._type_effectiveness(move_types, opp_def_type_1[:, 1:2], opp_def_type_2[:, 1:2])
+        self_eff = self._type_effectiveness(move_types, actor_def_type_1.unsqueeze(1), actor_def_type_2.unsqueeze(1))
+        partner_eff = self._type_effectiveness(
+            move_types,
+            partner_def_type_1.unsqueeze(1),
+            partner_def_type_2.unsqueeze(1),
+        )
+
+        live_foe_count = opp_present.to(dtype=torch.float32).sum(dim=1, keepdim=True)
+        foe_mean_eff = (
+            opp1_eff * opp_present[:, 0:1].to(dtype=opp1_eff.dtype)
+            + opp2_eff * opp_present[:, 1:2].to(dtype=opp2_eff.dtype)
+        ) / live_foe_count.clamp(min=1.0)
+        foe_mean_eff = torch.where(live_foe_count > 0, foe_mean_eff, torch.ones_like(foe_mean_eff))
+        foe_best_eff = torch.maximum(
+            torch.where(opp_present[:, 0:1], opp1_eff, torch.zeros_like(opp1_eff)),
+            torch.where(opp_present[:, 1:2], opp2_eff, torch.zeros_like(opp2_eff)),
+        )
+        foe_best_eff = torch.where(live_foe_count > 0, foe_best_eff, torch.ones_like(foe_best_eff))
+
+        target_type_1_bank = torch.stack(
+            [
+                opp_def_type_1[:, 0],
+                opp_def_type_1[:, 1],
+                partner_def_type_1,
+                actor_def_type_1,
+                torch.zeros(batch_size, dtype=torch.long, device=device),
+                torch.zeros(batch_size, dtype=torch.long, device=device),
+            ],
+            dim=1,
+        )
+        target_type_2_bank = torch.stack(
+            [
+                opp_def_type_2[:, 0],
+                opp_def_type_2[:, 1],
+                partner_def_type_2,
+                actor_def_type_2,
+                torch.zeros(batch_size, dtype=torch.long, device=device),
+                torch.zeros(batch_size, dtype=torch.long, device=device),
+            ],
+            dim=1,
+        )
+        target_present_bank = torch.stack(
+            [
+                opp_present[:, 0],
+                opp_present[:, 1],
+                partner_present,
+                actor_present,
+                torch.zeros(batch_size, dtype=torch.bool, device=device),
+                torch.zeros(batch_size, dtype=torch.bool, device=device),
+            ],
+            dim=1,
+        )
+        target_indices = self._action_target_slot.view(1, self.num_actions).expand(batch_size, -1)
+        target_type_1 = target_type_1_bank.gather(1, target_indices)
+        target_type_2 = target_type_2_bank.gather(1, target_indices)
+        target_present = target_present_bank.gather(1, target_indices)
+        targeted_eff = self._type_effectiveness(move_types, target_type_1, target_type_2)
+        targeted_eff = torch.where(target_present, targeted_eff, torch.ones_like(targeted_eff))
+
+        no_target_move = self._action_is_move.view(1, self.num_actions) & (
+            self._action_target_slot.view(1, self.num_actions) == TARGET_NONE
+        )
+        no_target_eff = torch.ones_like(targeted_eff)
+        no_target_eff = torch.where(
+            (target_flags[..., 0] > 0) | (target_flags[..., 1] > 0),
+            foe_mean_eff,
+            no_target_eff,
+        )
+        no_target_eff = torch.where(target_flags[..., 2] > 0, partner_eff, no_target_eff)
+        no_target_eff = torch.where(target_flags[..., 3] > 0, self_eff, no_target_eff)
+        current_target_eff = torch.where(no_target_move, no_target_eff, targeted_eff)
+
+        current_power = base_power * current_stab * current_target_eff / 4.0
+        tera_power_gain = base_power * current_target_eff * (post_tera_stab - current_stab) / 4.0
+        target_eff_scaled = current_target_eff / 4.0
+        foe_best_scaled = foe_best_eff / 4.0
+        foe_mean_scaled = foe_mean_eff / 4.0
+
+        features = torch.stack(
+            [
+                is_move,
+                is_switch,
+                is_pass,
+                base_power * is_move,
+                accuracy * is_move,
+                priority * is_move,
+                (categories == 0).to(dtype=torch.float32) * is_move,
+                (categories == 1).to(dtype=torch.float32) * is_move,
+                (categories == 2).to(dtype=torch.float32) * is_move,
+                (current_stab - 1.0) * is_move,
+                (post_tera_stab - current_stab) * is_move,
+                (current_target_eff == 0).to(dtype=torch.float32) * is_move,
+                ((current_target_eff > 0) & (current_target_eff < 1)).to(dtype=torch.float32) * is_move,
+                (current_target_eff > 1).to(dtype=torch.float32) * is_move,
+                target_eff_scaled * is_move,
+                foe_best_scaled * is_move,
+                foe_mean_scaled * is_move,
+                current_power * is_move,
+                tera_power_gain * is_move,
+                live_foe_count.expand(-1, self.num_actions) / 2.0,
+                target_flags[..., 4] * is_move,
+                target_flags[..., 5] * is_move,
+            ],
+            dim=-1,
+        )
+        return features
+
+    def _stab_multipliers(
+        self,
+        *,
+        move_types: torch.Tensor,
+        actor_types: torch.Tensor,
+        actor_continuous: torch.Tensor,
+        can_tera_slot: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        move_types = move_types.to(dtype=torch.long)
+        type_1 = actor_types[:, 0:1]
+        type_2 = actor_types[:, 1:2]
+        tera_type = actor_types[:, 2:3]
+        original_match = (move_types == type_1) | ((type_2 != 0) & (move_types == type_2))
+        tera_match = (tera_type != 0) & (move_types == tera_type)
+        terastallized = actor_continuous[:, TERASTALLIZED_OFFSET:TERASTALLIZED_OFFSET + 1] > 0.5
+
+        current = torch.ones_like(move_types, dtype=torch.float32)
+        current = torch.where(original_match, torch.full_like(current, 1.5), current)
+        terastallized_stab = torch.where(
+            tera_match & original_match,
+            torch.full_like(current, 2.0),
+            torch.where(tera_match | original_match, torch.full_like(current, 1.5), current),
+        )
+        current = torch.where(terastallized, terastallized_stab, current)
+
+        can_tera_now = can_tera_slot.view(-1, 1) & ~terastallized
+        post_tera = torch.where(
+            can_tera_now,
+            torch.where(
+                tera_match & original_match,
+                torch.full_like(current, 2.0),
+                torch.where(tera_match | original_match, torch.full_like(current, 1.5), torch.ones_like(current)),
+            ),
+            current,
+        )
+        return current, post_tera
+
+    def _type_effectiveness(
+        self,
+        move_types: torch.Tensor,
+        target_type_1: torch.Tensor,
+        target_type_2: torch.Tensor,
+    ) -> torch.Tensor:
+        move_types = move_types.clamp(min=0, max=self._type_effectiveness_lookup.shape[0] - 1)
+        target_type_1 = target_type_1.clamp(min=0, max=self._type_effectiveness_lookup.shape[1] - 1)
+        target_type_2 = target_type_2.clamp(min=0, max=self._type_effectiveness_lookup.shape[1] - 1)
+        multiplier_1 = self._type_effectiveness_lookup[move_types, target_type_1]
+        multiplier_2 = self._type_effectiveness_lookup[move_types, target_type_2]
+        multiplier_2 = torch.where(target_type_2 != 0, multiplier_2, torch.ones_like(multiplier_1))
+        multiplier = multiplier_1 * multiplier_2
+        return torch.where(move_types != 0, multiplier, torch.ones_like(multiplier))
+
+    @staticmethod
+    def _defensive_type_pair(
+        types: torch.Tensor,
+        continuous: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tera_type = types[..., 2]
+        terastallized = continuous[..., TERASTALLIZED_OFFSET] > 0.5
+        type_1 = torch.where(terastallized, tera_type, types[..., 0])
+        type_2 = torch.where(terastallized, torch.zeros_like(types[..., 1]), types[..., 1])
+        return type_1, type_2
+
+    @staticmethod
+    def _gather_team_rows(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        gather_index = indices.view(indices.shape[0], 1, *([1] * (values.ndim - 2))).expand(-1, 1, *values.shape[2:])
+        return values.gather(1, gather_index).squeeze(1)
+
+    @staticmethod
+    def _gather_team_slots(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        gather_index = indices.unsqueeze(-1).expand(-1, -1, values.shape[-1])
+        return values.gather(1, gather_index)
+
+    @staticmethod
+    def _active_slot_present(
+        battle_obs: dict[str, torch.Tensor],
+        side_prefix: str,
+        slot: int,
+    ) -> torch.Tensor:
+        key = f"{side_prefix}_active_present"
+        if key not in battle_obs:
+            batch_size = battle_obs[f"{side_prefix}_active_indices"].shape[0]
+            return torch.ones(batch_size, dtype=torch.bool, device=battle_obs[f"{side_prefix}_active_indices"].device)
+        return battle_obs[key][:, slot].to(dtype=torch.bool)
+
+    @staticmethod
+    def _ensure_long_buffer(tensor: torch.Tensor | None) -> torch.Tensor:
+        if tensor is None:
+            return torch.zeros(1, dtype=torch.long)
+        return tensor.to(dtype=torch.long)
+
+    @staticmethod
+    def _ensure_float_buffer(
+        tensor: torch.Tensor | None,
+        *,
+        dims: int = 1,
+        width: int = 1,
+    ) -> torch.Tensor:
+        if tensor is None:
+            if dims == 1:
+                return torch.zeros(1, dtype=torch.float32)
+            if dims == 2:
+                return torch.zeros((1, width), dtype=torch.float32)
+            raise ValueError(f"Unsupported fallback tensor rank {dims}.")
+        return tensor.to(dtype=torch.float32)
+
     @staticmethod
     def _build_action_metadata() -> dict[str, torch.Tensor]:
         action_ids = []
@@ -334,18 +739,26 @@ class ActionHead(nn.Module):
 
 
 class TeamPreviewHead(nn.Module):
-    """Autoregressive team selection for team preview (pick 4 from 6)."""
+    """Canonical bring-set selection plus ordered lead-pair choice."""
 
     def __init__(self, pokemon_dim: int, context_dim: int, pick_size: int = 4):
         super().__init__()
+        if pick_size < 2:
+            raise ValueError("TeamPreviewHead requires pick_size >= 2 so it can choose a lead pair.")
         self.pick_size = pick_size
         self.opponent_attention = MaskedSetAttention(context_dim, pokemon_dim, 128)
-        self.score = nn.Sequential(
+        self.bring_score = nn.Sequential(
             nn.Linear(pokemon_dim * 2 + context_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
         )
         self.context_proj = nn.Linear(context_dim + pokemon_dim, context_dim)
+        self.lead_context_proj = nn.Linear(context_dim + pokemon_dim, context_dim)
+        self.lead_pair_score = nn.Sequential(
+            nn.Linear(context_dim + pokemon_dim * 4, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+        )
 
     def forward(
         self,
@@ -358,10 +771,6 @@ class TeamPreviewHead(nn.Module):
         greedy: bool = False,
     ) -> dict[str, torch.Tensor]:
         batch, team_size, pdim = pokemon_reps.shape
-
-        all_log_probs = []
-        all_entropies = []
-        all_picks = []
         if team_mask is None:
             available = torch.ones(batch, team_size, dtype=torch.bool, device=context.device)
         else:
@@ -370,7 +779,16 @@ class TeamPreviewHead(nn.Module):
             raise ValueError(
                 f"TeamPreviewHead needs at least {self.pick_size} available pokemon per batch item."
             )
+
+        canonical_bring = None if picks is None else picks.sort(dim=1).values
+        team_positions = torch.arange(team_size, device=context.device).view(1, team_size)
+
+        bring_log_probs: list[torch.Tensor] = []
+        bring_entropies: list[torch.Tensor] = []
+        bring_picks: list[torch.Tensor] = []
         picked_sum = torch.zeros(batch, pdim, device=context.device)
+        next_min_index = torch.zeros(batch, 1, dtype=torch.long, device=context.device)
+        remaining = available.clone()
 
         for step in range(self.pick_size):
             ctx = self.context_proj(torch.cat([context, picked_sum], dim=-1))
@@ -378,31 +796,89 @@ class TeamPreviewHead(nn.Module):
 
             ctx_expanded = ctx.unsqueeze(1).expand(-1, team_size, -1)
             opponent_expanded = opponent_summary.unsqueeze(1).expand(-1, team_size, -1)
-            inputs = torch.cat([pokemon_reps, ctx_expanded, opponent_expanded], dim=-1)
-            scores = self.score(inputs).squeeze(-1)
-            scores = scores.masked_fill(~available, -1e8)
+            bring_inputs = torch.cat([pokemon_reps, ctx_expanded, opponent_expanded], dim=-1)
+            bring_scores = self.bring_score(bring_inputs).squeeze(-1)
+            picks_left = self.pick_size - step
+            suffix_available = torch.cumsum(remaining.flip(1).to(dtype=torch.int64), dim=1).flip(1)
+            valid = remaining & (team_positions >= next_min_index) & (suffix_available >= picks_left)
+            bring_scores = bring_scores.masked_fill(~valid, -1e8)
+            dist = torch.distributions.Categorical(logits=bring_scores)
 
-            dist = torch.distributions.Categorical(logits=scores)
-
-            if picks is None:
-                chosen = scores.argmax(dim=1) if greedy else dist.sample()
+            if canonical_bring is None:
+                chosen = bring_scores.argmax(dim=1) if greedy else dist.sample()
             else:
-                chosen = picks[:, step]
+                chosen = canonical_bring[:, step]
 
-            all_picks.append(chosen)
-            all_log_probs.append(dist.log_prob(chosen))
-            all_entropies.append(dist.entropy())
+            if not valid.gather(1, chosen.unsqueeze(1)).squeeze(1).all():
+                raise RuntimeError("TeamPreviewHead received an invalid canonical bring target.")
 
-            available.scatter_(1, chosen.unsqueeze(1), False)
+            bring_picks.append(chosen)
+            bring_log_probs.append(dist.log_prob(chosen))
+            bring_entropies.append(dist.entropy())
+
+            remaining.scatter_(1, chosen.unsqueeze(1), False)
+            next_min_index = chosen.unsqueeze(1) + 1
             chosen_rep = pokemon_reps.gather(
-                1, chosen.unsqueeze(1).unsqueeze(2).expand(-1, -1, pdim)
+                1,
+                chosen.unsqueeze(1).unsqueeze(2).expand(-1, -1, pdim),
             ).squeeze(1)
             picked_sum = picked_sum + chosen_rep
 
+        bring_picks_tensor = torch.stack(bring_picks, dim=1)
+        bring_log_prob = torch.stack(bring_log_probs, dim=1).sum(dim=1)
+        bring_entropy = torch.stack(bring_entropies, dim=1).sum(dim=1)
+
+        bring_mask = torch.zeros(batch, team_size, dtype=torch.bool, device=context.device)
+        bring_mask.scatter_(1, bring_picks_tensor, True)
+        bring_summary = picked_sum / float(self.pick_size)
+        lead_context = self.lead_context_proj(torch.cat([context, bring_summary], dim=-1))
+        lead_opponent_summary = self.opponent_attention(lead_context, opponent_reps, opponent_mask)
+
+        left = pokemon_reps.unsqueeze(2).expand(-1, team_size, team_size, -1)
+        right = pokemon_reps.unsqueeze(1).expand(-1, team_size, team_size, -1)
+        bring_expanded = bring_summary.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        opponent_expanded = lead_opponent_summary.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        lead_context_expanded = lead_context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        lead_pair_logits = self.lead_pair_score(
+            torch.cat([left, right, bring_expanded, opponent_expanded, lead_context_expanded], dim=-1)
+        ).squeeze(-1)
+
+        invalid_pairs = torch.eye(team_size, dtype=torch.bool, device=context.device).unsqueeze(0)
+        invalid_pairs = invalid_pairs | (~bring_mask).unsqueeze(1) | (~bring_mask).unsqueeze(2)
+        if team_mask is not None:
+            invalid_pairs = invalid_pairs | team_mask.unsqueeze(1) | team_mask.unsqueeze(2)
+        lead_pair_logits = lead_pair_logits.masked_fill(invalid_pairs, -1e8).reshape(batch, team_size * team_size)
+        lead_dist = torch.distributions.Categorical(logits=lead_pair_logits)
+
+        if picks is None:
+            chosen_pair = lead_pair_logits.argmax(dim=1) if greedy else lead_dist.sample()
+        else:
+            chosen_pair = picks[:, 0] * team_size + picks[:, 1]
+
+        valid_pairs = (~invalid_pairs).reshape(batch, team_size * team_size)
+        if not valid_pairs.gather(1, chosen_pair.unsqueeze(1)).squeeze(1).all():
+            raise RuntimeError("TeamPreviewHead received an invalid lead pair target.")
+
+        lead_log_prob = lead_dist.log_prob(chosen_pair)
+        lead_entropy = lead_dist.entropy()
+        lead_pair = torch.stack([chosen_pair // team_size, chosen_pair % team_size], dim=1)
+
+        remaining_bring_mask = bring_mask.clone()
+        remaining_bring_mask.scatter_(1, lead_pair, False)
+        bench_tail = team_positions.expand(batch, -1).masked_fill(~remaining_bring_mask, team_size)
+        bench_tail = bench_tail.sort(dim=1).values[:, : self.pick_size - 2]
+        final_picks = torch.cat([lead_pair, bench_tail], dim=1)
+
         return {
-            "picks": torch.stack(all_picks, dim=1),
-            "log_prob": torch.stack(all_log_probs, dim=1).sum(1),
-            "entropy": torch.stack(all_entropies, dim=1).sum(1),
+            "bring_picks": bring_picks_tensor,
+            "lead_pair": lead_pair,
+            "picks": final_picks,
+            "bring_log_prob": bring_log_prob,
+            "lead_log_prob": lead_log_prob,
+            "log_prob": bring_log_prob + lead_log_prob,
+            "bring_entropy": bring_entropy,
+            "lead_entropy": lead_entropy,
+            "entropy": bring_entropy + lead_entropy,
         }
 
 

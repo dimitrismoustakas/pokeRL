@@ -77,10 +77,23 @@ class PokeAgent(nn.Module):
         memory_out = config.memory_hidden
 
         # --- Heads ---
-        self.action_head = ActionHead(memory_out, config.pokemon_out, config.action_hidden)
+        move_stats = game_data.move_stats_matrix()
+        self.action_head = ActionHead(
+            memory_out,
+            config.pokemon_out,
+            config.action_hidden,
+            move_type_lookup=torch.from_numpy(game_data.move_type_indices()),
+            move_base_power_lookup=torch.from_numpy(move_stats[:, 0]),
+            move_accuracy_lookup=torch.from_numpy(move_stats[:, 1]),
+            move_priority_lookup=torch.from_numpy(game_data.move_priority_vector()),
+            move_category_lookup=torch.from_numpy(game_data.move_category_indices()),
+            move_target_flags=torch.from_numpy(game_data.move_target_flags()),
+            type_effectiveness=torch.from_numpy(game_data.type_effectiveness_matrix()),
+        )
         self.team_preview_head = TeamPreviewHead(config.pokemon_out, memory_out, config.pick_size)
         self.opponent_preview_head = OpponentPreviewHead(config.pokemon_out, memory_out)
         self.value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)
+        self.preview_value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)
 
         # Optional: stat-based embedding init
         if config.init_embeddings_from_stats:
@@ -120,6 +133,7 @@ class PokeAgent(nn.Module):
             opp_active_reps,
             action_masks,
             actions,
+            battle_obs=obs,
         )
         value = self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 
@@ -155,9 +169,17 @@ class PokeAgent(nn.Module):
             greedy,
         )
         opponent_out = self.opponent_preview_head(opp_reps, context, obs.get("opp_mask"))
+        preview_value = self.preview_value_head(
+            context,
+            own_reps,
+            opp_reps,
+            obs.get("own_mask"),
+            obs.get("opp_mask"),
+        )
         return {
             **preview_out,
             **opponent_out,
+            "preview_value": preview_value,
             "hidden": new_hidden,
         }
 
@@ -168,6 +190,18 @@ class PokeAgent(nn.Module):
         own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
         opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
         return self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
+
+    def get_preview_value(self, obs: dict[str, torch.Tensor], hidden=None) -> torch.Tensor:
+        """Preview-only value estimate used as the team-preview baseline."""
+        context, _, own_reps, opp_reps, _ = self.spatial(obs)
+        context, _ = self.memory(context, hidden)
+        return self.preview_value_head(
+            context,
+            own_reps,
+            opp_reps,
+            obs.get("own_mask"),
+            obs.get("opp_mask"),
+        )
 
     def initial_hidden(self, batch_size: int):
         return self.memory.initial_hidden(batch_size)

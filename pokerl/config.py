@@ -49,6 +49,7 @@ class TrainingConfig:
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
+    team_preview_value_coef: float = 0.5
     team_preview_bring_coef: float = 0.1
     team_preview_lead_coef: float = 0.05
 

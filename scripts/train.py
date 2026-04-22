@@ -499,6 +499,7 @@ def train():
             "num_epochs": train_config.num_epochs,
             "num_minibatches": train_config.num_minibatches,
             "bptt_chunk_steps": train_config.bptt_chunk_steps,
+            "team_preview_value_coef": train_config.team_preview_value_coef,
             "team_preview_bring_coef": train_config.team_preview_bring_coef,
             "team_preview_lead_coef": train_config.team_preview_lead_coef,
             "total_timesteps": train_config.total_timesteps,
@@ -808,6 +809,7 @@ def train():
                     f"Value loss {metrics['value_loss']:.4f} | "
                     f"Entropy {metrics['entropy']:.4f} | "
                     f"Preview loss {metrics.get('team_preview_loss', float('nan')):.4f} | "
+                    f"Preview value {metrics.get('team_preview_value_loss', float('nan')):.4f} | "
                     f"League pool {len(league.checkpoints)}"
                 )
 

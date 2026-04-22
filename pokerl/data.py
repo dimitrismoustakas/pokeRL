@@ -37,6 +37,7 @@ class GameData:
         # Store raw data for stat init
         self._pokedex = data.pokedex
         self._moves = data.moves
+        self._type_chart = data.type_chart
 
     @property
     def num_species(self) -> int:
@@ -85,6 +86,92 @@ class GameData:
             mat[idx, 1] = (entry.get("accuracy", 100) or 100) / 100.0
             mat[idx, 2] = (entry.get("pp", 0) or 0) / 64.0
         return mat
+
+    def move_type_indices(self) -> np.ndarray:
+        """Move type index lookup aligned with the move vocabulary."""
+        indices = np.zeros(self.num_moves, dtype=np.int64)
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            move_type = str(self._moves.get(move_id, {}).get("type", "")).lower()
+            indices[idx] = self.type_to_idx.get(move_type, UNKNOWN_IDX)
+        return indices
+
+    def move_category_indices(self) -> np.ndarray:
+        """Move category lookup: 0=status, 1=physical, 2=special."""
+        category_to_idx = {
+            "status": 0,
+            "physical": 1,
+            "special": 2,
+        }
+        indices = np.zeros(self.num_moves, dtype=np.int64)
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            category = str(self._moves.get(move_id, {}).get("category", "Status")).lower()
+            indices[idx] = category_to_idx.get(category, 0)
+        return indices
+
+    def move_priority_vector(self) -> np.ndarray:
+        """Move priority lookup normalized into roughly [-1, 1]."""
+        values = np.zeros(self.num_moves, dtype=np.float32)
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            priority = float(self._moves.get(move_id, {}).get("priority", 0) or 0)
+            values[idx] = np.clip(priority / 7.0, -1.0, 1.0)
+        return values
+
+    def move_target_flags(self) -> np.ndarray:
+        """Move target class flags aligned with the move vocabulary.
+
+        Columns are:
+        0. no explicit target hits foes
+        1. no explicit target hits all active pokemon
+        2. no explicit target hits allies / own side
+        3. no explicit target hits self
+        4. can damage allies
+        5. can hit multiple foes
+        """
+        flags = np.zeros((self.num_moves, 6), dtype=np.float32)
+        foe_only_targets = {"alladjacentfoes", "foeside"}
+        all_active_targets = {"alladjacent", "all"}
+        ally_targets = {"allies", "allyside", "allyteam"}
+        self_targets = {"self"}
+
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            target = str(self._moves.get(move_id, {}).get("target", "")).lower()
+            if target in foe_only_targets:
+                flags[idx, 0] = 1.0
+                flags[idx, 5] = 1.0
+            elif target in all_active_targets:
+                flags[idx, 1] = 1.0
+                flags[idx, 4] = 1.0
+                flags[idx, 5] = 1.0
+            elif target in ally_targets:
+                flags[idx, 2] = 1.0
+            elif target in self_targets:
+                flags[idx, 3] = 1.0
+        return flags
+
+    def type_effectiveness_matrix(self) -> np.ndarray:
+        """Attack-type x defend-type effectiveness lookup.
+
+        Unknown rows/columns stay neutral at 1.0.
+        """
+        matrix = np.ones((self.num_types, self.num_types), dtype=np.float32)
+        for defend_type, attack_map in self._type_chart.items():
+            defend_idx = self.type_to_idx.get(str(defend_type).lower(), UNKNOWN_IDX)
+            if defend_idx == UNKNOWN_IDX:
+                continue
+            for attack_type, multiplier in attack_map.items():
+                attack_idx = self.type_to_idx.get(str(attack_type).lower(), UNKNOWN_IDX)
+                if attack_idx == UNKNOWN_IDX:
+                    continue
+                matrix[attack_idx, defend_idx] = float(multiplier)
+        return matrix
 
     def init_species_embedding(self, embedding: torch.nn.Embedding):
         """Initialize species embedding with a linear projection of base stats."""

@@ -17,7 +17,7 @@ If this document and the code ever disagree, the code is authoritative.
 
 ## 1. High-Level Overview
 
-`PokeAgent` is a recurrent actor-critic for doubles battles. The policy is trained with PPO against opponents sampled from a self-play league of frozen checkpoints. Team preview is trained separately with REINFORCE plus opponent-model auxiliary losses.
+`PokeAgent` is a recurrent actor-critic for doubles battles. The policy is trained with PPO against opponents sampled from a self-play league of frozen checkpoints. Team preview is trained separately with a preview-specific value baseline plus opponent-model auxiliary losses.
 
 Battle-turn pipeline:
 
@@ -38,8 +38,11 @@ Preview pipeline:
 synthetic preview observation
   -> same spatial encoder
   -> same memory module
-  -> team preview head (pick 4 of 6 autoregressively)
+  -> team preview head
+       canonical bring set
+       -> ordered lead pair
   -> opponent preview head (auxiliary only)
+  -> preview value head
 ```
 
 Core properties:
@@ -130,6 +133,7 @@ Entry point: `pokerl/model/agent.py`.
 - `team_preview_head`: `TeamPreviewHead`
 - `opponent_preview_head`: `OpponentPreviewHead`
 - `value_head`: `ValueHead`
+- `preview_value_head`: `ValueHead`
 
 If `ModelConfig.init_embeddings_from_stats` is enabled, `GameData` initializes species and move embeddings from stats before training.
 
@@ -288,6 +292,20 @@ That entity is projected through:
 128 -> Linear(256) -> ReLU
 ```
 
+#### Explicit matchup features
+
+The action head now also scores each candidate with hand-aligned move matchup features computed from the live observation plus move/type metadata from `GameData`.
+
+Examples include:
+
+- move base power, accuracy, and priority
+- move category (`status`, `physical`, `special`)
+- current STAB and potential tera STAB gain
+- current target effectiveness
+- best/mean foe effectiveness across the two active opponents
+- current expected power proxy and tera power gain proxy
+- spread / ally-hit flags for targetless moves
+
 #### Slot 1
 
 Base query:
@@ -311,7 +329,7 @@ Fused query:
 Scoring:
 
 ```text
-[query, static_action_features, dynamic_entity_features]
+[query, static_action_features, dynamic_entity_features, explicit_matchup_features]
 -> Linear(256) -> ReLU -> Linear(1)
 ```
 
@@ -333,7 +351,7 @@ Legality comes from row `a1 + 1` of the joint mask.
 After `a1` and `a2` are chosen, the model makes a third categorical choice:
 
 ```text
-[memory_out, own_active_0, own_active_1, opp_active_0, opp_active_1, a1_emb, a2_emb]
+[memory_out, own_active_0, own_active_1, opp_active_0, opp_active_1, a1_emb, a2_emb, a1_matchup_features, a2_matchup_features]
 -> Linear(256) -> ReLU
 -> Linear(3)
 ```
@@ -381,23 +399,36 @@ If a side has no valid bench targets, the corresponding attention summary collap
 
 ### 3.8 TeamPreviewHead
 
-`TeamPreviewHead` selects `pick_size` unique Pokemon from the full own team.
+`TeamPreviewHead` now separates bring selection from lead ordering.
 
-At each pick step:
+Bring stage:
 
 1. accumulate the sum of already-picked own representations
 2. project `[memory_out, picked_sum] -> context_dim`
 3. attend over opponent reps with `MaskedSetAttention`
 4. score each still-available own Pokemon from `[pokemon_rep, projected_context, opponent_summary]`
-5. sample or argmax one choice
+5. pick `pick_size` unique Pokemon in canonical increasing team-slot order
+
+Lead stage:
+
+1. summarize the chosen bring set
+2. project `[memory_out, bring_summary] -> context_dim`
+3. score all ordered pairs from `[left_rep, right_rep, bring_summary, opponent_summary, projected_context]`
+4. mask out self-pairs, unchosen Pokemon, and padding
+5. choose an ordered lead pair
+
+Final Showdown preview order:
+
+- picks `0` and `1` are the chosen ordered lead pair
+- the remaining brought Pokemon are appended in canonical team-slot order
 
 Outputs:
 
+- `bring_picks`: `(batch, pick_size)` canonical bring set
+- `lead_pair`: `(batch, 2)` ordered leads
 - `picks`: `(batch, pick_size)`
-- `log_prob`: summed across pick steps
-- `entropy`: summed across pick steps
-
-Lead ordering is implicit: picks `0` and `1` become the lead pair because Showdown preview commands preserve order.
+- `log_prob`: bring-set log-prob plus lead-pair log-prob
+- `entropy`: bring entropy plus lead-pair entropy
 
 ### 3.9 OpponentPreviewHead
 
@@ -543,17 +574,20 @@ This update uses end-of-battle preview examples captured during rollout:
 (preview_obs, own_picks, final_reward, opponent_picks)
 ```
 
-The training rule is REINFORCE with a learned baseline:
+The preview actor uses a dedicated preview value head as its baseline:
 
 ```text
-advantage = final_reward - baseline
+advantage = final_reward - preview_value.detach()
 policy_loss = -(log_prob * advantage).mean()
+value_loss = 0.5 * (preview_value - final_reward)^2
 ```
 
-Baseline details:
+The preview loss combines:
 
-- the baseline is `agent.get_value(preview_obs)` with no carried battle hidden state
-- this corresponds to the start-of-battle value estimate
+- preview policy loss
+- preview value loss
+- opponent bring BCE auxiliary loss
+- opponent ordered lead-pair cross-entropy auxiliary loss
 
 Auxiliary losses:
 
@@ -665,9 +699,9 @@ Opponent PP fractions remain all-zero in the continuous feature block.
 
 The battle reward function is sparse: win `+1`, loss `-1`, otherwise `0`.
 
-### 8.4 Team preview lead structure is implicit
+### 8.4 Team preview still assumes a canonical bench tail
 
-The preview head chooses an ordered 4-Pokemon list, but there is no separate lead-selection head.
+Bring choice and lead ordering are now separated, but the two non-lead brought Pokemon are still emitted in canonical team-slot order rather than from a separate bench-order policy.
 
 ### 8.5 There is no explicit opponent belief model
 
@@ -702,8 +736,9 @@ Team preview:
   synthetic obs
     -> SpatialEncoder
     -> Memory
-    -> TeamPreviewHead (pick 4 of 6)
+    -> TeamPreviewHead (bring set -> lead pair)
     -> OpponentPreviewHead (auxiliary)
+    -> PreviewValueHead
 
 Training:
   rollout collection
