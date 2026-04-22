@@ -570,7 +570,8 @@ def _summarize_preview_results(preview_results: list[dict[str, object]]) -> dict
 def _summarize_battle_behavior(battle_results: list[dict[str, object]]) -> dict[str, object]:
     tera_used_games = [result for result in battle_results if result.get("tera_used")]
     tera_unused_games = [result for result in battle_results if not result.get("tera_used")]
-    tera_turns = [float(result["first_tera_turn"]) for result in tera_used_games if result.get("first_tera_turn")]
+    tera_turns = [int(result["first_tera_turn"]) for result in tera_used_games if result.get("first_tera_turn")]
+    tera_turn_counts = Counter(tera_turns)
     switch_counts = [int(result.get("switch_actions", 0)) for result in battle_results]
 
     return {
@@ -585,6 +586,14 @@ def _summarize_battle_behavior(battle_results: list[dict[str, object]]) -> dict[
             len(tera_unused_games),
         ),
         "avg_first_tera_turn": float(np.mean(tera_turns)) if tera_turns else 0.0,
+        "first_tera_turn_distribution": [
+            {
+                "turn": int(turn),
+                "count": int(count),
+                "rate": _safe_rate(int(count), len(tera_used_games)),
+            }
+            for turn, count in sorted(tera_turn_counts.items())
+        ],
         "avg_switch_actions_per_game": float(np.mean(switch_counts)) if switch_counts else 0.0,
     }
 
