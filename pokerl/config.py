@@ -52,6 +52,8 @@ class TrainingConfig:
     team_preview_value_coef: float = 0.5
     team_preview_bring_coef: float = 0.1
     team_preview_lead_coef: float = 0.05
+    team_preview_update_interval: int = 8  # flush the preview accumulator every N PPO updates
+    team_preview_max_samples: int = 1024    # cap the accumulator; oldest entries are dropped first
 
     # Batching
     rollout_steps: int = 128

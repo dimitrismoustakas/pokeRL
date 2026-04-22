@@ -574,6 +574,8 @@ This update uses end-of-battle preview examples captured during rollout:
 (preview_obs, own_picks, final_reward, opponent_picks)
 ```
 
+Preview samples are accumulated across `team_preview_update_interval` PPO updates before a gradient step runs. Completed episodes per update are few (tens), so batching several updates together gives the preview REINFORCE loss a usable sample size. The accumulator is capped at `team_preview_max_samples`; oldest samples are dropped first on overflow.
+
 The preview actor uses a dedicated preview value head as its baseline:
 
 ```text
