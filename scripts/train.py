@@ -96,6 +96,36 @@ def parse_args() -> argparse.Namespace:
         help="Override how many frozen checkpoints are retained in the self-play league.",
     )
     parser.add_argument(
+        "--team-preview-update-interval",
+        type=int,
+        default=None,
+        help="Flush the preview accumulator and run a gradient step every N PPO updates.",
+    )
+    parser.add_argument(
+        "--team-preview-max-samples",
+        type=int,
+        default=None,
+        help="Cap on preview accumulator size; oldest samples are dropped first.",
+    )
+    parser.add_argument(
+        "--tera-exploration-start",
+        type=float,
+        default=None,
+        help="Initial probability of uniform-over-valid tera sampling during rollout.",
+    )
+    parser.add_argument(
+        "--tera-exploration-end",
+        type=float,
+        default=None,
+        help="Final tera-exploration epsilon after the decay window.",
+    )
+    parser.add_argument(
+        "--tera-exploration-decay-updates",
+        type=int,
+        default=None,
+        help="PPO updates over which to linearly decay tera-exploration epsilon.",
+    )
+    parser.add_argument(
         "--league-coalesce-ms",
         type=float,
         default=None,
@@ -147,6 +177,11 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "league_size": args.league_size,
         "league_update_interval": args.league_update_interval,
         "league_coalesce_ms": args.league_coalesce_ms,
+        "team_preview_update_interval": args.team_preview_update_interval,
+        "team_preview_max_samples": args.team_preview_max_samples,
+        "tera_exploration_start": args.tera_exploration_start,
+        "tera_exploration_end": args.tera_exploration_end,
+        "tera_exploration_decay_updates": args.tera_exploration_decay_updates,
     }
     for field_name, value in overrides.items():
         if value is not None:
@@ -502,6 +537,11 @@ def train():
             "team_preview_value_coef": train_config.team_preview_value_coef,
             "team_preview_bring_coef": train_config.team_preview_bring_coef,
             "team_preview_lead_coef": train_config.team_preview_lead_coef,
+            "team_preview_update_interval": train_config.team_preview_update_interval,
+            "team_preview_max_samples": train_config.team_preview_max_samples,
+            "tera_exploration_start": train_config.tera_exploration_start,
+            "tera_exploration_end": train_config.tera_exploration_end,
+            "tera_exploration_decay_updates": train_config.tera_exploration_decay_updates,
             "total_timesteps": train_config.total_timesteps,
             "server_urls": server_urls,
             "team_pool": team_pool.describe() if team_pool is not None else None,
@@ -548,12 +588,31 @@ def train():
         episode_rewards: list[float] = []
         start_time = time.time()
 
+        # Preview samples are tiny per update (~20-50 completed episodes), so batch
+        # across multiple updates before running a gradient step. Oldest samples are
+        # dropped first if the accumulator overflows.
+        accumulated_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
+
         for update in range(updates_done + 1, num_updates + 1):
             agent.eval()
             buffer.reset(initial_hidden=clone_hidden_state(hidden))
             if collect_timing:
                 parallel_env.reset_timing()
             rollout_started = time.perf_counter()
+
+            # Linear decay of tera-exploration epsilon. A zero-length decay window
+            # means "skip decay, apply end immediately". Negative values are rejected
+            # by TrainingConfig validation.
+            decay_updates = train_config.tera_exploration_decay_updates
+            if decay_updates == 0:
+                tera_eps = train_config.tera_exploration_end
+            else:
+                progress = min(1.0, max(0.0, (update - 1) / decay_updates))
+                tera_eps = (
+                    train_config.tera_exploration_start
+                    + (train_config.tera_exploration_end - train_config.tera_exploration_start)
+                    * progress
+                )
             update_episode_rewards: list[float] = []
             update_episode_secs: list[float] = []
             update_episode_turns: list[float] = []
@@ -561,7 +620,7 @@ def train():
             update_episode_opponent_repeated_turn_requests: list[int] = []
             update_episode_opponent_max_calls_same_turn: list[int] = []
             update_pathological_episodes: list[dict[str, object]] = []
-            team_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
+            update_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
             rollout_profile = {
                 "obs_to_device_sec": 0.0,
                 "mask_to_device_sec": 0.0,
@@ -587,7 +646,12 @@ def train():
                     rollout_profile["mask_to_device_sec"] += time.perf_counter() - mask_device_started
 
                     policy_started = time.perf_counter()
-                    out = agent(obs_t, hidden, action_masks=masks_t)
+                    out = agent(
+                        obs_t,
+                        hidden,
+                        action_masks=masks_t,
+                        tera_exploration_prob=tera_eps,
+                    )
                     rollout_profile["policy_forward_sec"] += time.perf_counter() - policy_started
 
                     policy_post_started = time.perf_counter()
@@ -662,7 +726,7 @@ def train():
                                 raise RuntimeError(
                                     "Episode recorded a team preview decision without opponent preview labels."
                                 )
-                            team_preview_data.append(
+                            update_preview_data.append(
                                 (
                                     info["team_preview_obs"],
                                     info["team_preview_picks"],
@@ -720,8 +784,23 @@ def train():
             agent.train()
             ppo_started = time.perf_counter()
             metrics = trainer.update(batch)
-            if team_preview_data:
-                metrics.update(trainer.update_team_preview(team_preview_data))
+            metrics["tera_exploration_prob"] = tera_eps
+
+            # Extend the preview accumulator and flush on the configured interval.
+            # FIFO drop keeps the buffer bounded without silently losing the freshest data.
+            if update_preview_data:
+                accumulated_preview_data.extend(update_preview_data)
+                overflow = len(accumulated_preview_data) - train_config.team_preview_max_samples
+                if overflow > 0:
+                    del accumulated_preview_data[:overflow]
+            preview_interval = max(1, train_config.team_preview_update_interval)
+            if accumulated_preview_data and update % preview_interval == 0:
+                metrics.update(trainer.update_team_preview(accumulated_preview_data))
+                metrics["team_preview_batch_size"] = float(len(accumulated_preview_data))
+                # Clear unconditionally: non-finite preview losses are usually caused by
+                # something specific to this batch, so retaining the samples would risk
+                # re-triggering on the next flush.
+                accumulated_preview_data = []
             ppo_sec = time.perf_counter() - ppo_started
             parallel_env.refresh_prepared_team_previews()
 
@@ -827,6 +906,13 @@ def train():
                     print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
                 else:
                     print(f"League updated (pool: {len(league.checkpoints)})")
+
+        # Flush any leftover preview samples before saving the final checkpoint.
+        # num_updates is rarely a multiple of team_preview_update_interval, so up to
+        # one interval's worth of samples would otherwise be collected but never used.
+        if accumulated_preview_data:
+            trainer.update_team_preview(accumulated_preview_data)
+            accumulated_preview_data = []
 
         print("Training complete.")
         final_path = f"{train_config.checkpoint_dir}/final.pt"

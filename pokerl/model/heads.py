@@ -211,6 +211,7 @@ class ActionHead(nn.Module):
         actions: torch.Tensor | None = None,
         greedy: bool = False,
         battle_obs: dict[str, torch.Tensor] | None = None,
+        tera_exploration_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         if "joint" not in masks or "can_tera" not in masks:
             raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
@@ -322,6 +323,17 @@ class ActionHead(nn.Module):
 
         if actions is None:
             tera_choice = tera_logits.argmax(dim=1) if greedy else tera_dist.sample()
+            if tera_exploration_prob > 0.0 and not greedy:
+                # Only explore when there is a real tera choice (>= 2 valid options).
+                # Otherwise tera_mask is [True, False, False] and uniform == policy.
+                has_choice = tera_mask.sum(dim=1) >= 2
+                explore = (
+                    torch.rand(context.shape[0], device=context.device) < tera_exploration_prob
+                ) & has_choice
+                if explore.any():
+                    uniform_logits = torch.zeros_like(tera_logits).masked_fill(~tera_mask, -1e8)
+                    uniform_sample = torch.distributions.Categorical(logits=uniform_logits).sample()
+                    tera_choice = torch.where(explore, uniform_sample, tera_choice)
         else:
             tera_choice = actions[:, 2]
 

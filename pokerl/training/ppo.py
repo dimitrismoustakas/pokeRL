@@ -15,12 +15,41 @@ from .rollout import RolloutBatch
 class PPOTrainer:
     """Proximal Policy Optimization with clipped surrogate objective."""
 
+    _LOG_RATIO_CLAMP = 20.0
+
     def __init__(self, agent: PokeAgent, config: TrainingConfig, device: torch.device):
         self.agent = agent.to(device)
         self.config = config
         self.device = device
         self.optimizer = torch.optim.Adam(agent.parameters(), lr=config.lr, eps=1e-5)
         self.global_step = 0
+
+    def _has_finite_gradients(self) -> bool:
+        for param in self.agent.parameters():
+            if param.grad is None:
+                continue
+            if not torch.isfinite(param.grad).all():
+                return False
+        return True
+
+    def _apply_update_step(self, loss: torch.Tensor) -> bool:
+        if not torch.isfinite(loss):
+            self.optimizer.zero_grad()
+            return False
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        if not self._has_finite_gradients():
+            self.optimizer.zero_grad()
+            return False
+
+        total_norm = nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
+        if not torch.isfinite(total_norm):
+            self.optimizer.zero_grad()
+            return False
+
+        self.optimizer.step()
+        return True
 
     def update(self, batch: RolloutBatch) -> dict[str, float]:
         """Run PPO update epochs on a rollout batch.
@@ -73,6 +102,7 @@ class PPOTrainer:
 
         metrics = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0}
         num_updates = 0
+        skipped_nonfinite = 0
 
         for epoch in range(self.config.num_epochs):
             env_order = torch.randperm(E, device=self.device)
@@ -168,7 +198,10 @@ class PPOTrainer:
 
                 # Policy loss (clipped surrogate objective).
                 log_ratio = log_probs_flat - mb_old_lp
-                ratio = log_ratio.exp()
+                # Rare extreme policy shifts can overflow exp(log_ratio) in float32 and
+                # poison Adam with non-finite gradients. Clamping here only affects
+                # already-pathological ratios far outside PPO's trust region.
+                ratio = torch.exp(log_ratio.clamp(min=-self._LOG_RATIO_CLAMP, max=self._LOG_RATIO_CLAMP))
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - self.config.clip_eps, 1.0 + self.config.clip_eps) * mb_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -192,21 +225,31 @@ class PPOTrainer:
                     + self.config.entropy_coef * entropy_loss
                 )
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
+                if not self._apply_update_step(loss):
+                    skipped_nonfinite += 1
+                    continue
 
                 with torch.no_grad():
-                    approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                    approx_kl = ((ratio - 1) - log_ratio.clamp(
+                        min=-self._LOG_RATIO_CLAMP,
+                        max=self._LOG_RATIO_CLAMP,
+                    )).mean().item()
                 metrics["policy_loss"] += policy_loss.item()
                 metrics["value_loss"] += value_loss.item()
                 metrics["entropy"] += -entropy_loss.item()
                 metrics["approx_kl"] += approx_kl
                 num_updates += 1
 
+        if num_updates == 0:
+            raise RuntimeError(
+                "PPO update skipped every minibatch because the loss or gradients became non-finite."
+            )
+
         self.global_step += T * E
-        return {k: v / num_updates for k, v in metrics.items()}
+        averaged = {k: v / num_updates for k, v in metrics.items()}
+        if skipped_nonfinite > 0:
+            averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
+        return averaged
 
     def update_team_preview(
         self,
@@ -261,10 +304,8 @@ class PPOTrainer:
             + self.config.team_preview_lead_coef * lead_loss
         )
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
-        self.optimizer.step()
+        if not self._apply_update_step(loss):
+            return {"team_preview_skipped_nonfinite": 1.0}
 
         return {
             "team_preview_loss": loss.item(),

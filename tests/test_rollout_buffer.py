@@ -246,6 +246,49 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
     assert set(metrics) == {"policy_loss", "value_loss", "entropy", "approx_kl"}
 
 
+def test_ppo_trainer_clamps_extreme_log_ratios_and_keeps_parameters_finite() -> None:
+    device = torch.device("cpu")
+    num_steps = 2
+    num_envs = 2
+    action_mask = {
+        "joint": np.ones((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool),
+        "can_tera": np.ones((num_envs, 2), dtype=bool),
+    }
+    agent = _DummyAgent().to(device)
+    config = TrainingConfig(num_epochs=1, num_minibatches=2)
+    trainer = PPOTrainer(agent, config, device)
+    buffer = RolloutBuffer(num_steps, num_envs, _ppo_obs(0, num_envs), action_mask, device)
+    buffer.reset(initial_hidden=agent.initial_hidden(num_envs))
+
+    for step in range(num_steps):
+        obs_t = _obs_to_tensor(_ppo_obs(step, num_envs), device)
+        masks_t = {
+            key: torch.from_numpy(value).to(device)
+            for key, value in action_mask.items()
+        }
+        with torch.no_grad():
+            out = agent(obs_t, action_masks=masks_t)
+
+        rewards_t = torch.tensor([1.0, -0.5], dtype=torch.float32, device=device)
+        dones_t = torch.tensor([False, step == num_steps - 1], dtype=torch.bool, device=device)
+        buffer.add(obs_t, out["actions"], masks_t, out["log_prob"], out["value"], rewards_t, dones_t)
+
+    batch = buffer.compute_gae(torch.zeros(num_envs, dtype=torch.float32, device=device))
+    batch.log_probs.fill_(-1.0e9)
+    batch.advantages.copy_(
+        torch.tensor(
+            [[-1.0, 1.0], [-1.0, 1.0]],
+            dtype=torch.float32,
+            device=device,
+        )
+    )
+
+    metrics = trainer.update(batch)
+
+    assert all(np.isfinite(float(value)) for value in metrics.values())
+    assert all(torch.isfinite(param).all() for param in agent.parameters())
+
+
 def test_action_head_uses_joint_and_tera_masks_to_coordinate_actions() -> None:
     torch.manual_seed(0)
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)

@@ -106,6 +106,7 @@ class PokeAgent(nn.Module):
         hidden=None,
         actions: torch.Tensor | None = None,
         action_masks: dict[str, torch.Tensor] | None = None,
+        tera_exploration_prob: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for battle turns.
 
@@ -116,6 +117,9 @@ class PokeAgent(nn.Module):
             action_masks: dict with boolean legality tables:
                 ``joint`` has shape (batch, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
                 ``can_tera`` has shape (batch, 2)
+            tera_exploration_prob: epsilon for uniform-over-valid tera exploration
+                during rollout. Default 0.0 (policy only). Ignored when ``actions``
+                is provided (PPO update path).
 
         Returns dict with: actions, log_prob, entropy, value, hidden
         """
@@ -134,6 +138,7 @@ class PokeAgent(nn.Module):
             action_masks,
             actions,
             battle_obs=obs,
+            tera_exploration_prob=tera_exploration_prob,
         )
         value = self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 
