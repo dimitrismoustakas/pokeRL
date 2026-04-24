@@ -458,6 +458,11 @@ class League:
         self.agent_template = agent_template
         self.device = device
         self.checkpoints: deque[str] = deque(maxlen=config.league_size)
+        # Paths that must survive `prune_checkpoints` calls even though they are
+        # not in the rolling pool. Used by the anchor eval harness so its
+        # permanent reference checkpoints aren't evicted from the shared
+        # inference cache every time the league adds a member.
+        self._protected_paths: set[str] = set()
         self._inference = _LeagueInferenceService(
             agent_template,
             device,
@@ -470,7 +475,20 @@ class League:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"agent": agent.state_dict()}, path)
         self.checkpoints.append(path)
-        self._inference.prune_checkpoints(set(self.checkpoints))
+        self._inference.prune_checkpoints(set(self.checkpoints) | self._protected_paths)
+
+    def protect_path(self, path: str) -> None:
+        """Mark a checkpoint path so it is preserved across `prune_checkpoints`.
+
+        Used by the anchor eval harness so its reference checkpoints aren't
+        re-loaded every time the league rolls.
+        """
+        self._protected_paths.add(path)
+
+    @property
+    def inference_service(self) -> "_LeagueInferenceService":
+        """Shared batched-inference worker. Reused by the anchor eval harness."""
+        return self._inference
 
     def make_opponent(
         self,
@@ -541,7 +559,7 @@ class League:
 
         for p in existing[-self.config.league_size:]:
             self.checkpoints.append(p)
-        self._inference.prune_checkpoints(set(self.checkpoints))
+        self._inference.prune_checkpoints(set(self.checkpoints) | self._protected_paths)
 
     def close(self) -> None:
         self._inference.close()

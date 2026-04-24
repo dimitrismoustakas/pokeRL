@@ -83,6 +83,19 @@ class TrainingConfig:
     league_update_interval: int = 10
     league_coalesce_ms: float = 10.0
 
+    # Anchor evaluation harness (see LEAGUE_IMPROVEMENTS.md §A): permanent
+    # frozen checkpoints kept outside the rolling league pool so we can track
+    # whether the live agent keeps beating its earlier selves, or has drifted.
+    anchor_eval_enabled: bool = True
+    # Fractions of total_timesteps at which to snapshot an anchor. Auto-scales
+    # to any run length. The doc's absolute 100k/500k/1M/2M defaults would
+    # never fire in short runs, so the harness uses fractions instead.
+    anchor_fractions: tuple[float, ...] = (0.05, 0.20, 0.40, 0.60)
+    # Units are PPO updates.
+    anchor_eval_interval_updates: int = 50
+    anchor_eval_games_per_anchor: int = 30
+    anchor_eval_num_envs: int = 16
+
     def __post_init__(self) -> None:
         if self.tera_exploration_decay_updates < 0:
             raise ValueError(
@@ -90,3 +103,19 @@ class TrainingConfig:
                 f"(got {self.tera_exploration_decay_updates}); "
                 "use 0 to skip decay and apply tera_exploration_end immediately."
             )
+        if self.anchor_eval_enabled:
+            if not self.anchor_fractions:
+                raise ValueError("anchor_fractions must contain at least one value when anchor_eval_enabled.")
+            for fraction in self.anchor_fractions:
+                if not 0.0 < fraction < 1.0:
+                    raise ValueError(
+                        f"anchor_fractions must be in (0, 1); got {fraction}."
+                    )
+            if sorted(self.anchor_fractions) != list(self.anchor_fractions):
+                raise ValueError("anchor_fractions must be sorted ascending.")
+            if self.anchor_eval_interval_updates <= 0:
+                raise ValueError("anchor_eval_interval_updates must be > 0.")
+            if self.anchor_eval_games_per_anchor <= 0:
+                raise ValueError("anchor_eval_games_per_anchor must be > 0.")
+            if self.anchor_eval_num_envs <= 0:
+                raise ValueError("anchor_eval_num_envs must be > 0.")

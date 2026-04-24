@@ -30,6 +30,7 @@ from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
 from pokerl.training.preview import TeamPreviewBatcher
+from pokerl.training.anchor_eval import AnchorEvaluator
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +133,35 @@ def parse_args() -> argparse.Namespace:
         help="Override the league-opponent inference coalescing window in milliseconds.",
     )
     parser.add_argument(
+        "--anchor-eval-enabled",
+        type=lambda v: v.lower() in {"1", "true", "yes", "y"},
+        default=None,
+        help="Enable the anchor evaluation harness (LEAGUE_IMPROVEMENTS.md A).",
+    )
+    parser.add_argument(
+        "--anchor-fractions",
+        default=None,
+        help="Comma-separated fractions of total_timesteps at which to snapshot anchors (e.g. 0.05,0.2,0.4,0.6).",
+    )
+    parser.add_argument(
+        "--anchor-eval-interval-updates",
+        type=int,
+        default=None,
+        help="Run anchor evaluation every N PPO updates.",
+    )
+    parser.add_argument(
+        "--anchor-eval-games-per-anchor",
+        type=int,
+        default=None,
+        help="Games played against each anchor per evaluation cycle.",
+    )
+    parser.add_argument(
+        "--anchor-eval-num-envs",
+        type=int,
+        default=None,
+        help="Dedicated parallel battle envs used by the anchor eval harness.",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
@@ -182,12 +212,29 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "tera_exploration_start": args.tera_exploration_start,
         "tera_exploration_end": args.tera_exploration_end,
         "tera_exploration_decay_updates": args.tera_exploration_decay_updates,
+        "anchor_eval_enabled": args.anchor_eval_enabled,
+        "anchor_eval_interval_updates": args.anchor_eval_interval_updates,
+        "anchor_eval_games_per_anchor": args.anchor_eval_games_per_anchor,
+        "anchor_eval_num_envs": args.anchor_eval_num_envs,
     }
     for field_name, value in overrides.items():
         if value is not None:
             if field_name == "bptt_chunk_steps" and value == 0:
                 value = None
             setattr(train_config, field_name, value)
+
+    if args.anchor_fractions is not None:
+        fractions = tuple(
+            float(token.strip())
+            for token in args.anchor_fractions.split(",")
+            if token.strip()
+        )
+        if not fractions:
+            raise ValueError("--anchor-fractions did not parse to any values.")
+        train_config.anchor_fractions = fractions
+
+    # Re-run validation since we bypassed __post_init__ by setattr'ing.
+    train_config.__post_init__()
 
     if args.num_updates is not None:
         train_config.total_timesteps = args.num_updates * train_config.rollout_steps * env_config.num_envs
@@ -523,6 +570,35 @@ def train():
         team_preview_batcher=team_preview_batcher,
         team_pair_provider=team_pair_provider,
     )
+
+    anchor_evaluator: AnchorEvaluator | None = None
+    if train_config.anchor_eval_enabled:
+        anchor_evaluator = AnchorEvaluator(
+            train_config=train_config,
+            env_config=env_config,
+            game_data=game_data,
+            agent=agent,
+            league=league,
+            server_urls=server_urls,
+            team_preview_fn=team_preview_fn,
+            team_preview_batcher=team_preview_batcher,
+            team_pair_provider=team_pair_provider,
+            device=device,
+        )
+        existing = anchor_evaluator.anchors
+        if existing:
+            print(
+                f"Anchor harness: resumed with {len(existing)} existing anchor(s): "
+                + ", ".join(f"{r.fraction:g}@step_{r.step}" for r in existing)
+            )
+        else:
+            print(
+                "Anchor harness enabled. Fractions: "
+                + ", ".join(f"{f:g}" for f in train_config.anchor_fractions)
+                + f"; eval every {train_config.anchor_eval_interval_updates} updates, "
+                f"{train_config.anchor_eval_games_per_anchor} games/anchor, "
+                f"{train_config.anchor_eval_num_envs} eval envs."
+            )
     run_summary = {
         "config": {
             "device": str(device),
@@ -545,8 +621,14 @@ def train():
             "total_timesteps": train_config.total_timesteps,
             "server_urls": server_urls,
             "team_pool": team_pool.describe() if team_pool is not None else None,
+            "anchor_eval_enabled": train_config.anchor_eval_enabled,
+            "anchor_fractions": list(train_config.anchor_fractions),
+            "anchor_eval_interval_updates": train_config.anchor_eval_interval_updates,
+            "anchor_eval_games_per_anchor": train_config.anchor_eval_games_per_anchor,
+            "anchor_eval_num_envs": train_config.anchor_eval_num_envs,
         },
         "updates": [],
+        "anchor_eval": [],
     }
 
     try:
@@ -907,6 +989,41 @@ def train():
                 else:
                     print(f"League updated (pool: {len(league.checkpoints)})")
 
+            # --- Anchor eval: snapshot if we crossed a threshold, eval on interval ---
+            if anchor_evaluator is not None:
+                new_anchor = anchor_evaluator.maybe_snapshot(
+                    agent,
+                    trainer.global_step,
+                    train_config.total_timesteps,
+                )
+                if new_anchor is not None:
+                    print(
+                        f"Anchor snapshot: fraction {new_anchor.fraction:g} "
+                        f"at step {new_anchor.step:,} -> {new_anchor.path}"
+                    )
+
+                eval_interval = train_config.anchor_eval_interval_updates
+                if (
+                    update % eval_interval == 0
+                    and anchor_evaluator.has_anchors()
+                ):
+                    eval_summary = anchor_evaluator.evaluate(
+                        update=update,
+                        global_step=trainer.global_step,
+                    )
+                    if eval_summary is not None:
+                        run_summary["anchor_eval"].append(eval_summary)
+                        summary_tokens = " | ".join(
+                            f"vs frac {row['anchor_fraction']:g}@step_{row['anchor_step']}: "
+                            f"{row['win_rate']:.1%} ({row['wins']}W/{row['losses']}L/{row['draws']}D, "
+                            f"CI {row['ci_low']:.2f}-{row['ci_high']:.2f})"
+                            for row in eval_summary["per_anchor"]
+                        )
+                        print(
+                            f"Anchor eval @update {update} ({eval_summary['eval_sec']:.1f}s): "
+                            + summary_tokens
+                        )
+
         # Flush any leftover preview samples before saving the final checkpoint.
         # num_updates is rarely a multiple of team_preview_update_interval, so up to
         # one interval's worth of samples would otherwise be collected but never used.
@@ -930,6 +1047,8 @@ def train():
             _write_run_summary(args.summary_path, run_summary)
         return run_summary
     finally:
+        if anchor_evaluator is not None:
+            anchor_evaluator.close()
         parallel_env.close()
         team_preview_batcher.close()
         league.close()
