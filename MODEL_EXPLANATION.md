@@ -646,7 +646,7 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
 ```python
 advantage = episode_reward - preview_value.detach()
 policy_loss = -(log_prob * advantage).mean()
-value_loss = 0.5 * (preview_value - episode_reward)**2.mean()
+value_loss = 0.5 * ((preview_value - episode_reward) ** 2).mean()
 ```
 
 The **preview value head** is a dedicated `ValueHead` instance used only as the REINFORCE baseline. Using the same battle-turn value head would be awkward because it is trained on per-turn state-value, whereas the preview head needs to predict the final return from a synthetic preview state.

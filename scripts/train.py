@@ -797,6 +797,9 @@ def train():
             if accumulated_preview_data and update % preview_interval == 0:
                 metrics.update(trainer.update_team_preview(accumulated_preview_data))
                 metrics["team_preview_batch_size"] = float(len(accumulated_preview_data))
+                # Clear unconditionally: non-finite preview losses are usually caused by
+                # something specific to this batch, so retaining the samples would risk
+                # re-triggering on the next flush.
                 accumulated_preview_data = []
             ppo_sec = time.perf_counter() - ppo_started
             parallel_env.refresh_prepared_team_previews()
@@ -903,6 +906,13 @@ def train():
                     print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
                 else:
                     print(f"League updated (pool: {len(league.checkpoints)})")
+
+        # Flush any leftover preview samples before saving the final checkpoint.
+        # num_updates is rarely a multiple of team_preview_update_interval, so up to
+        # one interval's worth of samples would otherwise be collected but never used.
+        if accumulated_preview_data:
+            trainer.update_team_preview(accumulated_preview_data)
+            accumulated_preview_data = []
 
         print("Training complete.")
         final_path = f"{train_config.checkpoint_dir}/final.pt"
