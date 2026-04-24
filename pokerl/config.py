@@ -82,3 +82,11 @@ class TrainingConfig:
     league_size: int = 12
     league_update_interval: int = 10
     league_coalesce_ms: float = 10.0
+
+    def __post_init__(self) -> None:
+        if self.tera_exploration_decay_updates < 0:
+            raise ValueError(
+                "tera_exploration_decay_updates must be >= 0 "
+                f"(got {self.tera_exploration_decay_updates}); "
+                "use 0 to skip decay and apply tera_exploration_end immediately."
+            )

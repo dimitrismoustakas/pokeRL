@@ -600,9 +600,10 @@ def train():
                 parallel_env.reset_timing()
             rollout_started = time.perf_counter()
 
-            # Linear decay of tera-exploration epsilon. Zero-length decay window means
-            # "apply end immediately"; negative times clamp to start.
-            decay_updates = max(0, train_config.tera_exploration_decay_updates)
+            # Linear decay of tera-exploration epsilon. A zero-length decay window
+            # means "skip decay, apply end immediately". Negative values are rejected
+            # by TrainingConfig validation.
+            decay_updates = train_config.tera_exploration_decay_updates
             if decay_updates == 0:
                 tera_eps = train_config.tera_exploration_end
             else:
