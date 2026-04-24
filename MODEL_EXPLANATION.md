@@ -904,9 +904,9 @@ Even with batching and multiple environments, Showdown battle latency dominates 
 
 ### 10.8 League diversity is bounded by a small rolling window
 
-With `league_size=12` and `league_update_interval=10`, the pool spans at most ~120 updates back. If the policy converges slowly, the pool can contain policies that are all very similar — no diversity benefit.
+With `league_size=12` and `league_update_interval=10`, the pool spans at most ~120 updates back. If the policy converges slowly, the pool can contain policies that are all very similar — no diversity benefit. There is also no diagnostic in place to detect strategic cycling (the current agent silently forgetting how to beat older policies).
 
-**Fix direction:** larger `league_size`, or a priority-replay scheme that maintains diverse checkpoints (e.g. keep a sample across different ELO tiers, or different seeds).
+**Fix direction:** larger `league_size`, or a priority-replay scheme that maintains diverse checkpoints (e.g. keep a sample across different ELO tiers, or different seeds). See [LEAGUE_IMPROVEMENTS.md](LEAGUE_IMPROVEMENTS.md) for a fuller design-space overview — evaluation harness, PFSP sampling, archiving, KL anchors, exploiter agents.
 
 ### 10.9 No explicit hazard / weather strategy
 
