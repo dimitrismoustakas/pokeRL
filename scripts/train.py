@@ -126,6 +126,18 @@ def parse_args() -> argparse.Namespace:
         help="PPO updates over which to linearly decay tera-exploration epsilon.",
     )
     parser.add_argument(
+        "--aux-hidden-info-coef",
+        type=float,
+        default=None,
+        help="Coefficient on the opponent hidden-info prediction loss (item/ability/tera/moves).",
+    )
+    parser.add_argument(
+        "--aux-opp-action-coef",
+        type=float,
+        default=None,
+        help="Coefficient on the opponent-action prediction loss (a1/a2/tera).",
+    )
+    parser.add_argument(
         "--league-coalesce-ms",
         type=float,
         default=None,
@@ -182,6 +194,8 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "tera_exploration_start": args.tera_exploration_start,
         "tera_exploration_end": args.tera_exploration_end,
         "tera_exploration_decay_updates": args.tera_exploration_decay_updates,
+        "aux_hidden_info_coef": args.aux_hidden_info_coef,
+        "aux_opp_action_coef": args.aux_opp_action_coef,
     }
     for field_name, value in overrides.items():
         if value is not None:
@@ -542,6 +556,8 @@ def train():
             "tera_exploration_start": train_config.tera_exploration_start,
             "tera_exploration_end": train_config.tera_exploration_end,
             "tera_exploration_decay_updates": train_config.tera_exploration_decay_updates,
+            "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
+            "aux_opp_action_coef": train_config.aux_opp_action_coef,
             "total_timesteps": train_config.total_timesteps,
             "server_urls": server_urls,
             "team_pool": team_pool.describe() if team_pool is not None else None,
@@ -695,6 +711,25 @@ def train():
                 dones_device_buffer = dones_t
                 rollout_profile["feedback_to_device_sec"] += time.perf_counter() - feedback_device_started
 
+                # Stack opponent actions for the aux head. Envs that didn't expose
+                # them (non-league opponents) leave opp_actions_valid=False and the
+                # PPO update masks those samples.
+                opp_actions_np = np.full((len(infos), 3), -1, dtype=np.int64)
+                opp_actions_valid_np = np.zeros(len(infos), dtype=bool)
+                for idx, info in enumerate(infos):
+                    if "opp_actions" in info:
+                        opp_actions_np[idx] = info["opp_actions"]
+                        opp_actions_valid_np[idx] = True
+                opp_actions_t = torch.from_numpy(opp_actions_np).to(device)
+                opp_actions_valid_t = torch.from_numpy(opp_actions_valid_np).to(device)
+
+                aux_label_obs_t = None
+                if np.any(dones) and all(key in next_obs for key in RolloutBuffer.AUX_LABEL_KEYS):
+                    aux_label_obs_t = {
+                        key: torch.from_numpy(next_obs[key]).to(device)
+                        for key in RolloutBuffer.AUX_LABEL_KEYS
+                    }
+
                 buffer_started = time.perf_counter()
                 buffer.add(
                     obs_for_buffer,
@@ -704,6 +739,9 @@ def train():
                     values_t,
                     rewards_t,
                     dones_t,
+                    opp_actions=opp_actions_t,
+                    opp_actions_valid=opp_actions_valid_t,
+                    aux_label_obs=aux_label_obs_t,
                 )
                 rollout_profile["buffer_add_sec"] += time.perf_counter() - buffer_started
 

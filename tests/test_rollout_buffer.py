@@ -13,7 +13,6 @@ from pokerl.config import TrainingConfig
 from pokerl.env.actions import (
     ACTIONS_PER_SLOT,
     FIRST_SLOT_MASK_ROW,
-    NUM_TERA_CHOICES,
     PASS_ACTION,
     SWITCH_OFFSET,
     TERA_NONE,
@@ -28,7 +27,7 @@ from pokerl.env.actions import (
     build_tera_action_mask,
 )
 from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
-from pokerl.env.observation import ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH
+from pokerl.env.observation import CONTINUOUS_DIM, ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH
 from pokerl.model.heads import ActionHead, MaskedSetAttention, TeamPreviewHead, ValueHead
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
@@ -59,6 +58,17 @@ def _mask(num_envs: int) -> dict[str, np.ndarray]:
 
 def _obs_to_tensor(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
     return {key: torch.from_numpy(value).to(device) for key, value in obs.items()}
+
+
+def _aux_obs(num_envs: int, item_idx: int) -> dict[str, np.ndarray]:
+    return {
+        "opp_item": np.full((num_envs, 6), item_idx, dtype=np.int64),
+        "opp_ability": np.full((num_envs, 6), 2, dtype=np.int64),
+        "opp_types": np.full((num_envs, 6, 3), 3, dtype=np.int64),
+        "opp_moves": np.full((num_envs, 6, 4), 4, dtype=np.int64),
+        "opp_continuous": np.zeros((num_envs, 6, CONTINUOUS_DIM), dtype=np.float32),
+        "opp_mask": np.zeros((num_envs, 6), dtype=bool),
+    }
 
 
 def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidden() -> None:
@@ -104,6 +114,51 @@ def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidd
     assert batch.obs["float_obs"].device == device
     assert torch.equal(batch.initial_hidden_h, expected_h)
     assert torch.equal(batch.initial_hidden_c, expected_c)
+    assert batch.aux_labels == {}
+    assert not batch.aux_label_valid.any()
+    assert not batch.opp_actions_valid.any()
+
+
+def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> None:
+    device = torch.device("cpu")
+    num_steps = 2
+    num_envs = 1
+    buffer = RolloutBuffer(num_steps, num_envs, _aux_obs(num_envs, 1), _mask(num_envs), device)
+    buffer.reset()
+
+    actions_t = torch.zeros((num_envs, 3), dtype=torch.long, device=device)
+    masks_t = {
+        key: torch.from_numpy(value).to(device)
+        for key, value in _mask(num_envs).items()
+    }
+    log_probs_t = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    values_t = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    rewards_t = torch.zeros(num_envs, dtype=torch.float32, device=device)
+
+    buffer.add(
+        _obs_to_tensor(_aux_obs(num_envs, 1), device),
+        actions_t,
+        masks_t,
+        log_probs_t,
+        values_t,
+        rewards_t,
+        torch.tensor([True], dtype=torch.bool, device=device),
+        aux_label_obs=_obs_to_tensor(_aux_obs(num_envs, 9), device),
+    )
+    buffer.add(
+        _obs_to_tensor(_aux_obs(num_envs, 3), device),
+        actions_t,
+        masks_t,
+        log_probs_t,
+        values_t,
+        rewards_t,
+        torch.tensor([False], dtype=torch.bool, device=device),
+    )
+
+    batch = buffer.compute_gae(torch.zeros(num_envs, dtype=torch.float32, device=device))
+
+    assert batch.aux_label_valid[:, 0].tolist() == [True, False]
+    assert batch.aux_labels["opp_item"][0, 0, 0].item() == 9
 
 
 def test_rollout_buffer_requires_a_complete_rollout_before_gae() -> None:
@@ -390,6 +445,28 @@ def test_action_head_matchup_features_distinguish_super_effective_and_resisted_t
 
     target_eff_feature = 14
     assert features[0, 0, target_eff_feature] > features[0, 1, target_eff_feature]
+
+
+def test_action_head_categorical_choice_matches_torch_distribution_for_evaluation() -> None:
+    logits = torch.tensor(
+        [
+            [1.5, -2.0, 0.25],
+            [-0.75, 0.5, 2.25],
+        ],
+        dtype=torch.float32,
+    )
+    actions = torch.tensor([0, 2], dtype=torch.long)
+
+    selected, log_prob, entropy = ActionHead._categorical_choice(
+        logits,
+        actions=actions,
+        greedy=False,
+    )
+    dist = torch.distributions.Categorical(logits=logits)
+
+    assert torch.equal(selected, actions)
+    assert torch.allclose(log_prob, dist.log_prob(actions))
+    assert torch.allclose(entropy, dist.entropy())
 
 
 def test_masked_set_attention_returns_zero_when_every_item_is_masked() -> None:

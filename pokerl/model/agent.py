@@ -8,9 +8,17 @@ import torch.nn as nn
 from ..config import ModelConfig
 from ..data import GameData
 from ..env.observation import CONTINUOUS_DIM, ROLE_BENCH
+from ..env.actions import ACTIONS_PER_SLOT, NUM_TERA_CHOICES
 from .encoders import PokemonEncoder, TeamEncoder, FieldEncoder, SpatialEncoder
 from .memory import build_memory
-from .heads import ActionHead, OpponentPreviewHead, TeamPreviewHead, ValueHead
+from .heads import (
+    ActionHead,
+    HiddenInfoHead,
+    OpponentActionHead,
+    OpponentPreviewHead,
+    TeamPreviewHead,
+    ValueHead,
+)
 
 
 def load_state_dict_compatible(
@@ -94,6 +102,21 @@ class PokeAgent(nn.Module):
         self.opponent_preview_head = OpponentPreviewHead(config.pokemon_out, memory_out)
         self.value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)
         self.preview_value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)
+
+        # --- Auxiliary heads (trained during PPO update only) ---
+        self.hidden_info_head = HiddenInfoHead(
+            pokemon_dim=config.pokemon_out,
+            num_items=game_data.num_items,
+            num_abilities=game_data.num_abilities,
+            num_types=game_data.num_types,
+            num_moves=game_data.num_moves,
+        )
+        self.opponent_action_head = OpponentActionHead(
+            context_dim=memory_out,
+            pokemon_dim=config.pokemon_out,
+            num_actions=ACTIONS_PER_SLOT,
+            num_tera_choices=NUM_TERA_CHOICES,
+        )
 
         # Optional: stat-based embedding init
         if config.init_embeddings_from_stats:

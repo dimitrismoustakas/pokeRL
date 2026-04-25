@@ -290,6 +290,9 @@ class LeaguePlayer(Player):
         self._prepared_preview_obs: dict[str, np.ndarray] | None = None
         self._prepared_preview_future: Future | None = None
         self._timing = None
+        # Most-recent (a1, a2, tera) chosen by this opponent. Read by the env
+        # after each turn resolves so the aux opponent-action head has labels.
+        self._last_actions: np.ndarray | None = None
 
     def stage_checkpoint(self, checkpoint_path: str) -> None:
         self._pending_checkpoint_path = checkpoint_path
@@ -339,6 +342,7 @@ class LeaguePlayer(Player):
         )
         self._pending_battle_obs = self._clone_obs(obs)
         self._pending_hidden = next_hidden
+        self._last_actions = np.asarray(actions, dtype=np.int64).copy()
 
         orders = []
         tera_slot_1, tera_slot_2 = decode_tera_choice(int(actions[2]))
@@ -393,6 +397,7 @@ class LeaguePlayer(Player):
         self._hidden = None
         self._pending_hidden = None
         self._pending_battle_obs = None
+        self._last_actions = None
 
     @staticmethod
     def _obs_equal(left: dict[str, np.ndarray], right: dict[str, np.ndarray]) -> bool:
