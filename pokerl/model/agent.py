@@ -130,6 +130,8 @@ class PokeAgent(nn.Module):
         actions: torch.Tensor | None = None,
         action_masks: dict[str, torch.Tensor] | None = None,
         tera_exploration_prob: float = 0.0,
+        tera_force_delay_prob: float = 0.0,
+        tera_force_delay_max_turn: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for battle turns.
 
@@ -143,6 +145,11 @@ class PokeAgent(nn.Module):
             tera_exploration_prob: epsilon for uniform-over-valid tera exploration
                 during rollout. Default 0.0 (policy only). Ignored when ``actions``
                 is provided (PPO update path).
+            tera_force_delay_prob: probability of converting early sampled tera
+                actions to no-tera during rollout. Ignored when ``actions`` is
+                provided (PPO update path).
+            tera_force_delay_max_turn: latest battle turn eligible for forced
+                no-tera exploration. 0 disables it.
 
         Returns dict with: actions, log_prob, entropy, value, hidden
         """
@@ -162,6 +169,8 @@ class PokeAgent(nn.Module):
             actions,
             battle_obs=obs,
             tera_exploration_prob=tera_exploration_prob,
+            tera_force_delay_prob=tera_force_delay_prob,
+            tera_force_delay_max_turn=tera_force_delay_max_turn,
         )
         value = self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 

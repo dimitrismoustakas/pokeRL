@@ -83,6 +83,14 @@ class TrainingConfig:
     tera_exploration_start: float = 0.15
     tera_exploration_end: float = 0.02
     tera_exploration_decay_updates: int = 2000
+    # Targeted anti-collapse exploration: on early turns, if the policy samples
+    # tera now, override that third action to no-tera with this decayed
+    # probability. This directly creates delayed-tera rollouts without changing
+    # the action/value model or reward.
+    tera_force_delay_start: float = 0.40
+    tera_force_delay_end: float = 0.03
+    tera_force_delay_decay_updates: int = 3000
+    tera_force_delay_max_turn: int = 3
 
     # League
     league_size: int = 12
@@ -95,4 +103,16 @@ class TrainingConfig:
                 "tera_exploration_decay_updates must be >= 0 "
                 f"(got {self.tera_exploration_decay_updates}); "
                 "use 0 to skip decay and apply tera_exploration_end immediately."
+            )
+        if self.tera_force_delay_decay_updates < 0:
+            raise ValueError(
+                "tera_force_delay_decay_updates must be >= 0 "
+                f"(got {self.tera_force_delay_decay_updates}); "
+                "use 0 to skip decay and apply tera_force_delay_end immediately."
+            )
+        if self.tera_force_delay_max_turn < 0:
+            raise ValueError(
+                "tera_force_delay_max_turn must be >= 0 "
+                f"(got {self.tera_force_delay_max_turn}); "
+                "use 0 to disable early-turn force-delay exploration."
             )

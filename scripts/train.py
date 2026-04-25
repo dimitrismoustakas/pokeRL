@@ -126,6 +126,30 @@ def parse_args() -> argparse.Namespace:
         help="PPO updates over which to linearly decay tera-exploration epsilon.",
     )
     parser.add_argument(
+        "--tera-force-delay-start",
+        type=float,
+        default=None,
+        help="Initial probability of forcing early sampled tera actions to no-tera during rollout.",
+    )
+    parser.add_argument(
+        "--tera-force-delay-end",
+        type=float,
+        default=None,
+        help="Final early-turn tera-delay probability after the decay window.",
+    )
+    parser.add_argument(
+        "--tera-force-delay-decay-updates",
+        type=int,
+        default=None,
+        help="PPO updates over which to linearly decay early-turn tera-delay exploration.",
+    )
+    parser.add_argument(
+        "--tera-force-delay-max-turn",
+        type=int,
+        default=None,
+        help="Apply forced tera delay only through this battle turn. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--aux-hidden-info-coef",
         type=float,
         default=None,
@@ -194,6 +218,10 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         "tera_exploration_start": args.tera_exploration_start,
         "tera_exploration_end": args.tera_exploration_end,
         "tera_exploration_decay_updates": args.tera_exploration_decay_updates,
+        "tera_force_delay_start": args.tera_force_delay_start,
+        "tera_force_delay_end": args.tera_force_delay_end,
+        "tera_force_delay_decay_updates": args.tera_force_delay_decay_updates,
+        "tera_force_delay_max_turn": args.tera_force_delay_max_turn,
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
         "aux_opp_action_coef": args.aux_opp_action_coef,
     }
@@ -206,6 +234,7 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
     if args.num_updates is not None:
         train_config.total_timesteps = args.num_updates * train_config.rollout_steps * env_config.num_envs
 
+    train_config.__post_init__()
     return model_config, env_config, train_config
 
 
@@ -556,6 +585,10 @@ def train():
             "tera_exploration_start": train_config.tera_exploration_start,
             "tera_exploration_end": train_config.tera_exploration_end,
             "tera_exploration_decay_updates": train_config.tera_exploration_decay_updates,
+            "tera_force_delay_start": train_config.tera_force_delay_start,
+            "tera_force_delay_end": train_config.tera_force_delay_end,
+            "tera_force_delay_decay_updates": train_config.tera_force_delay_decay_updates,
+            "tera_force_delay_max_turn": train_config.tera_force_delay_max_turn,
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
             "total_timesteps": train_config.total_timesteps,
@@ -616,8 +649,8 @@ def train():
                 parallel_env.reset_timing()
             rollout_started = time.perf_counter()
 
-            # Linear decay of tera-exploration epsilon. A zero-length decay window
-            # means "skip decay, apply end immediately". Negative values are rejected
+            # Linear decay of tera exploration. A zero-length decay window means
+            # "skip decay, apply end immediately". Negative values are rejected
             # by TrainingConfig validation.
             decay_updates = train_config.tera_exploration_decay_updates
             if decay_updates == 0:
@@ -628,6 +661,16 @@ def train():
                     train_config.tera_exploration_start
                     + (train_config.tera_exploration_end - train_config.tera_exploration_start)
                     * progress
+                )
+            delay_decay_updates = train_config.tera_force_delay_decay_updates
+            if delay_decay_updates == 0:
+                tera_force_delay_prob = train_config.tera_force_delay_end
+            else:
+                delay_progress = min(1.0, max(0.0, (update - 1) / delay_decay_updates))
+                tera_force_delay_prob = (
+                    train_config.tera_force_delay_start
+                    + (train_config.tera_force_delay_end - train_config.tera_force_delay_start)
+                    * delay_progress
                 )
             update_episode_rewards: list[float] = []
             update_episode_secs: list[float] = []
@@ -667,6 +710,8 @@ def train():
                         hidden,
                         action_masks=masks_t,
                         tera_exploration_prob=tera_eps,
+                        tera_force_delay_prob=tera_force_delay_prob,
+                        tera_force_delay_max_turn=train_config.tera_force_delay_max_turn,
                     )
                     rollout_profile["policy_forward_sec"] += time.perf_counter() - policy_started
 

@@ -27,7 +27,14 @@ from pokerl.env.actions import (
     build_tera_action_mask,
 )
 from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
-from pokerl.env.observation import CONTINUOUS_DIM, ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH
+from pokerl.env.observation import (
+    CONTINUOUS_DIM,
+    FIELD_TIMER_CAPS,
+    FIELD_TURN_OFFSET,
+    ROLE_ACTIVE_1,
+    ROLE_ACTIVE_2,
+    ROLE_BENCH,
+)
 from pokerl.model.heads import ActionHead, MaskedSetAttention, TeamPreviewHead, ValueHead
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
@@ -467,6 +474,65 @@ def test_action_head_categorical_choice_matches_torch_distribution_for_evaluatio
     assert torch.equal(selected, actions)
     assert torch.allclose(log_prob, dist.log_prob(actions))
     assert torch.allclose(entropy, dist.entropy())
+
+
+def test_action_head_force_delay_turns_early_sampled_tera_into_no_tera() -> None:
+    class FixedTeraScore(nn.Module):
+        def forward(self, query: torch.Tensor) -> torch.Tensor:
+            logits = torch.full((query.shape[0], 3), -1e8, dtype=query.dtype, device=query.device)
+            logits[:, TERA_SLOT_1] = 1e8
+            return logits
+
+    torch.manual_seed(0)
+    head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
+    head.tera_score = FixedTeraScore()
+    context = torch.zeros((1, 3))
+    active_reps = torch.zeros((1, 2, 2))
+    own_team_reps = torch.zeros((1, 6, 2))
+    opp_team_reps = torch.zeros((1, 6, 2))
+    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
+    opp_active_reps = torch.zeros((1, 2, 2))
+    masks = {
+        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "can_tera": torch.tensor([[True, False]], dtype=torch.bool),
+    }
+    masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
+    masks["joint"][0, 1, 0] = True
+    battle_obs = {
+        "field": torch.zeros((1, FIELD_TURN_OFFSET + 1), dtype=torch.float32),
+    }
+    battle_obs["field"][0, FIELD_TURN_OFFSET] = 1.0 / float(FIELD_TIMER_CAPS["turn"])
+
+    out = head(
+        context,
+        active_reps,
+        own_team_reps,
+        opp_team_reps,
+        opp_reserve_mask,
+        opp_active_reps,
+        masks,
+        battle_obs=battle_obs,
+        tera_force_delay_prob=1.0,
+        tera_force_delay_max_turn=3,
+    )
+
+    assert out["actions"][0, 2].item() == TERA_NONE
+
+    battle_obs["field"][0, FIELD_TURN_OFFSET] = 4.0 / float(FIELD_TIMER_CAPS["turn"])
+    out_after_window = head(
+        context,
+        active_reps,
+        own_team_reps,
+        opp_team_reps,
+        opp_reserve_mask,
+        opp_active_reps,
+        masks,
+        battle_obs=battle_obs,
+        tera_force_delay_prob=1.0,
+        tera_force_delay_max_turn=3,
+    )
+
+    assert out_after_window["actions"][0, 2].item() == TERA_SLOT_1
 
 
 def test_masked_set_attention_returns_zero_when_every_item_is_masked() -> None:

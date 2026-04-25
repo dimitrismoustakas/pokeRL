@@ -392,13 +392,17 @@ The tera mask is **derived internally** inside `ActionHead.forward(...)` from `m
 
 #### Tera exploration during rollout
 
-[heads.py:326-336](pokerl/model/heads.py#L326-L336) and [config.py:70-79](pokerl/config.py#L70-L79). The `tera_exploration_prob` parameter enables uniform-over-valid exploration during rollout collection. With probability `epsilon`, on any batch item that has ≥ 2 valid tera options, the policy's sampled tera is replaced with a uniform draw over the valid set.
+[heads.py](pokerl/model/heads.py) and [config.py](pokerl/config.py). The `tera_exploration_prob` parameter enables uniform-over-valid exploration during rollout collection. With probability `epsilon`, on any batch item that has ≥ 2 valid tera options, the policy's sampled tera is replaced with a uniform draw over the valid set.
 
 **Why:** once the policy tera's on turn 1, `can_tera` is false for every later turn in the episode. Without exploration the policy never observes the counterfactual trajectory where it saved tera, which traps it in a local optimum where tera fires immediately regardless of situation.
 
-The stored log-prob for the taken action is always computed under the **policy** distribution (not the mixed behavior distribution), so PPO's importance ratio is slightly off-policy. For small `epsilon` this is well within the clip window. Exploration is only active on the rollout path (`actions is None`); the PPO update path passes stored actions and is unaffected.
+Uniform-over-valid exploration is complemented by targeted early-turn delay. If `tera_force_delay_prob > 0`, the rollout path can convert a sampled tera action into `no tera` through `tera_force_delay_max_turn`. This does not change the model architecture or reward; it directly creates delayed-tera trajectories so the value function and policy can compare "tera now" against "save tera".
+
+The stored log-prob for the taken action is always computed under the **policy** distribution (not the mixed behavior distribution), so PPO's importance ratio is slightly off-policy. For small, decayed probabilities this is kept within the clip window. Exploration is only active on the rollout path (`actions is None`); the PPO update path passes stored actions and is unaffected.
 
 Epsilon decays linearly from `tera_exploration_start = 0.15` to `tera_exploration_end = 0.02` across `tera_exploration_decay_updates = 2000` PPO updates.
+
+Forced delay decays linearly from `tera_force_delay_start = 0.40` to `tera_force_delay_end = 0.03` across `tera_force_delay_decay_updates = 3000` PPO updates, and applies only through `tera_force_delay_max_turn = 3`.
 
 #### ActionHead outputs
 
@@ -510,7 +514,8 @@ obs dict
         own_reps (6×128), opp_reps (6×128), opp_active_reps (2×128) }
   → LSTMMemory:     context (320) → memory_out (256), (h, c)
   → ActionHead:     (memory_out, active_reps, own_reps, opp_reps, opp_bench_mask,
-                     opp_active_reps, masks, battle_obs, tera_exploration_prob)
+                     opp_active_reps, masks, battle_obs,
+                     tera_exploration_prob, tera_force_delay_prob)
                     → { actions (3), log_prob, entropy }
   → ValueHead:      (memory_out, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
                     → value
@@ -851,6 +856,10 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `tera_exploration_start` | 0.15 | initial tera exploration ε |
 | `tera_exploration_end` | 0.02 | final tera exploration ε |
 | `tera_exploration_decay_updates` | 2000 | linear decay horizon (updates) |
+| `tera_force_delay_start` | 0.40 | initial probability of converting early sampled tera to no-tera |
+| `tera_force_delay_end` | 0.03 | final early-turn force-delay probability |
+| `tera_force_delay_decay_updates` | 3000 | linear force-delay decay horizon (updates) |
+| `tera_force_delay_max_turn` | 3 | latest battle turn eligible for forced tera delay |
 | `total_timesteps` | 10M | training budget |
 | `log_interval` | 10 | console log every N updates |
 | `save_interval` | 100 | save checkpoint every N updates |

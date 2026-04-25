@@ -13,9 +13,10 @@ from ..env.actions import (
     NUM_TARGETS,
     NUM_TERA_CHOICES,
     TARGET_NONE,
+    TERA_NONE,
     decode_action,
 )
-from ..env.observation import TERASTALLIZED_OFFSET
+from ..env.observation import FIELD_TIMER_CAPS, FIELD_TURN_OFFSET, TERASTALLIZED_OFFSET
 
 
 class MaskedSetAttention(nn.Module):
@@ -212,6 +213,8 @@ class ActionHead(nn.Module):
         greedy: bool = False,
         battle_obs: dict[str, torch.Tensor] | None = None,
         tera_exploration_prob: float = 0.0,
+        tera_force_delay_prob: float = 0.0,
+        tera_force_delay_max_turn: int = 0,
     ) -> dict[str, torch.Tensor]:
         if "joint" not in masks or "can_tera" not in masks:
             raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
@@ -336,11 +339,21 @@ class ActionHead(nn.Module):
                 explore = (
                     torch.rand(context.shape[0], device=context.device) < tera_exploration_prob
                 ) & has_choice
-                if explore.any():
-                    uniform_logits = torch.zeros_like(tera_logits).masked_fill(~tera_mask, -1e8)
-                    uniform_probs = torch.softmax(uniform_logits, dim=-1)
-                    uniform_sample = torch.multinomial(uniform_probs, 1).squeeze(1)
-                    tera_choice = torch.where(explore, uniform_sample, tera_choice)
+                uniform_logits = torch.zeros_like(tera_logits).masked_fill(~tera_mask, -1e8)
+                uniform_probs = torch.softmax(uniform_logits, dim=-1)
+                uniform_sample = torch.multinomial(uniform_probs, 1).squeeze(1)
+                tera_choice = torch.where(explore, uniform_sample, tera_choice)
+            if tera_force_delay_prob > 0.0 and tera_force_delay_max_turn > 0 and not greedy:
+                early_turn = self._early_turn_mask(
+                    battle_obs=battle_obs,
+                    batch_size=batch_size,
+                    device=device,
+                    max_turn=tera_force_delay_max_turn,
+                )
+                force_delay = (
+                    torch.rand(batch_size, device=device) < tera_force_delay_prob
+                ) & early_turn & (tera_choice != TERA_NONE)
+                tera_choice = torch.where(force_delay, torch.zeros_like(tera_choice), tera_choice)
         else:
             tera_choice = actions[:, 2]
 
@@ -375,6 +388,22 @@ class ActionHead(nn.Module):
         selected_log_prob = log_probs.gather(1, selected.unsqueeze(1)).squeeze(1)
         entropy = -(probs * log_probs).sum(dim=-1)
         return selected, selected_log_prob, entropy
+
+    @staticmethod
+    def _early_turn_mask(
+        *,
+        battle_obs: dict[str, torch.Tensor] | None,
+        batch_size: int,
+        device: torch.device,
+        max_turn: int,
+    ) -> torch.Tensor:
+        if battle_obs is None or "field" not in battle_obs:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+        field = battle_obs["field"]
+        if field.shape[-1] <= FIELD_TURN_OFFSET:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+        max_turn_feature = max_turn / float(FIELD_TIMER_CAPS["turn"])
+        return field[:, FIELD_TURN_OFFSET] <= max_turn_feature + 1e-6
 
     def _score_actions(
         self,
