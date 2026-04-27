@@ -122,7 +122,7 @@ class RolloutBuffer:
         self._opp_actions_valid = torch.zeros((num_steps, num_envs), dtype=torch.bool, device=device)
         # Tracks the timestep within the current rollout at which each env's
         # active episode began. Used to retroactively fill aux labels on done.
-        self._episode_start = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self._episode_start = [0] * num_envs
 
     def add(
         self,
@@ -136,6 +136,7 @@ class RolloutBuffer:
         opp_actions: torch.Tensor | None = None,
         opp_actions_valid: torch.Tensor | None = None,
         aux_label_obs: dict[str, torch.Tensor] | None = None,
+        done_env_indices: np.ndarray | list[int] | tuple[int, ...] | None = None,
     ) -> None:
         if self.step >= self.num_steps:
             raise IndexError(
@@ -166,11 +167,15 @@ class RolloutBuffer:
         # step gets the terminal opponent state copied into every timestep from
         # episode start through the done step.
         if self._aux_enabled:
-            done_envs = dones.detach().nonzero(as_tuple=False).squeeze(-1)
-            if done_envs.numel() > 0:
+            if done_env_indices is None:
+                done_envs = dones.detach().nonzero(as_tuple=False).squeeze(-1).tolist()
+            else:
+                done_envs = done_env_indices
+            if len(done_envs) > 0:
                 label_obs = aux_label_obs if aux_label_obs is not None else obs
-                for env_idx in done_envs.tolist():
-                    start = int(self._episode_start[env_idx].item())
+                for env_idx_raw in done_envs:
+                    env_idx = int(env_idx_raw)
+                    start = self._episode_start[env_idx]
                     for key in self.AUX_LABEL_KEYS:
                         label_value = label_obs[key][env_idx].detach()
                         self._aux_labels[key][start : slot + 1, env_idx].copy_(
@@ -238,7 +243,7 @@ class RolloutBuffer:
         self._opp_actions.fill_(-1)
         self._opp_actions_valid.fill_(False)
         # New rollout starts a fresh episode-start tracker for every env.
-        self._episode_start.zero_()
+        self._episode_start = [0] * self.num_envs
 
         if initial_hidden is None:
             return

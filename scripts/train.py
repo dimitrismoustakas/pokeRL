@@ -10,7 +10,6 @@ Usage:
 import argparse
 import asyncio
 import json
-import socket
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +23,8 @@ from pokerl.model.agent import PokeAgent
 from pokerl.env.showdown_env import (
     BattleEnv,
     ParallelBattleEnv,
+    battlestream_summary,
+    default_showdown_dir,
 )
 from pokerl.team_pool import TeamPool, default_team_pool_manifest_path, load_team_pool
 from pokerl.training.rollout import RolloutBuffer
@@ -45,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-steps", type=int, default=None, help="Override rollout steps collected per update.")
     parser.add_argument("--num-updates", type=int, default=None, help="Override how many rollout/PPO updates to run.")
     parser.add_argument("--total-timesteps", type=int, default=None, help="Override the total environment steps to train for.")
+    parser.add_argument(
+        "--collect-timing",
+        action="store_true",
+        help="Collect detailed rollout/env micro-profiles even without --summary-path.",
+    )
     parser.add_argument("--num-epochs", type=int, default=None, help="Override PPO epochs per update.")
     parser.add_argument("--num-minibatches", type=int, default=None, help="Override PPO minibatches per update.")
     parser.add_argument(
@@ -57,9 +63,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-interval", type=int, default=None, help="Override checkpoint save frequency in updates.")
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint output directory.")
     parser.add_argument(
-        "--server-urls",
+        "--showdown-dir",
         default=None,
-        help="Comma-separated server URLs to shard envs across, for example localhost:8000,localhost:8001.",
+        help="Pokemon Showdown checkout used by local BattleStream workers.",
+    )
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=None,
+        help="Local BattleStream worker process count. Defaults from env count and CPU count.",
+    )
+    parser.add_argument(
+        "--battles-per-worker",
+        type=int,
+        default=None,
+        help="Maximum concurrent local battles per worker. Defaults from num-envs and worker count.",
+    )
+    parser.add_argument(
+        "--pool-mode",
+        choices=("single", "shared"),
+        default=None,
+        help="Local BattleStream worker mode. Defaults to shared.",
+    )
+    parser.add_argument(
+        "--runtime-loop-count",
+        type=int,
+        default=None,
+        help="Number of runtime loops used by local BattleStream workers. Defaults to up to 4.",
+    )
+    parser.add_argument(
+        "--opponent-groups",
+        type=int,
+        default=None,
+        help="Number of independently sampled league checkpoints across envs. Defaults to 2 when possible.",
     )
     parser.add_argument(
         "--team-pool-format",
@@ -201,6 +237,17 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         env_config.pick_size = args.pick_size
         model_config.pick_size = args.pick_size
 
+    if args.showdown_dir is not None:
+        env_config.showdown_dir = args.showdown_dir
+    if args.worker_count is not None:
+        env_config.worker_count = args.worker_count
+    if args.battles_per_worker is not None:
+        env_config.battles_per_worker = args.battles_per_worker
+    if args.pool_mode is not None:
+        env_config.pool_mode = args.pool_mode
+    if args.runtime_loop_count is not None:
+        env_config.runtime_loop_count = args.runtime_loop_count
+
     overrides = {
         "rollout_steps": args.rollout_steps,
         "total_timesteps": args.total_timesteps,
@@ -239,17 +286,12 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
 
 
 def make_league_opponent_factory(
-    env_config: EnvConfig,
     league: League,
     checkpoint_path: str | None = None,
 ):
-    """Create a league opponent factory bound to a specific env's server URL."""
-    server_url = env_config.server_url
-
     def league_factory(loop: asyncio.AbstractEventLoop):
         opponent = league.make_opponent(
             loop,
-            server_url=server_url,
             checkpoint_path=checkpoint_path,
         )
         if opponent is None:
@@ -262,30 +304,14 @@ def make_league_opponent_factory(
     return league_factory
 
 
-def parse_server_urls(raw_value: str | None, default_url: str) -> list[str]:
-    if not raw_value:
-        return [default_url]
-    server_urls = [item.strip() for item in raw_value.split(",") if item.strip()]
-    if not server_urls:
-        raise ValueError("--server-urls did not contain any valid host:port entries.")
-    return server_urls
-
-
-def _port_open(server_url: str) -> bool:
-    host, port_raw = server_url.split(":", maxsplit=1)
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(1.0)
-        return sock.connect_ex((host, int(port_raw))) == 0
-
-
-def ensure_server_urls_ready(server_urls: list[str]) -> None:
-    missing = [url for url in server_urls if not _port_open(url)]
-    if missing:
-        missing_ports = ", ".join(missing)
-        raise SystemExit(
-            f"The following Showdown servers are not reachable: {missing_ports}. "
-            "Start them first with scripts/start_showdown_server.ps1 or choose active ports."
-        )
+def resolve_opponent_groups(raw_value: int | None, num_envs: int) -> int:
+    if num_envs <= 0:
+        raise ValueError("num_envs must be positive.")
+    if raw_value is None:
+        return min(2, num_envs)
+    if raw_value <= 0:
+        raise ValueError("--opponent-groups must be positive.")
+    return min(raw_value, num_envs)
 
 
 def make_team_preview_fn(batcher: TeamPreviewBatcher):
@@ -331,21 +357,42 @@ def make_team_pair_provider(team_pool: TeamPool | None):
     return provider
 
 
+def _sample_league_checkpoint(league: League, *, action: str) -> str:
+    checkpoint_path = league.sample_checkpoint_path()
+    if checkpoint_path is None:
+        raise RuntimeError(
+            f"League opponent {action} requested, but the league is empty. "
+            "This should not happen if the league was seeded before training."
+        )
+    return checkpoint_path
+
+
+def _sample_checkpoints_by_group(league: League, opponent_groups: int) -> dict[int, str]:
+    return {
+        opponent_group: _sample_league_checkpoint(league, action="assignment")
+        for opponent_group in range(opponent_groups)
+    }
+
+
 def make_envs(
     env_config: EnvConfig,
     game_data: GameData,
     league: League,
-    server_urls: list[str],
+    opponent_groups: int,
     team_preview_fn,
     team_preview_batcher: TeamPreviewBatcher | None = None,
     team_pair_provider=None,
+    collect_timing: bool = False,
 ) -> ParallelBattleEnv:
     """Create parallel battle environments backed by league opponents."""
     envs = []
+    checkpoint_by_group = _sample_checkpoints_by_group(league, opponent_groups)
     for i in range(env_config.num_envs):
-        env_server_url = server_urls[i % len(server_urls)]
-        env_instance_config = replace(env_config, server_url=env_server_url)
-        opponent_factory = make_league_opponent_factory(env_instance_config, league)
+        env_instance_config = replace(env_config, opponent_group=i % opponent_groups)
+        opponent_factory = make_league_opponent_factory(
+            league,
+            checkpoint_path=checkpoint_by_group[env_instance_config.opponent_group],
+        )
         env = BattleEnv(
             env_instance_config,
             game_data,
@@ -353,9 +400,10 @@ def make_envs(
             team_preview_fn=team_preview_fn,
             team_preview_batcher=team_preview_batcher,
             team_pair_provider=team_pair_provider,
+            collect_timing=collect_timing,
         )
         envs.append(env)
-    return ParallelBattleEnv(envs)
+    return ParallelBattleEnv(envs, collect_timing=collect_timing)
 
 
 def _sample_refresh_assignments(
@@ -363,18 +411,13 @@ def _sample_refresh_assignments(
     league: League,
 ) -> list[tuple[BattleEnv, str]]:
     assignments: list[tuple[BattleEnv, str]] = []
-    checkpoint_by_server: dict[str, str] = {}
+    checkpoint_by_group: dict[int, str] = {}
     for env in parallel_env.envs:
-        server_url = env.config.server_url
-        checkpoint_path = checkpoint_by_server.get(server_url)
+        opponent_group = int(env.config.opponent_group)
+        checkpoint_path = checkpoint_by_group.get(opponent_group)
         if checkpoint_path is None:
-            checkpoint_path = league.sample_checkpoint_path()
-            if checkpoint_path is None:
-                raise RuntimeError(
-                    "League opponent refresh requested, but the league is empty. "
-                    "This should not happen if the league was seeded before training."
-                )
-            checkpoint_by_server[server_url] = checkpoint_path
+            checkpoint_path = _sample_league_checkpoint(league, action="refresh")
+            checkpoint_by_group[opponent_group] = checkpoint_path
         assignments.append((env, checkpoint_path))
     return assignments
 
@@ -383,15 +426,15 @@ def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
     """Swap out opponents in existing environments.
 
     Called periodically so the agent faces a freshly sampled set of past
-    selves. All envs on the same Showdown server share one sampled checkpoint,
-    which keeps opponent inference batches large on small local setups.
+    selves. Envs in the same opponent group share one sampled checkpoint, which
+    keeps opponent inference batches large on local setups.
     """
     assignments = _sample_refresh_assignments(parallel_env, league)
     for env, checkpoint_path in assignments:
         if env.stage_next_opponent_checkpoint(checkpoint_path):
             continue
         env.set_next_opponent(
-            make_league_opponent_factory(env.config, league, checkpoint_path=checkpoint_path)
+            make_league_opponent_factory(league, checkpoint_path=checkpoint_path)
         )
 
 
@@ -503,13 +546,21 @@ def train():
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
     run_started = time.perf_counter()
-    collect_timing = args.summary_path is not None
+    collect_timing = args.summary_path is not None or args.collect_timing
 
     print(f"Device: {device}")
 
     model_config, env_config, train_config = build_configs(args)
-    server_urls = parse_server_urls(args.server_urls, env_config.server_url)
-    ensure_server_urls_ready(server_urls)
+    if env_config.showdown_dir is None:
+        env_config.showdown_dir = default_showdown_dir()
+    if env_config.showdown_dir is None:
+        raise SystemExit(
+            "--showdown-dir is required. Set it to a Pokemon Showdown checkout, "
+            "or set POKERL_SHOWDOWN_DIR."
+        )
+    if not Path(env_config.showdown_dir).exists():
+        raise SystemExit(f"Pokemon Showdown checkout not found: {env_config.showdown_dir}")
+    opponent_groups = resolve_opponent_groups(args.opponent_groups, env_config.num_envs)
     team_pool = load_requested_team_pool(args)
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
@@ -561,10 +612,11 @@ def train():
         env_config,
         game_data,
         league,
-        server_urls,
+        opponent_groups,
         team_preview_fn=team_preview_fn,
         team_preview_batcher=team_preview_batcher,
         team_pair_provider=team_pair_provider,
+        collect_timing=collect_timing,
     )
     run_summary = {
         "config": {
@@ -592,7 +644,9 @@ def train():
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
             "total_timesteps": train_config.total_timesteps,
-            "server_urls": server_urls,
+            "backend": "local_battlestream",
+            "opponent_groups": opponent_groups,
+            "battlestream": battlestream_summary(env_config),
             "team_pool": team_pool.describe() if team_pool is not None else None,
         },
         "updates": [],
@@ -619,12 +673,26 @@ def train():
         mask_device_buffers: dict[str, torch.Tensor] | None = None
         rewards_device_buffer: torch.Tensor | None = None
         dones_device_buffer: torch.Tensor | None = None
+        opp_actions_np_buffer = np.empty((env_config.num_envs, 3), dtype=np.int64)
+        opp_actions_valid_np_buffer = np.empty(env_config.num_envs, dtype=bool)
+        opp_actions_device_buffer: torch.Tensor | None = None
+        opp_actions_valid_device_buffer: torch.Tensor | None = None
+        aux_label_obs_device_buffers: dict[str, torch.Tensor] | None = None
         num_updates = train_config.total_timesteps // steps_per_update
         updates_done = trainer.global_step // steps_per_update
 
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")
-        print(f"Server URLs: {', '.join(server_urls)}")
+        print("Backend: local BattleStream")
+        print(f"Opponent groups: {opponent_groups}")
+        local_summary = battlestream_summary(env_config)
+        print(
+            "Local BattleStream: "
+            f"workers={local_summary['worker_count']} "
+            f"battles/worker={local_summary['max_battles_per_worker']} "
+            f"pool={local_summary['pool_mode']} "
+            f"runtime_loops={local_summary['runtime_loop_count']}"
+        )
         print(f"Initial reset: {initial_reset_sec:.2f}s")
         if updates_done:
             print(f"Resuming from update {updates_done + 1} / {num_updates}")
@@ -680,31 +748,38 @@ def train():
             update_episode_opponent_max_calls_same_turn: list[int] = []
             update_pathological_episodes: list[dict[str, object]] = []
             update_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
-            rollout_profile = {
-                "obs_to_device_sec": 0.0,
-                "mask_to_device_sec": 0.0,
-                "policy_forward_sec": 0.0,
-                "policy_postprocess_sec": 0.0,
-                "env_step_sec": 0.0,
-                "feedback_to_device_sec": 0.0,
-                "buffer_add_sec": 0.0,
-                "hidden_reset_sec": 0.0,
-            }
+            rollout_profile = {}
+            if collect_timing:
+                rollout_profile = {
+                    "obs_to_device_sec": 0.0,
+                    "mask_to_device_sec": 0.0,
+                    "policy_forward_sec": 0.0,
+                    "policy_postprocess_sec": 0.0,
+                    "env_step_sec": 0.0,
+                    "feedback_to_device_sec": 0.0,
+                    "buffer_add_sec": 0.0,
+                    "hidden_reset_sec": 0.0,
+                }
 
             # --- Collect rollout ---
             for step in range(train_config.rollout_steps):
                 with torch.no_grad():
-                    obs_device_started = time.perf_counter()
+                    if collect_timing:
+                        obs_device_started = time.perf_counter()
                     obs_t = obs_to_device(obs, device, buffers=obs_device_buffers)
                     obs_device_buffers = obs_t
-                    rollout_profile["obs_to_device_sec"] += time.perf_counter() - obs_device_started
+                    if collect_timing:
+                        rollout_profile["obs_to_device_sec"] += time.perf_counter() - obs_device_started
 
-                    mask_device_started = time.perf_counter()
+                    if collect_timing:
+                        mask_device_started = time.perf_counter()
                     masks_t = action_masks_to_device(masks, device, buffers=mask_device_buffers)
                     mask_device_buffers = masks_t
-                    rollout_profile["mask_to_device_sec"] += time.perf_counter() - mask_device_started
+                    if collect_timing:
+                        rollout_profile["mask_to_device_sec"] += time.perf_counter() - mask_device_started
 
-                    policy_started = time.perf_counter()
+                    if collect_timing:
+                        policy_started = time.perf_counter()
                     out = agent(
                         obs_t,
                         hidden,
@@ -713,15 +788,18 @@ def train():
                         tera_force_delay_prob=tera_force_delay_prob,
                         tera_force_delay_max_turn=train_config.tera_force_delay_max_turn,
                     )
-                    rollout_profile["policy_forward_sec"] += time.perf_counter() - policy_started
+                    if collect_timing:
+                        rollout_profile["policy_forward_sec"] += time.perf_counter() - policy_started
 
-                    policy_post_started = time.perf_counter()
+                    if collect_timing:
+                        policy_post_started = time.perf_counter()
                     actions_t = out["actions"]
                     log_probs_t = out["log_prob"]
                     values_t = out["value"]
                     actions = actions_t.cpu().numpy()
                     hidden = out["hidden"]
-                    rollout_profile["policy_postprocess_sec"] += time.perf_counter() - policy_post_started
+                    if collect_timing:
+                        rollout_profile["policy_postprocess_sec"] += time.perf_counter() - policy_post_started
                     if device.type == "cpu":
                         obs_for_buffer = {
                             key: value.detach().clone()
@@ -735,11 +813,14 @@ def train():
                         obs_for_buffer = obs_t
                         masks_for_buffer = masks_t
 
-                env_step_started = time.perf_counter()
+                if collect_timing:
+                    env_step_started = time.perf_counter()
                 next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
-                rollout_profile["env_step_sec"] += time.perf_counter() - env_step_started
+                if collect_timing:
+                    rollout_profile["env_step_sec"] += time.perf_counter() - env_step_started
 
-                feedback_device_started = time.perf_counter()
+                if collect_timing:
+                    feedback_device_started = time.perf_counter()
                 rewards_t = array_to_device(
                     rewards,
                     device,
@@ -754,28 +835,45 @@ def train():
                 )
                 rewards_device_buffer = rewards_t
                 dones_device_buffer = dones_t
-                rollout_profile["feedback_to_device_sec"] += time.perf_counter() - feedback_device_started
+                if collect_timing:
+                    rollout_profile["feedback_to_device_sec"] += time.perf_counter() - feedback_device_started
 
                 # Stack opponent actions for the aux head. Envs that didn't expose
                 # them (non-league opponents) leave opp_actions_valid=False and the
                 # PPO update masks those samples.
-                opp_actions_np = np.full((len(infos), 3), -1, dtype=np.int64)
-                opp_actions_valid_np = np.zeros(len(infos), dtype=bool)
+                opp_actions_np_buffer.fill(-1)
+                opp_actions_valid_np_buffer.fill(False)
                 for idx, info in enumerate(infos):
                     if "opp_actions" in info:
-                        opp_actions_np[idx] = info["opp_actions"]
-                        opp_actions_valid_np[idx] = True
-                opp_actions_t = torch.from_numpy(opp_actions_np).to(device)
-                opp_actions_valid_t = torch.from_numpy(opp_actions_valid_np).to(device)
+                        opp_actions_np_buffer[idx] = info["opp_actions"]
+                        opp_actions_valid_np_buffer[idx] = True
+                opp_actions_t = array_to_device(
+                    opp_actions_np_buffer,
+                    device,
+                    dtype=torch.long,
+                    buffer=opp_actions_device_buffer,
+                )
+                opp_actions_valid_t = array_to_device(
+                    opp_actions_valid_np_buffer,
+                    device,
+                    dtype=torch.bool,
+                    buffer=opp_actions_valid_device_buffer,
+                )
+                opp_actions_device_buffer = opp_actions_t
+                opp_actions_valid_device_buffer = opp_actions_valid_t
 
                 aux_label_obs_t = None
-                if np.any(dones) and all(key in next_obs for key in RolloutBuffer.AUX_LABEL_KEYS):
-                    aux_label_obs_t = {
-                        key: torch.from_numpy(next_obs[key]).to(device)
-                        for key in RolloutBuffer.AUX_LABEL_KEYS
-                    }
+                done_env_indices = np.flatnonzero(dones)
+                if done_env_indices.size and all(key in next_obs for key in RolloutBuffer.AUX_LABEL_KEYS):
+                    aux_label_obs_t = obs_to_device(
+                        {key: next_obs[key] for key in RolloutBuffer.AUX_LABEL_KEYS},
+                        device,
+                        buffers=aux_label_obs_device_buffers,
+                    )
+                    aux_label_obs_device_buffers = aux_label_obs_t
 
-                buffer_started = time.perf_counter()
+                if collect_timing:
+                    buffer_started = time.perf_counter()
                 buffer.add(
                     obs_for_buffer,
                     actions_t,
@@ -787,16 +885,20 @@ def train():
                     opp_actions=opp_actions_t,
                     opp_actions_valid=opp_actions_valid_t,
                     aux_label_obs=aux_label_obs_t,
+                    done_env_indices=done_env_indices,
                 )
-                rollout_profile["buffer_add_sec"] += time.perf_counter() - buffer_started
+                if collect_timing:
+                    rollout_profile["buffer_add_sec"] += time.perf_counter() - buffer_started
 
                 # Reset hidden state for done environments
                 if hidden is not None:
-                    hidden_reset_started = time.perf_counter()
+                    if collect_timing:
+                        hidden_reset_started = time.perf_counter()
                     h, c = hidden
                     not_done = (~dones_t).to(h.dtype).view(1, dones_t.shape[0], 1)
                     hidden = (h * not_done, c * not_done)
-                    rollout_profile["hidden_reset_sec"] += time.perf_counter() - hidden_reset_started
+                    if collect_timing:
+                        rollout_profile["hidden_reset_sec"] += time.perf_counter() - hidden_reset_started
 
                 # Track episode rewards and team preview decisions
                 for info in infos:
@@ -847,7 +949,8 @@ def train():
                 obs, masks = next_obs, next_masks
 
             rollout_sec = time.perf_counter() - rollout_started
-            rollout_profile["rollout_sec"] = rollout_sec
+            if collect_timing:
+                rollout_profile["rollout_sec"] = rollout_sec
             env_profile = parallel_env.snapshot_timing() if collect_timing else {}
             parallel_env.wait_for_prepared_team_previews()
             refresh_after_update = (
@@ -957,7 +1060,7 @@ def train():
                     f"Update {update}/{num_updates} | "
                     f"Step {trainer.global_step:,} | "
                     f"Envs {env_config.num_envs} | "
-                    f"Servers {len(server_urls)} | "
+                    f"Opp groups {opponent_groups} | "
                     f"Avg SPS {sps:.0f} | "
                     f"Upd SPS {update_steps_per_second:.0f} | "
                     f"Rollout {rollout_sec:.2f}s | "

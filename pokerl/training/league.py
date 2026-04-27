@@ -26,7 +26,11 @@ from ..env.actions import (
     build_policy_action_masks,
     decode_tera_choice,
 )
-from ..env.showdown_env import make_local_account_configuration, showdown_log_level
+from ..env.showdown_env import (
+    make_battlestream_configuration,
+    make_local_account_configuration,
+    showdown_log_level,
+)
 
 
 @dataclass
@@ -238,6 +242,18 @@ class _LeagueInferenceService:
         agent: PokeAgent,
         requests: list[_InferenceRequest],
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if all(request.hidden is not None for request in requests):
+            return (
+                torch.cat(
+                    [self._to_inference_device(request.hidden[0]) for request in requests],
+                    dim=1,
+                ),
+                torch.cat(
+                    [self._to_inference_device(request.hidden[1]) for request in requests],
+                    dim=1,
+                ),
+            )
+
         hidden_batch = agent.initial_hidden(len(requests))
         if hidden_batch is None:
             return None
@@ -247,9 +263,16 @@ class _LeagueInferenceService:
             if request.hidden is None:
                 continue
             h_req, c_req = request.hidden
-            h_batch[:, index : index + 1].copy_(h_req.to(self._device))
-            c_batch[:, index : index + 1].copy_(c_req.to(self._device))
+            h_batch[:, index : index + 1].copy_(self._to_inference_device(h_req))
+            c_batch[:, index : index + 1].copy_(self._to_inference_device(c_req))
         return h_batch, c_batch
+
+    def _to_inference_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == self._device.type and (
+            self._device.index is None or tensor.device.index == self._device.index
+        ):
+            return tensor
+        return tensor.to(self._device, non_blocking=True)
 
     @staticmethod
     def _slice_hidden(
@@ -260,8 +283,8 @@ class _LeagueInferenceService:
             return None
         h, c = hidden
         return (
-            h[:, index : index + 1].detach().cpu(),
-            c[:, index : index + 1].detach().cpu(),
+            h[:, index : index + 1].detach(),
+            c[:, index : index + 1].detach(),
         )
 
 
@@ -310,24 +333,29 @@ class LeaguePlayer(Player):
         self._timing = timing
 
     def prepare_team_preview(self, own_packed_team: str, opponent_packed_team: str) -> None:
-        started = time.perf_counter()
+        timing_enabled = LeaguePlayer._timing_enabled(self)
+        if timing_enabled:
+            started = time.perf_counter()
         obs = build_team_preview_observation(
             self.obs_builder.gd,
             self.obs_builder.team_size,
             own_packed_team,
             opponent_packed_team,
         )
-        self._add_timing("opponent_precompute_preview_obs_sec", time.perf_counter() - started)
+        if timing_enabled:
+            self._add_timing("opponent_precompute_preview_obs_sec", time.perf_counter() - started)
 
-        submit_started = time.perf_counter()
+        if timing_enabled:
+            submit_started = time.perf_counter()
         self._prepared_preview_obs = obs
         checkpoint_path = self._pending_checkpoint_path or self.checkpoint_path
         self._prepared_preview_future = self.inference_service.submit_team_preview(
             checkpoint_path,
             obs,
         )
-        self._add_timing("opponent_precompute_preview_submit_sec", time.perf_counter() - submit_started)
-        self._increment_timing("opponent_precompute_preview_submit_calls")
+        if timing_enabled:
+            self._add_timing("opponent_precompute_preview_submit_sec", time.perf_counter() - submit_started)
+            self._increment_timing("opponent_precompute_preview_submit_calls")
 
     def choose_move(self, battle: DoubleBattle):
         obs = self.obs_builder.build(battle)
@@ -367,11 +395,14 @@ class LeaguePlayer(Player):
         prepared_future = self._prepared_preview_future
         self._prepared_preview_obs = None
         self._prepared_preview_future = None
+        timing_enabled = LeaguePlayer._timing_enabled(self)
 
         if prepared_obs is None and prepared_future is None:
-            infer_started = time.perf_counter()
+            if timing_enabled:
+                infer_started = time.perf_counter()
             picks = self.inference_service.infer_team_preview(self.checkpoint_path, obs)
-            self._add_timing("opponent_teampreview_infer_sec", time.perf_counter() - infer_started)
+            if timing_enabled:
+                self._add_timing("opponent_teampreview_infer_sec", time.perf_counter() - infer_started)
             return "/team " + "".join(str(int(p) + 1) for p in picks)
 
         if prepared_obs is None or prepared_future is None:
@@ -379,16 +410,19 @@ class LeaguePlayer(Player):
             raise RuntimeError("Prepared opponent team preview state was partially missing.")
 
         if self._obs_equal(obs, prepared_obs):
-            self._increment_timing("opponent_precompute_preview_hits")
-            wait_started = time.perf_counter()
+            if timing_enabled:
+                self._increment_timing("opponent_precompute_preview_hits")
+                wait_started = time.perf_counter()
             picks = prepared_future.result()
-            self._add_timing(
-                "opponent_precompute_preview_hit_wait_sec",
-                time.perf_counter() - wait_started,
-            )
+            if timing_enabled:
+                self._add_timing(
+                    "opponent_precompute_preview_hit_wait_sec",
+                    time.perf_counter() - wait_started,
+                )
             return "/team " + "".join(str(int(p) + 1) for p in picks)
 
-        self._increment_timing("opponent_precompute_preview_misses")
+        if timing_enabled:
+            self._increment_timing("opponent_precompute_preview_misses")
         self._record_preview_obs_mismatch(obs, prepared_obs)
         raise RuntimeError("Prepared opponent team preview observation did not match the live battle state.")
 
@@ -440,6 +474,10 @@ class LeaguePlayer(Player):
         if timing is not None:
             timing.increment(key, delta)
 
+    def _timing_enabled(self) -> bool:
+        timing = getattr(self, "_timing", None)
+        return timing is not None and bool(getattr(timing, "enabled", True))
+
 
 class League:
     """Manages a pool of opponent checkpoints for self-play training.
@@ -480,16 +518,12 @@ class League:
     def make_opponent(
         self,
         loop: asyncio.AbstractEventLoop,
-        server_url: str | None = None,
         checkpoint_path: str | None = None,
     ) -> "LeaguePlayer | None":
         """Create a LeaguePlayer from a sampled checkpoint.
 
         Args:
             loop: The asyncio event loop the opponent will run on.
-            server_url: The Showdown server URL to connect to. Must match the URL
-                used by the paired player so both are on the same server. Defaults
-                to the league's own env_config.server_url if not provided.
 
         Returns None if the league is empty.
         """
@@ -498,13 +532,7 @@ class League:
             return None
         self._inference.ensure_checkpoint(path)
 
-        url = server_url if server_url is not None else self.env_config.server_url
-        host, port = url.split(":")
-        from poke_env import ServerConfiguration
-        server_config = ServerConfiguration(
-            f"ws://{host}:{port}/showdown/websocket",
-            f"http://{host}:{port}/action.php",
-        )
+        battlestream_config = make_battlestream_configuration(self.env_config)
 
         obs_builder = ObservationBuilder(self.game_data, self.env_config.team_size)
         return LeaguePlayer(
@@ -513,7 +541,7 @@ class League:
             obs_builder,
             account_configuration=make_local_account_configuration("league"),
             battle_format=self.env_config.battle_format,
-            server_configuration=server_config,
+            server_configuration=battlestream_config,
             log_level=showdown_log_level(),
             loop=loop,
         )

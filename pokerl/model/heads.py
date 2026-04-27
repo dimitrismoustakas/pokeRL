@@ -215,6 +215,7 @@ class ActionHead(nn.Module):
         tera_exploration_prob: float = 0.0,
         tera_force_delay_prob: float = 0.0,
         tera_force_delay_max_turn: int = 0,
+        validate_actions: bool = True,
     ) -> dict[str, torch.Tensor]:
         if "joint" not in masks or "can_tera" not in masks:
             raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
@@ -232,7 +233,7 @@ class ActionHead(nn.Module):
         joint_masks = masks["joint"]
         can_tera = masks["can_tera"]
         mask1 = joint_masks[:, FIRST_SLOT_MASK_ROW]
-        action_features = self._static_action_features(device)
+        action_features = self._static_action_features()
         matchup_context = self._matchup_context(battle_obs, batch_size, device)
         matchup_features_1 = self._candidate_action_features(
             matchup_context=matchup_context,
@@ -268,14 +269,14 @@ class ActionHead(nn.Module):
             greedy=greedy,
         )
 
-        if not mask1.gather(1, a1.unsqueeze(1)).squeeze(1).all():
+        if validate_actions and not mask1.gather(1, a1.unsqueeze(1)).squeeze(1).all():
             raise RuntimeError(
                 "ActionHead received an illegal first-slot action for the current joint mask."
             )
 
         batch_indices = torch.arange(context.shape[0], device=context.device)
         mask2 = joint_masks[batch_indices, a1 + 1]
-        if not mask2.any(dim=1).all():
+        if validate_actions and not mask2.any(dim=1).all():
             raise RuntimeError(
                 "ActionHead received an empty conditional joint action mask for pokemon 2. "
                 "This means build_joint_action_mask() produced an inconsistent legality table."
@@ -302,7 +303,7 @@ class ActionHead(nn.Module):
             greedy=greedy,
         )
 
-        if not mask2.gather(1, a2.unsqueeze(1)).squeeze(1).all():
+        if validate_actions and not mask2.gather(1, a2.unsqueeze(1)).squeeze(1).all():
             raise RuntimeError(
                 "ActionHead received an illegal second-slot action for the current joint mask."
             )
@@ -357,7 +358,7 @@ class ActionHead(nn.Module):
         else:
             tera_choice = actions[:, 2]
 
-        if not tera_mask.gather(1, tera_choice.unsqueeze(1)).squeeze(1).all():
+        if validate_actions and not tera_mask.gather(1, tera_choice.unsqueeze(1)).squeeze(1).all():
             raise RuntimeError(
                 "ActionHead received an illegal tera choice for the current joint action pair."
             )
@@ -425,12 +426,12 @@ class ActionHead(nn.Module):
             torch.cat([query_features, action_features, entity_features, matchup_emb], dim=-1)
         ).squeeze(-1)
 
-    def _static_action_features(self, device: torch.device) -> torch.Tensor:
-        action_ids = self._action_ids.to(device)
-        kind = self._action_kind.to(device)
-        move_slot = self._action_move_slot.to(device)
-        target_slot = self._action_target_slot.to(device)
-        switch_slot = self._action_switch_slot.to(device)
+    def _static_action_features(self) -> torch.Tensor:
+        action_ids = self._action_ids
+        kind = self._action_kind
+        move_slot = self._action_move_slot
+        target_slot = self._action_target_slot
+        switch_slot = self._action_switch_slot
         return (
             self.action_id_emb(action_ids)
             + self.kind_emb(kind)
@@ -504,9 +505,9 @@ class ActionHead(nn.Module):
         opp_def_type_1, opp_def_type_2 = self._defensive_type_pair(opp_types_active, opp_cont_active)
         opp_present = battle_obs["opp_active_present"].to(dtype=torch.bool)
 
-        action_is_move = self._action_is_move.view(1, self.num_actions).to(device=device)
-        action_is_switch = self._action_is_switch.view(1, self.num_actions).to(device=device)
-        action_target_slot = self._action_target_slot.view(1, self.num_actions).to(device=device)
+        action_is_move = self._action_is_move.view(1, self.num_actions)
+        action_is_switch = self._action_is_switch.view(1, self.num_actions)
+        action_target_slot = self._action_target_slot.view(1, self.num_actions)
         action_is_move_float = action_is_move.to(dtype=torch.float32)
         action_is_switch_float = action_is_switch.to(dtype=torch.float32)
 
@@ -520,7 +521,6 @@ class ActionHead(nn.Module):
             "opp_present": opp_present,
             "live_foe_count": opp_present.to(dtype=torch.float32).sum(dim=1, keepdim=True),
             "move_slots": self._action_move_slot.clamp(max=NUM_MOVES - 1)
-            .to(device=device)
             .view(1, self.num_actions)
             .expand(batch_size, -1),
             "target_indices": action_target_slot.expand(batch_size, -1),

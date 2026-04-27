@@ -2,6 +2,7 @@
 
 import asyncio
 import itertools
+import math
 import os
 import time
 import uuid
@@ -13,7 +14,7 @@ from typing import Generic, TypeVar
 
 import numpy as np
 
-from poke_env import AccountConfiguration, ServerConfiguration
+from poke_env import AccountConfiguration, LocalBattleStreamConfiguration
 from poke_env.battle import DoubleBattle
 from poke_env.concurrency import create_in_poke_loop
 from poke_env.player import BattleOrder, DoubleBattleOrder, ForfeitBattleOrder, PassBattleOrder, Player
@@ -48,27 +49,51 @@ def showdown_log_level() -> int | None:
     return int(value)
 
 
+def default_showdown_dir() -> str | None:
+    env_path = os.environ.get("POKERL_SHOWDOWN_DIR")
+    if env_path:
+        return env_path
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    candidate = os.path.join(local_app_data, "pokeRL", "pokemon-showdown")
+    return candidate if os.path.exists(candidate) else None
+
+
 class _TimingStats:
-    def __init__(self):
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
         self._lock = Lock()
         self._values: dict[str, float] = {}
 
     def add(self, key: str, value: float) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self._values[key] = self._values.get(key, 0.0) + value
 
     def increment(self, key: str, delta: int = 1) -> None:
+        if not self.enabled:
+            return
         self.add(key, float(delta))
 
     def snapshot_and_reset(self) -> dict[str, float]:
+        if not self.enabled:
+            return {}
         with self._lock:
             snapshot = dict(self._values)
             self._values.clear()
         return snapshot
 
     def reset(self) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self._values.clear()
+
+
+def _timing_enabled(timing) -> bool:
+    return bool(getattr(timing, "enabled", True))
 
 
 class LoopThread:
@@ -158,11 +183,51 @@ def make_local_account_configuration(prefix: str) -> AccountConfiguration:
     return AccountConfiguration(f"{clean_prefix}{suffix}"[:18], None)
 
 
-def make_server_configuration(config: EnvConfig) -> ServerConfiguration:
-    host, port = config.server_url.split(":")
-    return ServerConfiguration(
-        f"ws://{host}:{port}/showdown/websocket",
-        f"http://{host}:{port}/action.php",
+def _worker_count(config: EnvConfig) -> int:
+    if config.worker_count is not None:
+        return config.worker_count
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(config.num_envs, max(16, cpu_count // 2 or 1)))
+
+
+def _battles_per_worker(config: EnvConfig, worker_count: int) -> int:
+    if config.battles_per_worker is not None:
+        return config.battles_per_worker
+    return max(1, math.ceil(config.num_envs / worker_count * 2.0))
+
+
+def _runtime_loop_count(config: EnvConfig, worker_count: int) -> int:
+    if config.runtime_loop_count is not None:
+        return config.runtime_loop_count
+    if worker_count <= 1:
+        return 0
+    return min(4, worker_count)
+
+
+def battlestream_summary(config: EnvConfig) -> dict[str, object]:
+    worker_count = _worker_count(config)
+    return {
+        "showdown_dir": config.showdown_dir,
+        "worker_count": worker_count,
+        "max_battles_per_worker": _battles_per_worker(config, worker_count),
+        "pool_mode": config.pool_mode,
+        "runtime_loop_count": _runtime_loop_count(config, worker_count),
+    }
+
+
+def make_battlestream_configuration(
+    config: EnvConfig,
+) -> LocalBattleStreamConfiguration:
+    if not config.showdown_dir:
+        raise ValueError("EnvConfig.showdown_dir must be set for local BattleStream training.")
+
+    worker_count = _worker_count(config)
+    return LocalBattleStreamConfiguration(
+        showdown_dir=config.showdown_dir,
+        worker_count=worker_count,
+        max_battles_per_worker=_battles_per_worker(config, worker_count),
+        pool_mode=config.pool_mode,
+        runtime_loop_count=_runtime_loop_count(config, worker_count),
     )
 
 
@@ -223,7 +288,9 @@ class ShowdownPlayer(Player):
 
     def _make_order(self, action: np.ndarray, battle: DoubleBattle) -> BattleOrder:
         """Convert a (3,) action array to a DoubleBattleOrder."""
-        started = time.perf_counter()
+        timing_enabled = _timing_enabled(self.timing)
+        if timing_enabled:
+            started = time.perf_counter()
         action_state = self._pending_action_state if self._pending_action_battle is battle else None
         self._pending_action_state = None
         self._pending_action_battle = None
@@ -241,8 +308,9 @@ class ShowdownPlayer(Player):
             )
             orders.append(order)
 
-        self.timing.increment("player_make_order_calls")
-        self.timing.add("player_make_order_sec", time.perf_counter() - started)
+        if timing_enabled:
+            self.timing.increment("player_make_order_calls")
+            self.timing.add("player_make_order_sec", time.perf_counter() - started)
         if all(isinstance(order, PassBattleOrder) for order in orders):
             return self.choose_default_move()
         return DoubleBattleOrder(orders[0], orders[1])
@@ -253,11 +321,15 @@ class ShowdownPlayer(Player):
         if battle.finished and finished_token == self._last_finished_token:
             return
 
-        emit_started = time.perf_counter()
+        timing_enabled = _timing_enabled(self.timing)
+        if timing_enabled:
+            emit_started = time.perf_counter()
         obs = self.obs_builder.build(battle)
-        self.timing.add("player_emit_obs_sec", time.perf_counter() - emit_started)
+        if timing_enabled:
+            self.timing.add("player_emit_obs_sec", time.perf_counter() - emit_started)
 
-        mask_started = time.perf_counter()
+        if timing_enabled:
+            mask_started = time.perf_counter()
         if battle.finished:
             mask = empty_action_masks()
             self._pending_action_state = None
@@ -267,18 +339,23 @@ class ShowdownPlayer(Player):
             mask = build_policy_action_masks(battle, action_state=action_state)
             self._pending_action_state = action_state
             self._pending_action_battle = battle
-        self.timing.add("player_emit_mask_sec", time.perf_counter() - mask_started)
+        if timing_enabled:
+            self.timing.add("player_emit_mask_sec", time.perf_counter() - mask_started)
 
-        reward_started = time.perf_counter()
+        if timing_enabled:
+            reward_started = time.perf_counter()
         reward = sparse_reward(battle)
-        self.timing.add("player_emit_reward_sec", time.perf_counter() - reward_started)
+        if timing_enabled:
+            self.timing.add("player_emit_reward_sec", time.perf_counter() - reward_started)
         done = battle.finished
 
-        queue_put_started = time.perf_counter()
+        if timing_enabled:
+            queue_put_started = time.perf_counter()
         self.obs_queue.put((obs, mask, reward, done, battle))
-        self.timing.add("player_emit_queue_put_sec", time.perf_counter() - queue_put_started)
-        self.timing.increment("player_emit_calls")
-        self.timing.add("player_emit_total_sec", time.perf_counter() - emit_started)
+        if timing_enabled:
+            self.timing.add("player_emit_queue_put_sec", time.perf_counter() - queue_put_started)
+            self.timing.increment("player_emit_calls")
+            self.timing.add("player_emit_total_sec", time.perf_counter() - emit_started)
         if done:
             self._last_finished_token = finished_token
 
@@ -302,6 +379,7 @@ class BattleEnv:
         team_preview_batcher: TeamPreviewBatcher | None = None,
         team_pair_provider: TeamPairProvider | None = None,
         player_kwargs: dict | None = None,
+        collect_timing: bool = False,
     ):
         self.config = config
         self.game_data = game_data
@@ -311,7 +389,7 @@ class BattleEnv:
         self._pending_opponent: Player | None = None
         self._closed = False
         self._battle_started_at: float | None = None
-        self._timing = _TimingStats()
+        self._timing = _TimingStats(enabled=collect_timing)
         self._ext_team_preview_fn = team_preview_fn
         self._team_preview_batcher = team_preview_batcher
         self._team_pair_provider = team_pair_provider
@@ -347,7 +425,7 @@ class BattleEnv:
             obs_builder,
             timing=self._timing,
             battle_format=config.battle_format,
-            server_configuration=make_server_configuration(config),
+            server_configuration=make_battlestream_configuration(config),
             loop=self._loop,
             **player_options,
         )
@@ -362,41 +440,54 @@ class BattleEnv:
         if self._closed:
             raise RuntimeError("BattleEnv.reset() called after the environment was closed.")
 
-        reset_started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            reset_started = time.perf_counter()
         self._episode_team_preview = None
         self._episode_opponent_preview_picks = None
         self._episode_opponent_choice_calls = 0
         self._episode_opponent_turn_calls.clear()
         self._episode_opponent_checkpoint_path = getattr(self.opponent, "checkpoint_path", None)
-        apply_pending_started = time.perf_counter()
+        if timing_enabled:
+            apply_pending_started = time.perf_counter()
         self._apply_pending_opponent()
-        self._timing.add("env_reset_apply_pending_sec", time.perf_counter() - apply_pending_started)
+        if timing_enabled:
+            self._timing.add("env_reset_apply_pending_sec", time.perf_counter() - apply_pending_started)
         self._episode_opponent_checkpoint_path = getattr(self.opponent, "checkpoint_path", None)
 
-        assign_teams_started = time.perf_counter()
+        if timing_enabled:
+            assign_teams_started = time.perf_counter()
         self._assign_teams_for_next_battle()
-        self._timing.add("env_reset_team_assign_sec", time.perf_counter() - assign_teams_started)
+        if timing_enabled:
+            self._timing.add("env_reset_team_assign_sec", time.perf_counter() - assign_teams_started)
 
         # Give stateful opponents (e.g. LeaguePlayer) a clean slate for the new battle.
-        hidden_reset_started = time.perf_counter()
+        if timing_enabled:
+            hidden_reset_started = time.perf_counter()
         if hasattr(self.opponent, "reset_hidden"):
             self.opponent.reset_hidden()
-        self._timing.add("env_reset_hidden_reset_sec", time.perf_counter() - hidden_reset_started)
+        if timing_enabled:
+            self._timing.add("env_reset_hidden_reset_sec", time.perf_counter() - hidden_reset_started)
 
-        battle_start_started = time.perf_counter()
+        if timing_enabled:
+            battle_start_started = time.perf_counter()
         self._battle_task = asyncio.run_coroutine_threadsafe(
             self.player.battle_against(self.opponent, n_battles=1),
             self._loop,
         )
-        self._timing.add("env_reset_battle_start_sec", time.perf_counter() - battle_start_started)
+        if timing_enabled:
+            self._timing.add("env_reset_battle_start_sec", time.perf_counter() - battle_start_started)
         self._battle_started_at = time.perf_counter()
 
-        wait_started = time.perf_counter()
+        if timing_enabled:
+            wait_started = time.perf_counter()
         obs, mask, _, _, _ = self.player.obs_queue.get()
-        self._timing.add("env_reset_wait_first_obs_sec", time.perf_counter() - wait_started)
+        if timing_enabled:
+            self._timing.add("env_reset_wait_first_obs_sec", time.perf_counter() - wait_started)
         self._prepare_next_battle()
-        self._timing.increment("env_reset_calls")
-        self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
+        if timing_enabled:
+            self._timing.increment("env_reset_calls")
+            self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
         return obs, mask
 
     def step(self, action: np.ndarray) -> tuple[dict, dict[str, np.ndarray], float, bool, dict]:
@@ -411,19 +502,24 @@ class BattleEnv:
         if self._closed:
             raise RuntimeError("BattleEnv.step() called after the environment was closed.")
 
-        step_started = time.perf_counter()
-        enqueue_started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            step_started = time.perf_counter()
+            enqueue_started = step_started
         self._last_player_action = np.array(action, copy=True)
         if hasattr(self.opponent, "_last_actions"):
             self.opponent._last_actions = None
         self.player.action_queue.put(action)
-        self._timing.add("env_action_enqueue_sec", time.perf_counter() - enqueue_started)
+        if timing_enabled:
+            self._timing.add("env_action_enqueue_sec", time.perf_counter() - enqueue_started)
 
-        wait_started = time.perf_counter()
+        if timing_enabled:
+            wait_started = time.perf_counter()
         obs, mask, reward, done, battle = self.player.obs_queue.get()
-        self._timing.add("env_queue_wait_sec", time.perf_counter() - wait_started)
-        self._timing.increment("env_step_calls")
-        self._timing.add("env_step_total_sec", time.perf_counter() - step_started)
+        if timing_enabled:
+            self._timing.add("env_queue_wait_sec", time.perf_counter() - wait_started)
+            self._timing.increment("env_step_calls")
+            self._timing.add("env_step_total_sec", time.perf_counter() - step_started)
         info = {
             "battle_tag": battle.battle_tag if battle else "",
             "battle_turn": getattr(battle, "turn", 0),
@@ -494,9 +590,12 @@ class BattleEnv:
         return self.player.last_battle
 
     def set_next_opponent(self, opponent_factory: OpponentFactory):
-        prebuild_started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            prebuild_started = time.perf_counter()
         next_opponent = self._build_opponent(opponent_factory)
-        self._timing.add("env_prebuild_opponent_sec", time.perf_counter() - prebuild_started)
+        if timing_enabled:
+            self._timing.add("env_prebuild_opponent_sec", time.perf_counter() - prebuild_started)
         if self._pending_opponent is not None:
             self._disconnect_player(self._pending_opponent, self._loop)
         self._pending_opponent = next_opponent
@@ -504,32 +603,41 @@ class BattleEnv:
     def stage_next_opponent_checkpoint(self, checkpoint_path: str) -> bool:
         if self._pending_opponent is not None or not hasattr(self.opponent, "stage_checkpoint"):
             return False
-        stage_started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            stage_started = time.perf_counter()
         self.opponent.stage_checkpoint(checkpoint_path)
-        self._timing.add(
-            "env_stage_opponent_checkpoint_sec",
-            time.perf_counter() - stage_started,
-        )
-        self._timing.increment("env_stage_opponent_checkpoint_calls")
+        if timing_enabled:
+            self._timing.add(
+                "env_stage_opponent_checkpoint_sec",
+                time.perf_counter() - stage_started,
+            )
+            self._timing.increment("env_stage_opponent_checkpoint_calls")
         return True
 
     def _apply_pending_opponent(self):
         if self._pending_opponent is None:
             if hasattr(self.opponent, "apply_staged_checkpoint"):
-                swap_started = time.perf_counter()
+                timing_enabled = self._timing.enabled
+                if timing_enabled:
+                    swap_started = time.perf_counter()
                 if self.opponent.apply_staged_checkpoint():
-                    self._timing.add(
-                        "env_reset_opponent_checkpoint_swap_sec",
-                        time.perf_counter() - swap_started,
-                    )
+                    if timing_enabled:
+                        self._timing.add(
+                            "env_reset_opponent_checkpoint_swap_sec",
+                            time.perf_counter() - swap_started,
+                        )
             return
 
         if self._pending_opponent is None:
             return
 
-        disconnect_started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            disconnect_started = time.perf_counter()
         self._disconnect_player(self.opponent, self._loop)
-        self._timing.add("env_reset_opponent_disconnect_sec", time.perf_counter() - disconnect_started)
+        if timing_enabled:
+            self._timing.add("env_reset_opponent_disconnect_sec", time.perf_counter() - disconnect_started)
         self.opponent = self._pending_opponent
         self._pending_opponent = None
 
@@ -552,31 +660,38 @@ class BattleEnv:
         if not recompute_preview or self._team_preview_batcher is None or self._ext_team_preview_fn is None:
             return
 
-        build_started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            build_started = time.perf_counter()
         self._prepared_preview_obs = build_team_preview_observation(
             self.game_data,
             self.config.team_size,
             self._prepared_player_team,
             self._prepared_opponent_team,
         )
-        self._timing.add("env_precompute_preview_obs_sec", time.perf_counter() - build_started)
+        if timing_enabled:
+            self._timing.add("env_precompute_preview_obs_sec", time.perf_counter() - build_started)
 
-        submit_started = time.perf_counter()
+        if timing_enabled:
+            submit_started = time.perf_counter()
         self._prepared_preview_future = self._team_preview_batcher.submit(self._prepared_preview_obs)
-        self._timing.add("env_precompute_preview_submit_sec", time.perf_counter() - submit_started)
-        self._timing.increment("env_precompute_preview_submit_calls")
+        if timing_enabled:
+            self._timing.add("env_precompute_preview_submit_sec", time.perf_counter() - submit_started)
+            self._timing.increment("env_precompute_preview_submit_calls")
 
         next_opponent = self._pending_opponent if self._pending_opponent is not None else self.opponent
         if hasattr(next_opponent, "prepare_team_preview"):
-            opp_started = time.perf_counter()
+            if timing_enabled:
+                opp_started = time.perf_counter()
             next_opponent.prepare_team_preview(
                 own_packed_team=self._prepared_opponent_team,
                 opponent_packed_team=self._prepared_player_team,
             )
-            self._timing.add(
-                "env_precompute_opponent_preview_prepare_sec",
-                time.perf_counter() - opp_started,
-            )
+            if timing_enabled:
+                self._timing.add(
+                    "env_precompute_opponent_preview_prepare_sec",
+                    time.perf_counter() - opp_started,
+                )
 
     def refresh_prepared_team_preview(self) -> None:
         if self._prepared_player_team is None or self._prepared_opponent_team is None:
@@ -586,9 +701,12 @@ class BattleEnv:
     def wait_for_prepared_team_preview(self) -> None:
         if self._prepared_preview_future is None:
             return
-        wait_started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            wait_started = time.perf_counter()
         self._prepared_preview_future.result()
-        self._timing.add("env_precompute_preview_wait_sec", time.perf_counter() - wait_started)
+        if timing_enabled:
+            self._timing.add("env_precompute_preview_wait_sec", time.perf_counter() - wait_started)
 
     def _choose_team_preview_picks(self, obs: dict[str, np.ndarray]) -> np.ndarray:
         prepared_obs = self._active_preview_obs
@@ -601,17 +719,23 @@ class BattleEnv:
             return picks
 
         if prepared_obs is None or prepared_future is None:
-            self._timing.increment("env_precompute_preview_missing_state")
+            if _timing_enabled(self._timing):
+                self._timing.increment("env_precompute_preview_missing_state")
             raise RuntimeError("Prepared team preview state was partially missing.")
 
         if self._obs_equal(obs, prepared_obs):
-            self._timing.increment("env_precompute_preview_hits")
-            wait_started = time.perf_counter()
+            timing_enabled = _timing_enabled(self._timing)
+            if timing_enabled:
+                self._timing.increment("env_precompute_preview_hits")
+            if timing_enabled:
+                wait_started = time.perf_counter()
             picks = prepared_future.result()
-            self._timing.add("env_precompute_preview_hit_wait_sec", time.perf_counter() - wait_started)
+            if timing_enabled:
+                self._timing.add("env_precompute_preview_hit_wait_sec", time.perf_counter() - wait_started)
             return picks
 
-        self._timing.increment("env_precompute_preview_misses")
+        if _timing_enabled(self._timing):
+            self._timing.increment("env_precompute_preview_misses")
         self._record_preview_obs_mismatch(obs, prepared_obs)
         raise RuntimeError("Prepared team preview observation did not match the live battle state.")
 
@@ -637,10 +761,13 @@ class BattleEnv:
         original_choose_move = opponent.choose_move
 
         def timed_choose_move(battle):
-            started = time.perf_counter()
+            timing_enabled = self._timing.enabled
+            if timing_enabled:
+                started = time.perf_counter()
             result = original_choose_move(battle)
-            self._timing.increment("opponent_choice_calls")
-            self._timing.add("opponent_choice_sec", time.perf_counter() - started)
+            if timing_enabled:
+                self._timing.increment("opponent_choice_calls")
+                self._timing.add("opponent_choice_sec", time.perf_counter() - started)
             battle_tag = getattr(battle, "battle_tag", "")
             turn = int(getattr(battle, "turn", 0))
             self._episode_opponent_choice_calls += 1
@@ -686,10 +813,13 @@ class BattleEnv:
         original_teampreview = opponent.teampreview
 
         def timed_teampreview(battle):
-            started = time.perf_counter()
+            timing_enabled = self._timing.enabled
+            if timing_enabled:
+                started = time.perf_counter()
             result = original_teampreview(battle)
-            self._timing.increment("opponent_teampreview_calls")
-            self._timing.add("opponent_teampreview_sec", time.perf_counter() - started)
+            if timing_enabled:
+                self._timing.increment("opponent_teampreview_calls")
+                self._timing.add("opponent_teampreview_sec", time.perf_counter() - started)
             self._episode_opponent_preview_picks = parse_team_preview_order(
                 result,
                 team_size=self.config.team_size,
@@ -767,20 +897,25 @@ class ParallelBattleEnv:
     and collects results. Environments that finish are auto-reset.
     """
 
-    def __init__(self, envs: list[BattleEnv]):
+    def __init__(self, envs: list[BattleEnv], collect_timing: bool = False):
         self.envs = envs
         self.num_envs = len(envs)
         self._executor = ThreadPoolExecutor(max_workers=self.num_envs)
-        self._timing = _TimingStats()
+        self._timing = _TimingStats(enabled=collect_timing)
         self._obs_batch_buffers: dict[str, np.ndarray] | None = None
         self._mask_batch_buffers: dict[str, np.ndarray] | None = None
+        self._reward_buffer = np.empty(self.num_envs, dtype=np.float32)
+        self._done_buffer = np.empty(self.num_envs, dtype=bool)
 
     def reset(self) -> tuple[dict, dict[str, np.ndarray]]:
         """Reset all environments and return batched obs + masks."""
-        started = time.perf_counter()
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            started = time.perf_counter()
         results = list(self._executor.map(lambda env: env.reset(), self.envs))
-        self._timing.increment("parallel_reset_calls")
-        self._timing.add("parallel_reset_wall_sec", time.perf_counter() - started)
+        if timing_enabled:
+            self._timing.increment("parallel_reset_calls")
+            self._timing.add("parallel_reset_wall_sec", time.perf_counter() - started)
         return self._collate([r[0] for r in results], [r[1] for r in results])
 
     def step(
@@ -794,30 +929,32 @@ class ParallelBattleEnv:
         Returns:
             obs_batch, mask_batch, rewards, dones, infos
         """
-        step_started = time.perf_counter()
-        futures = [
-            self._executor.submit(self._step_env, env, action)
-            for env, action in zip(self.envs, actions, strict=True)
-        ]
-        results = [future.result() for future in futures]
-        step_wait_sec = time.perf_counter() - step_started
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            step_started = time.perf_counter()
+        results = list(self._executor.map(self._step_env, self.envs, actions))
+        if timing_enabled:
+            step_wait_sec = time.perf_counter() - step_started
         obs_list = [result[0] for result in results]
         mask_list = [result[1] for result in results]
-        rewards = [result[2] for result in results]
-        dones = [result[3] for result in results]
         infos = [result[4] for result in results]
+        for index, result in enumerate(results):
+            self._reward_buffer[index] = result[2]
+            self._done_buffer[index] = result[3]
 
-        collate_started = time.perf_counter()
+        if timing_enabled:
+            collate_started = time.perf_counter()
         batched_obs, batched_mask = self._collate(obs_list, mask_list)
-        self._timing.increment("parallel_step_calls")
-        self._timing.add("parallel_step_wait_sec", step_wait_sec)
-        self._timing.add("parallel_collate_sec", time.perf_counter() - collate_started)
-        self._timing.add("parallel_step_wall_sec", time.perf_counter() - step_started)
+        if timing_enabled:
+            self._timing.increment("parallel_step_calls")
+            self._timing.add("parallel_step_wait_sec", step_wait_sec)
+            self._timing.add("parallel_collate_sec", time.perf_counter() - collate_started)
+            self._timing.add("parallel_step_wall_sec", time.perf_counter() - step_started)
         return (
             batched_obs,
             batched_mask,
-            np.array(rewards, dtype=np.float32),
-            np.array(dones, dtype=bool),
+            self._reward_buffer,
+            self._done_buffer,
             infos,
         )
 

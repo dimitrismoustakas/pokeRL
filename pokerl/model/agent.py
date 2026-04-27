@@ -132,6 +132,7 @@ class PokeAgent(nn.Module):
         tera_exploration_prob: float = 0.0,
         tera_force_delay_prob: float = 0.0,
         tera_force_delay_max_turn: int = 0,
+        validate_actions: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for battle turns.
 
@@ -171,6 +172,7 @@ class PokeAgent(nn.Module):
             tera_exploration_prob=tera_exploration_prob,
             tera_force_delay_prob=tera_force_delay_prob,
             tera_force_delay_max_turn=tera_force_delay_max_turn,
+            validate_actions=validate_actions,
         )
         value = self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 

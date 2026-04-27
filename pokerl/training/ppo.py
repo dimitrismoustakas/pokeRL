@@ -21,36 +21,30 @@ class PPOTrainer:
     """Proximal Policy Optimization with clipped surrogate objective."""
 
     _LOG_RATIO_CLAMP = 20.0
+    _HEAD_BATCH_TARGET = 1024
 
     def __init__(self, agent: PokeAgent, config: TrainingConfig, device: torch.device):
         self.agent = agent.to(device)
         self.config = config
         self.device = device
-        self.optimizer = torch.optim.Adam(agent.parameters(), lr=config.lr, eps=1e-5)
+        self.optimizer = self._make_optimizer()
+        self._trainable_params = [param for param in agent.parameters() if param.requires_grad]
         self.global_step = 0
 
-    def _has_finite_gradients(self) -> bool:
-        for param in self.agent.parameters():
-            if param.grad is None:
-                continue
-            if not torch.isfinite(param.grad).all():
-                return False
-        return True
+    def _make_optimizer(self) -> torch.optim.Adam:
+        return torch.optim.Adam(self.agent.parameters(), lr=self.config.lr, eps=1e-5)
 
     def _apply_update_step(self, loss: torch.Tensor) -> bool:
-        if not torch.isfinite(loss):
-            self.optimizer.zero_grad()
+        if not torch.isfinite(loss).item():
+            self.optimizer.zero_grad(set_to_none=True)
             return False
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        if not self._has_finite_gradients():
-            self.optimizer.zero_grad()
-            return False
 
-        total_norm = nn.utils.clip_grad_norm_(self.agent.parameters(), self.config.max_grad_norm)
-        if not torch.isfinite(total_norm):
-            self.optimizer.zero_grad()
+        total_norm = nn.utils.clip_grad_norm_(self._trainable_params, self.config.max_grad_norm)
+        if not torch.isfinite(total_norm).item():
+            self.optimizer.zero_grad(set_to_none=True)
             return False
 
         self.optimizer.step()
@@ -105,11 +99,11 @@ class PPOTrainer:
             init_h_all = None
             init_c_all = None
 
-        metrics = {
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "entropy": 0.0,
-            "approx_kl": 0.0,
+        metric_sums = {
+            "policy_loss": torch.zeros((), device=self.device),
+            "value_loss": torch.zeros((), device=self.device),
+            "entropy": torch.zeros((), device=self.device),
+            "approx_kl": torch.zeros((), device=self.device),
         }
         num_updates = 0
         skipped_nonfinite = 0
@@ -130,9 +124,9 @@ class PPOTrainer:
             and bool(opp_actions_valid_all.any().item())
         )
         if hidden_info_enabled:
-            metrics["aux_hidden_info_loss"] = 0.0
+            metric_sums["aux_hidden_info_loss"] = torch.zeros((), device=self.device)
         if opp_action_enabled:
-            metrics["aux_opp_action_loss"] = 0.0
+            metric_sums["aux_opp_action_loss"] = torch.zeros((), device=self.device)
 
         for epoch in range(self.config.num_epochs):
             env_order = torch.randperm(E, device=self.device)
@@ -175,40 +169,13 @@ class PPOTrainer:
                 own_bench_mask_seq_mb = (mb_obs_seq["own_roles"] != ROLE_BENCH) | mb_obs_seq["own_mask"]
                 opp_bench_mask_seq_mb = (mb_obs_seq["opp_roles"] != ROLE_BENCH) | mb_obs_seq["opp_mask"]
 
-                # LSTM + heads: step through the sequence one turn at a time.
-                # Gradients flow back through all turns within each non-terminal
-                # episode segment; the hidden is zeroed at episode boundaries.
-                all_log_probs: list[torch.Tensor] = []
-                all_entropies: list[torch.Tensor] = []
-                all_values: list[torch.Tensor] = []
+                # LSTM: step through the sequence so episode-boundary resets
+                # preserve recurrent semantics, then batch the stateless heads.
                 all_ctx: list[torch.Tensor] = []
 
                 for t in range(T):
                     ctx_t, hidden = self.agent.memory(context_seq_mb[t], hidden)
                     all_ctx.append(ctx_t)
-
-                    action_out = self.agent.action_head(
-                        ctx_t,
-                        active_reps_seq_mb[t],
-                        own_reps_seq_mb[t],
-                        opp_reps_seq_mb[t],
-                        opp_bench_mask_seq_mb[t],
-                        opp_active_reps_seq_mb[t],
-                        {key: value[t] for key, value in mb_masks_seq.items()},
-                        mb_actions_seq[t],
-                        battle_obs={key: value[t] for key, value in mb_obs_seq.items()},
-                    )
-                    value_t = self.agent.value_head(
-                        ctx_t,
-                        own_reps_seq_mb[t],
-                        opp_reps_seq_mb[t],
-                        own_bench_mask_seq_mb[t],
-                        opp_bench_mask_seq_mb[t],
-                    )
-
-                    all_log_probs.append(action_out["log_prob"])
-                    all_entropies.append(action_out["entropy"])
-                    all_values.append(value_t)
 
                     # Zero hidden state at episode boundaries without host-side syncs.
                     if hidden is not None:
@@ -223,10 +190,79 @@ class PPOTrainer:
                         ):
                             hidden = tuple(state.detach() for state in hidden)
 
-                # Flatten (T, E_mb) → (T*E_mb,) for loss computation.
-                log_probs_flat = torch.stack(all_log_probs).reshape(-1)
-                entropies_flat = torch.stack(all_entropies).reshape(-1)
-                values_flat = torch.stack(all_values).reshape(-1)
+                # Evaluate heads in flattened time-major chunks for loss computation.
+                ctx_seq_mb = torch.stack(all_ctx, dim=0)  # (T, E_mb, mem_dim)
+
+                # The action and value heads are independent across timesteps.
+                # Chunking avoids many tiny GPU launches without evaluating the
+                # whole rollout minibatch at once.
+                all_log_probs: list[torch.Tensor] = []
+                all_entropies: list[torch.Tensor] = []
+                all_values: list[torch.Tensor] = []
+                head_chunk_steps = max(1, min(T, self._HEAD_BATCH_TARGET // E_mb))
+                for start in range(0, T, head_chunk_steps):
+                    end = min(start + head_chunk_steps, T)
+                    flat_count = (end - start) * E_mb
+                    ctx_flat = ctx_seq_mb[start:end].reshape(flat_count, -1)
+                    own_reps_flat = own_reps_seq_mb[start:end].reshape(
+                        flat_count,
+                        own_reps_seq_mb.shape[2],
+                        own_reps_seq_mb.shape[-1],
+                    )
+                    opp_reps_flat = opp_reps_seq_mb[start:end].reshape(
+                        flat_count,
+                        opp_reps_seq_mb.shape[2],
+                        opp_reps_seq_mb.shape[-1],
+                    )
+                    opp_bench_mask_flat = opp_bench_mask_seq_mb[start:end].reshape(
+                        flat_count,
+                        opp_bench_mask_seq_mb.shape[-1],
+                    )
+
+                    action_out = self.agent.action_head(
+                        ctx_flat,
+                        active_reps_seq_mb[start:end].reshape(
+                            flat_count,
+                            2,
+                            active_reps_seq_mb.shape[-1],
+                        ),
+                        own_reps_flat,
+                        opp_reps_flat,
+                        opp_bench_mask_flat,
+                        opp_active_reps_seq_mb[start:end].reshape(
+                            flat_count,
+                            2,
+                            opp_active_reps_seq_mb.shape[-1],
+                        ),
+                        {
+                            key: value[start:end].reshape(flat_count, *value.shape[2:])
+                            for key, value in mb_masks_seq.items()
+                        },
+                        mb_actions_seq[start:end].reshape(flat_count, 3),
+                        battle_obs={
+                            key: value[start:end].reshape(flat_count, *value.shape[2:])
+                            for key, value in mb_obs_seq.items()
+                        },
+                        validate_actions=False,
+                    )
+                    value_t = self.agent.value_head(
+                        ctx_flat,
+                        own_reps_flat,
+                        opp_reps_flat,
+                        own_bench_mask_seq_mb[start:end].reshape(
+                            flat_count,
+                            own_bench_mask_seq_mb.shape[-1],
+                        ),
+                        opp_bench_mask_flat,
+                    )
+
+                    all_log_probs.append(action_out["log_prob"])
+                    all_entropies.append(action_out["entropy"])
+                    all_values.append(value_t)
+
+                log_probs_flat = torch.cat(all_log_probs)
+                entropies_flat = torch.cat(all_entropies)
+                values_flat = torch.cat(all_values)
 
                 # Policy loss (clipped surrogate objective).
                 log_ratio = log_probs_flat - mb_old_lp
@@ -276,7 +312,6 @@ class PPOTrainer:
                     loss = loss + self.config.aux_hidden_info_coef * hidden_info_loss
 
                 if opp_action_enabled:
-                    ctx_seq_mb = torch.stack(all_ctx, dim=0)  # (T, E_mb, mem_dim)
                     opp_action_out = self.agent.opponent_action_head(
                         ctx_seq_mb.reshape(T * E_mb, -1),
                         opp_active_reps_seq_mb.reshape(T * E_mb, 2, -1),
@@ -299,15 +334,15 @@ class PPOTrainer:
                     approx_kl = ((ratio - 1) - log_ratio.clamp(
                         min=-self._LOG_RATIO_CLAMP,
                         max=self._LOG_RATIO_CLAMP,
-                    )).mean().item()
-                metrics["policy_loss"] += policy_loss.item()
-                metrics["value_loss"] += value_loss.item()
-                metrics["entropy"] += -entropy_loss.item()
-                metrics["approx_kl"] += approx_kl
-                if hidden_info_enabled:
-                    metrics["aux_hidden_info_loss"] += hidden_info_loss.item()
-                if opp_action_enabled:
-                    metrics["aux_opp_action_loss"] += opp_action_loss.item()
+                    )).mean()
+                    metric_sums["policy_loss"].add_(policy_loss.detach())
+                    metric_sums["value_loss"].add_(value_loss.detach())
+                    metric_sums["entropy"].add_((-entropy_loss).detach())
+                    metric_sums["approx_kl"].add_(approx_kl)
+                    if hidden_info_enabled:
+                        metric_sums["aux_hidden_info_loss"].add_(hidden_info_loss.detach())
+                    if opp_action_enabled:
+                        metric_sums["aux_opp_action_loss"].add_(opp_action_loss.detach())
                 num_updates += 1
 
         if num_updates == 0:
@@ -316,7 +351,7 @@ class PPOTrainer:
             )
 
         self.global_step += T * E
-        averaged = {k: v / num_updates for k, v in metrics.items()}
+        averaged = {key: (value / num_updates).item() for key, value in metric_sums.items()}
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
@@ -504,7 +539,7 @@ class PPOTrainer:
         if optimizer_compatible:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
         else:
-            self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=self.config.lr, eps=1e-5)
+            self.optimizer = self._make_optimizer()
             print(
                 "Checkpoint architecture changed; loaded compatible agent weights only. "
                 f"Skipped={len(load_report['skipped_keys'])}, "

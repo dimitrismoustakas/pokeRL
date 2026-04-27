@@ -9,14 +9,18 @@ from types import MethodType
 
 import numpy as np
 import torch
-from poke_env import ServerConfiguration
 from poke_env.battle import DoubleBattle
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 
 from pokerl.config import EnvConfig, ModelConfig
 from pokerl.data import GameData
 from pokerl.env.actions import FIRST_SLOT_MASK_ROW, NUM_TARGETS, PASS_ACTION, SWITCH_OFFSET
-from pokerl.env.showdown_env import BattleEnv, make_local_account_configuration
+from pokerl.env.showdown_env import (
+    BattleEnv,
+    default_showdown_dir,
+    make_battlestream_configuration,
+    make_local_account_configuration,
+)
 from pokerl.model.agent import PokeAgent
 
 
@@ -30,6 +34,10 @@ def parse_args() -> argparse.Namespace:
         help="Maximum decision steps. Use 0 for no decision-step cap.",
     )
     parser.add_argument("--policy", choices=["max-power", "random-legal", "legal-first", "model"], default="max-power")
+    parser.add_argument("--showdown-dir", default=None, help="Pokemon Showdown checkout for local BattleStream.")
+    parser.add_argument("--worker-count", type=int, default=None, help="Local BattleStream worker count.")
+    parser.add_argument("--battles-per-worker", type=int, default=None, help="Max concurrent local battles per worker.")
+    parser.add_argument("--runtime-loop-count", type=int, default=None, help="Local BattleStream runtime loop count.")
     parser.add_argument(
         "--opponent",
         choices=["max-base-power", "random", "simple-heuristic"],
@@ -40,14 +48,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-limit", type=int, default=20, help="Maximum traced decision steps.")
     parser.add_argument("--json", action="store_true", help="Emit the final summary as JSON.")
     return parser.parse_args()
-
-
-def server_config(env_config: EnvConfig) -> ServerConfiguration:
-    host, port = env_config.server_url.split(":")
-    return ServerConfiguration(
-        f"ws://{host}:{port}/showdown/websocket",
-        f"http://{host}:{port}/action.php",
-    )
 
 
 def choose_action(
@@ -215,7 +215,7 @@ def _build_opponent_factory(name: str, env_config: EnvConfig, timing: dict[str, 
         opponent = opponent_classes[name](
             account_configuration=make_local_account_configuration("smokeopp"),
             battle_format=env_config.battle_format,
-            server_configuration=server_config(env_config),
+            server_configuration=make_battlestream_configuration(env_config),
             loop=loop,
         )
         _attach_choice_timer(opponent, timing, "opponent")
@@ -229,9 +229,18 @@ def main() -> None:
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
     started_at = time.perf_counter()
+    showdown_dir = args.showdown_dir or default_showdown_dir()
+    if showdown_dir is None:
+        raise SystemExit("--showdown-dir is required, or set POKERL_SHOWDOWN_DIR.")
 
     game_data = GameData(gen=9)
-    env_config = EnvConfig(num_envs=1)
+    env_config = EnvConfig(
+        num_envs=1,
+        showdown_dir=showdown_dir,
+        worker_count=args.worker_count,
+        battles_per_worker=args.battles_per_worker,
+        runtime_loop_count=args.runtime_loop_count,
+    )
     agent = PokeAgent(ModelConfig(), game_data).to(device)
     timing = _empty_timing()
     opponent_factory = _build_opponent_factory(args.opponent, env_config, timing)

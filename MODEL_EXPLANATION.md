@@ -826,10 +826,15 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | Parameter | Default |
 |---|---|
 | `battle_format` | `"gen9randomdoublesbattle"` |
-| `server_url` | `"localhost:8000"` |
 | `num_envs` | 16 |
 | `team_size` | 6 |
 | `pick_size` | 4 |
+| `showdown_dir` | `None` |
+| `worker_count` | `None` |
+| `battles_per_worker` | `None` |
+| `pool_mode` | `"shared"` |
+| `runtime_loop_count` | `None` |
+| `opponent_group` | 0 |
 
 ### 9.3 TrainingConfig (defaults)
 

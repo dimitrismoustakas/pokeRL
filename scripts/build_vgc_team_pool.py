@@ -375,7 +375,7 @@ class ShowdownCliValidator:
         if not self.entrypoint.exists():
             raise FileNotFoundError(
                 f"Could not find Pokemon Showdown entrypoint at {self.entrypoint}. "
-                "Run scripts/start_showdown_server.ps1 first."
+                "Set --showdown-dir to a Pokemon Showdown checkout."
             )
 
     def _run(self, args: list[str], team_text: str) -> subprocess.CompletedProcess[str]:

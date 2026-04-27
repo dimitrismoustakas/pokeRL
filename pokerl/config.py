@@ -33,10 +33,15 @@ class ModelConfig:
 @dataclass
 class EnvConfig:
     battle_format: str = "gen9randomdoublesbattle"
-    server_url: str = "localhost:8000"
     num_envs: int = 16
     team_size: int = 6
     pick_size: int = 4  # how many pokemon to bring from team_size
+    showdown_dir: str | None = None
+    worker_count: int | None = None
+    battles_per_worker: int | None = None
+    pool_mode: str = "shared"
+    runtime_loop_count: int | None = None
+    opponent_group: int = 0
 
 
 @dataclass

@@ -13,26 +13,13 @@ uv sync --dev
 
 The project package is installed editable into `.venv`.
 
-## Local Showdown server
+## Local Pokemon Showdown checkout
 
-Start the local Pokemon Showdown server before smoke tests or training:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1
-```
-
-It serves on `localhost:8000` by default.
-
-For automation, use detached startup so the command returns after the port is reachable:
+Smoke tests and training use poke-env's local BattleStream backend. Put a
+Pokemon Showdown checkout at `%LOCALAPPDATA%\pokeRL\pokemon-showdown`, or set:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1 -Port 8000 -Detached
-```
-
-To run additional local instances on other ports:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1 -Port 8001
+$env:POKERL_SHOWDOWN_DIR = "C:\path\to\pokemon-showdown"
 ```
 
 ## Smoke battle
@@ -52,19 +39,19 @@ Training logs include rollout time, PPO update time, completed episodes, average
 To train on a fixed Regulation F pool with team preview (bring 4 of 6):
 
 ```powershell
-& .\.venv\Scripts\python.exe .\scripts\train.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --num-envs 8 --server-urls localhost:8000,localhost:8001
+& .\.venv\Scripts\python.exe .\scripts\train.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --num-envs 8 --opponent-groups 2
 ```
 
-To shard envs across multiple local Showdown servers:
+To tune how many frozen opponents are shared across the env batch:
 
 ```powershell
-& .\.venv\Scripts\python.exe .\scripts\train.py --device cpu --num-envs 16 --server-urls localhost:8000,localhost:8001
+& .\.venv\Scripts\python.exe .\scripts\train.py --device cpu --num-envs 16 --opponent-groups 2
 ```
 
-For a short env/server scaling benchmark over two rollout->PPO rounds:
+For a short local BattleStream scaling benchmark over two rollout->PPO rounds:
 
 ```powershell
-& .\.venv\Scripts\python.exe .\scripts\benchmark_parallel_training.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --env-counts 4,8,16 --server-counts 1,2,4 --rollout-steps 16 --num-updates 2
+& .\.venv\Scripts\python.exe .\scripts\benchmark_parallel_training.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --env-counts 4,8,16 --opponent-groups 1,2 --rollout-steps 16 --num-updates 2
 ```
 
 The benchmark writes per-run logs and a JSON summary under `benchmarks/<timestamp>/`.
@@ -74,12 +61,6 @@ The benchmark writes per-run logs and a JSON summary under `benchmarks/<timestam
 The repository includes a helper to fetch public VGC teams, validate them
 against the local Pokemon Showdown checkout, and optionally generate extra
 legal remix teams from the curated pool.
-
-First make sure the local Showdown checkout is installed and up to date:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1 -InstallOnly -Update
-```
 
 Then build a Regulation I pool:
 

@@ -1,14 +1,15 @@
-"""Benchmark short PPO training runs across env/server configurations."""
+"""Benchmark short PPO training runs across local BattleStream configurations."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import socket
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+from pokerl.env.showdown_env import default_showdown_dir
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,9 +17,10 @@ TRAIN_SCRIPT = REPO_ROOT / "scripts" / "train.py"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark pokeRL env/server scaling.")
+    parser = argparse.ArgumentParser(description="Benchmark pokeRL local BattleStream scaling.")
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to train.py auto-detection")
     parser.add_argument("--battle-format", default="gen9vgc2026regf", help="Showdown format to benchmark.")
+    parser.add_argument("--showdown-dir", default=None, help="Pokemon Showdown checkout for local BattleStream.")
     parser.add_argument(
         "--team-pool-format",
         default="gen9vgc2026regf",
@@ -32,8 +34,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--team-pool-seed", type=int, default=0, help="Seed for fixed-team sampling.")
     parser.add_argument("--env-counts", default="4,8,16", help="Comma-separated env counts to benchmark.")
-    parser.add_argument("--server-counts", default="1,2,4", help="Comma-separated server counts to benchmark.")
-    parser.add_argument("--base-port", type=int, default=8000, help="First localhost port in the server list.")
+    parser.add_argument("--opponent-groups", default="1,2", help="Comma-separated opponent group counts.")
+    parser.add_argument(
+        "--worker-counts",
+        default="",
+        help="Comma-separated local worker counts. Empty uses train.py's default.",
+    )
     parser.add_argument("--rollout-steps", type=int, default=16, help="Rollout steps collected per update.")
     parser.add_argument("--num-updates", type=int, default=2, help="How many rollout/PPO updates to run per config.")
     parser.add_argument("--num-epochs", type=int, default=4, help="PPO epochs per update.")
@@ -57,38 +63,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_csv_ints(raw_value: str) -> list[int]:
-    return [int(item.strip()) for item in raw_value.split(",") if item.strip()]
-
-
-def ensure_servers_ready(server_urls: list[str]) -> None:
-    missing = [url for url in server_urls if not _port_open(url)]
-    if missing:
-        missing_ports = ", ".join(missing)
-        raise SystemExit(
-            f"The following Showdown servers are not reachable: {missing_ports}. "
-            "Start them first with scripts/start_showdown_server.ps1."
-        )
-
-
-def _port_open(server_url: str) -> bool:
-    host, port_raw = server_url.split(":", maxsplit=1)
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(1.0)
-        return sock.connect_ex((host, int(port_raw))) == 0
+def parse_csv_ints(raw_value: str, *, allow_empty: bool = False) -> list[int]:
+    values = [int(item.strip()) for item in raw_value.split(",") if item.strip()]
+    if not values and not allow_empty:
+        raise ValueError("Expected at least one integer value.")
+    return values
 
 
 def benchmark_config(
     *,
     args: argparse.Namespace,
     env_count: int,
-    server_count: int,
+    opponent_group_count: int,
+    worker_count: int | None,
+    showdown_dir: str,
     output_dir: Path,
 ) -> dict:
-    server_urls = [f"localhost:{args.base_port + idx}" for idx in range(server_count)]
-    ensure_servers_ready(server_urls)
-
-    run_name = f"env{env_count}_srv{server_count}"
+    run_name = f"env{env_count}_grp{opponent_group_count}_wrk{worker_count or 'auto'}"
     run_dir = output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     summary_path = run_dir / "summary.json"
@@ -100,6 +91,8 @@ def benchmark_config(
         str(TRAIN_SCRIPT),
         "--battle-format",
         args.battle_format,
+        "--showdown-dir",
+        showdown_dir,
         "--team-pool-format",
         args.team_pool_format,
         "--team-pool-subset",
@@ -108,6 +101,8 @@ def benchmark_config(
         str(args.team_pool_seed),
         "--num-envs",
         str(env_count),
+        "--opponent-groups",
+        str(opponent_group_count),
         "--rollout-steps",
         str(args.rollout_steps),
         "--num-updates",
@@ -122,8 +117,6 @@ def benchmark_config(
         "1000000",
         "--league-update-interval",
         str(args.league_update_interval),
-        "--server-urls",
-        ",".join(server_urls),
         "--checkpoint-dir",
         str(checkpoint_dir),
         "--summary-path",
@@ -131,6 +124,8 @@ def benchmark_config(
     ]
     if args.device:
         command.extend(["--device", args.device])
+    if worker_count is not None:
+        command.extend(["--worker-count", str(worker_count)])
 
     print(
         f"Starting {run_name} | "
@@ -191,8 +186,8 @@ def benchmark_config(
 
     result = {
         "envs": env_count,
-        "servers": server_count,
-        "server_urls": server_urls,
+        "opponent_groups": opponent_group_count,
+        "worker_count": worker_count,
         "rollout_steps": args.rollout_steps,
         "num_updates": args.num_updates,
         "num_epochs": args.num_epochs,
@@ -218,38 +213,48 @@ def benchmark_config(
 
 def main() -> None:
     args = parse_args()
+    showdown_dir = args.showdown_dir or default_showdown_dir()
+    if showdown_dir is None:
+        raise SystemExit("--showdown-dir is required, or set POKERL_SHOWDOWN_DIR.")
+    if not Path(showdown_dir).exists():
+        raise SystemExit(f"Pokemon Showdown checkout not found: {showdown_dir}")
+
     env_counts = parse_csv_ints(args.env_counts)
-    server_counts = parse_csv_ints(args.server_counts)
+    opponent_group_counts = parse_csv_ints(args.opponent_groups)
+    worker_counts = parse_csv_ints(args.worker_counts, allow_empty=True) or [None]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT / "benchmarks" / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict] = []
     for env_count in env_counts:
-        for server_count in server_counts:
-            if server_count > env_count:
+        for opponent_group_count in opponent_group_counts:
+            if opponent_group_count > env_count:
                 continue
-
-            result = benchmark_config(
-                args=args,
-                env_count=env_count,
-                server_count=server_count,
-                output_dir=output_dir,
-            )
-            results.append(result)
-            print(
-                f"envs={env_count} servers={server_count} | "
-                f"SPS {result['steps_per_sec']:.1f} | "
-                f"init {result['initial_reset_sec']:.2f}s | "
-                f"rollout {result['total_rollout_sec']:.2f}s | "
-                f"ppo {result['total_ppo_sec']:.2f}s | "
-                f"queue {result['queue_wait_share'] * 100.0:.1f}%"
-            )
+            for worker_count in worker_counts:
+                result = benchmark_config(
+                    args=args,
+                    env_count=env_count,
+                    opponent_group_count=opponent_group_count,
+                    worker_count=worker_count,
+                    showdown_dir=showdown_dir,
+                    output_dir=output_dir,
+                )
+                results.append(result)
+                print(
+                    f"envs={env_count} groups={opponent_group_count} workers={worker_count or 'auto'} | "
+                    f"SPS {result['steps_per_sec']:.1f} | "
+                    f"init {result['initial_reset_sec']:.2f}s | "
+                    f"rollout {result['total_rollout_sec']:.2f}s | "
+                    f"ppo {result['total_ppo_sec']:.2f}s | "
+                    f"queue {result['queue_wait_share'] * 100.0:.1f}%"
+                )
 
     ranked = sorted(results, key=lambda item: item["steps_per_sec"], reverse=True)
     summary = {
         "battle_format": args.battle_format,
         "team_pool_format": args.team_pool_format,
+        "showdown_dir": showdown_dir,
         "generated_at": datetime.now().isoformat(),
         "results": results,
         "ranked_by_steps_per_sec": ranked,

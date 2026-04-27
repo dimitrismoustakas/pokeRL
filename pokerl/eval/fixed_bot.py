@@ -27,7 +27,7 @@ from ..env.actions import (
     decode_action,
     decode_tera_choice,
 )
-from ..env.showdown_env import BattleEnv, make_local_account_configuration, make_server_configuration
+from ..env.showdown_env import BattleEnv, make_battlestream_configuration, make_local_account_configuration
 from ..team_pool import TeamPool, TeamPoolEntry
 from .replay import save_replay, save_replay_json
 
@@ -660,7 +660,7 @@ def evaluate_policy_vs_fixed_bot(
         return DeterministicPreviewMaxBasePowerPlayer(
             account_configuration=make_local_account_configuration("fixedbot"),
             battle_format=env_config.battle_format,
-            server_configuration=make_server_configuration(env_config),
+            server_configuration=make_battlestream_configuration(env_config),
             loop=loop,
             team=model_team_spec.packed_team,
             species_bst_lookup=species_bst_lookup,

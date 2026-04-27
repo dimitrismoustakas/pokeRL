@@ -6,7 +6,12 @@ import torch
 from ..config import ModelConfig, EnvConfig
 from ..data import GameData
 from ..model.agent import PokeAgent, load_state_dict_compatible
-from ..env.showdown_env import BattleEnv, make_local_account_configuration, make_server_configuration
+from ..env.showdown_env import (
+    BattleEnv,
+    default_showdown_dir,
+    make_battlestream_configuration,
+    make_local_account_configuration,
+)
 
 
 def evaluate(
@@ -60,6 +65,7 @@ def load_and_evaluate(
     checkpoint_path: str,
     num_games: int = 100,
     device_name: str = "cpu",
+    showdown_dir: str | None = None,
 ):
     """Load a checkpoint and evaluate against a max-base-power bot."""
     from poke_env.player import MaxBasePowerPlayer
@@ -67,7 +73,7 @@ def load_and_evaluate(
     device = torch.device(device_name)
     game_data = GameData(gen=9)
     model_config = ModelConfig()
-    env_config = EnvConfig()
+    env_config = EnvConfig(showdown_dir=showdown_dir or default_showdown_dir())
 
     agent = PokeAgent(model_config, game_data)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -78,7 +84,7 @@ def load_and_evaluate(
         return MaxBasePowerPlayer(
             account_configuration=make_local_account_configuration("eval"),
             battle_format=env_config.battle_format,
-            server_configuration=make_server_configuration(env_config),
+            server_configuration=make_battlestream_configuration(env_config),
             loop=loop,
         )
 

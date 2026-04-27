@@ -7,16 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Uses `uv` package manager with Python 3.13
 - Install: `uv venv --python 3.13` then `uv sync --dev`
 
-### Local Pokemon Showdown Server
+### Local Pokemon Showdown Checkout
 
-Required before running any training or smoke tests:
+Training and smoke tests use poke-env's local BattleStream backend. Set this
+once if the checkout is not in the default `%LOCALAPPDATA%\pokeRL\pokemon-showdown`
+location:
 
 ```powershell
-# Start server (blocks until port is reachable)
-powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1 -Port 8000 -Detached
-
-# Additional instances for parallel training
-powershell -ExecutionPolicy Bypass -File .\scripts\start_showdown_server.ps1 -Port 8001 -Detached
+$env:POKERL_SHOWDOWN_DIR = "C:\path\to\pokemon-showdown"
 ```
 
 ## Common Commands
@@ -40,7 +38,7 @@ ruff format pokerl/ scripts/ tests/
 & .\.venv\Scripts\python.exe .\scripts\train.py --device cpu --num-envs 2 --rollout-steps 8 --total-timesteps 32 --num-epochs 1 --num-minibatches 1 --log-interval 1
 
 # Standard VGC training
-& .\.venv\Scripts\python.exe .\scripts\train.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --num-envs 8 --server-urls localhost:8000,localhost:8001
+& .\.venv\Scripts\python.exe .\scripts\train.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --num-envs 8 --opponent-groups 2
 
 # Build VGC team pool
 & .\.venv\Scripts\python.exe .\scripts\build_vgc_team_pool.py --format gen9vgc2026regf --target-team-count 150
@@ -48,8 +46,8 @@ ruff format pokerl/ scripts/ tests/
 # Evaluate a checkpoint
 & .\.venv\Scripts\python.exe .\scripts\evaluate_fixed_bot.py --checkpoint checkpoints/step_100000.pt
 
-# Parallel training benchmark (output → benchmarks/<timestamp>/)
-& .\.venv\Scripts\python.exe .\scripts\benchmark_parallel_training.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --env-counts 4,8,16 --server-counts 1,2,4
+# Parallel training benchmark (output -> benchmarks/<timestamp>/)
+& .\.venv\Scripts\python.exe .\scripts\benchmark_parallel_training.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --env-counts 4,8,16 --opponent-groups 1,2
 ```
 
 ## Architecture

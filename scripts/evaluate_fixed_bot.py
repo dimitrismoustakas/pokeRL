@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import socket
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +11,7 @@ import torch
 
 from pokerl.config import EnvConfig, ModelConfig
 from pokerl.data import GameData
+from pokerl.env.showdown_env import default_showdown_dir
 from pokerl.eval.fixed_bot import (
     build_species_bst_lookup,
     evaluate_policy_vs_fixed_bot,
@@ -32,7 +32,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path; omit for random initialization.")
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
     parser.add_argument("--battle-format", default="gen9vgc2026regf", help="Showdown battle format.")
-    parser.add_argument("--server-url", default="localhost:8000", help="Showdown server host:port.")
+    parser.add_argument("--showdown-dir", default=None, help="Pokemon Showdown checkout for local BattleStream.")
+    parser.add_argument("--worker-count", type=int, default=None, help="Local BattleStream worker count.")
+    parser.add_argument("--battles-per-worker", type=int, default=None, help="Max concurrent local battles per worker.")
+    parser.add_argument("--runtime-loop-count", type=int, default=None, help="Local BattleStream runtime loop count.")
     parser.add_argument(
         "--team-pool-format",
         default="gen9vgc2026regf",
@@ -78,13 +81,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _port_open(server_url: str) -> bool:
-    host, port_raw = server_url.split(":", maxsplit=1)
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(1.0)
-        return sock.connect_ex((host, int(port_raw))) == 0
-
-
 def _write_json(path: str, payload: dict) -> Path:
     out_path = Path(path)
     if not out_path.is_absolute():
@@ -96,10 +92,11 @@ def _write_json(path: str, payload: dict) -> Path:
 
 def main() -> None:
     args = parse_args()
-    if not _port_open(args.server_url):
-        raise SystemExit(
-            f"Showdown server {args.server_url} is not reachable. Start it first with scripts/start_showdown_server.ps1."
-        )
+    showdown_dir = args.showdown_dir or default_showdown_dir()
+    if showdown_dir is None:
+        raise SystemExit("--showdown-dir is required, or set POKERL_SHOWDOWN_DIR.")
+    if not Path(showdown_dir).exists():
+        raise SystemExit(f"Pokemon Showdown checkout not found: {showdown_dir}")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -108,10 +105,13 @@ def main() -> None:
     device = torch.device(device_name)
     env_config = EnvConfig(
         battle_format=args.battle_format,
-        server_url=args.server_url,
         num_envs=1,
         team_size=6,
         pick_size=4,
+        showdown_dir=showdown_dir,
+        worker_count=args.worker_count,
+        battles_per_worker=args.battles_per_worker,
+        runtime_loop_count=args.runtime_loop_count,
     )
     model_config = ModelConfig(pick_size=env_config.pick_size)
     game_data = GameData(gen=9)
@@ -148,7 +148,7 @@ def main() -> None:
             "checkpoint": args.checkpoint,
             "device": str(device),
             "battle_format": env_config.battle_format,
-            "server_url": env_config.server_url,
+            "showdown_dir": env_config.showdown_dir,
             "games": args.games,
             "action_mode": args.action_mode,
             "opponent": "max-base-power",
