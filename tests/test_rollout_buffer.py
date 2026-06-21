@@ -1148,6 +1148,61 @@ def test_finished_battle_update_skips_legality_rebuild(monkeypatch: pytest.Monke
     np.testing.assert_array_equal(mask["can_tera"], np.array([False, False], dtype=bool))
 
 
+def test_finished_battle_callback_defers_terminal_observation() -> None:
+    queued = []
+    fake_player = SimpleNamespace(
+        _pending_finished_battle=None,
+        obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
+    )
+    battle = SimpleNamespace(battle_tag="battle-1", turn=7, finished=True)
+
+    ShowdownPlayer._battle_finished_callback(fake_player, battle)
+
+    assert queued == []
+    assert fake_player._pending_finished_battle is battle
+
+
+def test_emit_pending_finished_battle_enqueues_terminal_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queued = []
+    timing = SimpleNamespace(
+        increment=lambda *args, **kwargs: None,
+        add=lambda *args, **kwargs: None,
+    )
+    fake_player = SimpleNamespace(
+        last_battle=None,
+        _last_finished_token=None,
+        _pending_finished_battle=None,
+        obs_builder=SimpleNamespace(build=lambda battle: {"context": np.array([1], dtype=np.int64)}),
+        timing=timing,
+        obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
+        _pending_action_state=None,
+        _pending_action_battle=None,
+    )
+    fake_player._emit_battle_update = lambda battle: ShowdownPlayer._emit_battle_update(
+        fake_player,
+        battle,
+    )
+    battle = SimpleNamespace(battle_tag="battle-1", turn=7, finished=True, won=True, lost=False)
+    fake_player._pending_finished_battle = battle
+
+    monkeypatch.setattr(
+        showdown_env_module,
+        "build_legal_action_state",
+        lambda battle: (_ for _ in ()).throw(AssertionError("finished battles should not rebuild legality")),
+    )
+
+    emitted = ShowdownPlayer.emit_pending_finished_battle(fake_player)
+
+    assert emitted is True
+    assert fake_player._pending_finished_battle is None
+    _, _mask, reward, done, queued_battle = queued[0]
+    assert reward == 1.0
+    assert done is True
+    assert queued_battle is battle
+
+
 def test_league_player_team_preview_propagates_precompute_failure() -> None:
     obs = {"context": np.array([1, 2, 3], dtype=np.int64)}
     future: Future = Future()

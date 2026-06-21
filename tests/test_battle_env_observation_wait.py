@@ -1,3 +1,4 @@
+import asyncio
 from concurrent.futures import Future, TimeoutError
 from types import SimpleNamespace
 
@@ -130,6 +131,27 @@ def test_step_rejects_terminal_task_that_does_not_finish() -> None:
 
     with pytest.raises(TimeoutError, match="overlap the previous battle"):
         env.step(np.asarray([0, 0, 0], dtype=np.int64))
+
+
+def test_run_battle_emits_terminal_after_battle_coroutine_returns() -> None:
+    events = []
+
+    class Player:
+        async def battle_against(self, opponent, n_battles: int = 1):
+            assert n_battles == 1
+            assert opponent == "opponent"
+            events.append("battle-returned")
+
+        def emit_pending_finished_battle(self):
+            events.append("terminal-emitted")
+
+    env = object.__new__(BattleEnv)
+    env.player = Player()
+    env.opponent = "opponent"
+
+    asyncio.run(env._run_battle())
+
+    assert events == ["battle-returned", "terminal-emitted"]
 
 
 def test_close_does_not_mask_existing_training_exception() -> None:

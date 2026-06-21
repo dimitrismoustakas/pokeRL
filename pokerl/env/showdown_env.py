@@ -281,15 +281,17 @@ class ShowdownPlayer(Player):
         self._team_preview_fn = None
         self._pending_action_state = None
         self._pending_action_battle: DoubleBattle | None = None
+        self._pending_finished_battle: DoubleBattle | None = None
 
     def choose_move(self, battle: DoubleBattle) -> Awaitable[BattleOrder]:
         return self._choose_move(battle)
 
     async def _choose_move(self, battle: DoubleBattle) -> BattleOrder:
-        self._emit_battle_update(battle)
-
         if battle.finished:
+            self._pending_finished_battle = battle
             return self.choose_default_move()
+
+        self._emit_battle_update(battle)
 
         action = await self.action_queue.async_get()
         if action is None:
@@ -299,7 +301,17 @@ class ShowdownPlayer(Player):
         return self._make_order(action, battle)
 
     def _battle_finished_callback(self, battle):
+        self._pending_finished_battle = battle
+
+    def emit_pending_finished_battle(self) -> bool:
+        battle = self._pending_finished_battle
+        if battle is None and self.last_battle is not None and self.last_battle.finished:
+            battle = self.last_battle
+        if battle is None:
+            return False
+        self._pending_finished_battle = None
         self._emit_battle_update(battle)
+        return True
 
     def teampreview(self, battle: DoubleBattle) -> str:
         if self._team_preview_fn is None:
@@ -502,10 +514,7 @@ class BattleEnv:
 
         if timing_enabled:
             battle_start_started = time.perf_counter()
-        self._battle_task = asyncio.run_coroutine_threadsafe(
-            self.player.battle_against(self.opponent, n_battles=1),
-            self._loop,
-        )
+        self._battle_task = asyncio.run_coroutine_threadsafe(self._run_battle(), self._loop)
         if timing_enabled:
             self._timing.add("env_reset_battle_start_sec", time.perf_counter() - battle_start_started)
         self._battle_started_at = time.perf_counter()
@@ -520,6 +529,10 @@ class BattleEnv:
             self._timing.increment("env_reset_calls")
             self._timing.add("env_reset_total_sec", time.perf_counter() - reset_started)
         return obs, mask
+
+    async def _run_battle(self) -> None:
+        await self.player.battle_against(self.opponent, n_battles=1)
+        self.player.emit_pending_finished_battle()
 
     def step(self, action: np.ndarray) -> tuple[dict, dict[str, np.ndarray], float, bool, dict]:
         """Send an action and get the next observation.
