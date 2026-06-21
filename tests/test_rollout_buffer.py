@@ -1279,6 +1279,10 @@ def test_league_player_decision_signature_tracks_action_request_fields() -> None
     unrelated_side_update["side"]["pokemon"][0]["condition"] = "1/100"
     assert LeaguePlayer._request_decision_signature(unrelated_side_update) == base_signature
 
+    fainted_side_update = copy.deepcopy(request)
+    fainted_side_update["side"]["pokemon"][0]["condition"] = "0 fnt"
+    assert LeaguePlayer._request_decision_signature(fainted_side_update) != base_signature
+
     changed_target = copy.deepcopy(request)
     changed_target["active"][0]["moves"][1]["target"] = "adjacentFoe"
     assert LeaguePlayer._request_decision_signature(changed_target) != base_signature

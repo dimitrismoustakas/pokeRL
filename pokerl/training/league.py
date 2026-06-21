@@ -601,6 +601,7 @@ class LeaguePlayer(Player):
             bool(request.get("teamPreview", False)),
             cls._simple_decision_tuple(request.get("forceSwitch")),
             tuple(active_signature),
+            cls._side_switch_signature(request.get("side")),
         )
 
     @staticmethod
@@ -612,6 +613,26 @@ class LeaguePlayer(Player):
         if isinstance(value, (list, tuple)):
             return tuple(value)
         return (value,)
+
+    @classmethod
+    def _side_switch_signature(cls, side) -> tuple[object, ...]:
+        if not isinstance(side, dict):
+            return ()
+        pokemon = side.get("pokemon") or ()
+        signature = []
+        for pokemon_request in pokemon:
+            if not isinstance(pokemon_request, dict):
+                signature.append(repr(pokemon_request))
+                continue
+            condition = str(pokemon_request.get("condition", ""))
+            signature.append(
+                (
+                    pokemon_request.get("ident"),
+                    bool(pokemon_request.get("active", False)),
+                    condition.endswith(" fnt"),
+                )
+            )
+        return tuple(signature)
 
     def _record_preview_obs_mismatch(
         self,
