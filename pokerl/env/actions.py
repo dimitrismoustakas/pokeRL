@@ -8,7 +8,7 @@ still delegated to ``DoubleBattleOrder.join_orders``.
 from dataclasses import dataclass
 
 from poke_env.battle import DoubleBattle, Move
-from poke_env.player import DoubleBattleOrder, PassBattleOrder, SingleBattleOrder
+from poke_env.player import DoubleBattleOrder, PassBattleOrder, SingleBattleOrder, SkippedBattleOrder
 
 import numpy as np
 
@@ -54,8 +54,8 @@ class LegalActionState:
     """Per-request legality tables derived from the live Showdown request."""
 
     slot_action_orders: tuple[
-        dict[int, SingleBattleOrder | PassBattleOrder],
-        dict[int, SingleBattleOrder | PassBattleOrder],
+        dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
+        dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
     ]
     slot_masks: tuple[np.ndarray, np.ndarray]
     joint_mask: np.ndarray
@@ -64,9 +64,9 @@ class LegalActionState:
 
 @dataclass(frozen=True)
 class _SlotActionState:
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder]
+    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder]
     mask: np.ndarray
-    joined_orders: list[SingleBattleOrder | PassBattleOrder]
+    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder]
     action_by_order_id: dict[int, int]
 
 
@@ -227,7 +227,7 @@ def action_to_order(
     slot: int,
     terastallize: bool = False,
     action_state: LegalActionState | None = None,
-) -> SingleBattleOrder | PassBattleOrder:
+) -> SingleBattleOrder | PassBattleOrder | SkippedBattleOrder:
     """Convert a flat action index to the exact current legal order."""
     if action_state is None:
         action_state = build_legal_action_state(battle)
@@ -251,7 +251,7 @@ def action_to_order(
         raise RuntimeError(
             f"Action {action_idx} for slot {slot} requested terastallization, but battle.can_tera[{slot}] is false."
         )
-    if isinstance(base_order, PassBattleOrder):
+    if isinstance(base_order, (PassBattleOrder, SkippedBattleOrder)):
         raise RuntimeError(f"Pass action {action_idx} cannot terastallize.")
     return SingleBattleOrder(
         base_order.order,
@@ -263,13 +263,13 @@ def action_to_order(
 def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionState:
     trapped = getattr(battle, "trapped", [False, False])
     force_switch = battle.force_switch
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder] = {}
-    joined_orders: list[SingleBattleOrder | PassBattleOrder] = []
+    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder] = {}
+    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder] = []
     action_by_order_id: dict[int, int] = {}
     mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
 
     if any(force_switch) and not force_switch[slot]:
-        return _build_pass_slot_state(mask)
+        return _build_pass_slot_state(mask, explicit=True)
 
     if not trapped[slot]:
         ordered_team = _ordered_own_team(battle)
@@ -320,12 +320,12 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
                 )
 
     if not action_orders:
-        return _build_pass_slot_state(mask)
+        return _build_pass_slot_state(mask, explicit=bool(force_switch[slot]))
     return _finalize_slot_state(action_orders, mask, joined_orders, action_by_order_id)
 
 
-def _build_pass_slot_state(mask: np.ndarray) -> _SlotActionState:
-    pass_order = PassBattleOrder()
+def _build_pass_slot_state(mask: np.ndarray, *, explicit: bool) -> _SlotActionState:
+    pass_order = PassBattleOrder() if explicit else SkippedBattleOrder()
     action_orders = {PASS_ACTION: pass_order}
     mask[PASS_ACTION] = True
     return _SlotActionState(
@@ -337,9 +337,9 @@ def _build_pass_slot_state(mask: np.ndarray) -> _SlotActionState:
 
 
 def _finalize_slot_state(
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder],
+    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
     mask: np.ndarray,
-    joined_orders: list[SingleBattleOrder | PassBattleOrder],
+    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
     action_by_order_id: dict[int, int],
 ) -> _SlotActionState:
     return _SlotActionState(
@@ -352,12 +352,12 @@ def _finalize_slot_state(
 
 def _add_order(
     *,
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder],
+    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
     action_by_order_id: dict[int, int],
-    joined_orders: list[SingleBattleOrder | PassBattleOrder],
+    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
     mask: np.ndarray,
     action_idx: int,
-    order: SingleBattleOrder | PassBattleOrder,
+    order: SingleBattleOrder | PassBattleOrder | SkippedBattleOrder,
     slot: int,
 ) -> None:
     existing = action_orders.get(action_idx)
@@ -420,16 +420,6 @@ def _request_aware_move_targets(
     slot: int,
 ) -> tuple[Move, list[int]]:
     hydrated_move = _hydrate_move_for_request(move, battle, slot)
-    move_request = _request_move_entry(move, battle, slot)
-    if (
-        move_request is not None
-        and move_request.get("target") is None
-        and _is_random_normal_move(move)
-    ):
-        # Showdown sometimes omits a request target for initial Outrage/Thrash-style
-        # selections even though a foe target is still required. Preserve poke-env's
-        # occupancy filtering by reusing its adjacent-foe resolver.
-        hydrated_move.request_target = "adjacentFoe"
     return hydrated_move, _legal_target_locs(hydrated_move, active_pokemon, battle)
 
 
@@ -483,8 +473,3 @@ def _legal_target_locs(move: Move, active_pokemon, battle: DoubleBattle) -> list
             "This indicates the request state and target mapping are inconsistent."
         )
     return list(target_locs)
-
-
-def _is_random_normal_move(move: Move) -> bool:
-    target = move.target
-    return target is not None and target.name == "RANDOM_NORMAL"
