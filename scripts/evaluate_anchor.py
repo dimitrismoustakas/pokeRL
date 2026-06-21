@@ -102,7 +102,7 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             if args.battlestream_startup_timeout is not None
             else EnvConfig.battlestream_startup_timeout
         ),
-        pool_mode=args.pool_mode or "shared",
+        pool_mode=args.pool_mode or EnvConfig.pool_mode,
     )
     model_config = ModelConfig(pick_size=env_config.pick_size)
     game_data = GameData(gen=9)

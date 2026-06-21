@@ -31,16 +31,39 @@ def test_make_battlestream_configuration_uses_configured_workers(tmp_path: Path)
     assert battlestream_config.startup_timeout == 55.0
 
 
-def test_battlestream_defaults_scale_from_env_count(tmp_path: Path) -> None:
+def test_battlestream_defaults_use_bounded_shared_workers(tmp_path: Path) -> None:
     config = EnvConfig(num_envs=72, showdown_dir=str(tmp_path))
 
     summary = battlestream_summary(config)
 
-    assert int(summary["worker_count"]) >= 1
-    assert int(summary["max_battles_per_worker"]) >= 1
+    assert summary["worker_count"] == 24
+    assert summary["max_battles_per_worker"] == 3
     assert summary["pool_mode"] == "shared"
-    assert int(summary["runtime_loop_count"]) >= 0
+    assert summary["runtime_loop_count"] == 2
     assert summary["startup_timeout"] == 30.0
+
+
+def test_battlestream_single_mode_defaults_isolate_workers(tmp_path: Path) -> None:
+    config = EnvConfig(num_envs=72, showdown_dir=str(tmp_path), pool_mode="single")
+
+    summary = battlestream_summary(config)
+
+    assert summary["worker_count"] == 72
+    assert summary["max_battles_per_worker"] == 1
+    assert summary["pool_mode"] == "single"
+    assert summary["runtime_loop_count"] == 2
+
+
+def test_battlestream_explicit_shared_worker_count_defaults_to_required_capacity(
+    tmp_path: Path,
+) -> None:
+    config = EnvConfig(num_envs=72, showdown_dir=str(tmp_path), worker_count=16)
+
+    summary = battlestream_summary(config)
+
+    assert summary["worker_count"] == 16
+    assert summary["max_battles_per_worker"] == 5
+    assert summary["pool_mode"] == "shared"
 
 
 def test_battlestream_configuration_requires_showdown_dir() -> None:

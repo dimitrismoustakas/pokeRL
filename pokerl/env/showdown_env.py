@@ -48,6 +48,8 @@ _ACCOUNT_COUNTER = itertools.count()
 _ACCOUNT_RUN_TAG = uuid.uuid4().hex[:4]
 QueueItemT = TypeVar("QueueItemT")
 _OBSERVATION_POLL_SECONDS = 1.0
+_DEFAULT_RUNTIME_LOOP_COUNT = 2
+_DEFAULT_SHARED_BATTLES_PER_WORKER = 3
 OpponentFactory = Callable[[asyncio.AbstractEventLoop], Player]
 TeamPairProvider = Callable[[], tuple[str | None, str | None]]
 
@@ -196,14 +198,19 @@ def make_local_account_configuration(prefix: str) -> AccountConfiguration:
 def _worker_count(config: EnvConfig) -> int:
     if config.worker_count is not None:
         return config.worker_count
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(config.num_envs, max(16, cpu_count // 2 or 1)))
+    if config.pool_mode == "single":
+        return max(1, config.num_envs)
+    return max(1, math.ceil(config.num_envs / _DEFAULT_SHARED_BATTLES_PER_WORKER))
 
 
 def _battles_per_worker(config: EnvConfig, worker_count: int) -> int:
     if config.battles_per_worker is not None:
         return config.battles_per_worker
-    return max(1, math.ceil(config.num_envs / worker_count * 2.0))
+    if config.pool_mode == "single":
+        return 1
+    if config.worker_count is None:
+        return _DEFAULT_SHARED_BATTLES_PER_WORKER
+    return max(1, math.ceil(config.num_envs / worker_count))
 
 
 def _runtime_loop_count(config: EnvConfig, worker_count: int) -> int:
@@ -211,7 +218,7 @@ def _runtime_loop_count(config: EnvConfig, worker_count: int) -> int:
         return config.runtime_loop_count
     if worker_count <= 1:
         return 0
-    return min(4, worker_count)
+    return min(_DEFAULT_RUNTIME_LOOP_COUNT, worker_count)
 
 
 def battlestream_summary(config: EnvConfig) -> dict[str, object]:

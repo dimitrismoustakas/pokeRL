@@ -35,10 +35,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--battle-format", default="gen9vgc2026regf", help="Showdown battle format.")
     parser.add_argument("--showdown-dir", default=None, help="Pokemon Showdown checkout for local BattleStream.")
     parser.add_argument("--num-envs", type=int, default=72, help="Number of parallel BattleEnv instances.")
-    parser.add_argument("--worker-count", type=int, default=16, help="Local BattleStream worker count.")
-    parser.add_argument("--battles-per-worker", type=int, default=9, help="Max battles per local worker.")
-    parser.add_argument("--runtime-loop-count", type=int, default=4, help="Local BattleStream runtime loop count.")
-    parser.add_argument("--pool-mode", choices=("single", "shared"), default="shared", help="BattleStream pool mode.")
+    parser.add_argument("--worker-count", type=int, default=None, help="Local BattleStream worker count.")
+    parser.add_argument("--battles-per-worker", type=int, default=None, help="Max battles per local worker.")
+    parser.add_argument("--runtime-loop-count", type=int, default=None, help="Local BattleStream runtime loop count.")
+    parser.add_argument(
+        "--pool-mode",
+        choices=("single", "shared"),
+        default=None,
+        help="BattleStream pool mode. Defaults to EnvConfig.pool_mode.",
+    )
     parser.add_argument(
         "--battlestream-startup-timeout",
         type=float,
@@ -205,7 +210,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         worker_count=args.worker_count,
         battles_per_worker=args.battles_per_worker,
         runtime_loop_count=args.runtime_loop_count,
-        pool_mode=args.pool_mode,
+        pool_mode=args.pool_mode or EnvConfig.pool_mode,
         battlestream_startup_timeout=args.battlestream_startup_timeout,
     )
     game_data = GameData(gen=9)

@@ -71,25 +71,25 @@ def parse_args() -> argparse.Namespace:
         "--worker-count",
         type=int,
         default=None,
-        help="Local BattleStream worker process count. Defaults from env count and CPU count.",
+        help="Local BattleStream worker process count. Defaults from local worker mode.",
     )
     parser.add_argument(
         "--battles-per-worker",
         type=int,
         default=None,
-        help="Maximum concurrent local battles per worker. Defaults from num-envs and worker count.",
+        help="Maximum concurrent local battles per worker. Defaults from local worker mode.",
     )
     parser.add_argument(
         "--pool-mode",
         choices=("single", "shared"),
         default=None,
-        help="Local BattleStream worker mode. Defaults to shared.",
+        help="Local BattleStream worker mode. Defaults to bounded shared.",
     )
     parser.add_argument(
         "--runtime-loop-count",
         type=int,
         default=None,
-        help="Number of runtime loops used by local BattleStream workers. Defaults to up to 4.",
+        help="Number of runtime loops used by local BattleStream workers. Defaults from local worker mode.",
     )
     parser.add_argument(
         "--battlestream-startup-timeout",
