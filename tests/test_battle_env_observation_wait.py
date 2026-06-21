@@ -94,6 +94,14 @@ def test_get_player_observation_reports_task_completed_without_observation() -> 
         env._get_player_observation("step observation")
 
 
+def test_get_player_observation_times_out_pending_battle_task() -> None:
+    env = _make_env(_ObservationQueue(TimeoutError()), Future())
+    env._describe_pending_battle_tasks = lambda: "diagnostic task stack"
+
+    with pytest.raises(TimeoutError, match="diagnostic task stack"):
+        env._get_player_observation("initial observation", max_wait_sec=0.0)
+
+
 def test_step_waits_for_terminal_battle_task_before_returning_done() -> None:
     task = Future()
     task.set_result(None)

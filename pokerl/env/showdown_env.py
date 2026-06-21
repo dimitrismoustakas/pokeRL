@@ -162,7 +162,13 @@ class _AsyncQueue(Generic[QueueItemT]):
     def get(self, timeout: float | None = None) -> QueueItemT:
         coro = self.async_get() if timeout is None else asyncio.wait_for(self.async_get(), timeout)
         result = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return result.result()
+        if timeout is None:
+            return result.result()
+        try:
+            return result.result(timeout=timeout + 0.5)
+        except TimeoutError:
+            result.cancel()
+            raise
 
     async def async_put(self, item: QueueItemT) -> None:
         await self.queue.put(item)
@@ -521,7 +527,10 @@ class BattleEnv:
 
         if timing_enabled:
             wait_started = time.perf_counter()
-        obs, mask, _, _, _ = self._get_player_observation("initial observation")
+        obs, mask, _, _, _ = self._get_player_observation(
+            "initial observation",
+            max_wait_sec=self.config.battlestream_startup_timeout,
+        )
         if timing_enabled:
             self._timing.add("env_reset_wait_first_obs_sec", time.perf_counter() - wait_started)
         self._prepare_next_battle()
@@ -559,7 +568,10 @@ class BattleEnv:
 
         if timing_enabled:
             wait_started = time.perf_counter()
-        obs, mask, reward, done, battle = self._get_player_observation("step observation")
+        obs, mask, reward, done, battle = self._get_player_observation(
+            "step observation",
+            max_wait_sec=self.config.battlestream_startup_timeout,
+        )
         if timing_enabled:
             self._timing.add("env_queue_wait_sec", time.perf_counter() - wait_started)
             self._timing.increment("env_step_calls")
@@ -600,12 +612,25 @@ class BattleEnv:
     def _get_player_observation(
         self,
         context: str,
+        *,
+        max_wait_sec: float | None = None,
     ) -> tuple[dict, dict[str, np.ndarray], float, bool, DoubleBattle]:
+        started = time.perf_counter()
         while True:
             try:
                 return self.player.obs_queue.get(timeout=_OBSERVATION_POLL_SECONDS)
             except TimeoutError as exc:
                 self._raise_battle_task_failure(context, exc)
+                if (
+                    max_wait_sec is not None
+                    and time.perf_counter() - started >= max_wait_sec
+                ):
+                    diagnostics = self._describe_pending_battle_tasks()
+                    raise TimeoutError(
+                        f"Timed out waiting {max_wait_sec:.1f}s for BattleEnv "
+                        f"{context} while the battle task was still pending. "
+                        f"{diagnostics}"
+                    ) from exc
 
     def _raise_battle_task_failure(
         self,
@@ -624,6 +649,35 @@ class BattleEnv:
         raise RuntimeError(
             f"Battle task completed without producing BattleEnv {context}."
         ) from timeout_error
+
+    def _describe_pending_battle_tasks(self) -> str:
+        async def _describe() -> str:
+            descriptions: list[str] = []
+            current = asyncio.current_task()
+            for task in asyncio.all_tasks():
+                if task is current or task.done():
+                    continue
+                coro = task.get_coro()
+                frames = task.get_stack(limit=6)
+                if frames:
+                    frame_bits = [
+                        f"{frame.f_code.co_name}@{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+                        for frame in frames
+                    ]
+                    stack = " <- ".join(frame_bits)
+                else:
+                    stack = "no Python stack"
+                descriptions.append(f"{coro!r}: {stack}")
+            return "Pending event-loop tasks: " + (
+                " | ".join(descriptions) if descriptions else "none"
+            )
+
+        try:
+            return asyncio.run_coroutine_threadsafe(_describe(), self._loop).result(
+                timeout=1.0
+            )
+        except Exception as exc:
+            return f"Could not describe pending event-loop tasks: {exc!r}"
 
     def _wait_for_battle_task_completion(self, context: str) -> None:
         task = self._battle_task
