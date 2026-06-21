@@ -577,7 +577,9 @@ def _write_run_summary(path: str, summary: dict) -> None:
     if not out_path.is_absolute():
         out_path = REPO_ROOT / out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
 
 
 def _maybe_write_run_summary(path: str | None, summary: dict) -> None:
