@@ -402,14 +402,17 @@ def _hydrate_move_for_request(move: Move, battle: DoubleBattle, slot: int) -> Mo
     """Copy a move and attach the current request target, if any.
 
     ``poke-env`` uses ``Move.request_target`` to disambiguate target classes such
-    as ``randomNormal``. Cloning avoids leaking per-turn request state across
-    reused move objects.
+    as ``randomNormal`` and ``Move.request_index`` for request entries where
+    Showdown's indexed move path has different semantics than the named path.
+    Cloning avoids leaking per-turn request state across reused move objects.
     """
     hydrated = Move(move.id, gen=move.gen)
     move_request = _request_move_entry(move, battle, slot)
     target = None if move_request is None else move_request.get("target")
     if target is not None:
         hydrated.request_target = target
+    else:
+        hydrated.request_index = getattr(move, "request_index", None)
     return hydrated
 
 
