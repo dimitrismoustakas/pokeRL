@@ -761,6 +761,7 @@ def train():
         accumulated_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
 
         for update in range(updates_done + 1, num_updates + 1):
+            update_wall_started = time.perf_counter()
             agent.eval()
             buffer.reset(initial_hidden=clone_hidden_state(hidden))
             if collect_timing:
@@ -1010,11 +1011,13 @@ def train():
                 refresh_opponents(parallel_env, league)
 
             # --- Compute advantages ---
+            advantage_started = time.perf_counter()
             with torch.no_grad():
                 obs_t = obs_to_device(obs, device)
                 last_value = agent.get_value(obs_t, hidden)
 
             batch = buffer.compute_gae(last_value, train_config.gamma, train_config.gae_lambda)
+            advantage_sec = time.perf_counter() - advantage_started
 
             # --- PPO update ---
             agent.train()
@@ -1038,7 +1041,9 @@ def train():
                 # re-triggering on the next flush.
                 accumulated_preview_data = []
             ppo_sec = time.perf_counter() - ppo_started
+            preview_refresh_started = time.perf_counter()
             parallel_env.refresh_prepared_team_previews()
+            preview_refresh_sec = time.perf_counter() - preview_refresh_started
 
             avg_episode_sec = float(np.mean(update_episode_secs)) if update_episode_secs else 0.0
             avg_episode_turns = float(np.mean(update_episode_turns)) if update_episode_turns else 0.0
@@ -1071,12 +1076,16 @@ def train():
             update_steps_per_second = (
                 steps_per_update / (rollout_sec + ppo_sec) if (rollout_sec + ppo_sec) > 0 else 0.0
             )
+            update_accounted_sec = rollout_sec + advantage_sec + ppo_sec + preview_refresh_sec
             update_summary = {
                 "update": update,
                 "global_step": trainer.global_step,
                 "completed_battles": len(update_episode_rewards),
                 "rollout_sec": rollout_sec,
+                "advantage_sec": advantage_sec,
                 "ppo_sec": ppo_sec,
+                "preview_refresh_sec": preview_refresh_sec,
+                "update_accounted_sec": update_accounted_sec,
                 "update_steps_per_second": update_steps_per_second,
                 "avg_episode_sec": avg_episode_sec,
                 "avg_episode_turns": avg_episode_turns,
@@ -1146,19 +1155,41 @@ def train():
                 )
 
             # --- Checkpointing ---
+            checkpoint_sec = 0.0
             if update % train_config.save_interval == 0:
+                checkpoint_started = time.perf_counter()
                 path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
                 trainer.save(path)
                 league.save_state(_league_state_path(train_config))
+                checkpoint_sec = time.perf_counter() - checkpoint_started
                 print(f"Saved checkpoint: {path}")
 
             # --- League: add checkpoint and refresh opponents ---
+            league_update_sec = 0.0
             if update % train_config.league_update_interval == 0:
+                league_update_started = time.perf_counter()
                 league.add_checkpoint(agent, trainer.global_step)
+                league_update_sec = time.perf_counter() - league_update_started
                 if refresh_after_update:
                     print(f"League updated (pool: {len(league.checkpoints)}), opponents refreshed")
                 else:
                     print(f"League updated (pool: {len(league.checkpoints)})")
+
+            update_wall_sec = time.perf_counter() - update_wall_started
+            update_summary["checkpoint_sec"] = checkpoint_sec
+            update_summary["league_update_sec"] = league_update_sec
+            update_summary["update_wall_sec"] = update_wall_sec
+            update_summary["update_wall_steps_per_second"] = (
+                steps_per_update / update_wall_sec if update_wall_sec > 0 else 0.0
+            )
+            update_summary["update_overhead_sec"] = max(
+                0.0,
+                update_wall_sec
+                - update_accounted_sec
+                - checkpoint_sec
+                - league_update_sec,
+            )
+            _maybe_write_run_summary(args.summary_path, run_summary)
 
         # Flush any leftover preview samples before saving the final checkpoint.
         # num_updates is rarely a multiple of team_preview_update_interval, so up to
