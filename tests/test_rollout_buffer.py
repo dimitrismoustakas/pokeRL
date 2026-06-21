@@ -829,13 +829,16 @@ class _FakeTargetBattle:
 
 
 def test_request_target_restricts_foe_only_moves_in_action_mask() -> None:
-    battle = _FakeTargetBattle(Move("icespinner", gen=9))
+    move = Move("icespinner", gen=9)
+    move.request_index = 1
+    battle = _FakeTargetBattle(move)
 
     mask = build_action_mask(battle, slot=0)
 
     assert mask[0]
     assert mask[1]
     assert not mask[2]
+    assert action_to_order(0, battle, slot=0).message == "/choose move 1 1"
 
     with pytest.raises(RuntimeError, match="not legal"):
         action_to_order(2, battle, slot=0)
@@ -929,10 +932,12 @@ def test_struggle_does_not_expose_explicit_targets() -> None:
         {"id": "outrage", "disabled": False},
     ],
 )
-def test_random_normal_move_without_explicit_request_target_uses_foe_targets(
+def test_random_normal_move_without_explicit_request_target_uses_request_slot(
     move_request: dict[str, object],
 ) -> None:
-    battle = _FakeTargetBattle(Move("outrage", gen=9))
+    move = Move("outrage", gen=9)
+    move.request_index = 1
+    battle = _FakeTargetBattle(move)
     battle.last_request = {
         "active": [
             {
@@ -944,12 +949,13 @@ def test_random_normal_move_without_explicit_request_target_uses_foe_targets(
 
     mask = build_action_mask(battle, slot=0)
 
-    assert mask[0]
-    assert mask[1]
-    assert not mask[TARGET_NONE]
+    assert mask[TARGET_NONE]
+    assert not mask[0]
+    assert not mask[1]
+    assert action_to_order(TARGET_NONE, battle, slot=0).message == "/choose move 1"
 
     with pytest.raises(RuntimeError, match="not legal"):
-        action_to_order(TARGET_NONE, battle, slot=0)
+        action_to_order(0, battle, slot=0)
 
 
 def test_action_mask_filters_missing_target_slots() -> None:
