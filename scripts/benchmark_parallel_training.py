@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -40,10 +41,46 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated local worker counts. Empty uses train.py's default.",
     )
+    parser.add_argument(
+        "--battles-per-worker",
+        type=int,
+        default=None,
+        help="Pass a fixed local battles-per-worker value through to train.py.",
+    )
+    parser.add_argument(
+        "--pool-mode",
+        choices=("single", "shared"),
+        default=None,
+        help="Pass a fixed local BattleStream pool mode through to train.py.",
+    )
+    parser.add_argument(
+        "--runtime-loop-count",
+        type=int,
+        default=None,
+        help="Pass a fixed local BattleStream runtime loop count through to train.py.",
+    )
+    parser.add_argument(
+        "--battlestream-startup-timeout",
+        type=float,
+        default=None,
+        help="Pass a fixed local BattleStream startup timeout through to train.py.",
+    )
+    parser.add_argument(
+        "--league-coalesce-ms",
+        type=float,
+        default=None,
+        help="Pass a fixed league-opponent inference coalescing window through to train.py.",
+    )
     parser.add_argument("--rollout-steps", type=int, default=16, help="Rollout steps collected per update.")
     parser.add_argument("--num-updates", type=int, default=2, help="How many rollout/PPO updates to run per config.")
     parser.add_argument("--num-epochs", type=int, default=4, help="PPO epochs per update.")
     parser.add_argument("--num-minibatches", type=int, default=4, help="Maximum PPO minibatches per update.")
+    parser.add_argument(
+        "--no-collect-timing",
+        action="store_false",
+        dest="collect_timing",
+        help="Do not pass --collect-timing to train.py; measures lower-overhead training summaries.",
+    )
     parser.add_argument(
         "--league-update-interval",
         type=int,
@@ -122,10 +159,22 @@ def benchmark_config(
         "--summary-path",
         str(summary_path),
     ]
+    if args.collect_timing:
+        command.append("--collect-timing")
     if args.device:
         command.extend(["--device", args.device])
     if worker_count is not None:
         command.extend(["--worker-count", str(worker_count)])
+    if args.battles_per_worker is not None:
+        command.extend(["--battles-per-worker", str(args.battles_per_worker)])
+    if args.pool_mode is not None:
+        command.extend(["--pool-mode", args.pool_mode])
+    if args.runtime_loop_count is not None:
+        command.extend(["--runtime-loop-count", str(args.runtime_loop_count)])
+    if args.battlestream_startup_timeout is not None:
+        command.extend(["--battlestream-startup-timeout", str(args.battlestream_startup_timeout)])
+    if args.league_coalesce_ms is not None:
+        command.extend(["--league-coalesce-ms", str(args.league_coalesce_ms)])
 
     print(
         f"Starting {run_name} | "
@@ -165,6 +214,8 @@ def benchmark_config(
     total_ppo = sum(float(update["ppo_sec"]) for update in updates)
     final_wall = float(summary["final"]["wall_time_sec"])
     total_steps = int(summary["final"]["global_step"])
+    env_timing_available = any("env_profile" in update for update in updates)
+    rollout_timing_available = any("rollout_profile" in update for update in updates)
     total_env_step_calls = sum(
         float(update.get("env_profile", {}).get("env_step_calls", 0.0)) for update in updates
     )
@@ -188,26 +239,50 @@ def benchmark_config(
         "envs": env_count,
         "opponent_groups": opponent_group_count,
         "worker_count": worker_count,
+        "battles_per_worker": args.battles_per_worker,
+        "pool_mode": args.pool_mode,
+        "runtime_loop_count": args.runtime_loop_count,
+        "league_coalesce_ms": args.league_coalesce_ms,
         "rollout_steps": args.rollout_steps,
         "num_updates": args.num_updates,
         "num_epochs": args.num_epochs,
         "num_minibatches": effective_minibatches,
+        "collect_timing": args.collect_timing,
         "initial_reset_sec": float(summary.get("initial_reset_sec", 0.0)),
         "total_rollout_sec": total_rollout,
         "total_ppo_sec": total_ppo,
         "total_wall_sec": final_wall,
         "steps": total_steps,
         "steps_per_sec": total_steps / final_wall if final_wall > 0 else 0.0,
-        "env_step_avg_ms": (total_env_step_sec / total_env_step_calls * 1000.0) if total_env_step_calls else 0.0,
-        "queue_wait_share": (total_queue_wait_sec / total_env_step_sec) if total_env_step_sec > 0 else 0.0,
-        "policy_forward_share": (total_policy_forward_sec / total_rollout) if total_rollout > 0 else 0.0,
-        "device_transfer_share": ((total_obs_to_device_sec + total_mask_to_device_sec) / total_rollout) if total_rollout > 0 else 0.0,
+        "env_step_avg_ms": (
+            (total_env_step_sec / total_env_step_calls * 1000.0)
+            if env_timing_available and total_env_step_calls
+            else None
+        ),
+        "queue_wait_share": (
+            (total_queue_wait_sec / total_env_step_sec)
+            if env_timing_available and total_env_step_sec > 0
+            else None
+        ),
+        "policy_forward_share": (
+            (total_policy_forward_sec / total_rollout)
+            if rollout_timing_available and total_rollout > 0
+            else None
+        ),
+        "device_transfer_share": (
+            ((total_obs_to_device_sec + total_mask_to_device_sec) / total_rollout)
+            if rollout_timing_available and total_rollout > 0
+            else None
+        ),
         "summary_path": str(summary_path),
         "stdout_log": str(stdout_log),
         "stderr_log": str(stderr_log),
     }
-    if not args.keep_checkpoints:
+    if args.keep_checkpoints:
         result["checkpoint_dir"] = str(checkpoint_dir)
+    else:
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        result["checkpoint_dir_removed"] = str(checkpoint_dir)
     return result
 
 
@@ -241,13 +316,15 @@ def main() -> None:
                     output_dir=output_dir,
                 )
                 results.append(result)
+                queue_wait_share = result["queue_wait_share"]
+                queue_text = "n/a" if queue_wait_share is None else f"{queue_wait_share * 100.0:.1f}%"
                 print(
                     f"envs={env_count} groups={opponent_group_count} workers={worker_count or 'auto'} | "
                     f"SPS {result['steps_per_sec']:.1f} | "
                     f"init {result['initial_reset_sec']:.2f}s | "
                     f"rollout {result['total_rollout_sec']:.2f}s | "
                     f"ppo {result['total_ppo_sec']:.2f}s | "
-                    f"queue {result['queue_wait_share'] * 100.0:.1f}%"
+                    f"queue {queue_text}"
                 )
 
     ranked = sorted(results, key=lambda item: item["steps_per_sec"], reverse=True)

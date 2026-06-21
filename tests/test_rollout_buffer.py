@@ -441,6 +441,40 @@ def test_action_head_uses_joint_and_tera_masks_to_coordinate_actions() -> None:
     assert out["actions"][0, 2].item() == TERA_SLOT_1
 
 
+def test_action_head_can_skip_policy_stats_for_frozen_opponent_inference() -> None:
+    torch.manual_seed(0)
+    head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
+    context = torch.zeros((1, 3))
+    active_reps = torch.zeros((1, 2, 2))
+    own_team_reps = torch.zeros((1, 6, 2))
+    opp_team_reps = torch.zeros((1, 6, 2))
+    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
+    opp_active_reps = torch.zeros((1, 2, 2))
+    masks = {
+        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "can_tera": torch.zeros((1, 2), dtype=torch.bool),
+    }
+    masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
+    masks["joint"][0, 1, 0] = True
+    chosen_actions = torch.tensor([[0, 0, TERA_NONE]], dtype=torch.long)
+
+    out = head(
+        context,
+        active_reps,
+        own_team_reps,
+        opp_team_reps,
+        opp_reserve_mask,
+        opp_active_reps,
+        masks,
+        actions=chosen_actions,
+        include_policy_stats=False,
+    )
+
+    assert torch.equal(out["actions"], chosen_actions)
+    assert "log_prob" not in out
+    assert "entropy" not in out
+
+
 def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_target() -> None:
     torch.manual_seed(0)
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
@@ -1140,7 +1174,7 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
             self.hidden_inputs: list[torch.Tensor | None] = []
             self.step = 0
 
-        def infer_action(self, checkpoint_path, obs, masks, hidden):
+        def infer_action(self, checkpoint_path, obs, masks, hidden, timing=None):
             self.step += 1
             self.hidden_inputs.append(None if hidden is None else hidden[0].clone())
             next_value = float(10 + self.step)
@@ -1151,18 +1185,24 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
             return np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden
 
     fake_service = _FakeInferenceService()
+    build_calls = []
+
+    def _build_obs(battle):
+        build_calls.append(battle.state)
+        return {"context": np.array([battle.state], dtype=np.int64)}
+
     player = LeaguePlayer.__new__(LeaguePlayer)
     player.checkpoint_path = "checkpoint.pt"
     player.inference_service = fake_service
-    player.obs_builder = SimpleNamespace(
-        build=lambda battle: {"context": np.array([battle.state], dtype=np.int64)}
-    )
+    player.obs_builder = SimpleNamespace(build=_build_obs)
     player._hidden = (
         torch.full((1, 1, 1), 1.0),
         torch.full((1, 1, 1), 101.0),
     )
     player._pending_hidden = None
-    player._pending_battle_obs = None
+    player._pending_decision_key = None
+    player._last_actions = None
+    player.choose_default_move = lambda: PassBattleOrder()
     monkeypatch.setattr(
         league_module,
         "build_legal_action_state",
@@ -1200,6 +1240,47 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
     LeaguePlayer.choose_move(player, retry_battle)
     LeaguePlayer.choose_move(player, next_battle)
 
+    assert fake_service.step == 3
+    assert build_calls == [1, 1, 2]
     assert torch.equal(fake_service.hidden_inputs[0], torch.full((1, 1, 1), 1.0))
     assert torch.equal(fake_service.hidden_inputs[1], torch.full((1, 1, 1), 1.0))
     assert torch.equal(fake_service.hidden_inputs[2], torch.full((1, 1, 1), 12.0))
+
+
+def test_league_player_decision_signature_tracks_action_request_fields() -> None:
+    request = {
+        "forceSwitch": [False, False],
+        "side": {"pokemon": [{"ident": "p1: A", "condition": "100/100"}]},
+        "active": [
+            {
+                "canTerastallize": True,
+                "moves": [
+                    {"id": "protect", "target": "self", "disabled": False},
+                    {"id": "earthquake", "target": "allAdjacent", "disabled": False},
+                ],
+            },
+            {
+                "moves": [
+                    {"id": "spore", "target": "normal", "disabled": True},
+                ],
+            },
+        ],
+    }
+
+    base_signature = LeaguePlayer._request_decision_signature(request)
+
+    unrelated_side_update = copy.deepcopy(request)
+    unrelated_side_update["side"]["pokemon"][0]["condition"] = "1/100"
+    assert LeaguePlayer._request_decision_signature(unrelated_side_update) == base_signature
+
+    changed_target = copy.deepcopy(request)
+    changed_target["active"][0]["moves"][1]["target"] = "adjacentFoe"
+    assert LeaguePlayer._request_decision_signature(changed_target) != base_signature
+
+    changed_disabled = copy.deepcopy(request)
+    changed_disabled["active"][1]["moves"][0]["disabled"] = False
+    assert LeaguePlayer._request_decision_signature(changed_disabled) != base_signature
+
+    changed_force_switch = copy.deepcopy(request)
+    changed_force_switch["forceSwitch"] = [True, False]
+    assert LeaguePlayer._request_decision_signature(changed_force_switch) != base_signature

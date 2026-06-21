@@ -13,6 +13,16 @@ uv sync --dev
 
 The project package is installed editable into `.venv`.
 
+The no-server training path requires a `poke-env` build that exposes
+`LocalBattleStreamConfiguration`. Until that support is available from the
+published package, install the local `poke-env` checkout editable into the same
+venv and verify the capability:
+
+```powershell
+uv pip install -e ..\poke-env
+& .\.venv\Scripts\python.exe -c "from poke_env import LocalBattleStreamConfiguration"
+```
+
 ## Local Pokemon Showdown checkout
 
 Smoke tests and training use poke-env's local BattleStream backend. Put a
@@ -42,6 +52,12 @@ To train on a fixed Regulation F pool with team preview (bring 4 of 6):
 & .\.venv\Scripts\python.exe .\scripts\train.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --num-envs 8 --opponent-groups 2
 ```
 
+To evaluate whether a checkpoint is improving against a frozen past self:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\evaluate_anchor.py --checkpoint checkpoints\current.pt --anchor checkpoints\anchor.pt --games 32 --summary-path logs\anchor_eval.json
+```
+
 To tune how many frozen opponents are shared across the env batch:
 
 ```powershell
@@ -55,6 +71,9 @@ For a short local BattleStream scaling benchmark over two rollout->PPO rounds:
 ```
 
 The benchmark writes per-run logs and a JSON summary under `benchmarks/<timestamp>/`.
+Use `--worker-counts`, `--battles-per-worker`, `--runtime-loop-count`,
+`--pool-mode`, and `--league-coalesce-ms` to test the local BattleStream knobs
+used by longer runs.
 
 ## Building a VGC team pool
 

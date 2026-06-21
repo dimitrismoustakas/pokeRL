@@ -99,6 +99,7 @@ class ActionHead(nn.Module):
         self.move_slot_emb = nn.Embedding(NUM_MOVES + 1, hidden_dim)
         self.target_emb = nn.Embedding(NUM_TARGETS + 1, hidden_dim)
         self.switch_slot_emb = nn.Embedding(MAX_TEAM_SLOTS + 1, hidden_dim)
+        self._static_action_features_cache: torch.Tensor | None = None
 
         self.query1 = nn.Sequential(
             nn.Linear(context_dim + pokemon_dim * 4, hidden_dim),
@@ -200,6 +201,10 @@ class ActionHead(nn.Module):
             persistent=False,
         )
 
+    def _apply(self, fn):
+        self._static_action_features_cache = None
+        return super()._apply(fn)
+
     def forward(
         self,
         context: torch.Tensor,
@@ -216,6 +221,7 @@ class ActionHead(nn.Module):
         tera_force_delay_prob: float = 0.0,
         tera_force_delay_max_turn: int = 0,
         validate_actions: bool = True,
+        include_policy_stats: bool = True,
     ) -> dict[str, torch.Tensor]:
         if "joint" not in masks or "can_tera" not in masks:
             raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
@@ -267,6 +273,7 @@ class ActionHead(nn.Module):
             logits1,
             actions=None if actions is None else actions[:, 0],
             greedy=greedy,
+            include_stats=include_policy_stats,
         )
 
         if validate_actions and not mask1.gather(1, a1.unsqueeze(1)).squeeze(1).all():
@@ -301,6 +308,7 @@ class ActionHead(nn.Module):
             logits2,
             actions=None if actions is None else actions[:, 1],
             greedy=greedy,
+            include_stats=include_policy_stats,
         )
 
         if validate_actions and not mask2.gather(1, a2.unsqueeze(1)).squeeze(1).all():
@@ -327,9 +335,14 @@ class ActionHead(nn.Module):
             )
         )
         tera_logits = self.tera_score(tera_query).masked_fill(~tera_mask, -1e8)
-        tera_log_probs = torch.log_softmax(tera_logits, dim=-1)
-        tera_probs = tera_log_probs.exp()
-        tera_entropy = -(tera_probs * tera_log_probs).sum(dim=-1)
+        if include_policy_stats:
+            tera_log_probs = torch.log_softmax(tera_logits, dim=-1)
+            tera_probs = tera_log_probs.exp()
+            tera_entropy = -(tera_probs * tera_log_probs).sum(dim=-1)
+        else:
+            tera_log_probs = None
+            tera_probs = torch.softmax(tera_logits, dim=-1)
+            tera_entropy = None
 
         if actions is None:
             tera_choice = tera_logits.argmax(dim=1) if greedy else torch.multinomial(tera_probs, 1).squeeze(1)
@@ -363,15 +376,16 @@ class ActionHead(nn.Module):
                 "ActionHead received an illegal tera choice for the current joint action pair."
             )
 
-        tera_log_prob = tera_log_probs.gather(1, tera_choice.unsqueeze(1)).squeeze(1)
-        log_prob = log_prob1 + log_prob2 + tera_log_prob
-        entropy = entropy1 + entropy2 + tera_entropy
-
-        return {
+        result = {
             "actions": torch.stack([a1, a2, tera_choice], dim=1),
-            "log_prob": log_prob,
-            "entropy": entropy,
         }
+        if include_policy_stats:
+            if tera_log_probs is None or log_prob1 is None or log_prob2 is None or entropy1 is None or entropy2 is None or tera_entropy is None:
+                raise RuntimeError("ActionHead policy stats were not computed.")
+            tera_log_prob = tera_log_probs.gather(1, tera_choice.unsqueeze(1)).squeeze(1)
+            result["log_prob"] = log_prob1 + log_prob2 + tera_log_prob
+            result["entropy"] = entropy1 + entropy2 + tera_entropy
+        return result
 
     @staticmethod
     def _categorical_choice(
@@ -379,16 +393,28 @@ class ActionHead(nn.Module):
         *,
         actions: torch.Tensor | None,
         greedy: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        log_probs = torch.log_softmax(logits, dim=-1)
-        probs = log_probs.exp()
+        include_stats: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if include_stats:
+            log_probs = torch.log_softmax(logits, dim=-1)
+            probs = log_probs.exp()
+            if actions is None:
+                selected = logits.argmax(dim=1) if greedy else torch.multinomial(probs, 1).squeeze(1)
+            else:
+                selected = actions
+            selected_log_prob = log_probs.gather(1, selected.unsqueeze(1)).squeeze(1)
+            entropy = -(probs * log_probs).sum(dim=-1)
+            return selected, selected_log_prob, entropy
+
         if actions is None:
-            selected = logits.argmax(dim=1) if greedy else torch.multinomial(probs, 1).squeeze(1)
+            if greedy:
+                selected = logits.argmax(dim=1)
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                selected = torch.multinomial(probs, 1).squeeze(1)
         else:
             selected = actions
-        selected_log_prob = log_probs.gather(1, selected.unsqueeze(1)).squeeze(1)
-        entropy = -(probs * log_probs).sum(dim=-1)
-        return selected, selected_log_prob, entropy
+        return selected, None, None
 
     @staticmethod
     def _early_turn_mask(
@@ -427,18 +453,32 @@ class ActionHead(nn.Module):
         ).squeeze(-1)
 
     def _static_action_features(self) -> torch.Tensor:
+        cache_allowed = (
+            not self.training
+            and not self.action_id_emb.weight.requires_grad
+            and not self.kind_emb.weight.requires_grad
+            and not self.move_slot_emb.weight.requires_grad
+            and not self.target_emb.weight.requires_grad
+            and not self.switch_slot_emb.weight.requires_grad
+        )
+        if cache_allowed and self._static_action_features_cache is not None:
+            return self._static_action_features_cache
+
         action_ids = self._action_ids
         kind = self._action_kind
         move_slot = self._action_move_slot
         target_slot = self._action_target_slot
         switch_slot = self._action_switch_slot
-        return (
+        features = (
             self.action_id_emb(action_ids)
             + self.kind_emb(kind)
             + self.move_slot_emb(move_slot)
             + self.target_emb(target_slot)
             + self.switch_slot_emb(switch_slot)
         )
+        if cache_allowed:
+            self._static_action_features_cache = features
+        return features
 
     def _dynamic_action_entities(
         self,

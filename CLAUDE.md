@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Uses `uv` package manager with Python 3.13
 - Install: `uv venv --python 3.13` then `uv sync --dev`
+- No-server training requires a `poke-env` build with
+  `LocalBattleStreamConfiguration`. Until that support is published upstream,
+  install the local `poke-env` checkout editable into the same venv:
+  `uv pip install -e ..\poke-env`.
 
 ### Local Pokemon Showdown Checkout
 
@@ -103,3 +107,4 @@ All hyperparameters live in `pokerl/config.py` as dataclasses (`ModelConfig`, `E
 3. **No workarounds** — fix issues at their root, not by bypassing them
 4. **Keep CLIs simple** — avoid flags that encourage hacks or hide configuration
 5. **Avoid clutter** — fix suboptimal code directly instead of layering workarounds
+6. **Sparse rewards only** — keep training reward to win/loss/draw outcomes. Do not add HP, KO, damage, board-position, or other hand-shaped intermediate reward terms; those signals may be observations or evaluation diagnostics, not reward shaping.

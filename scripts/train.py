@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of runtime loops used by local BattleStream workers. Defaults to up to 4.",
     )
     parser.add_argument(
+        "--battlestream-startup-timeout",
+        type=float,
+        default=None,
+        help="Seconds to wait for a local BattleStream battle to produce its first protocol output.",
+    )
+    parser.add_argument(
         "--opponent-groups",
         type=int,
         default=None,
@@ -247,6 +253,8 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, EnvConfig, Tra
         env_config.pool_mode = args.pool_mode
     if args.runtime_loop_count is not None:
         env_config.runtime_loop_count = args.runtime_loop_count
+    if args.battlestream_startup_timeout is not None:
+        env_config.battlestream_startup_timeout = args.battlestream_startup_timeout
 
     overrides = {
         "rollout_steps": args.rollout_steps,
@@ -533,6 +541,37 @@ def _json_ready_metrics(metrics: dict[str, float]) -> dict[str, float]:
     return {key: float(value) for key, value in metrics.items()}
 
 
+def _safe_div(numerator: float, denominator: float) -> float:
+    return float(numerator / denominator) if denominator else 0.0
+
+
+def build_rollout_diagnostics(
+    rollout_profile: dict[str, float],
+    env_profile: dict[str, float],
+) -> dict[str, float]:
+    """Summarize timing counters into stable throughput diagnostics."""
+    env_step_total_sec = float(env_profile.get("env_step_total_sec", 0.0))
+    env_step_calls = float(env_profile.get("env_step_calls", 0.0))
+    env_queue_wait_sec = float(env_profile.get("env_queue_wait_sec", 0.0))
+    parallel_step_wall_sec = float(env_profile.get("parallel_step_wall_sec", 0.0))
+    parallel_step_calls = float(env_profile.get("parallel_step_calls", 0.0))
+    opponent_choice_sec = float(env_profile.get("opponent_choice_sec", 0.0))
+    opponent_choice_calls = float(env_profile.get("opponent_choice_calls", 0.0))
+    rollout_sec = float(rollout_profile.get("rollout_sec", 0.0))
+    device_transfer_sec = float(rollout_profile.get("obs_to_device_sec", 0.0)) + float(
+        rollout_profile.get("mask_to_device_sec", 0.0)
+    ) + float(rollout_profile.get("feedback_to_device_sec", 0.0))
+
+    return {
+        "env_queue_wait_share": _safe_div(env_queue_wait_sec, env_step_total_sec),
+        "avg_env_step_ms": _safe_div(env_step_total_sec, env_step_calls) * 1000.0,
+        "avg_parallel_step_wall_ms": _safe_div(parallel_step_wall_sec, parallel_step_calls) * 1000.0,
+        "avg_opponent_choice_ms": _safe_div(opponent_choice_sec, opponent_choice_calls) * 1000.0,
+        "policy_forward_share": _safe_div(float(rollout_profile.get("policy_forward_sec", 0.0)), rollout_sec),
+        "device_transfer_share": _safe_div(device_transfer_sec, rollout_sec),
+    }
+
+
 def _write_run_summary(path: str, summary: dict) -> None:
     out_path = Path(path)
     if not out_path.is_absolute():
@@ -541,16 +580,20 @@ def _write_run_summary(path: str, summary: dict) -> None:
     out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
+def _maybe_write_run_summary(path: str | None, summary: dict) -> None:
+    if path:
+        _write_run_summary(path, summary)
+
+
 def train():
     args = parse_args()
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
     run_started = time.perf_counter()
-    collect_timing = args.summary_path is not None or args.collect_timing
-
-    print(f"Device: {device}")
+    collect_timing = args.collect_timing
 
     model_config, env_config, train_config = build_configs(args)
+    print(f"Device: {device}")
     if env_config.showdown_dir is None:
         env_config.showdown_dir = default_showdown_dir()
     if env_config.showdown_dir is None:
@@ -619,6 +662,7 @@ def train():
         collect_timing=collect_timing,
     )
     run_summary = {
+        "status": "starting",
         "config": {
             "device": str(device),
             "battle_format": env_config.battle_format,
@@ -643,6 +687,8 @@ def train():
             "tera_force_delay_max_turn": train_config.tera_force_delay_max_turn,
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
+            "league_coalesce_ms": train_config.league_coalesce_ms,
+            "collect_timing": collect_timing,
             "total_timesteps": train_config.total_timesteps,
             "backend": "local_battlestream",
             "opponent_groups": opponent_groups,
@@ -701,6 +747,8 @@ def train():
         run_summary["initial_reset_sec"] = initial_reset_sec
         if collect_timing:
             run_summary["initial_env_profile"] = initial_env_profile
+        run_summary["status"] = "running"
+        _maybe_write_run_summary(args.summary_path, run_summary)
 
         episode_rewards: list[float] = []
         start_time = time.time()
@@ -1049,13 +1097,29 @@ def train():
             if collect_timing:
                 update_summary["rollout_profile"] = rollout_profile
                 update_summary["env_profile"] = env_profile
+                update_summary["rollout_diagnostics"] = build_rollout_diagnostics(
+                    rollout_profile,
+                    env_profile,
+                )
             run_summary["updates"].append(update_summary)
+            run_summary["status"] = "running"
+            run_summary["update_count"] = update
+            run_summary["global_step"] = trainer.global_step
+            _maybe_write_run_summary(args.summary_path, run_summary)
 
             # --- Logging ---
             if update % train_config.log_interval == 0:
                 elapsed = time.time() - start_time
                 sps = trainer.global_step / elapsed
                 win_rate = np.mean([r > 0 for r in episode_rewards[-100:]]) if episode_rewards else 0
+                diagnostics = update_summary.get("rollout_diagnostics", {})
+                diagnostics_text = ""
+                if diagnostics:
+                    diagnostics_text = (
+                        f" | Env wait {diagnostics['env_queue_wait_share']:.0%}"
+                        f" | Vec step {diagnostics['avg_parallel_step_wall_ms']:.0f}ms"
+                        f" | Opp choice {diagnostics['avg_opponent_choice_ms']:.1f}ms"
+                    )
                 print(
                     f"Update {update}/{num_updates} | "
                     f"Step {trainer.global_step:,} | "
@@ -1076,6 +1140,7 @@ def train():
                     f"Preview loss {metrics.get('team_preview_loss', float('nan')):.4f} | "
                     f"Preview value {metrics.get('team_preview_value_loss', float('nan')):.4f} | "
                     f"League pool {len(league.checkpoints)}"
+                    f"{diagnostics_text}"
                 )
 
             # --- Checkpointing ---
@@ -1112,9 +1177,17 @@ def train():
             "steps_per_second": trainer.global_step / total_wall_sec if total_wall_sec > 0 else 0.0,
             "final_checkpoint": final_path,
         }
-        if args.summary_path:
-            _write_run_summary(args.summary_path, run_summary)
+        run_summary["status"] = "completed"
+        _maybe_write_run_summary(args.summary_path, run_summary)
         return run_summary
+    except Exception as exc:
+        run_summary["status"] = "failed"
+        run_summary["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        _maybe_write_run_summary(args.summary_path, run_summary)
+        raise
     finally:
         parallel_env.close()
         team_preview_batcher.close()

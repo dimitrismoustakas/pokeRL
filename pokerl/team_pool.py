@@ -80,8 +80,8 @@ def load_team_pool(
         )
 
     manifest_path = Path(manifest_path).expanduser().resolve()
+    manifest = _load_manifest_json(manifest_path)
     repo_root = _find_repo_root(manifest_path.parent)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     raw_entries = manifest.get(subset)
     if not isinstance(raw_entries, list):
         raise ValueError(f"Manifest {manifest_path} is missing a list-valued {subset!r} section.")
@@ -107,6 +107,25 @@ def load_team_pool(
 
     format_id = str(manifest.get("format") or manifest_path.parent.name)
     return TeamPool(format_id=format_id, subset=subset, entries=entries, seed=seed)
+
+
+def _load_manifest_json(path: Path) -> dict:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+        result = {}
+        duplicates = []
+        for key, value in pairs:
+            if key in result:
+                duplicates.append(key)
+            result[key] = value
+        if duplicates:
+            duplicate_list = ", ".join(sorted(set(duplicates)))
+            raise ValueError(f"Manifest {path} contains duplicate JSON key(s): {duplicate_list}")
+        return result
+
+    loaded = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Manifest {path} must contain a JSON object.")
+    return loaded
 
 
 def _find_repo_root(start: Path) -> Path:

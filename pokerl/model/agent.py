@@ -133,6 +133,8 @@ class PokeAgent(nn.Module):
         tera_force_delay_prob: float = 0.0,
         tera_force_delay_max_turn: int = 0,
         validate_actions: bool = True,
+        include_value: bool = True,
+        include_policy_stats: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for battle turns.
 
@@ -151,12 +153,18 @@ class PokeAgent(nn.Module):
                 provided (PPO update path).
             tera_force_delay_max_turn: latest battle turn eligible for forced
                 no-tera exploration. 0 disables it.
+            include_value: whether to compute and return the value estimate.
+                League opponents set this to false because they only need actions
+                and recurrent hidden state.
+            include_policy_stats: whether to compute log-probability and entropy.
+                Frozen opponents set this to false because PPO does not consume
+                their policy statistics.
 
-        Returns dict with: actions, log_prob, entropy, value, hidden
+        Returns dict with: actions, log_prob, entropy, hidden, and value when
+        the corresponding include flags are true.
         """
         context, active_reps, own_reps, opp_reps, opp_active_reps = self.spatial(obs)
         context, new_hidden = self.memory(context, hidden)
-        own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
         opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
 
         action_out = self.action_head(
@@ -173,14 +181,23 @@ class PokeAgent(nn.Module):
             tera_force_delay_prob=tera_force_delay_prob,
             tera_force_delay_max_turn=tera_force_delay_max_turn,
             validate_actions=validate_actions,
+            include_policy_stats=include_policy_stats,
         )
-        value = self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
 
-        return {
+        result = {
             **action_out,
-            "value": value,
             "hidden": new_hidden,
         }
+        if include_value:
+            own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
+            result["value"] = self.value_head(
+                context,
+                own_reps,
+                opp_reps,
+                own_bench_mask,
+                opp_bench_mask,
+            )
+        return result
 
     def team_preview(
         self,

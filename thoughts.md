@@ -3,7 +3,7 @@
 Highest ROI
 
 Re-factor Tera into its own decision instead of baking it into every move action. Right now the flat action space creates a tera and non-tera twin for many moves, and the entropy bonus can unintentionally push exploration toward early tera. This is the first thing I would investigate for the “worse early tera” behavior.
-Add explicit last-turn event features. The cheap version is: previous own action ids, observed opponent action ids, move order, switches, KOs, protect success/failure, and maybe whether damage was taken before moving. That should help strategic timing more than making the model bigger.
+Add explicit last-turn event features. The cheap version is: previous own action ids, observed opponent action ids, move order, switches, KOs, protect success/failure, and maybe whether damage was taken before moving. These are observation features, not reward terms. They should help strategic timing more than making the model bigger.
 Improve the team preview training algorithm, not just the preview head. The current preview decision is still a sparse terminal-reward problem, so collapse is not surprising. A preview-specific critic/baseline, or at least a more stable preview update path, is probably higher leverage than more preview capacity alone.
 Add hidden-information auxiliaries. Predict opponent item, ability, unrevealed moves, and tera type from legal history, using eventual reveals as labels. That usually helps strategic play without changing the reward objective.
 Increase opponent diversity in training. A larger and more stratified self-play league, plus a few fixed heuristic opponents, is very feasible on one machine and often matters more than architecture tweaks.

@@ -527,6 +527,7 @@ class PPOTrainer:
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({
+            "checkpoint_type": "trainer",
             "agent": self.agent.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "global_step": self.global_step,
@@ -534,6 +535,22 @@ class PPOTrainer:
 
     def load(self, path: str):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Trainer checkpoint must be a mapping, got {type(checkpoint).__name__}.")
+        checkpoint_type = checkpoint.get("checkpoint_type")
+        if checkpoint_type is not None and checkpoint_type != "trainer":
+            raise ValueError(
+                f"Trainer checkpoint {path!r} has checkpoint_type={checkpoint_type!r}; "
+                "only checkpoint_type='trainer' can be used with --resume."
+            )
+        required_keys = {"agent", "optimizer", "global_step"}
+        missing_keys = sorted(required_keys.difference(checkpoint))
+        if missing_keys:
+            missing = ", ".join(missing_keys)
+            raise ValueError(
+                f"Trainer checkpoint {path!r} is missing required key(s): {missing}. "
+                "League checkpoints contain only agent weights and cannot be used with --resume."
+            )
         load_report = load_state_dict_compatible(self.agent, checkpoint["agent"])
         optimizer_compatible = not any(load_report.values())
         if optimizer_compatible:

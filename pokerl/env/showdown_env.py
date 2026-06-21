@@ -1,5 +1,7 @@
 """Gymnasium-compatible wrapper around poke-env for doubles battles."""
 
+from __future__ import annotations
+
 import asyncio
 import itertools
 import math
@@ -14,7 +16,14 @@ from typing import Generic, TypeVar
 
 import numpy as np
 
-from poke_env import AccountConfiguration, LocalBattleStreamConfiguration
+from poke_env import AccountConfiguration
+try:
+    from poke_env import LocalBattleStreamConfiguration
+except ImportError as exc:  # pragma: no cover - exercised by monkeypatch tests.
+    LocalBattleStreamConfiguration = None
+    _LOCAL_BATTLESTREAM_IMPORT_ERROR = exc
+else:
+    _LOCAL_BATTLESTREAM_IMPORT_ERROR = None
 from poke_env.battle import DoubleBattle
 from poke_env.concurrency import create_in_poke_loop
 from poke_env.player import BattleOrder, DoubleBattleOrder, ForfeitBattleOrder, PassBattleOrder, Player
@@ -38,6 +47,7 @@ _ACCOUNT_LOCK = Lock()
 _ACCOUNT_COUNTER = itertools.count()
 _ACCOUNT_RUN_TAG = uuid.uuid4().hex[:4]
 QueueItemT = TypeVar("QueueItemT")
+_OBSERVATION_POLL_SECONDS = 1.0
 OpponentFactory = Callable[[asyncio.AbstractEventLoop], Player]
 TeamPairProvider = Callable[[], tuple[str | None, str | None]]
 
@@ -212,6 +222,7 @@ def battlestream_summary(config: EnvConfig) -> dict[str, object]:
         "max_battles_per_worker": _battles_per_worker(config, worker_count),
         "pool_mode": config.pool_mode,
         "runtime_loop_count": _runtime_loop_count(config, worker_count),
+        "startup_timeout": config.battlestream_startup_timeout,
     }
 
 
@@ -221,14 +232,26 @@ def make_battlestream_configuration(
     if not config.showdown_dir:
         raise ValueError("EnvConfig.showdown_dir must be set for local BattleStream training.")
 
+    battlestream_configuration_cls = _require_local_battlestream_configuration()
     worker_count = _worker_count(config)
-    return LocalBattleStreamConfiguration(
+    return battlestream_configuration_cls(
         showdown_dir=config.showdown_dir,
         worker_count=worker_count,
         max_battles_per_worker=_battles_per_worker(config, worker_count),
         pool_mode=config.pool_mode,
         runtime_loop_count=_runtime_loop_count(config, worker_count),
+        startup_timeout=config.battlestream_startup_timeout,
     )
+
+
+def _require_local_battlestream_configuration():
+    if LocalBattleStreamConfiguration is None:
+        raise RuntimeError(
+            "pokeRL local no-server training requires a poke-env build exposing "
+            "LocalBattleStreamConfiguration. Install the local poke-env fork/editable "
+            "checkout before running smoke tests or training."
+        ) from _LOCAL_BATTLESTREAM_IMPORT_ERROR
+    return LocalBattleStreamConfiguration
 
 
 class ShowdownPlayer(Player):
@@ -443,6 +466,7 @@ class BattleEnv:
         timing_enabled = self._timing.enabled
         if timing_enabled:
             reset_started = time.perf_counter()
+        self._wait_for_battle_task_completion("before BattleEnv reset")
         self._episode_team_preview = None
         self._episode_opponent_preview_picks = None
         self._episode_opponent_choice_calls = 0
@@ -481,7 +505,7 @@ class BattleEnv:
 
         if timing_enabled:
             wait_started = time.perf_counter()
-        obs, mask, _, _, _ = self.player.obs_queue.get()
+        obs, mask, _, _, _ = self._get_player_observation("initial observation")
         if timing_enabled:
             self._timing.add("env_reset_wait_first_obs_sec", time.perf_counter() - wait_started)
         self._prepare_next_battle()
@@ -515,7 +539,7 @@ class BattleEnv:
 
         if timing_enabled:
             wait_started = time.perf_counter()
-        obs, mask, reward, done, battle = self.player.obs_queue.get()
+        obs, mask, reward, done, battle = self._get_player_observation("step observation")
         if timing_enabled:
             self._timing.add("env_queue_wait_sec", time.perf_counter() - wait_started)
             self._timing.increment("env_step_calls")
@@ -550,7 +574,65 @@ class BattleEnv:
             )
             if self._episode_opponent_checkpoint_path is not None:
                 info["episode_opponent_checkpoint_path"] = self._episode_opponent_checkpoint_path
+            self._wait_for_battle_task_completion("after terminal BattleEnv observation")
         return obs, mask, reward, done, info
+
+    def _get_player_observation(
+        self,
+        context: str,
+    ) -> tuple[dict, dict[str, np.ndarray], float, bool, DoubleBattle]:
+        while True:
+            try:
+                return self.player.obs_queue.get(timeout=_OBSERVATION_POLL_SECONDS)
+            except TimeoutError as exc:
+                self._raise_battle_task_failure(context, exc)
+
+    def _raise_battle_task_failure(
+        self,
+        context: str,
+        timeout_error: TimeoutError,
+    ) -> None:
+        task = self._battle_task
+        if task is None or not task.done():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Battle task failed while waiting for BattleEnv {context}."
+            ) from exc
+        raise RuntimeError(
+            f"Battle task completed without producing BattleEnv {context}."
+        ) from timeout_error
+
+    def _wait_for_battle_task_completion(self, context: str) -> None:
+        task = self._battle_task
+        if task is None:
+            return
+
+        timeout = self.config.battlestream_startup_timeout
+        timing_enabled = self._timing.enabled
+        if timing_enabled:
+            wait_started = time.perf_counter()
+        try:
+            task.result(timeout=timeout)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out waiting {timeout:.1f}s for the BattleEnv battle task "
+                f"to finish {context}; a new local BattleStream battle would "
+                "overlap the previous battle."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"Battle task failed {context}.") from exc
+        else:
+            self._battle_task = None
+        finally:
+            if timing_enabled:
+                self._timing.add(
+                    "env_battle_task_finish_wait_sec",
+                    time.perf_counter() - wait_started,
+                )
+                self._timing.increment("env_battle_task_finish_wait_calls")
 
     def _do_team_preview(self, battle: DoubleBattle) -> str:
         """Build the team preview response using the agent callback.
@@ -855,6 +937,8 @@ class BattleEnv:
                     self._battle_task.result(timeout=1.0)
                 except (CancelledError, TimeoutError):
                     pass
+            except Exception:
+                pass
 
         for participant in (self.player, self.opponent):
             self._disconnect_player(participant, self._loop)

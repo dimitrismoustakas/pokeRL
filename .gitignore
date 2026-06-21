@@ -210,3 +210,4 @@ __marimo__/
 ## benchmark results and checkpoints
 benchmarks/
 checkpoints/
+logs/

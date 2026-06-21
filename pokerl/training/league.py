@@ -41,6 +41,7 @@ class _InferenceRequest:
     masks: dict[str, np.ndarray] | None
     hidden: tuple[torch.Tensor, torch.Tensor] | None
     future: Future
+    timing: object | None = None
 
 
 class _LeagueInferenceService:
@@ -74,8 +75,8 @@ class _LeagueInferenceService:
 
         checkpoint = torch.load(checkpoint_path, map_location=self._device, weights_only=False)
         agent_copy = copy.deepcopy(self._agent_template)
-        load_state_dict_compatible(agent_copy, checkpoint["agent"])
         agent_copy.to(self._device)
+        load_state_dict_compatible(agent_copy, checkpoint["agent"])
         agent_copy.eval()
         agent_copy.requires_grad_(False)
 
@@ -94,6 +95,7 @@ class _LeagueInferenceService:
         obs: dict[str, np.ndarray],
         masks: dict[str, np.ndarray],
         hidden: tuple[torch.Tensor, torch.Tensor] | None,
+        timing: object | None = None,
     ) -> tuple[np.ndarray, tuple[torch.Tensor, torch.Tensor] | None]:
         future: Future = Future()
         self._submit(
@@ -104,6 +106,7 @@ class _LeagueInferenceService:
                 masks=masks,
                 hidden=hidden,
                 future=future,
+                timing=timing,
             )
         )
         return future.result()
@@ -195,6 +198,13 @@ class _LeagueInferenceService:
 
     def _run_battle_batch(self, checkpoint_path: str, requests: list[_InferenceRequest]) -> None:
         agent = self._get_agent(checkpoint_path)
+        batch_size = len(requests)
+        for request in requests:
+            self._increment_timing(request.timing, "opponent_infer_action_requests")
+            self._add_timing(request.timing, "opponent_infer_action_batches", 1.0 / batch_size)
+            self._add_timing(request.timing, "opponent_infer_action_batch_size_sum", float(batch_size))
+
+        stack_started = time.perf_counter()
         obs_batch = {
             key: torch.from_numpy(np.stack([request.obs[key] for request in requests])).to(self._device)
             for key in requests[0].obs
@@ -205,15 +215,52 @@ class _LeagueInferenceService:
             key: torch.from_numpy(np.stack([request.masks[key] for request in requests])).to(self._device).bool()
             for key in requests[0].masks
         }
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_stack_to_device_sec",
+            time.perf_counter() - stack_started,
+        )
+
+        hidden_started = time.perf_counter()
         hidden_batch = self._build_hidden_batch(agent, requests)
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_hidden_batch_sec",
+            time.perf_counter() - hidden_started,
+        )
 
+        forward_started = time.perf_counter()
         with torch.inference_mode():
-            out = agent(obs_batch, hidden_batch, action_masks=masks_batch)
+            out = agent(
+                obs_batch,
+                hidden_batch,
+                action_masks=masks_batch,
+                include_value=False,
+                include_policy_stats=False,
+            )
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_forward_launch_sec",
+            time.perf_counter() - forward_started,
+        )
 
+        output_started = time.perf_counter()
         actions = out["actions"].cpu().numpy()
         new_hidden = out["hidden"]
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_output_sync_sec",
+            time.perf_counter() - output_started,
+        )
+
+        result_started = time.perf_counter()
         for index, request in enumerate(requests):
             request.future.set_result((actions[index], self._slice_hidden(new_hidden, index)))
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_set_result_sec",
+            time.perf_counter() - result_started,
+        )
 
     def _run_preview_batch(self, checkpoint_path: str, requests: list[_InferenceRequest]) -> None:
         agent = self._get_agent(checkpoint_path)
@@ -274,6 +321,26 @@ class _LeagueInferenceService:
             return tensor
         return tensor.to(self._device, non_blocking=True)
 
+    def _add_batch_timing(
+        self,
+        requests: list[_InferenceRequest],
+        key: str,
+        value: float,
+    ) -> None:
+        per_request = value / len(requests)
+        for request in requests:
+            self._add_timing(request.timing, key, per_request)
+
+    @staticmethod
+    def _add_timing(timing, key: str, value: float) -> None:
+        if timing is not None:
+            timing.add(key, value)
+
+    @staticmethod
+    def _increment_timing(timing, key: str, delta: int = 1) -> None:
+        if timing is not None:
+            timing.increment(key, delta)
+
     @staticmethod
     def _slice_hidden(
         hidden: tuple[torch.Tensor, torch.Tensor] | None,
@@ -308,7 +375,7 @@ class LeaguePlayer(Player):
         self.obs_builder = obs_builder
         self._hidden: tuple[torch.Tensor, torch.Tensor] | None = None
         self._pending_hidden: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._pending_battle_obs: dict[str, np.ndarray] | None = None
+        self._pending_decision_key: tuple[object, ...] | None = None
         self._pending_checkpoint_path: str | None = None
         self._prepared_preview_obs: dict[str, np.ndarray] | None = None
         self._prepared_preview_future: Future | None = None
@@ -358,20 +425,44 @@ class LeaguePlayer(Player):
             self._increment_timing("opponent_precompute_preview_submit_calls")
 
     def choose_move(self, battle: DoubleBattle):
+        timing_enabled = LeaguePlayer._timing_enabled(self)
+        if timing_enabled:
+            choice_started = time.perf_counter()
+            key_started = time.perf_counter()
+        decision_key = self._decision_key(battle)
+        if timing_enabled:
+            self._add_timing("opponent_decision_key_sec", time.perf_counter() - key_started)
+
+        if timing_enabled:
+            hidden_started = time.perf_counter()
+        self._commit_hidden_if_battle_advanced(decision_key)
+        if timing_enabled:
+            self._add_timing("opponent_hidden_commit_sec", time.perf_counter() - hidden_started)
+            obs_started = time.perf_counter()
         obs = self.obs_builder.build(battle)
-        self._commit_hidden_if_battle_advanced(obs)
+        if timing_enabled:
+            self._add_timing("opponent_obs_build_sec", time.perf_counter() - obs_started)
+            masks_started = time.perf_counter()
         action_state = build_legal_action_state(battle)
         masks = build_policy_action_masks(battle, action_state=action_state)
+        if timing_enabled:
+            self._add_timing("opponent_mask_build_sec", time.perf_counter() - masks_started)
+            infer_started = time.perf_counter()
         actions, next_hidden = self.inference_service.infer_action(
             self.checkpoint_path,
             obs,
             masks,
             self._hidden,
+            timing=self._timing if timing_enabled else None,
         )
-        self._pending_battle_obs = self._clone_obs(obs)
+        if timing_enabled:
+            self._add_timing("opponent_infer_action_wait_sec", time.perf_counter() - infer_started)
+        self._pending_decision_key = decision_key
         self._pending_hidden = next_hidden
         self._last_actions = np.asarray(actions, dtype=np.int64).copy()
 
+        if timing_enabled:
+            order_started = time.perf_counter()
         orders = []
         tera_slot_1, tera_slot_2 = decode_tera_choice(int(actions[2]))
         for slot in range(2):
@@ -384,10 +475,15 @@ class LeaguePlayer(Player):
                     action_state=action_state,
                 )
             )
-
         if all(isinstance(order, PassBattleOrder) for order in orders):
-            return self.choose_default_move()
-        return DoubleBattleOrder(orders[0], orders[1])
+            result = self.choose_default_move()
+        else:
+            result = DoubleBattleOrder(orders[0], orders[1])
+        if timing_enabled:
+            self._add_timing("opponent_order_build_sec", time.perf_counter() - order_started)
+            self._add_timing("opponent_choose_move_internal_sec", time.perf_counter() - choice_started)
+            self._increment_timing("opponent_choose_move_internal_calls")
+        return result
 
     def teampreview(self, battle: DoubleBattle) -> str:
         obs = self.obs_builder.build(battle)
@@ -430,7 +526,7 @@ class LeaguePlayer(Player):
         """Clear LSTM state between battles. Called by BattleEnv.reset()."""
         self._hidden = None
         self._pending_hidden = None
-        self._pending_battle_obs = None
+        self._pending_decision_key = None
         self._last_actions = None
 
     @staticmethod
@@ -439,18 +535,83 @@ class LeaguePlayer(Player):
             return False
         return all(np.array_equal(left[key], right[key]) for key in left)
 
-    @staticmethod
-    def _clone_obs(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        return {key: value.copy() for key, value in obs.items()}
-
-    def _commit_hidden_if_battle_advanced(self, obs: dict[str, np.ndarray]) -> None:
-        if self._pending_battle_obs is None:
+    def _commit_hidden_if_battle_advanced(self, decision_key: tuple[object, ...]) -> None:
+        if self._pending_decision_key is None:
             return
-        if self._obs_equal(obs, self._pending_battle_obs):
+        if decision_key == self._pending_decision_key:
             return
         self._hidden = self._pending_hidden
         self._pending_hidden = None
-        self._pending_battle_obs = None
+        self._pending_decision_key = None
+
+    @classmethod
+    def _decision_key(cls, battle: DoubleBattle) -> tuple[object, ...]:
+        return (
+            getattr(battle, "battle_tag", ""),
+            int(getattr(battle, "turn", 0)),
+            cls._request_decision_signature(getattr(battle, "last_request", None)),
+            cls._simple_decision_tuple(getattr(battle, "force_switch", None)),
+            cls._simple_decision_tuple(getattr(battle, "can_tera", None)),
+            cls._simple_decision_tuple(getattr(battle, "trapped", None)),
+        )
+
+    @classmethod
+    def _request_decision_signature(cls, request) -> tuple[object, ...]:
+        """Compact key for the request fields that determine a battle decision.
+
+        poke-env assigns ``battle.last_request`` from the parsed Showdown request.
+        The previous implementation hashed the entire request JSON on every
+        opponent choice. For hidden-state commits we only need to distinguish
+        distinct decision requests, so keep the action-relevant fields instead
+        of serializing side/team payloads every time.
+        """
+        if not isinstance(request, dict):
+            return ()
+
+        active_requests = request.get("active") or ()
+        active_signature = []
+        for active_request in active_requests:
+            if not isinstance(active_request, dict):
+                active_signature.append(repr(active_request))
+                continue
+            moves = active_request.get("moves") or ()
+            move_signature = []
+            for move_request in moves:
+                if not isinstance(move_request, dict):
+                    move_signature.append(repr(move_request))
+                    continue
+                move_signature.append(
+                    (
+                        move_request.get("id"),
+                        move_request.get("target"),
+                        bool(move_request.get("disabled", False)),
+                    )
+                )
+            active_signature.append(
+                (
+                    bool(active_request.get("trapped", False)),
+                    bool(active_request.get("maybeTrapped", False)),
+                    bool(active_request.get("canTerastallize", False)),
+                    tuple(move_signature),
+                )
+            )
+
+        return (
+            bool(request.get("wait", False)),
+            bool(request.get("teamPreview", False)),
+            cls._simple_decision_tuple(request.get("forceSwitch")),
+            tuple(active_signature),
+        )
+
+    @staticmethod
+    def _simple_decision_tuple(value) -> tuple:
+        if value is None:
+            return ()
+        if isinstance(value, np.ndarray):
+            return tuple(value.tolist())
+        if isinstance(value, (list, tuple)):
+            return tuple(value)
+        return (value,)
 
     def _record_preview_obs_mismatch(
         self,
@@ -511,7 +672,7 @@ class League:
         """Snapshot the current agent as a new league member."""
         path = f"{self.config.checkpoint_dir}/league/step_{step}.pt"
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"agent": agent.state_dict()}, path)
+        torch.save({"checkpoint_type": "league", "agent": agent.state_dict()}, path)
         self.checkpoints.append(path)
         self._inference.prune_checkpoints(set(self.checkpoints))
 
