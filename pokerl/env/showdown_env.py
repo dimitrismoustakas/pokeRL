@@ -11,6 +11,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
+from queue import Empty, Queue as ThreadQueue
 from threading import Lock, Thread
 from typing import Generic, TypeVar
 
@@ -152,14 +153,32 @@ class LoopThread:
 
 
 class _AsyncQueue(Generic[QueueItemT]):
-    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int = 0):
-        self.queue = create_in_poke_loop(asyncio.Queue, loop, maxsize)
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        maxsize: int = 0,
+        *,
+        sync_get: bool = False,
+    ):
+        self._sync_queue: ThreadQueue[QueueItemT] | None = (
+            ThreadQueue(maxsize=maxsize) if sync_get else None
+        )
+        self.queue: asyncio.Queue[QueueItemT] | None = (
+            None if sync_get else create_in_poke_loop(asyncio.Queue, loop, maxsize)
+        )
         self._loop = loop
 
     async def async_get(self) -> QueueItemT:
+        if self.queue is None:
+            raise RuntimeError("This queue is configured for synchronous reads only.")
         return await self.queue.get()
 
     def get(self, timeout: float | None = None) -> QueueItemT:
+        if self._sync_queue is not None:
+            try:
+                return self._sync_queue.get(timeout=timeout)
+            except Empty as exc:
+                raise TimeoutError from exc
         coro = self.async_get() if timeout is None else asyncio.wait_for(self.async_get(), timeout)
         result = asyncio.run_coroutine_threadsafe(coro, self._loop)
         if timeout is None:
@@ -171,19 +190,39 @@ class _AsyncQueue(Generic[QueueItemT]):
             raise
 
     async def async_put(self, item: QueueItemT) -> None:
+        if self.queue is None:
+            raise RuntimeError("This queue is configured for synchronous reads only.")
         await self.queue.put(item)
 
+    def qsize(self) -> int:
+        if self._sync_queue is not None:
+            return self._sync_queue.qsize()
+        assert self.queue is not None
+        return self.queue.qsize()
+
     def put(self, item: QueueItemT) -> None:
+        if self._sync_queue is not None:
+            self._sync_queue.put_nowait(item)
+            return
         try:
             if asyncio.get_running_loop() is self._loop:
                 self.queue.put_nowait(item)
                 return
         except RuntimeError:
             pass
+        assert self.queue is not None
         self._loop.call_soon_threadsafe(self.queue.put_nowait, item)
 
     def clear(self) -> None:
+        if self._sync_queue is not None:
+            while True:
+                try:
+                    self._sync_queue.get_nowait()
+                except Empty:
+                    return
+
         async def _clear() -> None:
+            assert self.queue is not None
             while True:
                 try:
                     self.queue.get_nowait()
@@ -279,7 +318,9 @@ class ShowdownPlayer(Player):
         super().__init__(**kwargs)
         self.obs_builder = obs_builder
         self.timing = timing
-        self.obs_queue: _AsyncQueue[tuple[dict, dict[str, np.ndarray], float, bool, DoubleBattle]] = _AsyncQueue(self.ps_client.loop)
+        self.obs_queue: _AsyncQueue[
+            tuple[dict, dict[str, np.ndarray], float, bool, DoubleBattle]
+        ] = _AsyncQueue(self.ps_client.loop, sync_get=True)
         self.action_queue: _AsyncQueue[np.ndarray | None] = _AsyncQueue(self.ps_client.loop)
         self.last_battle: DoubleBattle | None = None
         self._last_finished_token: tuple[str, int] | None = None
@@ -651,23 +692,48 @@ class BattleEnv:
         ) from timeout_error
 
     def _describe_pending_battle_tasks(self) -> str:
+        def _describe_await_chain(coro, *, limit: int = 12) -> str:
+            bits: list[str] = []
+            current = coro
+            for _ in range(limit):
+                frame = getattr(current, "cr_frame", None) or getattr(
+                    current, "gi_frame", None
+                )
+                code = getattr(current, "cr_code", None) or getattr(current, "gi_code", None)
+                if frame is not None:
+                    bits.append(
+                        f"{frame.f_code.co_name}@{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+                    )
+                elif code is not None:
+                    bits.append(f"{code.co_name}@{os.path.basename(code.co_filename)}")
+                else:
+                    bits.append(repr(current))
+
+                next_coro = (
+                    getattr(current, "cr_await", None)
+                    or getattr(current, "gi_yieldfrom", None)
+                )
+                if next_coro is None:
+                    break
+                current = next_coro
+            return " -> ".join(bits)
+
         async def _describe() -> str:
             descriptions: list[str] = []
+            obs_queue = getattr(getattr(self, "player", None), "obs_queue", None)
+            action_queue = getattr(getattr(self, "player", None), "action_queue", None)
+            queue_bits = []
+            for name, queue in (("obs", obs_queue), ("action", action_queue)):
+                if hasattr(queue, "qsize"):
+                    queue_bits.append(f"{name}_qsize={queue.qsize()}")
+            if queue_bits:
+                descriptions.append("BattleEnv queues: " + ", ".join(queue_bits))
             current = asyncio.current_task()
             for task in asyncio.all_tasks():
                 if task is current or task.done():
                     continue
                 coro = task.get_coro()
-                frames = task.get_stack(limit=6)
-                if frames:
-                    frame_bits = [
-                        f"{frame.f_code.co_name}@{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
-                        for frame in frames
-                    ]
-                    stack = " <- ".join(frame_bits)
-                else:
-                    stack = "no Python stack"
-                descriptions.append(f"{coro!r}: {stack}")
+                descriptions.append(f"{coro!r}: {_describe_await_chain(coro)}")
             return "Pending event-loop tasks: " + (
                 " | ".join(descriptions) if descriptions else "none"
             )
