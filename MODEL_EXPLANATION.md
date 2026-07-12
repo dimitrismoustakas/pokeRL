@@ -142,8 +142,11 @@ These tensors are passed alongside the per-pokemon blocks rather than inside the
 - `own_mask`, `opp_mask`: `(6,)`, padding mask where `True` = unused slot.
 - `own_active_indices`, `opp_active_indices`: `(2,)`, indices of each active pokemon within the ordered team list.
 - `own_active_present`, `opp_active_present`: `(2,)`, whether each active slot actually exists (handles faint / forced switch gaps).
+- `opp_source_index`: `(6,)`, episode-local public roster identity used only to align auxiliary labels; `-1` means the displayed identity is ambiguous.
 
-Team ordering places active pokemon first but keeps stable team-slot identity so switches resolve correctly. Missing actives are gathered and then zeroed out by `SpatialEncoder._gather_slots`.
+Team ordering places active pokemon first while active-index tensors preserve the connection to the correct representations. In bring-4-of-6 formats, all six publicly shown preview species remain present throughout the battle: live public state overlays its preview shell, while unrevealed shells keep `revealed=0` and unknown item/ability/move/tera fields. This retains public roster knowledge without exposing which four were brought. Missing actives are gathered and then zeroed out by `SpatialEncoder._gather_slots`.
+
+The poke-env `unknown_item` sentinel is encoded as the ordinary unknown index with `item known=0`; it is never treated as a revealed held item.
 
 ### 2.4 Item Vocabulary
 
@@ -259,6 +262,7 @@ Two interchangeable implementations selected by `ModelConfig.memory_type`:
 - Accepts either `(batch, 320)` single-step or `(batch, seq, 320)` sequence input.
 - Returns `(memory_out, (h, c))`.
 - **Does not** reset hidden state on `done` and **does not** detach for BPTT by itself — both are handled by the rollout loop and PPO trainer. This keeps `LSTMMemory` a pure recurrent cell, with episode-boundary semantics owned by the caller that knows when episodes end.
+- During PPO, independent episode fragments are packed into one cuDNN LSTM call per minibatch (or explicit TBPTT window). Terminal resets and gradient boundaries are identical to stepwise unrolling, but avoid one recurrent launch per rollout timestep.
 
 The LSTM is what gives the policy (and critic — see below) their memory of the battle: HP trajectories, revealed moves, field-control flow. Without it the model would need to infer all of that purely from the current frame.
 
@@ -640,7 +644,7 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
    ```
 
    **Battle-turn auxiliary losses:**
-   - `hidden_info_loss`: masked CE/BCE for opponent item, ability, tera type, and revealed move set using completed-episode labels.
+   - `hidden_info_loss`: masked CE/BCE for opponent item, ability, tera type, and revealed move set using completed-episode labels aligned by stable public roster identity. Ambiguous identities and pokemon not publicly present at that timestep are excluded.
    - `opp_action_loss`: masked CE for the league opponent's observed `(a1, a2, tera)` this turn.
 
    **Total:** `loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss + aux_hidden_info_coef * hidden_info_loss + aux_opp_action_coef * opp_action_loss`, with `value_coef=0.5`, `entropy_coef=0.01`, and both auxiliary coefficients defaulting to `0.25`.
@@ -855,6 +859,7 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `team_preview_max_samples` | 1024 | accumulator cap (oldest dropped first) |
 | `aux_hidden_info_coef` | 0.25 | hidden-info prediction aux weight |
 | `aux_opp_action_coef` | 0.25 | opponent-action prediction aux weight |
+| `diagnose_memory_gradients` | `False` | opt-in one-minibatch norms/cosines for weighted battle-PPO gradients on shared memory |
 | `rollout_steps` | 128 | steps per env before update |
 | `num_epochs` | 4 | PPO epochs per rollout |
 | `num_minibatches` | 4 | env minibatches per epoch |
