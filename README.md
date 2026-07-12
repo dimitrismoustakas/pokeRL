@@ -13,14 +13,12 @@ uv sync --dev
 
 The project package is installed editable into `.venv`.
 
-The no-server training path requires a `poke-env` build that exposes
-`LocalBattleStreamConfiguration`. Until that support is available from the
-published package, install the local `poke-env` checkout editable into the same
-venv and verify the capability:
+The no-server training path targets the local BattleStream branch of
+`poke-env`. Until that support is available from the published package,
+install the sibling checkout editable into the same venv:
 
 ```powershell
 uv pip install -e ..\poke-env
-& .\.venv\Scripts\python.exe -c "from poke_env import LocalBattleStreamConfiguration"
 ```
 
 ## Local Pokemon Showdown checkout
@@ -72,8 +70,10 @@ For a short local BattleStream scaling benchmark over two rollout->PPO rounds:
 
 The benchmark writes per-run logs and a JSON summary under `benchmarks/<timestamp>/`.
 Use `--worker-counts`, `--battles-per-worker`, `--runtime-loop-count`,
-`--pool-mode`, and `--league-coalesce-ms` to test the local BattleStream knobs
-used by longer runs.
+`--battle-loop-count`, and `--league-coalesce-ms` to test the local
+BattleStream knobs used by longer runs. Training also accepts
+`--reset-concurrency` to bound simultaneous environment resets when startup
+load needs to be limited.
 
 ## Building a VGC team pool
 

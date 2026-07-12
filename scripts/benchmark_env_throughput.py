@@ -16,11 +16,13 @@ from pokerl.data import GameData
 from pokerl.env.actions import FIRST_SLOT_MASK_ROW, NUM_TARGETS, PASS_ACTION, SWITCH_OFFSET
 from pokerl.env.showdown_env import (
     BattleEnv,
+    LoopThread,
     ParallelBattleEnv,
     battlestream_summary,
     default_showdown_dir,
     make_battlestream_configuration,
     make_local_account_configuration,
+    resolve_battle_loop_count,
 )
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
 
@@ -39,10 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--battles-per-worker", type=int, default=None, help="Max battles per local worker.")
     parser.add_argument("--runtime-loop-count", type=int, default=None, help="Local BattleStream runtime loop count.")
     parser.add_argument(
-        "--pool-mode",
-        choices=("single", "shared"),
+        "--battle-loop-count",
+        type=int,
         default=None,
-        help="BattleStream pool mode. Defaults to EnvConfig.pool_mode.",
+        help="Event-loop threads hosting battle sessions. Defaults to min(num-envs, 4).",
     )
     parser.add_argument(
         "--battlestream-startup-timeout",
@@ -189,11 +191,66 @@ def _build_opponent_factory(env_config: EnvConfig, opponent_name: str):
     return factory
 
 
+def _build_parallel_env(
+    env_config: EnvConfig,
+    game_data: GameData,
+    opponent_factory,
+    team_pair_provider,
+    *,
+    collect_timing: bool,
+) -> ParallelBattleEnv:
+    """Build a round-robin shared-loop environment with failure-safe ownership."""
+    loop_count = resolve_battle_loop_count(
+        env_config.battle_loop_count,
+        env_config.num_envs,
+    )
+    loop_threads: list[LoopThread] = []
+    envs: list[BattleEnv] = []
+    try:
+        for _ in range(loop_count):
+            loop_threads.append(LoopThread.start())
+        for env_index in range(env_config.num_envs):
+            envs.append(
+                BattleEnv(
+                    env_config,
+                    game_data,
+                    opponent_factory,
+                    team_preview_fn=_team_preview_first_four,
+                    team_pair_provider=team_pair_provider,
+                    loop_thread=loop_threads[env_index % loop_count],
+                    collect_timing=collect_timing,
+                )
+            )
+        return ParallelBattleEnv(
+            envs,
+            collect_timing=collect_timing,
+            loop_threads=loop_threads,
+        )
+    except BaseException as construction_error:
+        cleanup_errors: list[BaseException] = []
+        for env in reversed(envs):
+            try:
+                env.close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        for loop_thread in loop_threads:
+            try:
+                loop_thread.close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        for cleanup_error in cleanup_errors:
+            construction_error.add_note(
+                f"Benchmark environment construction cleanup failed: {cleanup_error!r}"
+            )
+        raise
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     if args.num_envs <= 0:
         raise ValueError("--num-envs must be positive.")
     if args.steps <= 0:
         raise ValueError("--steps must be positive.")
+    resolve_battle_loop_count(args.battle_loop_count, args.num_envs)
 
     showdown_dir = args.showdown_dir or default_showdown_dir()
     if showdown_dir is None:
@@ -210,7 +267,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         worker_count=args.worker_count,
         battles_per_worker=args.battles_per_worker,
         runtime_loop_count=args.runtime_loop_count,
-        pool_mode=args.pool_mode or EnvConfig.pool_mode,
+        battle_loop_count=args.battle_loop_count,
         battlestream_startup_timeout=args.battlestream_startup_timeout,
     )
     game_data = GameData(gen=9)
@@ -224,18 +281,13 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         return team_pool.sample_packed_pair(distinct=True)
 
     opponent_factory = _build_opponent_factory(env_config, args.opponent)
-    envs = [
-        BattleEnv(
-            env_config,
-            game_data,
-            opponent_factory,
-            team_preview_fn=_team_preview_first_four,
-            team_pair_provider=team_pair_provider,
-            collect_timing=args.collect_timing,
-        )
-        for _ in range(args.num_envs)
-    ]
-    parallel_env = ParallelBattleEnv(envs, collect_timing=args.collect_timing)
+    parallel_env = _build_parallel_env(
+        env_config,
+        game_data,
+        opponent_factory,
+        team_pair_provider,
+        collect_timing=args.collect_timing,
+    )
     rng = np.random.default_rng(args.seed)
 
     completed_battles = 0

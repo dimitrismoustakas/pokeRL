@@ -48,16 +48,16 @@ def parse_args() -> argparse.Namespace:
         help="Pass a fixed local battles-per-worker value through to train.py.",
     )
     parser.add_argument(
-        "--pool-mode",
-        choices=("single", "shared"),
-        default=None,
-        help="Pass a fixed local BattleStream pool mode through to train.py.",
-    )
-    parser.add_argument(
         "--runtime-loop-count",
         type=int,
         default=None,
         help="Pass a fixed local BattleStream runtime loop count through to train.py.",
+    )
+    parser.add_argument(
+        "--battle-loop-count",
+        type=int,
+        default=None,
+        help="Pass a fixed battle-session event-loop thread count through to train.py.",
     )
     parser.add_argument(
         "--battlestream-startup-timeout",
@@ -167,10 +167,10 @@ def benchmark_config(
         command.extend(["--worker-count", str(worker_count)])
     if args.battles_per_worker is not None:
         command.extend(["--battles-per-worker", str(args.battles_per_worker)])
-    if args.pool_mode is not None:
-        command.extend(["--pool-mode", args.pool_mode])
     if args.runtime_loop_count is not None:
         command.extend(["--runtime-loop-count", str(args.runtime_loop_count)])
+    if args.battle_loop_count is not None:
+        command.extend(["--battle-loop-count", str(args.battle_loop_count)])
     if args.battlestream_startup_timeout is not None:
         command.extend(["--battlestream-startup-timeout", str(args.battlestream_startup_timeout)])
     if args.league_coalesce_ms is not None:
@@ -240,8 +240,8 @@ def benchmark_config(
         "opponent_groups": opponent_group_count,
         "worker_count": worker_count,
         "battles_per_worker": args.battles_per_worker,
-        "pool_mode": args.pool_mode,
         "runtime_loop_count": args.runtime_loop_count,
+        "battle_loop_count": args.battle_loop_count,
         "league_coalesce_ms": args.league_coalesce_ms,
         "rollout_steps": args.rollout_steps,
         "num_updates": args.num_updates,
@@ -288,6 +288,8 @@ def benchmark_config(
 
 def main() -> None:
     args = parse_args()
+    if args.battle_loop_count is not None and args.battle_loop_count <= 0:
+        raise ValueError("--battle-loop-count must be positive.")
     showdown_dir = args.showdown_dir or default_showdown_dir()
     if showdown_dir is None:
         raise SystemExit("--showdown-dir is required, or set POKERL_SHOWDOWN_DIR.")

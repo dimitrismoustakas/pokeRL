@@ -832,8 +832,9 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `showdown_dir` | `None` |
 | `worker_count` | `None` |
 | `battles_per_worker` | `None` |
-| `pool_mode` | `"shared"` |
 | `runtime_loop_count` | `None` |
+| `battle_loop_count` | `None` |
+| `reset_concurrency` | `None` |
 | `opponent_group` | 0 |
 
 ### 9.3 TrainingConfig (defaults)

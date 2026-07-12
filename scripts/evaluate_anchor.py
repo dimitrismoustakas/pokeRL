@@ -38,7 +38,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Seconds to wait for a local BattleStream battle to produce protocol output.",
     )
-    parser.add_argument("--pool-mode", choices=("single", "shared"), default=None, help="Local BattleStream pool mode.")
     parser.add_argument("--league-coalesce-ms", type=float, default=0.0, help="Anchor inference coalescing window.")
     parser.add_argument("--games", type=int, default=32, help="Number of evaluation battles.")
     parser.add_argument(
@@ -102,7 +101,6 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             if args.battlestream_startup_timeout is not None
             else EnvConfig.battlestream_startup_timeout
         ),
-        pool_mode=args.pool_mode or EnvConfig.pool_mode,
     )
     model_config = ModelConfig(pick_size=env_config.pick_size)
     game_data = GameData(gen=9)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Awaitable
 from types import MethodType
 
 import numpy as np
@@ -158,6 +159,14 @@ def _attach_choice_timer(player, timing: dict[str, float | int], key_prefix: str
     def timed_choose_move(self, battle):
         started = time.perf_counter()
         result = original_choose_move(battle)
+        if isinstance(result, Awaitable):
+            async def finish_async_choice():
+                return finish_timed_choice(await result, started)
+
+            return finish_async_choice()
+        return finish_timed_choice(result, started)
+
+    def finish_timed_choice(result, started: float):
         timing[f"{key_prefix}_choice_calls"] += 1
         timing[f"{key_prefix}_choice_sec"] += time.perf_counter() - started
         return result
