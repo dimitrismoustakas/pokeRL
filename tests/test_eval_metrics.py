@@ -36,6 +36,31 @@ def test_outcome_summary_empty_input_has_uninformative_intervals() -> None:
     }
 
 
+def test_outcome_summary_accepts_explicit_wdl_counts() -> None:
+    from_rewards = outcome_summary([1.0, 1.0, -1.0, 0.0])
+
+    assert outcome_summary(wins=2, losses=1, draws=1) == from_rewards
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"wins": 1, "losses": 0},
+        {"wins": 1, "losses": -1, "draws": 0},
+        {"wins": 1.5, "losses": 0, "draws": 0},
+        {"wins": True, "losses": 0, "draws": 0},
+    ],
+)
+def test_outcome_summary_rejects_incomplete_or_invalid_wdl_counts(kwargs) -> None:
+    with pytest.raises(ValueError):
+        outcome_summary(**kwargs)
+
+
+def test_outcome_summary_rejects_mixed_rewards_and_wdl_counts() -> None:
+    with pytest.raises(ValueError, match="either rewards or explicit"):
+        outcome_summary([1.0], wins=1, losses=0, draws=0)
+
+
 @pytest.mark.parametrize("rewards", [[math.nan], [math.inf], [-math.inf]])
 def test_outcome_summary_rejects_non_finite_rewards(rewards) -> None:
     with pytest.raises(ValueError, match="finite"):

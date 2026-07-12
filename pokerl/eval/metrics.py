@@ -51,18 +51,41 @@ def _summary_from_counts(wins: int, losses: int, draws: int) -> dict[str, Any]:
     }
 
 
-def outcome_summary(rewards: Iterable[float]) -> dict[str, Any]:
-    """Summarize battle rewards by sign with 95% Wilson intervals.
+def outcome_summary(
+    rewards: Iterable[float] | None = None,
+    *,
+    wins: int | None = None,
+    losses: int | None = None,
+    draws: int | None = None,
+) -> dict[str, Any]:
+    """Summarize rewards or explicit W/D/L counts with 95% Wilson intervals.
 
     Positive rewards are wins, negative rewards are losses, and zero rewards
     are draws. ``score_rate`` gives each draw half credit. Its interval applies
     the Wilson formula to the corresponding fractional success count, which is
     an approximation because battle scores are not binary observations.
 
-    Empty input produces zero rates and uninformative ``[0.0, 1.0]``
-    intervals. Non-finite rewards are rejected rather than silently counted as
-    draws.
+    Pass either an iterable of rewards or all three explicit ``wins``,
+    ``losses``, and ``draws`` keyword counts. Empty reward input and zero counts
+    produce zero rates and uninformative ``[0.0, 1.0]`` intervals. Non-finite
+    rewards and invalid counts are rejected rather than silently miscounted.
     """
+    supplied_counts = (wins, losses, draws)
+    if rewards is not None and any(value is not None for value in supplied_counts):
+        raise ValueError("pass either rewards or explicit W/D/L counts, not both")
+    if rewards is None:
+        if any(value is None for value in supplied_counts):
+            raise ValueError("pass rewards or provide all of wins, losses, and draws")
+        explicit_counts = {
+            "wins": wins,
+            "losses": losses,
+            "draws": draws,
+        }
+        valid_wins, valid_losses, valid_draws = _outcome_counts(
+            explicit_counts, "outcome"
+        )
+        return _summary_from_counts(valid_wins, valid_losses, valid_draws)
+
     wins = losses = draws = 0
     for reward_value in rewards:
         reward = float(reward_value)
