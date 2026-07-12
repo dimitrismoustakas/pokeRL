@@ -1,10 +1,15 @@
 """PPO trainer with support for action masking and LSTM policies."""
 
+import random
+import uuid
+from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pathlib import Path
 
 from ..config import TrainingConfig
 from ..env.observation import (
@@ -13,8 +18,194 @@ from ..env.observation import (
     ROLE_BENCH,
     TERA_KNOWN_OFFSET,
 )
-from ..model.agent import PokeAgent, load_state_dict_compatible
+from ..model.agent import PokeAgent
 from .rollout import RolloutBatch
+
+
+# Increment when trainer-checkpoint semantics or same-shaped model inputs change.
+TRAINER_CHECKPOINT_FORMAT_VERSION = 1
+
+
+def _qualified_type_name(value: object) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _state_dict_schema(
+    state_dict: Mapping[str, torch.Tensor],
+) -> dict[str, dict[str, object]]:
+    schema: dict[str, dict[str, object]] = {}
+    for key in sorted(state_dict):
+        value = state_dict[key]
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                f"Model state entry {key!r} must be a tensor, got "
+                f"{type(value).__name__}."
+            )
+        schema[key] = {
+            "shape": tuple(int(dimension) for dimension in value.shape),
+            "dtype": str(value.dtype),
+            "layout": str(value.layout),
+        }
+    return schema
+
+
+def _model_config_metadata(agent: nn.Module) -> dict[str, object] | None:
+    config = getattr(agent, "config", None)
+    if config is None:
+        return None
+    if is_dataclass(config) and not isinstance(config, type):
+        return {
+            "type": _qualified_type_name(config),
+            "values": asdict(config),
+        }
+    if isinstance(config, Mapping):
+        return {
+            "type": _qualified_type_name(config),
+            "values": dict(config),
+        }
+    return None
+
+
+def _model_checkpoint_metadata(agent: nn.Module) -> dict[str, object]:
+    return {
+        "model_type": _qualified_type_name(agent),
+        "model_config": _model_config_metadata(agent),
+        "game_data_signature": getattr(agent, "game_data_signature", None),
+        "state_schema": _state_dict_schema(agent.state_dict()),
+    }
+
+
+def _capture_rng_state() -> dict[str, object]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            tuple(torch.cuda.get_rng_state_all()) if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def _restore_rng_state(rng_state: Mapping[str, object]) -> None:
+    required = {"python", "numpy", "torch_cpu", "torch_cuda"}
+    missing = sorted(required.difference(rng_state))
+    if missing:
+        raise ValueError(
+            "Trainer checkpoint RNG state is missing key(s): " + ", ".join(missing)
+        )
+
+    random.setstate(rng_state["python"])
+    np.random.set_state(rng_state["numpy"])
+
+    torch_cpu_state = rng_state["torch_cpu"]
+    if not isinstance(torch_cpu_state, torch.Tensor):
+        raise ValueError("Trainer checkpoint torch CPU RNG state must be a tensor.")
+    torch.set_rng_state(torch_cpu_state.detach().to(device="cpu"))
+
+    cuda_states = rng_state["torch_cuda"]
+    if cuda_states is None or not torch.cuda.is_available():
+        return
+    if not isinstance(cuda_states, (tuple, list)) or not all(
+        isinstance(state, torch.Tensor) for state in cuda_states
+    ):
+        raise ValueError("Trainer checkpoint torch CUDA RNG state must be tensor list.")
+    device_count = torch.cuda.device_count()
+    if len(cuda_states) != device_count:
+        raise ValueError(
+            "Trainer checkpoint CUDA RNG state count does not match this runtime: "
+            f"checkpoint={len(cuda_states)}, runtime={device_count}."
+        )
+    torch.cuda.set_rng_state_all(
+        [state.detach().to(device="cpu") for state in cuda_states]
+    )
+
+
+def _validate_restorable_rng_state(rng_state: object) -> Mapping[str, object]:
+    if not isinstance(rng_state, Mapping):
+        raise ValueError("Trainer checkpoint RNG state must be a mapping.")
+    current_state = _capture_rng_state()
+    try:
+        _restore_rng_state(rng_state)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"Trainer checkpoint RNG state is invalid: {exc}") from exc
+    finally:
+        _restore_rng_state(current_state)
+    return rng_state
+
+
+def _validate_model_checkpoint_metadata(
+    *,
+    path: str,
+    checkpoint_state: object,
+    checkpoint_metadata: object,
+    current_agent: nn.Module,
+) -> Mapping[str, torch.Tensor]:
+    if not isinstance(checkpoint_state, Mapping):
+        raise ValueError("Trainer checkpoint agent state must be a mapping.")
+    if not isinstance(checkpoint_metadata, Mapping):
+        raise ValueError("Trainer checkpoint model metadata must be a mapping.")
+    required_metadata = {
+        "model_type",
+        "model_config",
+        "game_data_signature",
+        "state_schema",
+    }
+    missing_metadata = sorted(required_metadata.difference(checkpoint_metadata))
+    if missing_metadata:
+        raise ValueError(
+            "Trainer checkpoint model metadata is missing key(s): "
+            + ", ".join(missing_metadata)
+        )
+
+    declared_schema = checkpoint_metadata["state_schema"]
+    if not isinstance(declared_schema, Mapping):
+        raise ValueError("Trainer checkpoint model state schema must be a mapping.")
+    actual_checkpoint_schema = _state_dict_schema(checkpoint_state)
+    if actual_checkpoint_schema != dict(declared_schema):
+        raise ValueError(
+            f"Trainer checkpoint {path!r} agent state does not match its declared "
+            "model-state schema (missing, unexpected, shape, dtype, or layout mismatch)."
+        )
+
+    current_metadata = _model_checkpoint_metadata(current_agent)
+    if checkpoint_metadata["model_type"] != current_metadata["model_type"]:
+        raise ValueError(
+            f"Trainer checkpoint {path!r} model type mismatch: "
+            f"checkpoint={checkpoint_metadata['model_type']!r}, "
+            f"current={current_metadata['model_type']!r}."
+        )
+    if checkpoint_metadata["model_config"] != current_metadata["model_config"]:
+        raise ValueError(
+            f"Trainer checkpoint {path!r} model config mismatch; resume requires "
+            "the exact architecture configuration used to create the checkpoint."
+        )
+    if (
+        checkpoint_metadata["game_data_signature"]
+        != current_metadata["game_data_signature"]
+    ):
+        raise ValueError(
+            f"Trainer checkpoint {path!r} game-data vocabulary mismatch; resume "
+            "requires the exact categorical index mapping used by the checkpoint."
+        )
+
+    current_schema = current_metadata["state_schema"]
+    if declared_schema != current_schema:
+        checkpoint_keys = set(declared_schema)
+        current_keys = set(current_schema)
+        missing_keys = sorted(current_keys - checkpoint_keys)
+        unexpected_keys = sorted(checkpoint_keys - current_keys)
+        incompatible_keys = sorted(
+            key
+            for key in checkpoint_keys & current_keys
+            if declared_schema[key] != current_schema[key]
+        )
+        raise ValueError(
+            f"Trainer checkpoint {path!r} model-state schema mismatch: "
+            f"missing={missing_keys}, unexpected={unexpected_keys}, "
+            f"incompatible={incompatible_keys}."
+        )
+    return checkpoint_state
 
 
 class PPOTrainer:
@@ -37,7 +228,22 @@ class PPOTrainer:
             if memory is not None
             else ()
         )
+        opponent_representation = getattr(
+            getattr(agent, "spatial", None),
+            "team_opp",
+            None,
+        )
+        self._opponent_representation_params = (
+            tuple(
+                param
+                for param in opponent_representation.parameters()
+                if param.requires_grad
+            )
+            if opponent_representation is not None
+            else ()
+        )
         self.global_step = 0
+        self.loaded_training_state_id: str | None = None
 
     def _make_optimizer(self) -> torch.optim.Adam:
         return torch.optim.Adam(self.agent.parameters(), lr=self.config.lr, eps=1e-5)
@@ -116,19 +322,27 @@ class PPOTrainer:
             "entropy": torch.zeros((), device=self.device),
             "approx_kl": torch.zeros((), device=self.device),
         }
+        base_tera_entropy_sum = torch.zeros((), device=self.device)
+        base_tera_none_prob_sum = torch.zeros((), device=self.device)
+        base_tera_real_choice_evaluations = torch.zeros((), device=self.device)
         num_updates = 0
         skipped_nonfinite = 0
         memory_gradient_diagnostics: dict[str, float] = {}
+        initial_policy_shift: dict[str, torch.Tensor] = {}
 
         aux_labels_all = batch.aux_labels
         aux_label_valid_all = batch.aux_label_valid
+        hidden_info_coverage_metrics = self._hidden_info_coverage_metrics(
+            aux_label_valid_all,
+            obs_seq.get("opp_mask"),
+        )
         opp_actions_all = batch.opp_actions
         opp_actions_valid_all = batch.opp_actions_valid
         hidden_info_enabled = (
             self.config.aux_hidden_info_coef != 0.0
             and bool(aux_labels_all)
             and hasattr(self.agent, "hidden_info_head")
-            and bool(aux_label_valid_all.any().item())
+            and hidden_info_coverage_metrics["aux_hidden_info_valid_selected_slots"] > 0
         )
         opp_action_enabled = (
             self.config.aux_opp_action_coef != 0.0
@@ -215,6 +429,9 @@ class PPOTrainer:
                 # whole rollout minibatch at once.
                 all_log_probs: list[torch.Tensor] = []
                 all_entropies: list[torch.Tensor] = []
+                all_base_tera_entropies: list[torch.Tensor] = []
+                all_base_tera_none_probs: list[torch.Tensor] = []
+                all_base_tera_real_choices: list[torch.Tensor] = []
                 all_values: list[torch.Tensor] = []
                 head_chunk_steps = max(1, min(T, self._HEAD_BATCH_TARGET // E_mb))
                 for start in range(0, T, head_chunk_steps):
@@ -260,6 +477,9 @@ class PPOTrainer:
                             key: value[start:end].reshape(flat_count, *value.shape[2:])
                             for key, value in mb_obs_seq.items()
                         },
+                        tera_exploration_prob=batch.tera_exploration_prob,
+                        tera_force_delay_prob=batch.tera_force_delay_prob,
+                        tera_force_delay_max_turn=(batch.tera_force_delay_max_turn),
                         validate_actions=False,
                     )
                     value_t = self.agent.value_head(
@@ -275,10 +495,18 @@ class PPOTrainer:
 
                     all_log_probs.append(action_out["log_prob"])
                     all_entropies.append(action_out["entropy"])
+                    all_base_tera_entropies.append(action_out["base_tera_entropy"])
+                    all_base_tera_none_probs.append(action_out["base_tera_none_prob"])
+                    all_base_tera_real_choices.append(
+                        action_out["base_tera_has_real_choice"]
+                    )
                     all_values.append(value_t)
 
                 log_probs_flat = torch.cat(all_log_probs)
                 entropies_flat = torch.cat(all_entropies)
+                base_tera_entropies_flat = torch.cat(all_base_tera_entropies)
+                base_tera_none_probs_flat = torch.cat(all_base_tera_none_probs)
+                base_tera_real_choices_flat = torch.cat(all_base_tera_real_choices)
                 values_flat = torch.cat(all_values)
 
                 # Policy loss (clipped surrogate objective).
@@ -291,6 +519,28 @@ class PPOTrainer:
                         min=-self._LOG_RATIO_CLAMP, max=self._LOG_RATIO_CLAMP
                     )
                 )
+                if not initial_policy_shift:
+                    with torch.no_grad():
+                        approx_kl_before_battle_update = (
+                            (ratio - 1)
+                            - log_ratio.clamp(
+                                min=-self._LOG_RATIO_CLAMP,
+                                max=self._LOG_RATIO_CLAMP,
+                            )
+                        ).mean()
+                        initial_policy_shift = {
+                            "pre_ppo_approx_kl": approx_kl_before_battle_update.detach(),
+                            "pre_ppo_clip_fraction": (
+                                (ratio - 1.0).abs() > self.config.clip_eps
+                            )
+                            .to(torch.float32)
+                            .mean()
+                            .detach(),
+                            "pre_ppo_mean_abs_log_ratio": log_ratio.abs()
+                            .mean()
+                            .detach(),
+                            "pre_ppo_max_abs_log_ratio": log_ratio.abs().max().detach(),
+                        }
                 surr1 = ratio * mb_adv
                 surr2 = (
                     torch.clamp(
@@ -323,10 +573,11 @@ class PPOTrainer:
                 )
 
                 # --- Aux losses ---
-                # Hidden info: predict end-of-episode opponent item/ability/
-                # tera-type/move-set. Opp action: predict the opp's chosen
-                # (a1, a2, tera) using memory output plus both-side actives.
-                # Labels come from the buffer's retroactive fill on done.
+                # Hidden info: predict exact selected-team item/ability/
+                # tera-type/move-set from spatial reps plus recurrent belief
+                # state. Opp action: predict the opp's chosen (a1, a2, tera)
+                # using memory output plus both-side actives. Trainer-private
+                # labels come from the buffer's retroactive fill on done.
                 hidden_info_loss = None
                 opp_action_loss = None
                 if hidden_info_enabled:
@@ -334,7 +585,10 @@ class PPOTrainer:
                         key: value[:, mb_envs] for key, value in aux_labels_all.items()
                     }
                     aux_label_valid_mb = aux_label_valid_all[:, mb_envs]
-                    hidden_info_out = self.agent.hidden_info_head(opp_reps_seq_mb)
+                    hidden_info_out = self.agent.hidden_info_head(
+                        opp_reps_seq_mb,
+                        ctx_seq_mb,
+                    )
                     hidden_info_loss = self._hidden_info_loss(
                         logits=hidden_info_out,
                         labels=aux_labels_mb,
@@ -395,6 +649,14 @@ class PPOTrainer:
                             self._memory_params,
                             prefix="memory_grad",
                         )
+                        if self._opponent_representation_params:
+                            pending_memory_diagnostics.update(
+                                self._gradient_diagnostics(
+                                    objectives,
+                                    self._opponent_representation_params,
+                                    prefix="opp_rep_grad",
+                                )
+                            )
                         pending_memory_diagnostics.update(support)
                         pending_memory_diagnostics["memory_grad_minibatch_envs"] = (
                             float(E_mb)
@@ -417,6 +679,19 @@ class PPOTrainer:
                     metric_sums["policy_loss"].add_(policy_loss.detach())
                     metric_sums["value_loss"].add_(value_loss.detach())
                     metric_sums["entropy"].add_((-entropy_loss).detach())
+                    base_tera_entropy_sum.add_(
+                        base_tera_entropies_flat[base_tera_real_choices_flat]
+                        .sum()
+                        .detach()
+                    )
+                    base_tera_none_prob_sum.add_(
+                        base_tera_none_probs_flat[base_tera_real_choices_flat]
+                        .sum()
+                        .detach()
+                    )
+                    base_tera_real_choice_evaluations.add_(
+                        base_tera_real_choices_flat.sum().detach()
+                    )
                     metric_sums["approx_kl"].add_(approx_kl)
                     if hidden_info_enabled:
                         metric_sums["aux_hidden_info_loss"].add_(
@@ -437,10 +712,70 @@ class PPOTrainer:
         averaged = {
             key: (value / num_updates).item() for key, value in metric_sums.items()
         }
+        averaged.update(
+            {key: value.item() for key, value in initial_policy_shift.items()}
+        )
+        base_tera_support = base_tera_real_choice_evaluations.item()
+        averaged["base_tera_real_choice_evaluations"] = base_tera_support
+        averaged["base_tera_entropy"] = (
+            base_tera_entropy_sum.item() / base_tera_support
+            if base_tera_support > 0
+            else 0.0
+        )
+        averaged["base_tera_none_prob"] = (
+            base_tera_none_prob_sum.item() / base_tera_support
+            if base_tera_support > 0
+            else 0.0
+        )
+        if aux_labels_all:
+            averaged.update(hidden_info_coverage_metrics)
         averaged.update(memory_gradient_diagnostics)
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
+
+    @staticmethod
+    def _hidden_info_coverage_metrics(
+        label_valid: torch.Tensor,
+        opponent_padding: torch.Tensor | None,
+    ) -> dict[str, float]:
+        """Report how much public opponent state received terminal supervision."""
+        if label_valid.ndim != 3:
+            raise ValueError(
+                "Hidden-info validity must have shape (steps, envs, team_size)."
+            )
+        if opponent_padding is None or opponent_padding.shape != label_valid.shape:
+            public_slots = label_valid.new_zeros((), dtype=torch.int64)
+        else:
+            public_slots = (~opponent_padding).sum()
+        valid_slots = label_valid.sum()
+        labeled_steps = label_valid.any(dim=-1).sum()
+        values = (
+            torch.stack((valid_slots, public_slots, labeled_steps))
+            .detach()
+            .to(device="cpu", dtype=torch.float64)
+            .tolist()
+        )
+        valid_slots_value, public_slots_value, labeled_steps_value = values
+        total_steps = label_valid.shape[0] * label_valid.shape[1]
+        return {
+            "aux_hidden_info_valid_selected_slots": valid_slots_value,
+            "aux_hidden_info_public_slots": public_slots_value,
+            "aux_hidden_info_label_coverage": (
+                valid_slots_value / public_slots_value
+                if public_slots_value > 0
+                else 0.0
+            ),
+            "aux_hidden_info_labeled_steps": labeled_steps_value,
+            "aux_hidden_info_valid_selected_slots_per_labeled_step": (
+                valid_slots_value / labeled_steps_value
+                if labeled_steps_value > 0
+                else 0.0
+            ),
+            "aux_hidden_info_labeled_step_coverage": (
+                labeled_steps_value / total_steps if total_steps > 0 else 0.0
+            ),
+        }
 
     @staticmethod
     def _gradient_diagnostics(
@@ -544,7 +879,7 @@ class PPOTrainer:
         labels: dict[str, torch.Tensor],
         label_valid: torch.Tensor,
     ) -> torch.Tensor:
-        """Masked CE (item/ability/tera) + BCE (moves) against end-of-episode labels."""
+        """Masked CE/BCE against exact selected-team terminal labels."""
         opp_pad = labels["opp_mask"]  # (T, E_mb, 6) True if padding slot
         opp_cont = labels["opp_continuous"]  # (T, E_mb, 6, cont_dim)
         item_known = opp_cont[..., ITEM_KNOWN_OFFSET] > 0.5
@@ -729,49 +1064,99 @@ class PPOTrainer:
             "team_preview_lead_loss": lead_loss.item(),
         }
 
-    def save(self, path: str):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "checkpoint_type": "trainer",
-                "agent": self.agent.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "global_step": self.global_step,
-            },
-            path,
-        )
+    def save(self, path: str, *, training_state_id: str | None = None) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        state_id = training_state_id or uuid.uuid4().hex
+        if not isinstance(state_id, str) or not state_id:
+            raise ValueError("training_state_id must be a non-empty string.")
+        try:
+            torch.save(
+                {
+                    "checkpoint_type": "trainer",
+                    "format_version": TRAINER_CHECKPOINT_FORMAT_VERSION,
+                    "model_metadata": _model_checkpoint_metadata(self.agent),
+                    "agent": self.agent.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "global_step": self.global_step,
+                    "training_state_id": state_id,
+                    "rng_state": _capture_rng_state(),
+                },
+                temporary,
+            )
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
-    def load(self, path: str):
+    def load(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         if not isinstance(checkpoint, dict):
             raise ValueError(
                 f"Trainer checkpoint must be a mapping, got {type(checkpoint).__name__}."
             )
         checkpoint_type = checkpoint.get("checkpoint_type")
-        if checkpoint_type is not None and checkpoint_type != "trainer":
+        if checkpoint_type != "trainer":
             raise ValueError(
                 f"Trainer checkpoint {path!r} has checkpoint_type={checkpoint_type!r}; "
-                "only checkpoint_type='trainer' can be used with --resume."
+                "only a versioned checkpoint_type='trainer' checkpoint can be used "
+                "with --resume. Legacy and league checkpoints are unsupported."
             )
-        required_keys = {"agent", "optimizer", "global_step"}
+        format_version = checkpoint.get("format_version")
+        if format_version != TRAINER_CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                f"Trainer checkpoint {path!r} has unsupported format_version="
+                f"{format_version!r}; expected {TRAINER_CHECKPOINT_FORMAT_VERSION}. "
+                "Legacy trainer checkpoints cannot be resumed."
+            )
+        required_keys = {
+            "agent",
+            "optimizer",
+            "global_step",
+            "training_state_id",
+            "model_metadata",
+            "rng_state",
+        }
         missing_keys = sorted(required_keys.difference(checkpoint))
         if missing_keys:
             missing = ", ".join(missing_keys)
             raise ValueError(
-                f"Trainer checkpoint {path!r} is missing required key(s): {missing}. "
-                "League checkpoints contain only agent weights and cannot be used with --resume."
+                f"Trainer checkpoint {path!r} is missing required key(s): {missing}."
             )
-        load_report = load_state_dict_compatible(self.agent, checkpoint["agent"])
-        optimizer_compatible = not any(load_report.values())
-        if optimizer_compatible:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-        else:
-            self.optimizer = self._make_optimizer()
-            print(
-                "Checkpoint architecture changed; loaded compatible agent weights only. "
-                f"Skipped={len(load_report['skipped_keys'])}, "
-                f"Missing={len(load_report['missing_keys'])}, "
-                f"Unexpected={len(load_report['unexpected_keys'])}. "
-                "Optimizer state was reinitialized."
+
+        checkpoint_state = _validate_model_checkpoint_metadata(
+            path=path,
+            checkpoint_state=checkpoint["agent"],
+            checkpoint_metadata=checkpoint["model_metadata"],
+            current_agent=self.agent,
+        )
+        global_step = checkpoint["global_step"]
+        if isinstance(global_step, bool) or not isinstance(global_step, int):
+            raise ValueError("Trainer checkpoint global_step must be an integer.")
+        if global_step < 0:
+            raise ValueError("Trainer checkpoint global_step must be non-negative.")
+        training_state_id = checkpoint["training_state_id"]
+        if not isinstance(training_state_id, str) or not training_state_id:
+            raise ValueError(
+                "Trainer checkpoint training_state_id must be a non-empty string."
             )
-        self.global_step = checkpoint["global_step"]
+        rng_state = _validate_restorable_rng_state(checkpoint["rng_state"])
+
+        loaded_optimizer = self._make_optimizer()
+        try:
+            loaded_optimizer.load_state_dict(checkpoint["optimizer"])
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError(
+                f"Trainer checkpoint {path!r} optimizer state is incompatible: {exc}"
+            ) from exc
+
+        try:
+            self.agent.load_state_dict(checkpoint_state, strict=True)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Trainer checkpoint {path!r} model state failed strict loading: {exc}"
+            ) from exc
+        self.optimizer = loaded_optimizer
+        self.global_step = global_step
+        self.loaded_training_state_id = training_state_id
+        _restore_rng_state(rng_state)

@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 from poke_env.battle import Effect, Field, Pokemon, SideCondition, Status, Weather
 from poke_env.data import GenData
+from poke_env.teambuilder.constant_teambuilder import ConstantTeambuilder
+from poke_env.teambuilder.teambuilder import Teambuilder
 
 from pokerl.data import GameData, UNKNOWN_IDX
 from pokerl.env.observation import (
@@ -27,11 +29,99 @@ from pokerl.env.observation import (
     TERA_KNOWN_OFFSET,
     TERASTALLIZED_OFFSET,
     _init_team_preview_pokemon,
+    build_packed_team_aux_labels,
 )
 
 
 def _move(move_id: str, current_pp: int, max_pp: int) -> SimpleNamespace:
     return SimpleNamespace(id=move_id, current_pp=current_pp, max_pp=max_pp)
+
+
+def test_packed_team_aux_labels_are_exact_private_targets_for_selected_team() -> None:
+    game_data = GameData(gen=9)
+    packed_team = ConstantTeambuilder(
+        """Flutter Mane @ Choice Specs
+Ability: Protosynthesis
+Tera Type: Fairy
+- Dazzling Gleam
+- Shadow Ball
+- Moonblast
+- Protect
+
+Incineroar @ Safety Goggles
+Ability: Intimidate
+Tera Type: Grass
+- Fake Out
+- Flare Blitz
+- Knock Off
+- Parting Shot
+"""
+    ).yield_team()
+
+    labels = build_packed_team_aux_labels(
+        game_data,
+        team_size=6,
+        packed_team=packed_team,
+        selected_indices=[1],
+    )
+
+    assert labels["opp_source_index"].tolist() == [0, 1, -1, -1, -1, -1]
+    assert labels["opp_mask"].tolist() == [True, False, True, True, True, True]
+    assert labels["opp_item"][1] == game_data.item_index("safetygoggles")
+    assert labels["opp_ability"][1] == game_data.abilities_to_idx["intimidate"]
+    assert labels["opp_types"][1, 2] == game_data.type_to_idx["grass"]
+    assert set(labels["opp_moves"][1]) == {
+        game_data.move_to_idx[move]
+        for move in ("fakeout", "flareblitz", "knockoff", "partingshot")
+    }
+    assert labels["opp_continuous"][1, ITEM_KNOWN_OFFSET] == 1.0
+    assert labels["opp_continuous"][1, ABILITY_KNOWN_OFFSET] == 1.0
+    assert labels["opp_continuous"][1, TERA_KNOWN_OFFSET] == 1.0
+
+
+def test_packed_team_aux_labels_mask_exactly_the_unselected_two() -> None:
+    game_data = GameData(gen=9)
+    packed_team = ConstantTeambuilder(
+        "\n\n".join(
+            """Pikachu @ Light Ball
+Ability: Static
+Tera Type: Electric
+- Thunderbolt
+- Protect
+
+""".strip()
+            for _ in range(6)
+        )
+    ).yield_team()
+
+    labels = build_packed_team_aux_labels(
+        game_data,
+        team_size=6,
+        packed_team=packed_team,
+        selected_indices=[0, 2, 4, 5],
+    )
+
+    assert labels["opp_source_index"].tolist() == [0, 1, 2, 3, 4, 5]
+    assert labels["opp_mask"].tolist() == [False, True, False, True, False, False]
+
+
+def test_packed_team_aux_labels_reject_invalid_selected_positions() -> None:
+    game_data = GameData(gen=9)
+    packed_team = ConstantTeambuilder(
+        """Pikachu @ Light Ball
+Ability: Static
+Tera Type: Electric
+- Thunderbolt
+"""
+    ).yield_team()
+
+    with pytest.raises(ValueError, match="unique packed-team positions"):
+        build_packed_team_aux_labels(
+            game_data,
+            team_size=6,
+            packed_team=packed_team,
+            selected_indices=[0, 0],
+        )
 
 
 def _pokemon(
@@ -537,9 +627,17 @@ def test_observation_builder_keeps_unmatched_visible_opponent_active() -> None:
 
 def test_team_preview_pokemon_init_keeps_preview_revealed_flag_unset() -> None:
     gd = GameData(gen=9)
+    packed_team = ConstantTeambuilder(
+        """Incineroar @ Safety Goggles
+Ability: Intimidate
+Tera Type: Grass
+- Fake Out
+"""
+    ).yield_team()
+    teambuilder_pokemon = Teambuilder.parse_packed_team(packed_team)[0]
 
     own_preview = _init_team_preview_pokemon(
-        Pokemon(gen=gd.gen, species="incineroar"),
+        Pokemon(gen=gd.gen, teambuilder=teambuilder_pokemon),
         own_team=True,
     )
     opp_preview = _init_team_preview_pokemon(
@@ -548,6 +646,8 @@ def test_team_preview_pokemon_init_keeps_preview_revealed_flag_unset() -> None:
     )
 
     assert own_preview.revealed is False
+    assert own_preview.tera_type.name.lower() == "grass"
+    assert own_preview.is_terastallized is False
     assert opp_preview.revealed is False
 
 

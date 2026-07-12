@@ -39,6 +39,25 @@ from ..env.showdown_env import (
 from .cuda_execution import cuda_model_execution
 
 
+_LEAGUE_STATE_FORMAT_VERSION = 1
+
+
+def _tuples_to_lists(value):
+    if isinstance(value, tuple):
+        return [_tuples_to_lists(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _tuples_to_lists(item) for key, item in value.items()}
+    return value
+
+
+def _lists_to_tuples(value):
+    if isinstance(value, list):
+        return tuple(_lists_to_tuples(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _lists_to_tuples(item) for key, item in value.items()}
+    return value
+
+
 @dataclass
 class _InferenceRequest:
     checkpoint_path: str
@@ -350,9 +369,7 @@ class _LeagueInferenceService:
                         elif kind == "prune":
                             self._run_prune_batch(requests)
                         else:
-                            raise ValueError(
-                                f"Unknown inference request kind: {kind}"
-                            )
+                            raise ValueError(f"Unknown inference request kind: {kind}")
                     except Exception as exc:
                         failed = 0
                         for request in requests:
@@ -577,7 +594,10 @@ class _LeagueInferenceService:
                 )
             for key, expected_shape, expected_dtype in schema:
                 value = mapping[key]
-                if tuple(value.shape) != expected_shape or value.dtype.str != expected_dtype:
+                if (
+                    tuple(value.shape) != expected_shape
+                    or value.dtype.str != expected_dtype
+                ):
                     raise ValueError(
                         f"{cache_key}[{key!r}] request {batch_index} has "
                         f"shape={tuple(value.shape)} dtype={value.dtype}, expected "
@@ -702,8 +722,7 @@ class _LeagueInferenceService:
             for key, source in host_buffers.tensors.items():
                 buffers.tensors[key].copy_(source)
         return {
-            key: buffers.tensors[key][:batch_size]
-            for key, _, _ in host_buffers.schema
+            key: buffers.tensors[key][:batch_size] for key, _, _ in host_buffers.schema
         }
 
     def _allocate_device_batch_buffers(
@@ -740,9 +759,9 @@ class _LeagueInferenceService:
             row_size = int(np.prod(shape, dtype=np.int64))
             field_size = host_buffers.capacity * row_size
             offset = group_offsets[group_key]
-            tensors[key] = group_tensors[group_key][
-                offset : offset + field_size
-            ].view(host_buffers.capacity, *shape)
+            tensors[key] = group_tensors[group_key][offset : offset + field_size].view(
+                host_buffers.capacity, *shape
+            )
             group_offsets[group_key] = offset + field_size
         return _DeviceBatchBuffers(
             schema=host_buffers.schema,
@@ -808,7 +827,9 @@ class _LeagueInferenceService:
             request_masks,
         )
         if obs_batch_size != batch_size or masks_batch_size != batch_size:
-            raise RuntimeError("Battle inference staging produced a mismatched batch size.")
+            raise RuntimeError(
+                "Battle inference staging produced a mismatched batch size."
+            )
         cpu_pack_sec = time.perf_counter() - cpu_pack_started
         self._add_batch_timing(
             requests,
@@ -928,7 +949,9 @@ class _LeagueInferenceService:
             [request.obs for request in requests],
         )
         if obs_batch_size != batch_size:
-            raise RuntimeError("Preview inference staging produced a mismatched batch size.")
+            raise RuntimeError(
+                "Preview inference staging produced a mismatched batch size."
+            )
         cpu_pack_sec = time.perf_counter() - cpu_pack_started
         self._add_batch_timing(
             requests,
@@ -1637,12 +1660,17 @@ class League:
         game_data: GameData,
         agent_template: PokeAgent,
         device: torch.device,
+        *,
+        rng: random.Random | None = None,
     ):
         self.config = config
         self.env_config = env_config
         self.game_data = game_data
         self.agent_template = agent_template
         self.device = device
+        # League membership sampling has its own RNG so team-pool draws and
+        # unrelated Python randomness cannot perturb the opponent schedule.
+        self._rng = rng if rng is not None else random.Random(config.seed)
         self.inference_device = device
         self.preview_inference_device = (
             torch.device("cpu") if device.type == "cuda" else self.inference_device
@@ -1718,19 +1746,54 @@ class League:
             service.prefetch_checkpoint(path)
         return path
 
-    def save_state(self, path: str) -> None:
-        """Persist the ordered list of checkpoint paths to disk."""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(list(self.checkpoints), f)
+    def save_state(
+        self,
+        path: str,
+        *,
+        extra_state: dict[str, object] | None = None,
+    ) -> None:
+        """Atomically persist league membership and private sampling state."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        payload = {
+            "format_version": _LEAGUE_STATE_FORMAT_VERSION,
+            "checkpoints": list(self.checkpoints),
+            "rng_state": _tuples_to_lists(self._rng.getstate()),
+            "extra_state": _tuples_to_lists(extra_state or {}),
+        }
+        try:
+            temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
-    def load_state(self, path: str) -> None:
+    def load_state(self, path: str) -> dict[str, object]:
         """Restore checkpoint paths from a saved state file.
 
         Skips any paths that no longer exist on disk and warns if any are missing.
         """
-        with open(path) as f:
-            paths: list[str] = json.load(f)
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("League state must contain a versioned JSON object.")
+        if payload.get("format_version") != _LEAGUE_STATE_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported league-state format version: "
+                f"{payload.get('format_version')!r}."
+            )
+        paths = payload.get("checkpoints")
+        if not isinstance(paths, list) or not all(
+            isinstance(checkpoint_path, str) for checkpoint_path in paths
+        ):
+            raise ValueError("League state checkpoints must be a list of paths.")
+        rng_state = _lists_to_tuples(payload.get("rng_state"))
+        try:
+            self._rng.setstate(rng_state)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("League state contains an invalid RNG state.") from exc
+        extra_state = _lists_to_tuples(payload.get("extra_state", {}))
+        if not isinstance(extra_state, dict):
+            raise ValueError("League state extra_state must be an object.")
 
         existing = [p for p in paths if Path(p).exists()]
         missing = len(paths) - len(existing)
@@ -1739,11 +1802,13 @@ class League:
                 f"Warning: {missing} league checkpoint(s) no longer on disk, skipping."
             )
 
+        self.checkpoints.clear()
         for p in existing[-self.config.league_size :]:
             self.checkpoints.append(p)
         keep_paths = set(self.checkpoints)
         for service in self._inference_services():
             service.prune_checkpoints(keep_paths)
+        return extra_state
 
     def close(self) -> None:
         errors: list[Exception] = []
@@ -1771,9 +1836,9 @@ class League:
 
         mid = len(checkpoints) // 2
 
-        if len(checkpoints) < 2 or random.random() < 0.7:
+        if len(checkpoints) < 2 or self._rng.random() < 0.7:
             recent = checkpoints[mid:] if mid < len(checkpoints) else checkpoints
-            return random.choice(recent)
+            return self._rng.choice(recent)
         else:
             older = checkpoints[:mid] if mid > 0 else checkpoints
-            return random.choice(older)
+            return self._rng.choice(older)

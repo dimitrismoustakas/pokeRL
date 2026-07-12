@@ -24,9 +24,9 @@ class RolloutBatch:
     dones: torch.Tensor  # (num_steps, num_envs)
     advantages: torch.Tensor  # (num_steps, num_envs)
     returns: torch.Tensor  # (num_steps, num_envs)
-    # Aux labels for hidden-info prediction. Terminal opponent attributes are
-    # aligned to the same Pokemon at each earlier timestep. Unfinished episodes
-    # and ambiguous identities leave aux_label_valid=False for that Pokemon.
+    # Trainer-private exact labels for the opponent's selected team are aligned
+    # to the same Pokemon at each earlier timestep. Unfinished episodes,
+    # unselected Pokemon, and ambiguous identities leave aux_label_valid=False.
     aux_labels: dict[str, torch.Tensor]
     aux_label_valid: torch.Tensor  # (num_steps, num_envs, team_size) bool
     # Observed opponent actions for the aux opponent-action head. Entries where
@@ -37,6 +37,12 @@ class RolloutBatch:
     num_envs: int
     initial_hidden_h: torch.Tensor | None = None  # (num_envs, hidden_dim)
     initial_hidden_c: torch.Tensor | None = None  # (num_envs, hidden_dim)
+    # Fixed behavior-policy parameters used for every transition in this
+    # rollout. PPO must evaluate actions under the same transformed tera
+    # distribution that sampled them.
+    tera_exploration_prob: float = 0.0
+    tera_force_delay_prob: float = 0.0
+    tera_force_delay_max_turn: int = 0
 
 
 class RolloutBuffer:
@@ -112,6 +118,9 @@ class RolloutBuffer:
         )
         self._initial_hidden_h: torch.Tensor | None = None
         self._initial_hidden_c: torch.Tensor | None = None
+        self._tera_exploration_prob = 0.0
+        self._tera_force_delay_prob = 0.0
+        self._tera_force_delay_max_turn = 0
 
         # Aux labels require a Pokemon-shaped observation. Tests that pass a
         # minimal obs dict without these keys simply get empty aux buffers and
@@ -330,7 +339,36 @@ class RolloutBuffer:
             num_envs=self.num_envs,
             initial_hidden_h=self._initial_hidden_h,
             initial_hidden_c=self._initial_hidden_c,
+            tera_exploration_prob=self._tera_exploration_prob,
+            tera_force_delay_prob=self._tera_force_delay_prob,
+            tera_force_delay_max_turn=self._tera_force_delay_max_turn,
         )
+
+    def set_tera_behavior_policy(
+        self,
+        *,
+        exploration_prob: float,
+        force_delay_prob: float,
+        force_delay_max_turn: int,
+    ) -> None:
+        """Record the fixed tera behavior policy before collecting a rollout."""
+        if self.step != 0:
+            raise RuntimeError(
+                "Tera behavior policy cannot change after rollout collection starts."
+            )
+        for name, value in (
+            ("exploration_prob", exploration_prob),
+            ("force_delay_prob", force_delay_prob),
+        ):
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"{name} must be finite and within [0, 1], got {value}."
+                )
+        if force_delay_max_turn < 0:
+            raise ValueError("force_delay_max_turn must be non-negative.")
+        self._tera_exploration_prob = float(exploration_prob)
+        self._tera_force_delay_prob = float(force_delay_prob)
+        self._tera_force_delay_max_turn = int(force_delay_max_turn)
 
     def reset(
         self,
@@ -339,6 +377,9 @@ class RolloutBuffer:
         self.step = 0
         self._initial_hidden_h = None
         self._initial_hidden_c = None
+        self._tera_exploration_prob = 0.0
+        self._tera_force_delay_prob = 0.0
+        self._tera_force_delay_max_turn = 0
         self._aux_label_valid.fill_(False)
         self._opp_actions.fill_(-1)
         self._opp_actions_valid.fill_(False)

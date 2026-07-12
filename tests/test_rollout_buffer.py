@@ -48,6 +48,7 @@ from pokerl.model.heads import (
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
 from pokerl.training.ppo import PPOTrainer
+from pokerl.training.preview import TeamPreviewResult
 from pokerl.training.rollout import RolloutBuffer
 from poke_env.battle import Move, Pokemon
 from poke_env.battle.move import SPECIAL_MOVES
@@ -549,7 +550,9 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
     metrics = trainer.update(batch)
 
     assert trainer.global_step == num_steps * num_envs
-    assert set(metrics) == {"policy_loss", "value_loss", "entropy", "approx_kl"}
+    assert {"policy_loss", "value_loss", "entropy", "approx_kl"} <= set(metrics)
+    assert metrics["pre_ppo_clip_fraction"] >= 0.0
+    assert metrics["base_tera_real_choice_evaluations"] >= 0.0
 
 
 def test_ppo_trainer_clamps_extreme_log_ratios_and_keeps_parameters_finite() -> None:
@@ -1741,10 +1744,38 @@ async def test_battle_env_async_team_preview_awaits_precomputed_future() -> None
     await asyncio.sleep(0)
     assert not task.done()
 
-    expected = np.array([0, 1, 2, 3], dtype=np.int64)
+    expected = TeamPreviewResult(
+        picks=np.array([0, 1, 2, 3], dtype=np.int64),
+        policy_version=12,
+    )
     future.set_result(expected)
 
-    np.testing.assert_array_equal(await asyncio.wait_for(task, timeout=0.2), expected)
+    result = await asyncio.wait_for(task, timeout=0.2)
+    np.testing.assert_array_equal(result.picks, expected.picks)
+    assert result.policy_version == 12
+
+
+@pytest.mark.asyncio
+async def test_battle_env_team_preview_records_policy_version() -> None:
+    obs = {"context": np.array([1, 2, 3], dtype=np.int64)}
+    expected = TeamPreviewResult(
+        picks=np.array([0, 1, 2, 3], dtype=np.int64),
+        policy_version=21,
+    )
+    fake_env = SimpleNamespace(
+        _ext_team_preview_fn=object(),
+        player=SimpleNamespace(obs_builder=SimpleNamespace(build=lambda battle: obs)),
+        _choose_team_preview_picks_async=lambda current_obs: asyncio.sleep(
+            0,
+            result=expected,
+        ),
+        _episode_team_preview=None,
+    )
+
+    team_order = await BattleEnv._do_team_preview(fake_env, battle=object())
+
+    assert team_order == "/team 1234"
+    assert fake_env._episode_team_preview == (obs, expected.picks, 21)
 
 
 def test_finished_battle_update_skips_legality_rebuild(

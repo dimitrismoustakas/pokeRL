@@ -59,6 +59,24 @@ class GameData:
     def num_types(self) -> int:
         return len(self.type_to_idx)
 
+    def vocab_signature(self) -> str:
+        """Stable fingerprint for every categorical index used by checkpoints."""
+        payload = {
+            "gen": self.gen,
+            "species": self.species_to_idx,
+            "moves": self.move_to_idx,
+            "abilities": self.abilities_to_idx,
+            "items": self.item_to_idx,
+            "item_vocab_size": self._item_vocab_size,
+            "types": self.type_to_idx,
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def species_stats_matrix(self) -> np.ndarray:
         """Base stats matrix: (num_species, 6) with [HP, Atk, Def, SpA, SpD, Spe].
 

@@ -16,7 +16,7 @@ from pokerl.training.league import (
     _InferenceRequest,
     _LeagueInferenceService,
 )
-from pokerl.training.preview import TeamPreviewBatcher
+from pokerl.training.preview import TeamPreviewBatcher, TeamPreviewResult
 
 
 class _AliveThread:
@@ -268,18 +268,10 @@ def test_league_inference_prioritizes_battle_requests() -> None:
 
 def test_league_inference_snapshot_does_not_late_merge_later_key() -> None:
     service = _service_stub()
-    first_a = _request(
-        Future(), checkpoint_path="a.pt", submitted_at=1.0
-    )
-    first_b = _request(
-        Future(), checkpoint_path="b.pt", submitted_at=2.0
-    )
-    late_a = _request(
-        Future(), checkpoint_path="a.pt", submitted_at=3.0
-    )
-    late_b = _request(
-        Future(), checkpoint_path="b.pt", submitted_at=4.0
-    )
+    first_a = _request(Future(), checkpoint_path="a.pt", submitted_at=1.0)
+    first_b = _request(Future(), checkpoint_path="b.pt", submitted_at=2.0)
+    late_a = _request(Future(), checkpoint_path="a.pt", submitted_at=3.0)
+    late_b = _request(Future(), checkpoint_path="b.pt", submitted_at=4.0)
     service._pending = [first_a, first_b]
     calls: list[tuple[str, list[_InferenceRequest]]] = []
 
@@ -311,12 +303,8 @@ def test_league_inference_snapshot_does_not_late_merge_later_key() -> None:
 
 def test_league_inference_fatal_error_resolves_later_snapshot_group() -> None:
     service = _service_stub()
-    active = _request(
-        Future(), checkpoint_path="a.pt", submitted_at=1.0
-    )
-    future_key = _request(
-        Future(), checkpoint_path="b.pt", submitted_at=2.0
-    )
+    active = _request(Future(), checkpoint_path="a.pt", submitted_at=1.0)
+    future_key = _request(Future(), checkpoint_path="b.pt", submitted_at=2.0)
     service._pending = [active, future_key]
 
     def fail_batch(
@@ -343,12 +331,8 @@ def test_league_inference_fatal_error_resolves_later_snapshot_group() -> None:
 def test_league_inference_close_resolves_later_snapshot_group() -> None:
     service = _service_stub()
     service._thread = _StoppedThread()
-    active = _request(
-        Future(), checkpoint_path="a.pt", submitted_at=1.0
-    )
-    future_key = _request(
-        Future(), checkpoint_path="b.pt", submitted_at=2.0
-    )
+    active = _request(Future(), checkpoint_path="a.pt", submitted_at=1.0)
+    future_key = _request(Future(), checkpoint_path="b.pt", submitted_at=2.0)
     service._pending = [active, future_key]
     calls: list[str] = []
 
@@ -631,9 +615,7 @@ def test_league_battle_inference_synchronizes_before_publishing_device_samples(
 
 class _RecordingBatchAgent:
     def __init__(self) -> None:
-        self.calls: list[
-            tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]
-        ] = []
+        self.calls: list[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]] = []
 
     def initial_hidden(self, batch_size: int):
         del batch_size
@@ -772,9 +754,7 @@ def _assert_recorded_batch_matches_reference(
         actions, hidden = request.future.result()
         np.testing.assert_array_equal(actions, expected_actions[index].numpy())
         assert hidden is not None
-        assert hidden[0].item() == pytest.approx(
-            float(expected_obs["x"][index, 0])
-        )
+        assert hidden[0].item() == pytest.approx(float(expected_obs["x"][index, 0]))
 
 
 def test_league_staging_reuses_capacity_without_exposing_stale_rows() -> None:
@@ -974,11 +954,12 @@ def test_team_preview_batcher_requests_pick_only_inference() -> None:
     agent = _FakeAgent()
     batcher = TeamPreviewBatcher(agent, torch.device("cpu"))
     try:
-        picks = batcher.choose({"context": np.array([1, 2, 3], dtype=np.int64)})
+        result = batcher.choose({"context": np.array([1, 2, 3], dtype=np.int64)})
     finally:
         batcher.close()
 
-    np.testing.assert_array_equal(picks, np.zeros(4, dtype=np.int64))
+    np.testing.assert_array_equal(result.picks, np.zeros(4, dtype=np.int64))
+    assert result.policy_version == 0
     assert agent.kwargs == {
         "include_value": False,
         "include_policy_stats": False,
@@ -1002,11 +983,12 @@ def test_team_preview_batcher_rejects_training_mode_without_dying() -> None:
             batcher.choose({"context": np.array([1, 2, 3], dtype=np.int64)})
 
         agent.training = False
-        picks = batcher.choose({"context": np.array([1, 2, 3], dtype=np.int64)})
+        result = batcher.choose({"context": np.array([1, 2, 3], dtype=np.int64)})
     finally:
         batcher.close()
 
-    np.testing.assert_array_equal(picks, np.zeros(4, dtype=np.int64))
+    np.testing.assert_array_equal(result.picks, np.zeros(4, dtype=np.int64))
+    assert result.policy_version == 0
 
 
 def test_team_preview_batcher_ignores_cancelled_request(monkeypatch) -> None:
@@ -1024,9 +1006,61 @@ def test_team_preview_batcher_ignores_cancelled_request(monkeypatch) -> None:
         cancelled = batcher.submit({"context": np.array([1, 2, 3], dtype=np.int64)})
         assert cancelled.cancel()
         healthy = batcher.submit({"context": np.array([4, 5, 6], dtype=np.int64)})
-        picks = healthy.result(timeout=1.0)
+        result = healthy.result(timeout=1.0)
     finally:
         batcher.close()
 
     assert cancelled.cancelled()
-    np.testing.assert_array_equal(picks, np.zeros(4, dtype=np.int64))
+    np.testing.assert_array_equal(result.picks, np.zeros(4, dtype=np.int64))
+    assert result.policy_version == 0
+
+
+def test_team_preview_batcher_tags_results_across_policy_versions() -> None:
+    class _FakeAgent:
+        training = False
+
+        def team_preview(self, obs_batch, **kwargs):
+            del kwargs
+            batch_size = next(iter(obs_batch.values())).shape[0]
+            return {"picks": torch.zeros((batch_size, 4), dtype=torch.long)}
+
+    batcher = TeamPreviewBatcher(
+        _FakeAgent(),
+        torch.device("cpu"),
+        policy_version=8,
+    )
+    try:
+        old_result = batcher.choose({"context": np.array([1, 2, 3], dtype=np.int64)})
+        assert batcher.advance_policy_version() == 9
+        new_result = batcher.choose({"context": np.array([4, 5, 6], dtype=np.int64)})
+    finally:
+        batcher.close()
+
+    assert isinstance(old_result, TeamPreviewResult)
+    assert old_result.policy_version == 8
+    assert new_result.policy_version == 9
+
+
+def test_team_preview_batcher_refuses_version_advance_with_pending_work(
+    monkeypatch,
+) -> None:
+    class _FakeAgent:
+        training = False
+
+        def team_preview(self, obs_batch, **kwargs):
+            del kwargs
+            batch_size = next(iter(obs_batch.values())).shape[0]
+            return {"picks": torch.zeros((batch_size, 4), dtype=torch.long)}
+
+    monkeypatch.setattr(TeamPreviewBatcher, "_COALESCE_WINDOW_SEC", 0.05)
+    batcher = TeamPreviewBatcher(_FakeAgent(), torch.device("cpu"))
+    try:
+        pending = batcher.submit({"context": np.array([1, 2, 3], dtype=np.int64)})
+        with pytest.raises(RuntimeError, match="pending or active"):
+            batcher.advance_policy_version()
+        result = pending.result(timeout=1.0)
+        assert batcher.advance_policy_version() == 1
+    finally:
+        batcher.close()
+
+    assert result.policy_version == 0

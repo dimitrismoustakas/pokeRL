@@ -1,6 +1,7 @@
 """Converts a poke-env DoubleBattle into the tensor dict the model expects."""
 
 from collections import OrderedDict
+from functools import lru_cache
 
 import numpy as np
 from poke_env.battle import (
@@ -637,6 +638,74 @@ def build_team_preview_observation(
     return ObservationBuilder(game_data, team_size).build(battle)
 
 
+@lru_cache(maxsize=512)
+def _cached_packed_team_aux_labels(
+    game_data: GameData,
+    team_size: int,
+    packed_team: str,
+) -> dict[str, np.ndarray]:
+    """Encode a packed team once for trainer-private auxiliary targets."""
+    pokemon = [
+        Pokemon(gen=game_data.gen, teambuilder=entry)
+        for entry in Teambuilder.parse_packed_team(packed_team)[:team_size]
+    ]
+    padded_team: list[Pokemon | None] = [*pokemon]
+    padded_team.extend([None] * (team_size - len(padded_team)))
+    labels: dict[str, np.ndarray] = {}
+    ObservationBuilder(game_data, team_size)._encode_team(
+        padded_team,
+        np.full(team_size, ROLE_BENCH, dtype=np.int64),
+        labels,
+        prefix="opp",
+        full_info=True,
+    )
+    source_indices = np.full(team_size, -1, dtype=np.int64)
+    source_indices[: len(pokemon)] = np.arange(len(pokemon), dtype=np.int64)
+    labels["opp_source_index"] = source_indices
+    return labels
+
+
+def build_packed_team_aux_labels(
+    game_data: GameData,
+    team_size: int,
+    packed_team: str,
+    *,
+    selected_indices: np.ndarray | list[int] | tuple[int, ...] | None = None,
+) -> dict[str, np.ndarray]:
+    """Return exact, trainer-only opponent labels in team-preview order.
+
+    The packed team is already assigned to the simulator, but none of these
+    arrays are included in the policy observation.  They are attached only to
+    terminal training info so the hidden-information auxiliary head can learn
+    from complete item, ability, tera-type, and move-set targets.
+    """
+    labels = {
+        key: value.copy()
+        for key, value in _cached_packed_team_aux_labels(
+            game_data,
+            team_size,
+            packed_team,
+        ).items()
+    }
+    if selected_indices is None:
+        return labels
+
+    selected = np.asarray(selected_indices, dtype=np.int64)
+    if selected.ndim != 1:
+        raise ValueError("selected_indices must be one-dimensional.")
+    available = int((~labels["opp_mask"]).sum())
+    if (
+        len(np.unique(selected)) != len(selected)
+        or np.any(selected < 0)
+        or np.any(selected >= available)
+    ):
+        raise ValueError("selected_indices must contain unique packed-team positions.")
+    selected_mask = np.ones(team_size, dtype=bool)
+    selected_mask[selected] = False
+    labels["opp_mask"] |= selected_mask
+    return labels
+
+
 def _preview_visible_species(gen: int, tb) -> str:
     species = Pokemon(gen=gen, teambuilder=tb).species
     if species is None:
@@ -655,7 +724,6 @@ def _init_team_preview_pokemon(pokemon: Pokemon, *, own_team: bool) -> Pokemon:
             max_hp = 100
         pokemon._max_hp = max_hp
         pokemon._current_hp = max_hp
-        pokemon._terastallized_type = None
     else:
         pokemon._max_hp = 0
         pokemon._current_hp = 0

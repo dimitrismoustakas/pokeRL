@@ -56,6 +56,7 @@ class PokeAgent(nn.Module):
     def __init__(self, config: ModelConfig, game_data: GameData):
         super().__init__()
         self.config = config
+        self.game_data_signature = game_data.vocab_signature()
 
         # --- Spatial encoder ---
         pokemon_encoder = PokemonEncoder(
@@ -74,14 +75,26 @@ class PokeAgent(nn.Module):
             out_dim=config.pokemon_out,
         )
 
-        team_own = TeamEncoder(config.pokemon_out, config.team_attention_heads, config.team_attention_layers)
-        team_opp = TeamEncoder(config.pokemon_out, config.team_attention_heads, config.team_attention_layers)
+        team_own = TeamEncoder(
+            config.pokemon_out,
+            config.team_attention_heads,
+            config.team_attention_layers,
+        )
+        team_opp = TeamEncoder(
+            config.pokemon_out,
+            config.team_attention_heads,
+            config.team_attention_layers,
+        )
         field_encoder = FieldEncoder(config.field_out)
 
-        self.spatial = SpatialEncoder(pokemon_encoder, team_own, team_opp, field_encoder)
+        self.spatial = SpatialEncoder(
+            pokemon_encoder, team_own, team_opp, field_encoder
+        )
 
         # --- Memory ---
-        self.memory = build_memory(config.memory_type, self.spatial.context_dim, config.memory_hidden)
+        self.memory = build_memory(
+            config.memory_type, self.spatial.context_dim, config.memory_hidden
+        )
         memory_out = config.memory_hidden
 
         # --- Heads ---
@@ -98,14 +111,19 @@ class PokeAgent(nn.Module):
             move_target_flags=torch.from_numpy(game_data.move_target_flags()),
             type_effectiveness=torch.from_numpy(game_data.type_effectiveness_matrix()),
         )
-        self.team_preview_head = TeamPreviewHead(config.pokemon_out, memory_out, config.pick_size)
+        self.team_preview_head = TeamPreviewHead(
+            config.pokemon_out, memory_out, config.pick_size
+        )
         self.opponent_preview_head = OpponentPreviewHead(config.pokemon_out, memory_out)
         self.value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)
-        self.preview_value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)
+        self.preview_value_head = ValueHead(
+            memory_out, config.pokemon_out, config.value_hidden
+        )
 
         # --- Auxiliary heads (trained during PPO update only) ---
         self.hidden_info_head = HiddenInfoHead(
             pokemon_dim=config.pokemon_out,
+            context_dim=memory_out,
             num_items=game_data.num_items,
             num_abilities=game_data.num_abilities,
             num_types=game_data.num_types,
@@ -146,11 +164,11 @@ class PokeAgent(nn.Module):
                 ``joint`` has shape (batch, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
                 ``can_tera`` has shape (batch, 2)
             tera_exploration_prob: epsilon for uniform-over-valid tera exploration
-                during rollout. Default 0.0 (policy only). Ignored when ``actions``
-                is provided (PPO update path).
+                during rollout. PPO passes the same value when evaluating supplied
+                actions so behavior-policy likelihood ratios stay exact.
             tera_force_delay_prob: probability of converting early sampled tera
-                actions to no-tera during rollout. Ignored when ``actions`` is
-                provided (PPO update path).
+                actions to no-tera. PPO also applies the resulting marginal
+                distribution when evaluating supplied actions.
             tera_force_delay_max_turn: latest battle turn eligible for forced
                 no-tera exploration. 0 disables it.
             validate_actions: validate caller-supplied actions against the
@@ -236,7 +254,9 @@ class PokeAgent(nn.Module):
             "hidden": new_hidden,
         }
         if include_opponent_preview:
-            result.update(self.opponent_preview_head(opp_reps, context, obs.get("opp_mask")))
+            result.update(
+                self.opponent_preview_head(opp_reps, context, obs.get("opp_mask"))
+            )
         if include_value:
             result["preview_value"] = self.preview_value_head(
                 context,
@@ -253,9 +273,13 @@ class PokeAgent(nn.Module):
         context, _ = self.memory(context, hidden)
         own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
         opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
-        return self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
+        return self.value_head(
+            context, own_reps, opp_reps, own_bench_mask, opp_bench_mask
+        )
 
-    def get_preview_value(self, obs: dict[str, torch.Tensor], hidden=None) -> torch.Tensor:
+    def get_preview_value(
+        self, obs: dict[str, torch.Tensor], hidden=None
+    ) -> torch.Tensor:
         """Preview-only value estimate used as the team-preview baseline."""
         context, _, own_reps, opp_reps, _ = self.spatial(obs)
         context, _ = self.memory(context, hidden)

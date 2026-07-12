@@ -125,6 +125,11 @@ class _ScriptedParallelEnv:
                     current_state + 1,
                     aux_value=label,
                 )
+                if env_index == 0:
+                    info["opponent_aux_labels"] = _single_obs(
+                        current_state + 1,
+                        aux_value=990,
+                    )
                 info["episode_reward"] = float(label)
                 next_state = reset_state
             else:
@@ -143,7 +148,7 @@ class _ScriptedParallelEnv:
         return batched_obs, _batched_masks(self.num_envs), rewards, dones, infos
 
 
-def test_collect_synchronous_rollout_preserves_sequences_hidden_and_terminal_labels(
+def test_collect_synchronous_rollout_prefers_private_exact_labels_and_preserves_sequences(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env = _ScriptedParallelEnv()
@@ -177,9 +182,9 @@ def test_collect_synchronous_rollout_preserves_sequences_hidden_and_terminal_lab
             hidden=hidden,
             device=torch.device("cpu"),
             num_steps=2,
-            tera_exploration_prob=0.0,
-            tera_force_delay_prob=0.0,
-            tera_force_delay_max_turn=0,
+            tera_exploration_prob=0.2,
+            tera_force_delay_prob=0.3,
+            tera_force_delay_max_turn=4,
             collect_timing=True,
         )
     )
@@ -199,9 +204,12 @@ def test_collect_synchronous_rollout_preserves_sequences_hidden_and_terminal_lab
         [False, False, False, True],
     ]
     assert batch.aux_label_valid[:, 0].any(dim=-1).tolist() == [True, False]
-    assert batch.aux_labels["opp_item"][0, 0, 0].item() == 900
+    assert batch.aux_labels["opp_item"][0, 0, 0].item() == 990
     assert batch.aux_label_valid[:, 3].any(dim=-1).tolist() == [True, True]
     assert batch.aux_labels["opp_item"][:, 3, 0].tolist() == [933, 933]
+    assert batch.tera_exploration_prob == pytest.approx(0.2)
+    assert batch.tera_force_delay_prob == pytest.approx(0.3)
+    assert batch.tera_force_delay_max_turn == 4
 
     assert agent.hidden_inputs[(0, 10, 20, 30)] == [10.0, 11.0, 12.0, 13.0]
     assert agent.hidden_inputs[(100, 11, 21, 31)] == [0.0, 12.0, 13.0, 14.0]
@@ -211,6 +219,8 @@ def test_collect_synchronous_rollout_preserves_sequences_hidden_and_terminal_lab
     assert final_obs["state"].reshape(-1).tolist() == [101.0, 12.0, 22.0, 300.0]
     assert len(infos) == 8
     assert all("final_observation" not in info for info in infos)
+    assert all("opponent_aux_labels" not in info for info in infos)
+    assert profile["exact_aux_label_episodes"] == 1.0
     assert profile["env_step_sec"] >= 0.0
     assert guard_entries == 2
 

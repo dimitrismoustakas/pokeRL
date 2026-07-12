@@ -38,8 +38,12 @@ from poke_env.player import (
 
 from ..config import EnvConfig
 from ..data import GameData
-from ..training.preview import TeamPreviewBatcher
-from .observation import ObservationBuilder, build_team_preview_observation
+from ..training.preview import TeamPreviewBatcher, TeamPreviewResult
+from .observation import (
+    ObservationBuilder,
+    build_packed_team_aux_labels,
+    build_team_preview_observation,
+)
 from .team_preview import parse_team_preview_order
 from .actions import (
     action_to_order,
@@ -785,7 +789,8 @@ class BattleEnv:
         config: EnvConfig,
         game_data: GameData,
         opponent_factory: OpponentFactory,
-        team_preview_fn: Callable[[dict], tuple[np.ndarray, str]] | None = None,
+        team_preview_fn: Callable[[dict], tuple[np.ndarray | TeamPreviewResult, str]]
+        | None = None,
         team_preview_batcher: TeamPreviewBatcher | None = None,
         team_pair_provider: TeamPairProvider | None = None,
         player_kwargs: dict | None = None,
@@ -814,8 +819,9 @@ class BattleEnv:
         self._active_preview_obs: dict[str, np.ndarray] | None = None
         self._active_preview_future: Future | None = None
         # Set at team preview time, read when the episode ends to attach to info.
-        self._episode_team_preview: tuple[dict, np.ndarray] | None = None
+        self._episode_team_preview: tuple[dict, np.ndarray, int | None] | None = None
         self._episode_opponent_preview_picks: np.ndarray | None = None
+        self._episode_opponent_packed_team: str | None = None
         self._episode_opponent_choice_calls = 0
         self._episode_opponent_turn_calls: dict[tuple[str, int], int] = defaultdict(int)
         self._episode_opponent_checkpoint_path: str | None = None
@@ -881,6 +887,7 @@ class BattleEnv:
         self._pending_player_request_id = None
         self._episode_team_preview = None
         self._episode_opponent_preview_picks = None
+        self._episode_opponent_packed_team = None
         self._episode_opponent_choice_calls = 0
         self._episode_opponent_turn_calls.clear()
         self._episode_opponent_checkpoint_path = getattr(
@@ -1019,13 +1026,26 @@ class BattleEnv:
             if self._battle_started_at is not None:
                 info["episode_sec"] = time.perf_counter() - self._battle_started_at
             if self._episode_team_preview is not None:
-                obs_tp, picks_tp = self._episode_team_preview
+                obs_tp, picks_tp, policy_version = self._episode_team_preview
                 info["team_preview_obs"] = obs_tp
                 info["team_preview_picks"] = picks_tp
+                info["team_preview_policy_version"] = policy_version
             if self._episode_opponent_preview_picks is not None:
                 info["opponent_team_preview_picks"] = (
                     self._episode_opponent_preview_picks
                 )
+                opponent_packed_team = getattr(
+                    self,
+                    "_episode_opponent_packed_team",
+                    None,
+                )
+                if opponent_packed_team is not None:
+                    info["opponent_aux_labels"] = build_packed_team_aux_labels(
+                        self.game_data,
+                        self.config.team_size,
+                        opponent_packed_team,
+                        selected_indices=self._episode_opponent_preview_picks,
+                    )
             info["episode_opponent_choice_calls"] = self._episode_opponent_choice_calls
             info["episode_opponent_repeated_turn_requests"] = sum(
                 count - 1
@@ -1375,9 +1395,10 @@ class BattleEnv:
                 "BattleEnv team preview requested without a team_preview_fn."
             )
         obs = self.player.obs_builder.build(battle)
-        picks = await self._choose_team_preview_picks_async(obs)
+        result = await self._choose_team_preview_picks_async(obs)
+        picks = result.picks
         team_str = "/team " + "".join(str(int(pick) + 1) for pick in picks)
-        self._episode_team_preview = (obs, picks)
+        self._episode_team_preview = (obs, picks, result.policy_version)
         return team_str
 
     def _assign_teams_for_next_battle(self) -> None:
@@ -1397,6 +1418,7 @@ class BattleEnv:
             self.player.update_team(player_team)
         if opponent_team is not None:
             self.opponent.update_team(opponent_team)
+            self._episode_opponent_packed_team = opponent_team
 
     @property
     def last_battle(self) -> DoubleBattle | None:
@@ -1544,15 +1566,17 @@ class BattleEnv:
                 "env_precompute_preview_wait_sec", time.perf_counter() - wait_started
             )
 
-    def _choose_team_preview_picks(self, obs: dict[str, np.ndarray]) -> np.ndarray:
+    def _choose_team_preview_picks(
+        self, obs: dict[str, np.ndarray]
+    ) -> TeamPreviewResult:
         prepared_obs = self._active_preview_obs
         prepared_future = self._active_preview_future
         self._active_preview_obs = None
         self._active_preview_future = None
 
         if prepared_obs is None and prepared_future is None:
-            picks, _ = self._ext_team_preview_fn(obs)
-            return picks
+            result, _ = self._ext_team_preview_fn(obs)
+            return BattleEnv._coerce_team_preview_result(result)
 
         if prepared_obs is None or prepared_future is None:
             if _timing_enabled(self._timing):
@@ -1565,13 +1589,13 @@ class BattleEnv:
                 self._timing.increment("env_precompute_preview_hits")
             if timing_enabled:
                 wait_started = time.perf_counter()
-            picks = prepared_future.result()
+            result = prepared_future.result()
             if timing_enabled:
                 self._timing.add(
                     "env_precompute_preview_hit_wait_sec",
                     time.perf_counter() - wait_started,
                 )
-            return picks
+            return BattleEnv._coerce_team_preview_result(result)
 
         if _timing_enabled(self._timing):
             self._timing.increment("env_precompute_preview_misses")
@@ -1582,7 +1606,7 @@ class BattleEnv:
 
     async def _choose_team_preview_picks_async(
         self, obs: dict[str, np.ndarray]
-    ) -> np.ndarray:
+    ) -> TeamPreviewResult:
         prepared_obs = self._active_preview_obs
         prepared_future = self._active_preview_future
         self._active_preview_obs = None
@@ -1595,7 +1619,7 @@ class BattleEnv:
             if isinstance(result, Awaitable):
                 result = await result
             picks, _ = result
-            return picks
+            return BattleEnv._coerce_team_preview_result(picks)
 
         if prepared_obs is None or prepared_future is None:
             if _timing_enabled(self._timing):
@@ -1608,19 +1632,30 @@ class BattleEnv:
                 self._timing.increment("env_precompute_preview_hits")
             if timing_enabled:
                 wait_started = time.perf_counter()
-            picks = await asyncio.wrap_future(prepared_future)
+            result = await asyncio.wrap_future(prepared_future)
             if timing_enabled:
                 self._timing.add(
                     "env_precompute_preview_hit_wait_sec",
                     time.perf_counter() - wait_started,
                 )
-            return picks
+            return BattleEnv._coerce_team_preview_result(result)
 
         if _timing_enabled(self._timing):
             self._timing.increment("env_precompute_preview_misses")
         self._record_preview_obs_mismatch(obs, prepared_obs)
         raise RuntimeError(
             "Prepared team preview observation did not match the live battle state."
+        )
+
+    @staticmethod
+    def _coerce_team_preview_result(
+        result: np.ndarray | TeamPreviewResult,
+    ) -> TeamPreviewResult:
+        if isinstance(result, TeamPreviewResult):
+            return result
+        return TeamPreviewResult(
+            picks=np.asarray(result, dtype=np.int64),
+            policy_version=None,
         )
 
     @staticmethod

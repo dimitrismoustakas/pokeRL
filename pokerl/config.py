@@ -61,12 +61,7 @@ class TrainingConfig:
     team_preview_value_coef: float = 0.5
     team_preview_bring_coef: float = 0.1
     team_preview_lead_coef: float = 0.05
-    team_preview_update_interval: int = (
-        8  # flush the preview accumulator every N PPO updates
-    )
-    team_preview_max_samples: int = (
-        1024  # cap the accumulator; oldest entries are dropped first
-    )
+    team_preview_max_samples: int = 1024  # uniform current-rollout subsample cap
     # Auxiliary prediction losses. These do not modify the reward or the
     # action/value path; they add dense gradient to the shared encoder by
     # predicting opponent hidden info (end-of-episode labels) and the
@@ -86,14 +81,15 @@ class TrainingConfig:
     log_interval: int = 10
     save_interval: int = 100
     checkpoint_dir: str = "checkpoints"
+    seed: int = 0
 
     # Tera exploration: with probability epsilon on each turn that has a real
     # tera choice (>= 2 valid options), override the policy's tera sample with a
     # uniform draw over valid options. Breaks the "tera always turn 1" attractor
-    # by forcing the policy to observe outcomes from saving tera. Log-probs are
-    # stored under the policy (not behavior), so PPO's clip absorbs the mild
-    # off-policy bias for small epsilon. Linear decay from start to end across
-    # tera_exploration_decay_updates PPO updates.
+    # by forcing the policy to observe outcomes from saving tera. Rollout and
+    # PPO log-probabilities both use the exact resulting behavior distribution.
+    # Linear decay from start to end across tera_exploration_decay_updates PPO
+    # updates.
     tera_exploration_start: float = 0.15
     tera_exploration_end: float = 0.02
     tera_exploration_decay_updates: int = 2000
@@ -109,9 +105,37 @@ class TrainingConfig:
     # League
     league_size: int = 12
     league_update_interval: int = 10
+    league_refresh_interval: int = 1
     league_coalesce_ms: float = 5.0
 
     def __post_init__(self) -> None:
+        if not 0 <= self.seed < 2**32:
+            raise ValueError(f"seed must be in [0, 2**32) (got {self.seed}).")
+        if self.league_size <= 0:
+            raise ValueError(f"league_size must be positive (got {self.league_size}).")
+        if self.league_update_interval <= 0:
+            raise ValueError(
+                "league_update_interval must be positive "
+                f"(got {self.league_update_interval})."
+            )
+        if self.league_refresh_interval <= 0:
+            raise ValueError(
+                "league_refresh_interval must be positive "
+                f"(got {self.league_refresh_interval})."
+            )
+        if self.team_preview_max_samples <= 0:
+            raise ValueError(
+                "team_preview_max_samples must be positive "
+                f"(got {self.team_preview_max_samples})."
+            )
+        for name, value in (
+            ("tera_exploration_start", self.tera_exploration_start),
+            ("tera_exploration_end", self.tera_exploration_end),
+            ("tera_force_delay_start", self.tera_force_delay_start),
+            ("tera_force_delay_end", self.tera_force_delay_end),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be within [0, 1] (got {value}).")
         if self.tera_exploration_decay_updates < 0:
             raise ValueError(
                 "tera_exploration_decay_updates must be >= 0 "

@@ -38,7 +38,12 @@ def test_opponent_preview_head_masks_invalid_lead_pairs() -> None:
 def test_hidden_info_loss_matches_dense_reference() -> None:
     torch.manual_seed(0)
     head = HiddenInfoHead(
-        pokemon_dim=4, num_items=7, num_abilities=5, num_types=6, num_moves=9
+        pokemon_dim=4,
+        context_dim=6,
+        num_items=7,
+        num_abilities=5,
+        num_types=6,
+        num_moves=9,
     )
     opp_reps = torch.randn(2, 2, 3, 4)
     labels = {
@@ -94,6 +99,74 @@ def test_hidden_info_loss_matches_dense_reference() -> None:
     dense_loss = _dense_hidden_info_loss(head(opp_reps), labels, label_valid)
 
     assert torch.allclose(sparse_loss, dense_loss)
+
+
+def test_hidden_info_context_adapter_is_initially_exactly_compatible() -> None:
+    torch.manual_seed(11)
+    head = HiddenInfoHead(
+        pokemon_dim=4,
+        context_dim=6,
+        num_items=7,
+        num_abilities=5,
+        num_types=6,
+        num_moves=9,
+    )
+    opp_reps = torch.randn(2, 3, 4)
+    context = torch.randn(2, 6, requires_grad=True)
+
+    spatial_only = head(opp_reps)
+    conditioned = head(opp_reps, context)
+
+    assert torch.count_nonzero(head.context_adapter.weight) == 0
+    assert torch.count_nonzero(head.context_adapter.bias) == 0
+    for key in spatial_only:
+        assert torch.equal(spatial_only[key], conditioned[key])
+
+    initial_loss = sum(value.square().mean() for value in conditioned.values())
+    initial_loss.backward()
+    assert head.context_adapter.weight.grad is not None
+    assert torch.count_nonzero(head.context_adapter.weight.grad) > 0
+    assert context.grad is not None
+    assert torch.count_nonzero(context.grad) == 0
+
+    with torch.no_grad():
+        head.context_adapter.weight.add_(-0.1 * head.context_adapter.weight.grad)
+    head.zero_grad(set_to_none=True)
+    learned_context = context.detach().clone().requires_grad_(True)
+    learned_loss = sum(
+        value.square().mean() for value in head(opp_reps, learned_context).values()
+    )
+    learned_loss.backward()
+
+    assert learned_context.grad is not None
+    assert torch.count_nonzero(learned_context.grad) > 0
+
+
+def test_hidden_info_coverage_reports_selected_slots_and_public_fraction() -> None:
+    label_valid = torch.tensor(
+        [
+            [[True, True, False, False], [False, False, False, False]],
+            [[True, False, True, False], [False, False, False, False]],
+        ]
+    )
+    opponent_padding = torch.tensor(
+        [
+            [[False, False, False, False], [False, False, True, True]],
+            [[False, False, False, False], [False, False, True, True]],
+        ]
+    )
+
+    metrics = PPOTrainer._hidden_info_coverage_metrics(
+        label_valid,
+        opponent_padding,
+    )
+
+    assert metrics["aux_hidden_info_valid_selected_slots"] == 4.0
+    assert metrics["aux_hidden_info_public_slots"] == 12.0
+    assert metrics["aux_hidden_info_label_coverage"] == pytest.approx(1 / 3)
+    assert metrics["aux_hidden_info_labeled_steps"] == 2.0
+    assert metrics["aux_hidden_info_valid_selected_slots_per_labeled_step"] == 2.0
+    assert metrics["aux_hidden_info_labeled_step_coverage"] == 0.5
 
 
 def test_gradient_diagnostics_measure_norms_conflicts_and_preserve_graph() -> None:

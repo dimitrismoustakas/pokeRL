@@ -428,52 +428,60 @@ class ActionHead(nn.Module):
             )
         )
         tera_logits = self.tera_score(tera_query).masked_fill(~tera_mask, -1e8)
+        self._validate_exploration_probability(
+            "tera_exploration_prob",
+            tera_exploration_prob,
+        )
+        self._validate_exploration_probability(
+            "tera_force_delay_prob",
+            tera_force_delay_prob,
+        )
         if include_policy_stats:
-            tera_log_probs = torch.log_softmax(tera_logits, dim=-1)
-            tera_probs = tera_log_probs.exp()
-            tera_entropy = -(tera_probs * tera_log_probs).sum(dim=-1)
+            base_tera_log_probs = torch.log_softmax(tera_logits, dim=-1)
+            base_tera_probs = base_tera_log_probs.exp()
+            base_tera_entropy = -(base_tera_probs * base_tera_log_probs).sum(dim=-1)
+        else:
+            base_tera_log_probs = None
+            base_tera_probs = None
+            base_tera_entropy = None
+        use_tera_behavior_policy = not greedy and (
+            tera_exploration_prob > 0.0
+            or (tera_force_delay_prob > 0.0 and tera_force_delay_max_turn > 0)
+        )
+        if use_tera_behavior_policy:
+            early_turn = self._early_turn_mask(
+                battle_obs=battle_obs,
+                batch_size=batch_size,
+                device=device,
+                max_turn=tera_force_delay_max_turn,
+            )
+            tera_log_probs, tera_probs = self._tera_behavior_distribution(
+                tera_logits,
+                tera_mask,
+                early_turn=early_turn,
+                exploration_prob=tera_exploration_prob,
+                force_delay_prob=tera_force_delay_prob,
+            )
+            tera_sampling_logits = tera_log_probs
+            tera_entropy = (
+                self._entropy_from_probs(tera_probs) if include_policy_stats else None
+            )
+        elif include_policy_stats:
+            tera_log_probs = base_tera_log_probs
+            tera_probs = base_tera_probs
+            tera_sampling_logits = tera_logits
+            tera_entropy = base_tera_entropy
         else:
             tera_log_probs = None
+            tera_sampling_logits = tera_logits
             tera_entropy = None
 
         if actions is None:
             tera_choice = (
                 tera_logits.argmax(dim=1)
                 if greedy
-                else _sample_categorical_logits(tera_logits)
+                else _sample_categorical_logits(tera_sampling_logits)
             )
-            if tera_exploration_prob > 0.0 and not greedy:
-                # Only explore when there is a real tera choice (>= 2 valid options).
-                # Otherwise tera_mask is [True, False, False] and uniform == policy.
-                has_choice = tera_mask.sum(dim=1) >= 2
-                explore = (
-                    torch.rand(context.shape[0], device=context.device)
-                    < tera_exploration_prob
-                ) & has_choice
-                uniform_logits = torch.zeros_like(tera_logits).masked_fill(
-                    ~tera_mask, -1e8
-                )
-                uniform_sample = _sample_categorical_logits(uniform_logits)
-                tera_choice = torch.where(explore, uniform_sample, tera_choice)
-            if (
-                tera_force_delay_prob > 0.0
-                and tera_force_delay_max_turn > 0
-                and not greedy
-            ):
-                early_turn = self._early_turn_mask(
-                    battle_obs=battle_obs,
-                    batch_size=batch_size,
-                    device=device,
-                    max_turn=tera_force_delay_max_turn,
-                )
-                force_delay = (
-                    (torch.rand(batch_size, device=device) < tera_force_delay_prob)
-                    & early_turn
-                    & (tera_choice != TERA_NONE)
-                )
-                tera_choice = torch.where(
-                    force_delay, torch.zeros_like(tera_choice), tera_choice
-                )
         else:
             tera_choice = actions[:, 2]
 
@@ -503,7 +511,80 @@ class ActionHead(nn.Module):
             )
             result["log_prob"] = log_prob1 + log_prob2 + tera_log_prob
             result["entropy"] = entropy1 + entropy2 + tera_entropy
+            result["base_tera_entropy"] = base_tera_entropy
+            result["base_tera_none_prob"] = base_tera_probs[:, TERA_NONE]
+            result["base_tera_has_real_choice"] = tera_mask.sum(dim=-1) >= 2
         return result
+
+    @staticmethod
+    def _tera_behavior_distribution(
+        base_logits: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        early_turn: torch.Tensor,
+        exploration_prob: float,
+        force_delay_prob: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return exact log-probs/probs for rollout tera exploration.
+
+        The rollout first mixes the learned policy with a uniform distribution
+        over valid tera choices. On eligible early turns, force-delay then moves
+        a fixed fraction of every non-zero tera choice's mass to ``TERA_NONE``.
+        Evaluating this same marginal distribution during PPO keeps the old/new
+        ratio on-policy and equal to one before parameters change.
+        """
+        if base_logits.ndim != 2 or base_logits.shape != valid_mask.shape:
+            raise ValueError(
+                "Tera logits and validity mask must have the same 2D shape."
+            )
+        if early_turn.shape != (base_logits.shape[0],):
+            raise ValueError("early_turn must have shape (batch,).")
+        if base_logits.shape[1] != NUM_TERA_CHOICES:
+            raise ValueError(
+                f"Expected {NUM_TERA_CHOICES} tera choices, got {base_logits.shape[1]}."
+            )
+
+        masked_logits = base_logits.masked_fill(~valid_mask, -torch.inf)
+        base_probs = torch.softmax(masked_logits, dim=-1)
+        has_real_choice = valid_mask.sum(dim=-1) >= 2
+        epsilon = has_real_choice.to(base_probs.dtype) * exploration_prob
+        uniform_probs = valid_mask.to(base_probs.dtype) / valid_mask.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1)
+        behavior_probs = base_probs + epsilon.unsqueeze(-1) * (
+            uniform_probs - base_probs
+        )
+
+        delay = early_turn.to(base_probs.dtype) * force_delay_prob
+        no_tera_prob = behavior_probs[:, TERA_NONE] + delay * (
+            1.0 - behavior_probs[:, TERA_NONE]
+        )
+        delayed_other_probs = behavior_probs[:, 1:] * (1.0 - delay.unsqueeze(-1))
+        behavior_probs = torch.cat(
+            (no_tera_prob.unsqueeze(-1), delayed_other_probs),
+            dim=-1,
+        )
+        behavior_probs = behavior_probs.masked_fill(~valid_mask, 0.0)
+        safe_log_probs = behavior_probs.clamp_min(
+            torch.finfo(behavior_probs.dtype).tiny
+        ).log()
+        behavior_log_probs = torch.where(
+            behavior_probs > 0,
+            safe_log_probs,
+            torch.full_like(safe_log_probs, -torch.inf),
+        )
+        return behavior_log_probs, behavior_probs
+
+    @staticmethod
+    def _entropy_from_probs(probs: torch.Tensor) -> torch.Tensor:
+        safe_log_probs = probs.clamp_min(torch.finfo(probs.dtype).tiny).log()
+        return -(probs * safe_log_probs).sum(dim=-1)
+
+    @staticmethod
+    def _validate_exploration_probability(name: str, value: float) -> None:
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be finite and within [0, 1], got {value}.")
 
     @staticmethod
     def _categorical_choice(
@@ -545,7 +626,7 @@ class ActionHead(nn.Module):
         device: torch.device,
         max_turn: int,
     ) -> torch.Tensor:
-        if battle_obs is None or "field" not in battle_obs:
+        if max_turn <= 0 or battle_obs is None or "field" not in battle_obs:
             return torch.zeros(batch_size, dtype=torch.bool, device=device)
         field = battle_obs["field"]
         if field.shape[-1] <= FIELD_TURN_OFFSET:
@@ -1423,18 +1504,29 @@ class OpponentPreviewHead(nn.Module):
         }
 
 
-class HiddenInfoHead(nn.Module):
-    """Auxiliary heads that predict hidden opponent attributes from its team reps.
+class _ZeroInitializedLinear(nn.Linear):
+    """Linear residual branch that does not consume the model RNG stream."""
 
-    These are pure training-signal heads: they only run during PPO update and
-    do not participate in the rollout/action path. Labels come from the
-    end-of-episode observation (the "eventually revealed" state), so a turn-1
-    prediction is trained to anticipate what will be known by battle's end.
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class HiddenInfoHead(nn.Module):
+    """Predict trainer-only opponent attributes from spatial and recurrent state.
+
+    These heads run only during PPO updates and never expose their predictions
+    or exact packed-team labels to policy inference. A zero-initialized
+    residual adapter adds recurrent context to every opponent representation;
+    its initial outputs therefore exactly match the spatial-only head while
+    later updates can train temporal belief features through memory.
     """
 
     def __init__(
         self,
         pokemon_dim: int,
+        context_dim: int,
         num_items: int,
         num_abilities: int,
         num_types: int,
@@ -1442,6 +1534,7 @@ class HiddenInfoHead(nn.Module):
         hidden_dim: int = 128,
     ):
         super().__init__()
+        self.context_adapter = _ZeroInitializedLinear(context_dim, pokemon_dim)
         self.item_mlp = nn.Sequential(
             nn.Linear(pokemon_dim, hidden_dim),
             nn.ReLU(),
@@ -1463,7 +1556,18 @@ class HiddenInfoHead(nn.Module):
             nn.Linear(hidden_dim, num_moves),
         )
 
-    def forward(self, opp_reps: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        opp_reps: torch.Tensor,
+        context: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if context is not None:
+            if context.shape[:-1] != opp_reps.shape[:-2]:
+                raise ValueError(
+                    "Hidden-info context must match every opponent-representation "
+                    "batch/sequence dimension."
+                )
+            opp_reps = opp_reps + self.context_adapter(context).unsqueeze(-2)
         return {
             "item_logits": self.item_mlp(opp_reps),
             "ability_logits": self.ability_mlp(opp_reps),

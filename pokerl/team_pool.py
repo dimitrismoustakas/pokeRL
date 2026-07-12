@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from dataclasses import dataclass
@@ -50,6 +51,16 @@ class TeamPool:
             "size": self.size,
         }
 
+    def signature(self) -> str:
+        """Fingerprint the ordered population used by the private sampler."""
+        digest = hashlib.sha256()
+        for entry in self.entries:
+            digest.update(entry.title.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(entry.packed_team.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
     def sample_pair(self, distinct: bool = True) -> tuple[TeamPoolEntry, TeamPoolEntry]:
         with self._lock:
             if distinct and len(self.entries) > 1:
@@ -62,6 +73,21 @@ class TeamPool:
     def sample_packed_pair(self, distinct: bool = True) -> tuple[str, str]:
         first, second = self.sample_pair(distinct=distinct)
         return first.packed_team, second.packed_team
+
+    def rng_state(self) -> tuple:
+        """Return the private sampling state for an exact training resume."""
+        with self._lock:
+            return self._rng.getstate()
+
+    def restore_rng_state(self, state: tuple) -> None:
+        """Restore a previously captured private sampling state."""
+        validator = random.Random()
+        try:
+            validator.setstate(state)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid team-pool RNG state.") from exc
+        with self._lock:
+            self._rng.setstate(state)
 
 
 def default_team_pool_manifest_path(repo_root: Path, format_id: str) -> Path:

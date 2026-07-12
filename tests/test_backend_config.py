@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from poke_env import LocalBattleStreamConfiguration
 
-from pokerl.config import EnvConfig
+from pokerl.config import EnvConfig, TrainingConfig
 from pokerl.env.showdown_env import (
     battlestream_summary,
     make_battlestream_configuration,
@@ -14,6 +14,7 @@ from pokerl.env.showdown_env import (
 from scripts.train import (
     apply_torch_runtime_config,
     build_configs,
+    configure_training_randomness,
     parse_args,
     resolve_opponent_groups,
     resolve_update_bounds,
@@ -149,6 +150,68 @@ def test_memory_gradient_diagnostics_are_opt_in(monkeypatch) -> None:
     _, _, train_config = build_configs(parse_args())
 
     assert train_config.diagnose_memory_gradients is True
+
+
+def test_league_refresh_defaults_to_every_update(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["train"])
+
+    _, _, train_config = build_configs(parse_args())
+
+    assert train_config.league_update_interval == 10
+    assert train_config.league_refresh_interval == 1
+
+
+def test_league_refresh_cli_is_independent_of_snapshot_interval(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--league-update-interval",
+            "12",
+            "--league-refresh-interval",
+            "3",
+        ],
+    )
+
+    _, _, train_config = build_configs(parse_args())
+
+    assert train_config.league_update_interval == 12
+    assert train_config.league_refresh_interval == 3
+
+
+@pytest.mark.parametrize(
+    "field_name", ["league_update_interval", "league_refresh_interval"]
+)
+def test_league_intervals_must_be_positive(field_name: str) -> None:
+    values = {field_name: 0}
+
+    with pytest.raises(ValueError, match=field_name):
+        TrainingConfig(**values)
+
+
+def test_training_seed_streams_are_recorded_and_separate() -> None:
+    streams = configure_training_randomness(41, team_pool_seed=None)
+
+    assert streams == {
+        "master": 41,
+        "torch": 41,
+        "python": 42,
+        "numpy": 43,
+        "league": 44,
+        "team_pool": 45,
+    }
+
+
+def test_explicit_team_pool_seed_overrides_derived_stream() -> None:
+    streams = configure_training_randomness(41, team_pool_seed=123)
+
+    assert streams["team_pool"] == 123
+
+
+@pytest.mark.parametrize("seed", [-1, 2**32])
+def test_training_seed_rejects_values_outside_uint32(seed: int) -> None:
+    with pytest.raises(ValueError, match="seed"):
+        TrainingConfig(seed=seed)
 
 
 def test_num_updates_are_additional_when_resuming() -> None:

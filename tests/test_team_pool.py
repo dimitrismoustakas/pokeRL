@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from pokerl.team_pool import load_team_pool
+from pokerl.team_pool import TeamPool, TeamPoolEntry, load_team_pool
 
 
 def test_load_team_pool_rejects_duplicate_manifest_keys(tmp_path: Path) -> None:
@@ -33,3 +33,27 @@ def test_checked_in_team_pool_manifest_loads() -> None:
     pool = load_team_pool(manifest_path, subset="pool", seed=0)
 
     assert pool.size == 77
+
+
+def test_team_pool_rng_state_and_population_signature_roundtrip() -> None:
+    entries = [
+        TeamPoolEntry(title="A", file="a", packed_team="a-packed"),
+        TeamPoolEntry(title="B", file="b", packed_team="b-packed"),
+        TeamPoolEntry(title="C", file="c", packed_team="c-packed"),
+    ]
+    source = TeamPool(format_id="test", subset="pool", entries=entries, seed=17)
+    state = source.rng_state()
+    expected = [source.sample_packed_pair() for _ in range(10)]
+
+    restored = TeamPool(format_id="test", subset="pool", entries=entries, seed=999)
+    restored.restore_rng_state(state)
+
+    assert [restored.sample_packed_pair() for _ in range(10)] == expected
+    assert restored.signature() == source.signature()
+    reordered = TeamPool(
+        format_id="test",
+        subset="pool",
+        entries=list(reversed(entries)),
+        seed=17,
+    )
+    assert reordered.signature() != source.signature()

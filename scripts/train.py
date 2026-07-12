@@ -10,8 +10,10 @@ Usage:
 import argparse
 import asyncio
 import json
+import random
 import time
-from dataclasses import replace
+import uuid
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -33,12 +35,135 @@ from pokerl.team_pool import TeamPool, default_team_pool_manifest_path, load_tea
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
-from pokerl.training.preview import TeamPreviewBatcher
+from pokerl.training.preview import (
+    TeamPreviewBatcher,
+    TeamPreviewResult,
+    VersionedTeamPreviewTrainingSample,
+    filter_current_team_preview_training_samples,
+    update_preview_then_battle,
+)
 from pokerl.training.recurrent_history import RecurrentObservationHistory
 from pokerl.training.cuda_execution import cuda_model_execution
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+_SEED_MODULUS = 2**32
+
+
+def _derived_seed(seed: int, offset: int) -> int:
+    return (seed + offset) % _SEED_MODULUS
+
+
+def configure_training_randomness(
+    seed: int,
+    *,
+    team_pool_seed: int | None,
+) -> dict[str, int]:
+    """Seed independent host streams and the shared torch learner stream.
+
+    Battle execution is asynchronous, so this makes configured sampling streams
+    reproducible without claiming bitwise-identical end-to-end training runs.
+    """
+    if not 0 <= seed < _SEED_MODULUS:
+        raise ValueError(f"--seed must be in [0, 2**32) (got {seed}).")
+    if team_pool_seed is not None and not 0 <= team_pool_seed < _SEED_MODULUS:
+        raise ValueError(
+            f"--team-pool-seed must be in [0, 2**32) (got {team_pool_seed})."
+        )
+
+    streams = {
+        "master": seed,
+        "torch": seed,
+        "python": _derived_seed(seed, 1),
+        "numpy": _derived_seed(seed, 2),
+        "league": _derived_seed(seed, 3),
+        "team_pool": (
+            team_pool_seed if team_pool_seed is not None else _derived_seed(seed, 4)
+        ),
+    }
+    random.seed(streams["python"])
+    np.random.seed(streams["numpy"])
+    torch.manual_seed(streams["torch"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(streams["torch"])
+    return streams
+
+
+OpponentOutcomeCounts = dict[str | None, dict[str, int]]
+
+
+def _record_opponent_outcome(
+    counts: OpponentOutcomeCounts,
+    checkpoint_path: object,
+    reward: float,
+) -> str | None:
+    path = (
+        checkpoint_path
+        if isinstance(checkpoint_path, str) and checkpoint_path
+        else None
+    )
+    bucket = counts.setdefault(path, {"wins": 0, "losses": 0, "draws": 0})
+    if reward > 0:
+        bucket["wins"] += 1
+    elif reward < 0:
+        bucket["losses"] += 1
+    else:
+        bucket["draws"] += 1
+    return path
+
+
+def _summarize_opponent_outcomes(
+    counts: OpponentOutcomeCounts,
+) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    total_wins = 0
+    total_losses = 0
+    total_draws = 0
+    for checkpoint_path in sorted(
+        counts,
+        key=lambda value: (value is None, "" if value is None else value),
+    ):
+        bucket = counts[checkpoint_path]
+        wins = int(bucket["wins"])
+        losses = int(bucket["losses"])
+        draws = int(bucket["draws"])
+        games = wins + losses + draws
+        total_wins += wins
+        total_losses += losses
+        total_draws += draws
+        rows.append(
+            {
+                "checkpoint_path": checkpoint_path,
+                "games": games,
+                "wins": wins,
+                "losses": losses,
+                "draws": draws,
+                "win_rate": wins / games if games else 0.0,
+            }
+        )
+
+    total_games = total_wins + total_losses + total_draws
+    return {
+        "games": total_games,
+        "wins": total_wins,
+        "losses": total_losses,
+        "draws": total_draws,
+        "win_rate": total_wins / total_games if total_games else 0.0,
+        "unattributed_games": sum(
+            counts.get(None, {"wins": 0, "losses": 0, "draws": 0}).values()
+        ),
+        "by_checkpoint": rows,
+    }
+
+
+def _sorted_assignment_paths(assignments: dict[int, str]) -> list[str]:
+    return sorted(set(assignments.values()))
+
+
+@dataclass(frozen=True)
+class LeagueMaintenance:
+    checkpoint_added: bool
+    assignments_by_group: dict[int, str]
 
 
 def _close_training_resources(*resources: tuple[str, object]) -> None:
@@ -57,6 +182,15 @@ def _close_training_resources(*resources: tuple[str, object]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train pokeRL with PPO.")
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Master training seed. Separate deterministic streams are derived for "
+            "league and team sampling; asynchronous battles are not bitwise deterministic."
+        ),
+    )
     parser.add_argument(
         "--float32-matmul-precision",
         choices=("highest", "high", "medium"),
@@ -222,13 +356,22 @@ def parse_args() -> argparse.Namespace:
         "--team-pool-seed",
         type=int,
         default=None,
-        help="Seed for fixed-team sampling. Useful for reproducible benchmarks.",
+        help="Override the team-sampling seed derived from --seed.",
     )
     parser.add_argument(
         "--league-update-interval",
         type=int,
         default=None,
-        help="Override league checkpoint and opponent refresh frequency in updates.",
+        help="Override how often the current policy is snapshotted into the league.",
+    )
+    parser.add_argument(
+        "--league-refresh-interval",
+        type=int,
+        default=None,
+        help=(
+            "Resample each opponent group every N updates. Defaults to every update, "
+            "independently of league checkpoint creation."
+        ),
     )
     parser.add_argument(
         "--league-size",
@@ -237,16 +380,10 @@ def parse_args() -> argparse.Namespace:
         help="Override how many frozen checkpoints are retained in the self-play league.",
     )
     parser.add_argument(
-        "--team-preview-update-interval",
-        type=int,
-        default=None,
-        help="Flush the preview accumulator and run a gradient step every N PPO updates.",
-    )
-    parser.add_argument(
         "--team-preview-max-samples",
         type=int,
         default=None,
-        help="Cap on preview accumulator size; oldest samples are dropped first.",
+        help="Uniform current-rollout preview sample cap.",
     )
     parser.add_argument(
         "--tera-exploration-start",
@@ -370,6 +507,7 @@ def build_configs(
         env_config.reset_concurrency = args.reset_concurrency
 
     overrides = {
+        "seed": args.seed,
         "rollout_steps": args.rollout_steps,
         "total_timesteps": args.total_timesteps,
         "num_epochs": args.num_epochs,
@@ -380,8 +518,8 @@ def build_configs(
         "checkpoint_dir": args.checkpoint_dir,
         "league_size": args.league_size,
         "league_update_interval": args.league_update_interval,
+        "league_refresh_interval": args.league_refresh_interval,
         "league_coalesce_ms": args.league_coalesce_ms,
-        "team_preview_update_interval": args.team_preview_update_interval,
         "team_preview_max_samples": args.team_preview_max_samples,
         "tera_exploration_start": args.tera_exploration_start,
         "tera_exploration_end": args.tera_exploration_end,
@@ -491,15 +629,22 @@ def make_team_preview_fn(batcher: TeamPreviewBatcher):
     the latest weights during rollout collection.
     """
 
-    def team_preview_fn(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
-        picks = batcher.choose(obs)
+    def team_preview_fn(
+        obs: dict[str, np.ndarray],
+    ) -> tuple[TeamPreviewResult, str]:
+        result = batcher.choose(obs)
+        picks = result.picks
         team_str = "/team " + "".join(str(int(p) + 1) for p in picks)
-        return picks, team_str
+        return result, team_str
 
     return team_preview_fn
 
 
-def load_requested_team_pool(args: argparse.Namespace) -> TeamPool | None:
+def load_requested_team_pool(
+    args: argparse.Namespace,
+    *,
+    seed: int | None = None,
+) -> TeamPool | None:
     manifest_path: Path | None = None
 
     if args.team_pool_manifest:
@@ -517,7 +662,7 @@ def load_requested_team_pool(args: argparse.Namespace) -> TeamPool | None:
     return load_team_pool(
         manifest_path,
         subset=args.team_pool_subset,
-        seed=args.team_pool_seed,
+        seed=args.team_pool_seed if args.team_pool_seed is not None else seed,
     )
 
 
@@ -632,7 +777,10 @@ def _sample_refresh_assignments(
     return assignments
 
 
-def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
+def refresh_opponents(
+    parallel_env: ParallelBattleEnv,
+    league: League,
+) -> dict[int, str]:
     """Swap out opponents in existing environments.
 
     Called periodically so the agent faces a freshly sampled set of past
@@ -640,12 +788,50 @@ def refresh_opponents(parallel_env: ParallelBattleEnv, league: League) -> None:
     keeps opponent inference batches large on local setups.
     """
     assignments = _sample_refresh_assignments(parallel_env, league)
+    checkpoint_by_group: dict[int, str] = {}
     for env, checkpoint_path in assignments:
+        checkpoint_by_group[int(env.config.opponent_group)] = checkpoint_path
         if env.stage_next_opponent_checkpoint(checkpoint_path):
             continue
         env.set_next_opponent(
             make_league_opponent_factory(league, checkpoint_path=checkpoint_path)
         )
+    return checkpoint_by_group
+
+
+def _current_opponent_assignments(
+    parallel_env: ParallelBattleEnv,
+) -> dict[int, str]:
+    assignments: dict[int, str] = {}
+    for env in parallel_env.envs:
+        checkpoint_path = getattr(env.opponent, "checkpoint_path", None)
+        if isinstance(checkpoint_path, str) and checkpoint_path:
+            assignments[int(env.config.opponent_group)] = checkpoint_path
+    return assignments
+
+
+def _maintain_league_after_update(
+    *,
+    update: int,
+    num_updates: int,
+    global_step: int,
+    agent: PokeAgent,
+    parallel_env: ParallelBattleEnv,
+    league: League,
+    config: TrainingConfig,
+) -> LeagueMaintenance:
+    """Snapshot first, then sample next-battle opponents from the new pool."""
+    checkpoint_added = update % config.league_update_interval == 0
+    if checkpoint_added:
+        league.add_checkpoint(agent, global_step)
+
+    assignments: dict[int, str] = {}
+    if update < num_updates and update % config.league_refresh_interval == 0:
+        assignments = refresh_opponents(parallel_env, league)
+    return LeagueMaintenance(
+        checkpoint_added=checkpoint_added,
+        assignments_by_group=assignments,
+    )
 
 
 def obs_to_device(
@@ -759,6 +945,11 @@ def collect_synchronous_rollout(
     efficient on GPUs whose forward latency is nearly batch-size invariant and
     preserves the standard synchronous PPO trajectory layout.
     """
+    buffer.set_tera_behavior_policy(
+        exploration_prob=tera_exploration_prob,
+        force_delay_prob=tera_force_delay_prob,
+        force_delay_max_turn=tera_force_delay_max_turn,
+    )
     profile = {
         "obs_to_device_sec": 0.0,
         "mask_to_device_sec": 0.0,
@@ -768,6 +959,7 @@ def collect_synchronous_rollout(
         "feedback_to_device_sec": 0.0,
         "buffer_add_sec": 0.0,
         "hidden_reset_sec": 0.0,
+        "exact_aux_label_episodes": 0.0,
     }
     rollout_infos: list[dict] = []
     obs_device_buffers: dict[str, torch.Tensor] | None = None
@@ -877,9 +1069,10 @@ def collect_synchronous_rollout(
         done_env_indices = np.flatnonzero(dones)
         aux_label_obs_t = None
         if done_env_indices.size:
-            terminal_observations: dict[int, dict[str, np.ndarray]] = {}
+            label_observations: dict[int, dict[str, np.ndarray]] = {}
             for env_index in done_env_indices:
-                final_observation = infos[int(env_index)].pop(
+                info = infos[int(env_index)]
+                final_observation = info.pop(
                     "final_observation",
                     None,
                 )
@@ -888,16 +1081,29 @@ def collect_synchronous_rollout(
                         "Auto-reset transition omitted final_observation for "
                         "terminal auxiliary labels."
                     )
-                terminal_observations[int(env_index)] = final_observation
+                private_labels = info.pop("opponent_aux_labels", None)
+                if private_labels is not None:
+                    missing_keys = set(RolloutBuffer.AUX_OBS_KEYS).difference(
+                        private_labels
+                    )
+                    if missing_keys:
+                        raise RuntimeError(
+                            "Trainer-private opponent labels omitted keys: "
+                            + ", ".join(sorted(missing_keys))
+                        )
+                    label_observations[int(env_index)] = private_labels
+                    profile["exact_aux_label_episodes"] += 1.0
+                else:
+                    label_observations[int(env_index)] = final_observation
 
             if all(key in next_obs for key in RolloutBuffer.AUX_OBS_KEYS):
                 aux_label_obs_np = {
                     key: np.empty_like(next_obs[key])
                     for key in RolloutBuffer.AUX_OBS_KEYS
                 }
-                for env_index, final_observation in terminal_observations.items():
+                for env_index, label_observation in label_observations.items():
                     for key in RolloutBuffer.AUX_OBS_KEYS:
-                        aux_label_obs_np[key][env_index] = final_observation[key]
+                        aux_label_obs_np[key][env_index] = label_observation[key]
                 aux_label_obs_t = obs_to_device(
                     aux_label_obs_np,
                     device,
@@ -938,12 +1144,31 @@ def collect_synchronous_rollout(
     return obs, action_masks, hidden, rollout_infos, profile
 
 
-def _league_state_path(train_config: TrainingConfig) -> str:
-    return f"{train_config.checkpoint_dir}/league_state.json"
-
-
 def _league_state_path_for_resume(resume_checkpoint: str) -> Path:
-    return Path(resume_checkpoint).resolve().with_name("league_state.json")
+    return Path(resume_checkpoint).resolve().with_suffix(".league_state.json")
+
+
+def _save_training_state(
+    league: League,
+    checkpoint_path: str,
+    team_pool: TeamPool | None,
+    training_state_id: str,
+) -> None:
+    team_pool_state = (
+        None
+        if team_pool is None
+        else {
+            "signature": team_pool.signature(),
+            "rng_state": team_pool.rng_state(),
+        }
+    )
+    league.save_state(
+        str(_league_state_path_for_resume(checkpoint_path)),
+        extra_state={
+            "training_state_id": training_state_id,
+            "team_pool": team_pool_state,
+        },
+    )
 
 
 def _json_ready_metrics(metrics: dict[str, float]) -> dict[str, float]:
@@ -1136,7 +1361,18 @@ def train():
     collect_timing = args.collect_timing
 
     model_config, env_config, train_config = build_configs(args)
+    seed_streams = configure_training_randomness(
+        train_config.seed,
+        team_pool_seed=args.team_pool_seed,
+    )
     print(f"Device: {device}")
+    print(
+        "Random streams: "
+        f"master={seed_streams['master']} "
+        f"torch={seed_streams['torch']} "
+        f"league={seed_streams['league']} "
+        f"team_pool={seed_streams['team_pool']}"
+    )
     print(
         "Torch runtime: "
         f"float32_matmul_precision={torch_runtime_config['float32_matmul_precision']} "
@@ -1155,7 +1391,7 @@ def train():
             f"Pokemon Showdown checkout not found: {env_config.showdown_dir}"
         )
     opponent_groups = resolve_opponent_groups(args.opponent_groups, env_config.num_envs)
-    team_pool = load_requested_team_pool(args)
+    team_pool = load_requested_team_pool(args, seed=seed_streams["team_pool"])
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
     if train_config.total_timesteps < steps_per_update:
@@ -1177,7 +1413,14 @@ def train():
 
     # Training
     trainer = PPOTrainer(agent, train_config, device)
-    league = League(train_config, env_config, game_data, agent, device)
+    league = League(
+        train_config,
+        env_config,
+        game_data,
+        agent,
+        device,
+        rng=random.Random(seed_streams["league"]),
+    )
 
     # --- Resume from checkpoint ---
     if args.resume:
@@ -1187,19 +1430,39 @@ def train():
         )
 
         league_state = _league_state_path_for_resume(args.resume)
-        if league_state.exists():
-            league.load_state(league_state)
-            print(
-                f"Restored league from {league_state!s}: {len(league.checkpoints)} checkpoint(s)"
+        if not league_state.exists():
+            raise FileNotFoundError(
+                "Strict resume requires the checkpoint's paired league state: "
+                f"{league_state!s}"
             )
+        extra_state = league.load_state(str(league_state))
+        if extra_state.get("training_state_id") != trainer.loaded_training_state_id:
+            raise ValueError(
+                "Trainer checkpoint and paired league state have different IDs."
+            )
+        saved_team_pool = extra_state.get("team_pool")
+        if team_pool is None:
+            if saved_team_pool is not None:
+                raise ValueError(
+                    "Checkpoint used a team pool, but this resume disabled it."
+                )
         else:
-            print(
-                "Warning: no league state file found alongside resumed checkpoint — league starts empty."
-            )
+            if not isinstance(saved_team_pool, dict):
+                raise ValueError("Paired league state omitted the team-pool state.")
+            if saved_team_pool.get("signature") != team_pool.signature():
+                raise ValueError(
+                    "Configured team pool does not match the resume checkpoint."
+                )
+            team_pool_rng_state = saved_team_pool.get("rng_state")
+            if not isinstance(team_pool_rng_state, tuple):
+                raise ValueError("Paired league state has invalid team-pool RNG state.")
+            team_pool.restore_rng_state(team_pool_rng_state)
+        print(
+            f"Restored league from {league_state!s}: {len(league.checkpoints)} checkpoint(s)"
+        )
 
     # --- Seed league so self-play is available from update 1 ---
-    # If resuming, this only runs when the league file was missing (edge case).
-    # On a fresh start, this ensures the agent never falls back to bots from the beginning.
+    # On a fresh start this ensures the agent never falls back to bots.
     if not league.checkpoints:
         with cuda_model_execution(device):
             league.add_checkpoint(agent, step=trainer.global_step)
@@ -1210,7 +1473,11 @@ def train():
     # Put the shared live policy in inference mode before the batcher thread can
     # observe it.
     agent.eval()
-    team_preview_batcher = TeamPreviewBatcher(agent, device)
+    team_preview_batcher = TeamPreviewBatcher(
+        agent,
+        device,
+        policy_version=trainer.global_step // steps_per_update,
+    )
     team_preview_fn = make_team_preview_fn(team_preview_batcher)
     team_pair_provider = make_team_pair_provider(team_pool)
     parallel_env = make_envs(
@@ -1223,10 +1490,16 @@ def train():
         team_pair_provider=team_pair_provider,
         collect_timing=collect_timing,
     )
+    current_opponent_assignments = _current_opponent_assignments(parallel_env)
+    run_assigned_opponents = set(current_opponent_assignments.values())
+    run_observed_opponents: set[str] = set()
+    run_opponent_outcomes: OpponentOutcomeCounts = {}
     run_summary = {
         "status": "starting",
         "config": {
             "device": str(device),
+            "seed": train_config.seed,
+            "seed_streams": seed_streams,
             "torch_runtime": torch_runtime_config,
             "battle_format": env_config.battle_format,
             "num_envs": env_config.num_envs,
@@ -1239,7 +1512,6 @@ def train():
             "team_preview_value_coef": train_config.team_preview_value_coef,
             "team_preview_bring_coef": train_config.team_preview_bring_coef,
             "team_preview_lead_coef": train_config.team_preview_lead_coef,
-            "team_preview_update_interval": train_config.team_preview_update_interval,
             "team_preview_max_samples": train_config.team_preview_max_samples,
             "tera_exploration_start": train_config.tera_exploration_start,
             "tera_exploration_end": train_config.tera_exploration_end,
@@ -1251,6 +1523,9 @@ def train():
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
             "diagnose_memory_gradients": train_config.diagnose_memory_gradients,
+            "league_size": train_config.league_size,
+            "league_update_interval": train_config.league_update_interval,
+            "league_refresh_interval": train_config.league_refresh_interval,
             "league_coalesce_ms": train_config.league_coalesce_ms,
             "league_inference_device": str(league.inference_device),
             "league_preview_inference_device": str(league.preview_inference_device),
@@ -1260,6 +1535,13 @@ def train():
             "opponent_groups": opponent_groups,
             "battlestream": battlestream_summary(env_config),
             "team_pool": team_pool.describe() if team_pool is not None else None,
+        },
+        "opponents": {
+            "distinct_assigned_opponents": len(run_assigned_opponents),
+            "assigned_checkpoint_paths": sorted(run_assigned_opponents),
+            "distinct_observed_opponents": 0,
+            "observed_checkpoint_paths": [],
+            "outcomes": _summarize_opponent_outcomes(run_opponent_outcomes),
         },
         "updates": [],
     }
@@ -1293,6 +1575,11 @@ def train():
         print(f"Steps per update: {steps_per_update}")
         print("Backend: local BattleStream")
         print(f"Opponent groups: {opponent_groups}")
+        print(
+            "League cadence: "
+            f"snapshot every {train_config.league_update_interval} update(s), "
+            f"refresh every {train_config.league_refresh_interval} update(s)"
+        )
         local_summary = battlestream_summary(env_config)
         print(
             "Local BattleStream: "
@@ -1314,13 +1601,11 @@ def train():
 
         episode_rewards: list[float] = []
         start_time = time.time()
-
-        # Preview samples are tiny per update (~20-50 completed episodes), so batch
-        # across multiple updates before running a gradient step. Oldest samples are
-        # dropped first if the accumulator overflows.
-        accumulated_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
+        invocation_start_global_step = trainer.global_step
 
         for update in range(updates_done + 1, num_updates + 1):
+            rollout_opponent_assignments = dict(current_opponent_assignments)
+            rollout_policy_version = team_preview_batcher.policy_version
             update_wall_started = time.perf_counter()
             with cuda_model_execution(device):
                 agent.eval()
@@ -1365,7 +1650,9 @@ def train():
             update_episode_opponent_repeated_turn_requests: list[int] = []
             update_episode_opponent_max_calls_same_turn: list[int] = []
             update_pathological_episodes: list[dict[str, object]] = []
-            update_preview_data: list[tuple[dict, np.ndarray, float, np.ndarray]] = []
+            versioned_preview_data: list[VersionedTeamPreviewTrainingSample] = []
+            update_opponent_outcomes: OpponentOutcomeCounts = {}
+            update_observed_opponents: set[str] = set()
 
             # --- Collect rollout ---
             obs, masks, hidden, rollout_infos, rollout_profile = (
@@ -1388,20 +1675,42 @@ def train():
             # Track episode rewards and team preview decisions
             for info in rollout_infos:
                 if "episode_reward" in info:
-                    reward = info["episode_reward"]
+                    reward = float(info["episode_reward"])
                     episode_rewards.append(reward)
                     update_episode_rewards.append(reward)
+                    opponent_path = _record_opponent_outcome(
+                        update_opponent_outcomes,
+                        info.get("episode_opponent_checkpoint_path"),
+                        reward,
+                    )
+                    _record_opponent_outcome(
+                        run_opponent_outcomes,
+                        opponent_path,
+                        reward,
+                    )
+                    if opponent_path is not None:
+                        update_observed_opponents.add(opponent_path)
+                        run_observed_opponents.add(opponent_path)
                     if "team_preview_obs" in info:
                         if "opponent_team_preview_picks" not in info:
                             raise RuntimeError(
                                 "Episode recorded a team preview decision without opponent preview labels."
                             )
-                        update_preview_data.append(
-                            (
-                                info["team_preview_obs"],
-                                info["team_preview_picks"],
-                                reward,
-                                info["opponent_team_preview_picks"],
+                        preview_policy_version = info.get("team_preview_policy_version")
+                        if type(preview_policy_version) is not int:
+                            raise RuntimeError(
+                                "Training episode omitted its integer team-preview "
+                                "policy version."
+                            )
+                        versioned_preview_data.append(
+                            VersionedTeamPreviewTrainingSample(
+                                sample=(
+                                    info["team_preview_obs"],
+                                    info["team_preview_picks"],
+                                    reward,
+                                    info["opponent_team_preview_picks"],
+                                ),
+                                policy_version=preview_policy_version,
                             )
                         )
                 if "episode_sec" in info:
@@ -1441,17 +1750,23 @@ def train():
                             }
                         )
 
+            try:
+                preview_training_data = filter_current_team_preview_training_samples(
+                    versioned_preview_data,
+                    rollout_policy_version,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Invalid team-preview policy version in rollout data."
+                ) from exc
+            update_preview_data = list(preview_training_data.samples)
+            stale_preview_samples = preview_training_data.stale_excluded_count
+
             rollout_sec = time.perf_counter() - rollout_started
             if collect_timing:
                 rollout_profile["rollout_sec"] = rollout_sec
             env_profile = parallel_env.snapshot_timing() if collect_timing else {}
             parallel_env.wait_for_prepared_team_previews()
-            refresh_after_update = (
-                update % train_config.league_update_interval == 0
-                and update < num_updates
-            )
-            if refresh_after_update:
-                refresh_opponents(parallel_env, league)
 
             # --- Compute advantages ---
             advantage_started = time.perf_counter()
@@ -1469,31 +1784,20 @@ def train():
             ppo_started = time.perf_counter()
             with cuda_model_execution(device):
                 agent.train()
-                metrics = trainer.update(batch)
+                metrics = update_preview_then_battle(
+                    trainer,
+                    batch,
+                    update_preview_data,
+                    train_config.team_preview_max_samples,
+                    seed=train_config.seed,
+                    update=update,
+                )
                 metrics["tera_exploration_prob"] = tera_eps
-
-                # Extend the preview accumulator and flush on the configured interval.
-                # FIFO drop keeps the buffer bounded without silently losing the freshest data.
-                if update_preview_data:
-                    accumulated_preview_data.extend(update_preview_data)
-                    overflow = (
-                        len(accumulated_preview_data)
-                        - train_config.team_preview_max_samples
-                    )
-                    if overflow > 0:
-                        del accumulated_preview_data[:overflow]
-                preview_interval = max(1, train_config.team_preview_update_interval)
-                if accumulated_preview_data and update % preview_interval == 0:
-                    metrics.update(
-                        trainer.update_team_preview(accumulated_preview_data)
-                    )
-                    metrics["team_preview_batch_size"] = float(
-                        len(accumulated_preview_data)
-                    )
-                    # Clear unconditionally: non-finite preview losses are usually caused by
-                    # something specific to this batch, so retaining the samples would risk
-                    # re-triggering on the next flush.
-                    accumulated_preview_data = []
+                metrics["tera_force_delay_prob"] = tera_force_delay_prob
+                metrics["team_preview_samples_stale_excluded"] = float(
+                    stale_preview_samples
+                )
+                metrics["team_preview_policy_version"] = float(rollout_policy_version)
 
                 # TeamPreviewBatcher shares the live policy object.  Prepared
                 # previews are submitted immediately below and may execute on
@@ -1502,6 +1806,13 @@ def train():
                 # mode.  Otherwise a preview can observe train-mode layers or
                 # race the next update's agent.eval() transition.
                 agent.eval()
+                next_preview_policy_version = (
+                    team_preview_batcher.advance_policy_version()
+                )
+                if next_preview_policy_version != rollout_policy_version + 1:
+                    raise RuntimeError(
+                        "Team-preview policy version did not advance exactly once."
+                    )
             hidden_refresh_started = time.perf_counter()
             with cuda_model_execution(device):
                 if hidden is not None:
@@ -1518,6 +1829,53 @@ def train():
                     )
             hidden_refresh_sec = time.perf_counter() - hidden_refresh_started
             ppo_sec = time.perf_counter() - ppo_started
+
+            # The updated policy enters the league before opponent groups are
+            # resampled, making a newly created snapshot eligible immediately.
+            league_maintenance_started = time.perf_counter()
+            with cuda_model_execution(device):
+                league_maintenance = _maintain_league_after_update(
+                    update=update,
+                    num_updates=num_updates,
+                    global_step=trainer.global_step,
+                    agent=agent,
+                    parallel_env=parallel_env,
+                    league=league,
+                    config=train_config,
+                )
+            league_update_sec = time.perf_counter() - league_maintenance_started
+            if league_maintenance.assignments_by_group:
+                current_opponent_assignments = dict(
+                    league_maintenance.assignments_by_group
+                )
+                run_assigned_opponents.update(current_opponent_assignments.values())
+            if league_maintenance.checkpoint_added:
+                refresh_note = (
+                    ", opponents refreshed"
+                    if league_maintenance.assignments_by_group
+                    else ""
+                )
+                print(f"League updated (pool: {len(league.checkpoints)}){refresh_note}")
+
+            # Save league state after adding the current snapshot so a trainer
+            # checkpoint and its paired .league_state.json describe one point
+            # in training.
+            checkpoint_sec = 0.0
+            if update % train_config.save_interval == 0:
+                checkpoint_started = time.perf_counter()
+                path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
+                training_state_id = uuid.uuid4().hex
+                _save_training_state(
+                    league,
+                    path,
+                    team_pool,
+                    training_state_id,
+                )
+                with cuda_model_execution(device):
+                    trainer.save(path, training_state_id=training_state_id)
+                checkpoint_sec = time.perf_counter() - checkpoint_started
+                print(f"Saved checkpoint: {path}")
+
             preview_refresh_sec = 0.0
             if update < num_updates:
                 preview_refresh_started = time.perf_counter()
@@ -1570,10 +1928,28 @@ def train():
             update_accounted_sec = (
                 rollout_sec + advantage_sec + ppo_sec + preview_refresh_sec
             )
+            update_wall_sec = time.perf_counter() - update_wall_started
+            update_outcome_summary = _summarize_opponent_outcomes(
+                update_opponent_outcomes
+            )
+            rollout_assignment_paths = _sorted_assignment_paths(
+                rollout_opponent_assignments
+            )
+            next_assignment_paths = (
+                _sorted_assignment_paths(current_opponent_assignments)
+                if update < num_updates
+                else []
+            )
+            exact_aux_label_episodes = int(rollout_profile["exact_aux_label_episodes"])
             update_summary = {
                 "update": update,
                 "global_step": trainer.global_step,
                 "completed_battles": len(update_episode_rewards),
+                "exact_aux_label_episodes": exact_aux_label_episodes,
+                "exact_aux_label_episode_coverage": _safe_div(
+                    exact_aux_label_episodes,
+                    len(update_episode_rewards),
+                ),
                 "rollout_sec": rollout_sec,
                 "advantage_sec": advantage_sec,
                 "ppo_sec": ppo_sec,
@@ -1598,6 +1974,40 @@ def train():
                 "max_episode_opponent_max_calls_same_turn": max_episode_opponent_max_calls_same_turn,
                 "retained_player_battles": retained_player_battles,
                 "retained_opponent_battles": retained_opponent_battles,
+                "opponents": {
+                    "assignments_by_group": {
+                        str(group): path
+                        for group, path in sorted(rollout_opponent_assignments.items())
+                    },
+                    "assigned_checkpoint_paths": rollout_assignment_paths,
+                    "distinct_assigned_opponents": len(rollout_assignment_paths),
+                    "observed_checkpoint_paths": sorted(update_observed_opponents),
+                    "distinct_observed_opponents": len(update_observed_opponents),
+                    "outcomes": update_outcome_summary,
+                    "refresh_performed": bool(league_maintenance.assignments_by_group),
+                    "next_assignments_by_group": {
+                        str(group): path
+                        for group, path in sorted(current_opponent_assignments.items())
+                    }
+                    if update < num_updates
+                    else {},
+                    "next_assigned_checkpoint_paths": next_assignment_paths,
+                    "next_distinct_assigned_opponents": len(next_assignment_paths),
+                },
+                "checkpoint_sec": checkpoint_sec,
+                "league_update_sec": league_update_sec,
+                "league_checkpoint_added": league_maintenance.checkpoint_added,
+                "update_wall_sec": update_wall_sec,
+                "update_wall_steps_per_second": (
+                    steps_per_update / update_wall_sec if update_wall_sec > 0 else 0.0
+                ),
+                "update_overhead_sec": max(
+                    0.0,
+                    update_wall_sec
+                    - update_accounted_sec
+                    - checkpoint_sec
+                    - league_update_sec,
+                ),
                 "metrics": metrics_json,
             }
             if device.type == "cuda":
@@ -1623,6 +2033,13 @@ def train():
                     rollout_profile,
                     env_profile,
                 )
+            run_summary["opponents"] = {
+                "distinct_assigned_opponents": len(run_assigned_opponents),
+                "assigned_checkpoint_paths": sorted(run_assigned_opponents),
+                "distinct_observed_opponents": len(run_observed_opponents),
+                "observed_checkpoint_paths": sorted(run_observed_opponents),
+                "outcomes": _summarize_opponent_outcomes(run_opponent_outcomes),
+            }
             run_summary["updates"].append(update_summary)
             run_summary["status"] = "running"
             run_summary["update_count"] = update
@@ -1632,7 +2049,8 @@ def train():
             # --- Logging ---
             if update % train_config.log_interval == 0:
                 elapsed = time.time() - start_time
-                sps = trainer.global_step / elapsed
+                invocation_steps = trainer.global_step - invocation_start_global_step
+                sps = invocation_steps / elapsed if elapsed > 0 else 0.0
                 win_rate = (
                     np.mean([r > 0 for r in episode_rewards[-100:]])
                     if episode_rewards
@@ -1667,77 +2085,41 @@ def train():
                     f"Max repeat-turn req {max_episode_opponent_repeated_turn_requests} | "
                     f"Retained battles {retained_player_battles + retained_opponent_battles} | "
                     f"Win rate (100) {win_rate:.2%} | "
+                    f"W/L/D {update_outcome_summary['wins']}/"
+                    f"{update_outcome_summary['losses']}/"
+                    f"{update_outcome_summary['draws']} | "
+                    f"Opp seen {len(update_observed_opponents)} | "
                     f"Policy loss {metrics['policy_loss']:.4f} | "
                     f"Value loss {metrics['value_loss']:.4f} | "
                     f"Entropy {metrics['entropy']:.4f} | "
+                    f"Base tera H(choice) {metrics['base_tera_entropy']:.3f} | "
+                    f"Pre-PPO KL {metrics['pre_ppo_approx_kl']:.5f}/"
+                    f"clip {metrics['pre_ppo_clip_fraction']:.1%} | "
                     f"Preview loss {metrics.get('team_preview_loss', float('nan')):.4f} | "
                     f"Preview value {metrics.get('team_preview_value_loss', float('nan')):.4f} | "
                     f"League pool {len(league.checkpoints)}"
                     f"{diagnostics_text}"
                 )
 
-            # --- Checkpointing ---
-            checkpoint_sec = 0.0
-            if update % train_config.save_interval == 0:
-                checkpoint_started = time.perf_counter()
-                path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
-                with cuda_model_execution(device):
-                    trainer.save(path)
-                league.save_state(_league_state_path(train_config))
-                checkpoint_sec = time.perf_counter() - checkpoint_started
-                print(f"Saved checkpoint: {path}")
-
-            # --- League: add checkpoint and refresh opponents ---
-            league_update_sec = 0.0
-            if update % train_config.league_update_interval == 0:
-                league_update_started = time.perf_counter()
-                with cuda_model_execution(device):
-                    league.add_checkpoint(agent, trainer.global_step)
-                league_update_sec = time.perf_counter() - league_update_started
-                if refresh_after_update:
-                    print(
-                        f"League updated (pool: {len(league.checkpoints)}), opponents refreshed"
-                    )
-                else:
-                    print(f"League updated (pool: {len(league.checkpoints)})")
-
-            update_wall_sec = time.perf_counter() - update_wall_started
-            update_summary["checkpoint_sec"] = checkpoint_sec
-            update_summary["league_update_sec"] = league_update_sec
-            update_summary["update_wall_sec"] = update_wall_sec
-            update_summary["update_wall_steps_per_second"] = (
-                steps_per_update / update_wall_sec if update_wall_sec > 0 else 0.0
-            )
-            update_summary["update_overhead_sec"] = max(
-                0.0,
-                update_wall_sec
-                - update_accounted_sec
-                - checkpoint_sec
-                - league_update_sec,
-            )
-            _maybe_write_run_summary(args.summary_path, run_summary)
-
-        # Flush any leftover preview samples before saving the final checkpoint.
-        # num_updates is rarely a multiple of team_preview_update_interval, so up to
-        # one interval's worth of samples would otherwise be collected but never used.
-        if accumulated_preview_data:
-            with cuda_model_execution(device):
-                agent.train()
-                trainer.update_team_preview(accumulated_preview_data)
-                agent.eval()
-            accumulated_preview_data = []
-
         print("Training complete.")
         final_path = f"{train_config.checkpoint_dir}/final.pt"
+        training_state_id = uuid.uuid4().hex
+        _save_training_state(
+            league,
+            final_path,
+            team_pool,
+            training_state_id,
+        )
         with cuda_model_execution(device):
-            trainer.save(final_path)
-        league.save_state(_league_state_path(train_config))
+            trainer.save(final_path, training_state_id=training_state_id)
         print(f"Saved final checkpoint: {final_path}")
         total_wall_sec = time.perf_counter() - run_started
+        steps_this_run = trainer.global_step - invocation_start_global_step
         run_summary["final"] = {
             "global_step": trainer.global_step,
+            "steps_this_run": steps_this_run,
             "wall_time_sec": total_wall_sec,
-            "steps_per_second": trainer.global_step / total_wall_sec
+            "steps_per_second": steps_this_run / total_wall_sec
             if total_wall_sec > 0
             else 0.0,
             "final_checkpoint": final_path,
