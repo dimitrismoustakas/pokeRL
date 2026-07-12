@@ -230,13 +230,17 @@ Attention is **permutation-equivariant** with respect to team order — the mode
 36 → Linear(64) → ReLU   →   (batch, 64)
 ```
 
-### 3.4 SpatialEncoder
+### 3.4 RecentEventEncoder and SpatialEncoder
 
-[pokerl/model/encoders.py:136-253](pokerl/model/encoders.py#L136-L253). Combines the three encoders above and exposes five tensors:
+`RecentEventEncoder` encodes a bounded chronological sequence of public events from the most recent completed turn (or the causal partial segment at a forced replacement), plus the agent's own previous submitted intent. The public sequence covers executed moves and targets, switches/drags, inability to act, faints, and Terastallization. It is bounded to 12 events with explicit partial/overflow metadata. Opponent requested actions and trainer-private terminal labels are never policy inputs.
+
+The encoder combines event-kind, actor/target position, move, switch species, Tera type, and event-flag embeddings with a small GRU. A separate projection encodes both prior own slot intents using semantic move/target/switch/Tera features. The resulting 64-dimensional summary complements the across-turn LSTM: the LSTM retains longer strategic history, while this encoder makes the immediately preceding action and resolution order explicit.
+
+`SpatialEncoder` combines the team, field, and recent-event encoders and exposes five tensors:
 
 | Output | Shape | Description |
 |---|---|---|
-| `context` | `(batch, 320)` | `mean(own_reps) ∥ mean(opp_reps) ∥ field` |
+| `context` | `(batch, 384)` | `mean(own_reps) ∥ mean(opp_reps) ∥ field ∥ recent_events` |
 | `active_reps` | `(batch, 2, 128)` | own two active pokemon |
 | `own_reps` | `(batch, 6, 128)` | full own team after attention |
 | `opp_reps` | `(batch, 6, 128)` | full opponent team after attention |
@@ -246,7 +250,7 @@ Notes:
 
 - Team means are **mask-aware** — padded slots are excluded from both the sum and the denominator.
 - Active reps are gathered by stable team index, then multiplied by `*_active_present` so missing actives zero out.
-- `context` is purely spatial: no temporal state has been injected yet.
+- `context` contains current spatial state plus an explicit causal summary of the previous transition. Longer history is added by memory next.
 
 ### 3.5 Memory Module
 
@@ -254,12 +258,12 @@ Notes:
 
 Two interchangeable implementations selected by `ModelConfig.memory_type`:
 
-**`IdentityMemory`** — feedforward baseline for ablation. Single `Linear(320, 256)` projection, no hidden state, each turn independent.
+**`IdentityMemory`** — feedforward baseline for ablation. Single `Linear(384, 256)` projection, no hidden state beyond the explicit recent-event input.
 
 **`LSTMMemory`** (default):
 
-- `nn.LSTM(input_dim=320, hidden_dim=256, batch_first=True)`.
-- Accepts either `(batch, 320)` single-step or `(batch, seq, 320)` sequence input.
+- `nn.LSTM(input_dim=384, hidden_dim=256, batch_first=True)`.
+- Accepts either `(batch, 384)` single-step or `(batch, seq, 384)` sequence input.
 - Returns `(memory_out, (h, c))`.
 - **Does not** reset hidden state on `done` and **does not** detach for BPTT by itself — both are handled by the rollout loop and PPO trainer. This keeps `LSTMMemory` a pure recurrent cell, with episode-boundary semantics owned by the caller that knows when episodes end.
 - During PPO, independent episode fragments are packed into one cuDNN LSTM call per minibatch (or explicit TBPTT window). Terminal resets and gradient boundaries are identical to stepwise unrolling, but avoid one recurrent launch per rollout timestep.
@@ -381,7 +385,7 @@ Legality comes from row `a1 + 1` of the joint mask (see [§4.2](#42-action-maski
 
 #### Tera decision
 
-After both slot actions are chosen, a third categorical picks `{no tera, tera slot 0, tera slot 1}`:
+After both slot actions are chosen, the policy factorizes the public `{no tera, tera slot 0, tera slot 1}` choice into a binary **use Tera now?** gate and, conditional on use, an eligible-slot choice:
 
 ```
 tera_query = Linear(
@@ -389,24 +393,22 @@ tera_query = Linear(
         ⊕ chosen_matchup_1 ⊕ chosen_matchup_2,
     256
 ) → ReLU
-tera_logits = Linear(256) → ReLU → Linear(3)
+tera_hidden = Linear(256) → ReLU
+use_logit = Linear(256 → 1)
+slot_logits = Linear(256 → 2)
 ```
+
+The exact three-choice marginal is reconstructed as `P(no tera)=P(wait)` and `P(tera slot i)=P(use)P(slot i | use)`. The use gate starts at `P(use)=0.20` with zero gate weights, avoiding the old near-uniform prior that implicitly preferred spending a one-use resource. Gate and conditional-slot entropy have separate coefficients, so encouraging diversity between eligible slots cannot pressure the model to use Tera immediately.
 
 The tera mask is **derived internally** inside `ActionHead.forward(...)` from `masks["can_tera"]` and whether each slot action is a move — so the policy does not consume a precomputed `(a1, a2, tera)` legality tensor during normal inference. (The `build_tera_action_mask` helper in `actions.py` still exists for supervised analyses.)
 
 #### Tera exploration during rollout
 
-[heads.py](pokerl/model/heads.py) and [config.py](pokerl/config.py). The `tera_exploration_prob` parameter enables uniform-over-valid exploration during rollout collection. With probability `epsilon`, on any batch item that has ≥ 2 valid tera options, the policy's sampled tera is replaced with a uniform draw over the valid set.
+[heads.py](pokerl/model/heads.py) and [config.py](pokerl/config.py). During the early exploration window, epsilon independently mixes the learned use gate toward `Bernoulli(0.5)` and the conditional eligible-slot distribution toward uniform, then reconstructs the exact three-choice behavior distribution.
 
 **Why:** once the policy tera's on turn 1, `can_tera` is false for every later turn in the episode. Without exploration the policy never observes the counterfactual trajectory where it saved tera, which traps it in a local optimum where tera fires immediately regardless of situation.
 
-Uniform-over-valid exploration is complemented by targeted early-turn delay. If `tera_force_delay_prob > 0`, the rollout path can convert a sampled tera action into `no tera` through `tera_force_delay_max_turn`. This does not change the model architecture or reward; it directly creates delayed-tera trajectories so the value function and policy can compare "tera now" against "save tera".
-
-Rollout sampling and PPO evaluation use the same exact **behavior distribution**. First, the learned tera distribution `q` is mixed with uniform-over-valid exploration: `q_eps = (1 - epsilon) q + epsilon U`. On an eligible early turn, force-delay moves probability mass from the two tera actions to `no tera`: `b(no tera) = q_eps(no tera) + d * (1 - q_eps(no tera))` and `b(tera slot) = (1 - d) * q_eps(tera slot)`. The rollout stores `log b(a)`, and PPO recomputes `log b(a)` with the rollout's fixed `epsilon`, `d`, and turn window. This gives a ratio of one before any intervening parameter update and remains the correct importance-sampling denominator when the current-rollout team-preview step runs first. Greedy play and ordinary evaluation continue to use the unmodified learned distribution `q`.
-
-Epsilon decays linearly from `tera_exploration_start = 0.15` to `tera_exploration_end = 0.02` across `tera_exploration_decay_updates = 2000` PPO updates.
-
-Forced delay decays linearly from `tera_force_delay_start = 0.40` to `tera_force_delay_end = 0.03` across `tera_force_delay_decay_updates = 3000` PPO updates, and applies only through `tera_force_delay_max_turn = 3`.
+Rollout sampling and PPO evaluation use the same exact **behavior distribution**, so the PPO likelihood ratio is one before parameters change. Exploration decays from `0.15` to zero over the first `tera_exploration_decay_fraction = 0.25` of the planned update horizon. The remaining three quarters of training use the same unmodified policy distribution as evaluation. There is no early-turn force-delay override and no Tera reward shaping.
 
 #### ActionHead outputs
 
@@ -514,12 +516,12 @@ obs dict
   → TeamEncoder     (own team) + TeamEncoder (opponent team)
   → FieldEncoder
   → SpatialEncoder output:
-      { context (320), active_reps (2×128),
+      { context (384), active_reps (2×128),
         own_reps (6×128), opp_reps (6×128), opp_active_reps (2×128) }
-  → LSTMMemory:     context (320) → memory_out (256), (h, c)
+  → LSTMMemory:     context (384) → memory_out (256), (h, c)
   → ActionHead:     (memory_out, active_reps, own_reps, opp_reps, opp_bench_mask,
                      opp_active_reps, masks, battle_obs,
-                     tera_exploration_prob, tera_force_delay_prob)
+                     tera_exploration_prob)
                     → { actions (3), log_prob, entropy }
   → ValueHead:      (memory_out, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
                     → value
@@ -675,7 +677,7 @@ value_loss = 0.5 * ((preview_value - episode_reward) ** 2).mean()
 
 The **preview value head** is a dedicated `ValueHead` instance used only as the REINFORCE baseline. Using the same battle-turn value head would be awkward because it is trained on per-turn state-value, whereas the preview head needs to predict the final return from a synthetic preview state.
 
-**On-policy sampling:** every batched preview decision is tagged with the live policy version that produced it. When a battle spans an optimizer boundary, its eventual preview sample is excluded instead of training against newer weights. Current-version samples are updated before the battle-policy PPO step; if more than `team_preview_max_samples = 1024` are available, a deterministic uniform sample without replacement is used. Summaries report current samples available, samples used, and stale boundary samples excluded. This avoids both stale supervision and the recency bias caused by dropping the oldest accumulated samples.
+**On-policy sampling:** every batched preview decision is tagged with the live policy version that produced it. When a battle spans an optimizer boundary, its eventual preview sample is excluded instead of training against newer weights. All current-version samples are used by default before battle PPO. They are processed in bounded 512-sample chunks whose globally normalized gradients are accumulated, clipped once, and applied as exactly one optimizer step. An optional deterministic uniform cap remains available for constrained experiments. Summaries report current samples available, samples used, and stale boundary samples excluded.
 
 **Auxiliary losses:**
 
@@ -854,12 +856,15 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `gae_lambda` | 0.95 | GAE smoothing parameter |
 | `clip_eps` | 0.2 | PPO clipping range |
 | `entropy_coef` | 0.01 | entropy bonus weight |
+| `tera_gate_entropy_coef` | 0.01 | use-now gate entropy bonus weight |
+| `tera_slot_entropy_coef` | 0.01 | conditional eligible-slot entropy bonus weight |
 | `value_coef` | 0.5 | value loss weight |
 | `max_grad_norm` | 0.5 | gradient clipping |
 | `team_preview_value_coef` | 0.5 | preview value-loss weight |
 | `team_preview_bring_coef` | 0.1 | bring-prediction aux weight |
 | `team_preview_lead_coef` | 0.05 | lead-prediction aux weight |
-| `team_preview_max_samples` | 1024 | uniform current-rollout preview sample cap |
+| `team_preview_max_samples` | `None` | optional uniform preview cap (`None` uses all current samples) |
+| `preview_update_minibatch_size` | 512 | activation-bounded preview gradient chunk size |
 | `aux_hidden_info_coef` | 0.25 | hidden-info prediction aux weight |
 | `aux_opp_action_coef` | 0.25 | opponent-action prediction aux weight |
 | `diagnose_memory_gradients` | `False` | opt-in one-minibatch norms/cosines for weighted battle-PPO gradients on shared memory |
@@ -868,12 +873,8 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `num_minibatches` | 4 | env minibatches per epoch |
 | `bptt_chunk_steps` | `None` | truncated BPTT chunk size (`None` = full) |
 | `tera_exploration_start` | 0.15 | initial tera exploration ε |
-| `tera_exploration_end` | 0.02 | final tera exploration ε |
-| `tera_exploration_decay_updates` | 2000 | linear decay horizon (updates) |
-| `tera_force_delay_start` | 0.40 | initial probability of converting early sampled tera to no-tera |
-| `tera_force_delay_end` | 0.03 | final early-turn force-delay probability |
-| `tera_force_delay_decay_updates` | 3000 | linear force-delay decay horizon (updates) |
-| `tera_force_delay_max_turn` | 3 | latest battle turn eligible for forced tera delay |
+| `tera_exploration_end` | 0.0 | final tera exploration ε |
+| `tera_exploration_decay_fraction` | 0.25 | fraction of the planned run used for linear exploration decay |
 | `total_timesteps` | 10M | training budget |
 | `log_interval` | 10 | console log every N updates |
 | `save_interval` | 100 | save checkpoint every N updates |

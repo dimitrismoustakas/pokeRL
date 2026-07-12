@@ -26,6 +26,13 @@ The evaluator now:
 - exactly enumerates all 180 legal 6-to-4 preview actions to measure how much
   the preview distribution actually depends on the opposing roster.
 
+Random, MaxBasePower, SimpleHeuristics, and any future scripted policies are
+evaluation baselines and deterministic probes only. They are not training
+opponents. Training remains scalable self-play against the frozen-checkpoint
+league; this avoids teaching the policy to exploit hand-written bot quirks and
+keeps the training distribution extensible without maintaining a parallel
+scripted curriculum.
+
 Python, NumPy, Torch, bot, and team-schedule randomness is seeded. Pokemon
 Showdown's simulator RNG is not yet seed-controlled, so damage rolls and other
 in-battle randomness are not bitwise reproducible. The present team panel is
@@ -119,45 +126,83 @@ exact (random 4-of-6 chance is 6.7%). Ordered opponent-lead accuracy remained
 1.3%, below the 3.3% uniform baseline. Useful opponent-roster information is
 present in the representation, but the own preview policy barely uses it.
 
-## Priorities before the next long run
+## Accepted direction after the 150-update evaluation
 
-1. **Fix Tera timing without weakening move play.** Replace the three-way
-   `none/slot 1/slot 2` decision's near-uniform prior with a binary `use Tera
-   now` gate and a conditional slot choice. Initialize the gate toward waiting,
-   give it its own entropy coefficient and diagnostics, and scale exploration
-   schedules to the planned run length instead of fixed 2,000/3,000-update
-   horizons.
+### Implemented for the next run
 
-2. **Treat preview as a contextual bandit.** Use all current-policy preview
-   outcomes (the 1,024 cap discarded about one quarter of eligible samples),
-   stratify batches and advantages by own roster/opponent context, and use a
-   clipped update plus an explicit preview-entropy floor. Keep exact
-   opponent/preview mutual information and preview ablations as acceptance
-   metrics; do not add a contrastive objective that rewards merely being
-   different without evidence that the choice wins.
+1. **Tera is now a factorized decision.** The deployment policy represents a
+   binary use-now gate followed by a conditional eligible-slot choice, while
+   preserving the exact external `{none, slot 1, slot 2}` distribution. The
+   gate starts with a waiting-biased prior and gate/slot entropy are measured
+   and weighted separately. The timing-specific force-delay override has been
+   removed. Rollout exploration is now the standard exact mixture on the gate
+   and conditional slot policy, and its linear schedule is expressed relative
+   to the planned update horizon instead of fixed update counts. PPO evaluates
+   the same behavior distribution that generated each rollout.
 
-3. **Break shared self-play blind spots.** Balance rollout sampling by roster
-   archetype and measured per-roster weakness. Add a small, measured fraction
-   of tactical/scripted curriculum states or external opponents so both sides
-   cannot agree that attacking immediately is the only strategy. Trick Room,
-   redirection, Fake Out, Protect, speed control, immunity avoidance, and Tera
-   timing should each have deterministic probe states before another long run.
+2. **Every current-policy preview sample is used by default.** The former 1,024
+   cap discarded roughly one quarter of eligible samples in the 150-update
+   run. Preview training now accumulates globally normalized gradients over
+   bounded chunks and performs one optimizer step, so activation memory stays
+   bounded without changing the full-sample objective. An explicit cap remains
+   available for constrained experiments, but is not the default.
 
-4. **Create a real validation population.** Expand the legal team population,
+3. **The policy now receives causal recent history explicitly.** `poke-env`
+   exposes a bounded immutable sequence of up to 12 perspective-public
+   MOVE/SWITCH/DRAG/CANT/FAINT/TERA events, with order, actor/target positions,
+   move, incoming species, Tera type, partial-turn state, and explicit overflow
+   metadata. pokeRL also carries the agent's own previous semantic intent
+   (move, target, switch, pass, and Tera), resolved before request-local action
+   slots can change. A dedicated recent-event encoder is concatenated into the
+   spatial context before the LSTM. Opponent-private action labels, packed
+   teams, and terminal auxiliary labels never enter the policy observation.
+
+4. **The stable PPO path remains in place.** The sampled action likelihood,
+   recurrent unroll, terminal resets, clipped objective, and pre-PPO KL/clip
+   diagnostics remain the source of truth. The 150-update run showed stable
+   pre-update ratios and bounded CUDA memory, and the factorized Tera path keeps
+   rollout and PPO likelihoods exact rather than introducing an off-policy
+   timing correction.
+
+### Representation-learning boundary
+
+The hidden-information, opponent-action, and opponent-preview heads currently
+shape the shared representation only through auxiliary losses. Their predicted
+beliefs are not fed back into the policy, so improvements in auxiliary accuracy
+must not be described as direct strategic use. Before promoting any belief
+output into policy context, evaluation must separate genuinely unknown labels
+from already revealed facts, report calibration on that unknown-only subset,
+and define semantic targets whose accuracy is actionable rather than merely
+easy to memorize. Until then these heads remain indirect representation
+regularizers.
+
+### Remaining priorities
+
+1. **Create a real validation population.** Expand the legal team population,
    reserve an archetype-stratified set that training never samples, and report
-   bot, preview, hidden-information, and checkpoint cross-play metrics on both
-   train and held-out teams. The current hidden-info result can otherwise be
-   fixed-set memorization.
+   preview, belief, checkpoint cross-play, and fixed-probe metrics on both train
+   and held-out teams. The current hidden-info result can otherwise be fixed-set
+   memorization.
 
-5. **Keep the LSTM for the next iteration.** The largest failures occur at team
-   preview and turn one, where recurrent history cannot help. First add explicit
-   previous joint action/target and turn-event features, then measure full-LSTM
-   versus reset-hidden performance. Replacing memory now risks a large change
-   without addressing the observed bottleneck.
+2. **Improve coverage inside self-play.** Balance league rollout sampling by
+   roster archetype and measured per-roster weakness while retaining frozen
+   checkpoints as the scalable opponent source. Trick Room, redirection, Fake
+   Out, Protect, speed control, immunity avoidance, and Tera timing should have
+   deterministic evaluation probes, not scripted training opponents.
 
-6. **Do not deploy PFSP merely because it is fashionable.** The current matrix
+3. **Keep preview evidence-based.** Continue to report exact opponent/preview
+   mutual information and preview ablations. Add stratification, clipping, or
+   an entropy floor only when short A/B runs show better held-out outcomes; do
+   not reward a preview for merely being different across opponents.
+
+4. **Keep the LSTM through this iteration.** Explicit public events and own
+   intent repair a real information omission while recurrence preserves longer
+   history. Measure full-history versus reset-hidden inference before replacing
+   memory.
+
+5. **Do not deploy PFSP merely because it is fashionable.** The current matrix
    shows a plateau but no cycle. Keep permanent evaluation anchors and the raw
-   payoff matrix. Add PFSP/worst-opponent sampling only if a larger held-out
+   payoff matrix. Add PFSP or worst-opponent sampling only if a larger held-out
    matrix exposes forgetting or a recurrent worst matchup.
 
 ## Efficiency implications
@@ -176,8 +221,14 @@ The safe efficiency work is:
 - benchmark 0-1 ms league coalescing on long, warmed runs rather than trusting
   startup-heavy microbenchmarks; and
 - improve learning per battle through roster balancing, better preview use,
-  and tactical curricula. A run that reaches the same strength in fewer
+  and better state information. A run that reaches the same strength in fewer
   battles is the largest remaining speedup that does not trade away quality.
+
+The synchronous batched collector remains the production path. A prior
+asynchronous collector experiment reduced effective batching and regressed
+throughput, so asynchronous collection is postponed rather than carried as a
+second complex training path. It should be revisited only with a design that
+preserves inference batch size and wins a warmed, multi-update A/B benchmark.
 
 Before a larger run, use short multi-seed A/B runs to require: no throughput
 regression, no friendly-fire/immunity regression, delayed and context-dependent
