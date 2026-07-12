@@ -4,8 +4,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from poke_env.battle import Effect, Field, Pokemon, SideCondition, Status, Weather
+from poke_env.data import GenData
 
-from pokerl.data import GameData
+from pokerl.data import GameData, UNKNOWN_IDX
 from pokerl.env.observation import (
     ABILITY_KNOWN_OFFSET,
     FIELD_OPPONENT_USED_TERA_OFFSET,
@@ -56,6 +57,7 @@ def _pokemon(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         species=species,
+        base_species=species,
         moves=moves,
         last_move=last_move,
         ability=ability,
@@ -74,6 +76,26 @@ def _pokemon(
         first_turn=first_turn,
         revealed=revealed,
         is_terastallized=terastallized,
+    )
+
+
+def _opponent_pokemon(
+    species: str,
+    *,
+    revealed: bool,
+    item: str | None = None,
+) -> SimpleNamespace:
+    return _pokemon(
+        species=species,
+        moves=OrderedDict(),
+        ability=None,
+        item=item if revealed else GenData.UNKNOWN_ITEM,
+        type_1="normal",
+        type_2=None,
+        tera_type=None,
+        current_hp=100 if revealed else 0,
+        max_hp=100 if revealed else 0,
+        revealed=revealed,
     )
 
 
@@ -303,6 +325,121 @@ def test_opponent_source_indices_remain_stable_when_actives_switch() -> None:
         assert identity_by_species == expected_identity_by_species
 
 
+def test_public_preview_roster_persists_as_live_opponents_are_revealed() -> None:
+    gd = GameData(gen=9)
+    builder = ObservationBuilder(gd, team_size=6)
+    species = (
+        "incineroar",
+        "pelipper",
+        "amoonguss",
+        "archaludon",
+        "urshifu",
+        "tornadus",
+    )
+    preview = [
+        _opponent_pokemon(species_name, revealed=False) for species_name in species
+    ]
+    live = {
+        index: _opponent_pokemon(species[index], revealed=True) for index in (0, 1, 3)
+    }
+    battle = SimpleNamespace(
+        team=OrderedDict(),
+        opponent_team=OrderedDict((f"p2:{index}", live[index]) for index in (0, 1)),
+        teampreview_opponent_team=preview,
+        active_pokemon=[None, None],
+        opponent_active_pokemon=[live[0], live[1]],
+        weather={},
+        fields={},
+        side_conditions={},
+        opponent_side_conditions={},
+        turn=1,
+        used_tera=False,
+        opponent_used_tera=False,
+    )
+
+    leads_only = builder.build(battle)
+
+    assert leads_only["opp_source_index"].tolist() == [0, 1, 2, 3, 4, 5]
+    assert not leads_only["opp_mask"].any()
+    assert set(leads_only["opp_species"].tolist()) == {
+        gd.species_to_idx[name] for name in species
+    }
+    revealed_by_source = {
+        int(source): float(row[REVEALED_OFFSET])
+        for source, row in zip(
+            leads_only["opp_source_index"],
+            leads_only["opp_continuous"],
+            strict=True,
+        )
+    }
+    assert revealed_by_source == {0: 1.0, 1: 1.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}
+
+    battle.opponent_team["p2:3"] = live[3]
+    battle.opponent_active_pokemon = [live[3], live[1]]
+    after_switch = builder.build(battle)
+
+    assert after_switch["opp_source_index"].tolist() == [1, 3, 0, 2, 4, 5]
+    assert not after_switch["opp_mask"].any()
+    assert set(after_switch["opp_species"].tolist()) == {
+        gd.species_to_idx[name] for name in species
+    }
+    revealed_by_source = {
+        int(source): float(row[REVEALED_OFFSET])
+        for source, row in zip(
+            after_switch["opp_source_index"],
+            after_switch["opp_continuous"],
+            strict=True,
+        )
+    }
+    assert revealed_by_source == {0: 1.0, 1: 1.0, 2: 0.0, 3: 1.0, 4: 0.0, 5: 0.0}
+
+
+def test_illusion_roster_keeps_display_but_withholds_ambiguous_source() -> None:
+    gd = GameData(gen=9)
+    builder = ObservationBuilder(gd, team_size=6)
+    species = ("gengar", "zoroark", "amoonguss", "pelipper", "urshifu", "tornadus")
+    preview = [
+        _opponent_pokemon(species_name, revealed=False) for species_name in species
+    ]
+    apparent_gengar = _opponent_pokemon("gengar", revealed=True)
+    battle = SimpleNamespace(
+        team=OrderedDict(),
+        opponent_team=OrderedDict([("p2:gengar", apparent_gengar)]),
+        teampreview_opponent_team=preview,
+        active_pokemon=[None, None],
+        opponent_active_pokemon=[apparent_gengar, None],
+        weather={},
+        fields={},
+        side_conditions={},
+        opponent_side_conditions={},
+        turn=1,
+        used_tera=False,
+        opponent_used_tera=False,
+    )
+
+    ambiguous = builder.build(battle)
+
+    assert ambiguous["opp_species"][0] == gd.species_to_idx["gengar"]
+    assert ambiguous["opp_source_index"][0] == -1
+
+    revealed_zoroark = _opponent_pokemon("zoroark", revealed=True)
+    battle.opponent_team["p2:zoroark"] = revealed_zoroark
+    battle.opponent_active_pokemon = [revealed_zoroark, None]
+    confirmed = builder.build(battle)
+
+    assert confirmed["opp_species"][0] == gd.species_to_idx["zoroark"]
+    assert confirmed["opp_source_index"][0] == 1
+    source_by_species = {
+        int(species_index): int(source)
+        for species_index, source in zip(
+            confirmed["opp_species"],
+            confirmed["opp_source_index"],
+            strict=True,
+        )
+    }
+    assert source_by_species[gd.species_to_idx["gengar"]] == 0
+
+
 def test_observation_builder_raises_when_active_pokemon_is_missing_from_team() -> None:
     gd = GameData(gen=9)
     builder = ObservationBuilder(gd, team_size=6)
@@ -412,3 +549,28 @@ def test_team_preview_pokemon_init_keeps_preview_revealed_flag_unset() -> None:
 
     assert own_preview.revealed is False
     assert opp_preview.revealed is False
+
+
+def test_unrevealed_item_sentinel_is_encoded_as_unknown() -> None:
+    gd = GameData(gen=9)
+    builder = ObservationBuilder(gd, team_size=6)
+    opponent = Pokemon(gen=gd.gen, species="amoonguss")
+    battle = SimpleNamespace(
+        team=OrderedDict(),
+        opponent_team=OrderedDict([("amoonguss", opponent)]),
+        active_pokemon=[None, None],
+        opponent_active_pokemon=[None, None],
+        weather={},
+        fields={},
+        side_conditions={},
+        opponent_side_conditions={},
+        turn=0,
+        used_tera=False,
+        opponent_used_tera=False,
+    )
+
+    obs = builder.build(battle)
+
+    assert opponent.item == GenData.UNKNOWN_ITEM
+    assert obs["opp_item"][0] == UNKNOWN_IDX
+    assert obs["opp_continuous"][0, ITEM_KNOWN_OFFSET] == 0.0

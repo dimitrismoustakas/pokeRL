@@ -12,6 +12,8 @@ from poke_env.battle import (
     Status,
     Weather,
 )
+from poke_env.data import GenData
+from poke_env.data.normalize import to_id_str
 from poke_env.teambuilder.teambuilder import Teambuilder
 
 from ..data import GameData, UNKNOWN_IDX
@@ -127,6 +129,7 @@ FIELD_TURN_OFFSET = 35
 ROLE_ACTIVE_1 = 0
 ROLE_ACTIVE_2 = 1
 ROLE_BENCH = 2
+_ILLUSION_SPECIES = frozenset(("zoroark", "zoroarkhisui"))
 
 assert (
     1
@@ -161,14 +164,15 @@ class ObservationBuilder:
         )
         self._encode_team(own_pokemon, own_roles, obs, prefix="own", full_info=True)
 
+        opponent_team, opponent_source_lookup = self._public_opponent_team(battle)
         opp_pokemon, opp_roles, opp_active_indices, opp_active_present = (
-            self._ordered_team_with_roles(battle, own=False)
+            self._ordered_team_with_roles(
+                battle,
+                own=False,
+                team_override=opponent_team,
+            )
         )
         self._encode_team(opp_pokemon, opp_roles, obs, prefix="opp", full_info=False)
-        opponent_source_lookup = {
-            id(pokemon): index
-            for index, pokemon in enumerate(battle.opponent_team.values())
-        }
         obs["opp_source_index"] = np.asarray(
             [
                 opponent_source_lookup.get(id(pokemon), -1)
@@ -185,6 +189,64 @@ class ObservationBuilder:
         obs["opp_active_indices"] = opp_active_indices
         obs["opp_active_present"] = opp_active_present
         return obs
+
+    def _public_opponent_team(
+        self,
+        battle: DoubleBattle,
+    ) -> tuple[list[Pokemon], dict[int, int]]:
+        """Overlay public live state onto the immutable team-preview roster."""
+        live_team = list(battle.opponent_team.values())
+        preview_team = list(getattr(battle, "teampreview_opponent_team", ()) or ())[
+            : self.team_size
+        ]
+        if not preview_team:
+            return live_team, {
+                id(pokemon): index for index, pokemon in enumerate(live_team)
+            }
+
+        roster = list(preview_team)
+        source_lookup = {
+            id(pokemon): index for index, pokemon in enumerate(preview_team)
+        }
+        preview_object_ids = set(source_lookup)
+        preview_slots_by_species: dict[str, list[int]] = {}
+        for index, pokemon in enumerate(preview_team):
+            preview_slots_by_species.setdefault(
+                self._base_species_id(pokemon),
+                [],
+            ).append(index)
+
+        public_live_team = [
+            pokemon for pokemon in live_team if id(pokemon) not in preview_object_ids
+        ]
+        illusion_is_confirmed = any(
+            self._base_species_id(pokemon) in _ILLUSION_SPECIES
+            for pokemon in public_live_team
+        )
+        illusion_is_ambiguous = (
+            any(species in preview_slots_by_species for species in _ILLUSION_SPECIES)
+            and not illusion_is_confirmed
+        )
+
+        for pokemon in public_live_team:
+            species = self._base_species_id(pokemon)
+            candidate_slots = preview_slots_by_species.get(species, ())
+            if len(candidate_slots) != 1:
+                source_lookup[id(pokemon)] = -1
+                continue
+            source_index = candidate_slots[0]
+            roster[source_index] = pokemon
+            source_lookup[id(pokemon)] = (
+                -1
+                if illusion_is_ambiguous and species not in _ILLUSION_SPECIES
+                else source_index
+            )
+
+        return roster, source_lookup
+
+    @staticmethod
+    def _base_species_id(pokemon: Pokemon) -> str:
+        return to_id_str(getattr(pokemon, "base_species", pokemon.species))
 
     def _encode_team(
         self,
@@ -258,7 +320,7 @@ class ObservationBuilder:
         return self.gd.abilities_to_idx.get(ability.lower(), UNKNOWN_IDX)
 
     def _item_idx(self, item: str | None) -> int:
-        if item is None or item == "":
+        if item in (None, "", GenData.UNKNOWN_ITEM):
             return UNKNOWN_IDX
         return self.gd.item_index(item)
 
@@ -332,7 +394,7 @@ class ObservationBuilder:
             len(pokemon_moves), NUM_MOVE_SLOTS
         ) / float(NUM_MOVE_SLOTS)
         feats[ABILITY_KNOWN_OFFSET] = float(ability is not None)
-        feats[ITEM_KNOWN_OFFSET] = float(item not in (None, ""))
+        feats[ITEM_KNOWN_OFFSET] = float(item not in (None, "", GenData.UNKNOWN_ITEM))
         feats[TERA_KNOWN_OFFSET] = float(pokemon.tera_type is not None)
         feats[TERASTALLIZED_OFFSET] = float(pokemon.is_terastallized)
 
@@ -340,10 +402,17 @@ class ObservationBuilder:
         self,
         battle: DoubleBattle,
         own: bool,
+        team_override: list[Pokemon] | None = None,
     ) -> tuple[list[Pokemon | None], np.ndarray, np.ndarray, np.ndarray]:
         """Return ordered team members plus role and active-index metadata."""
         team = (
-            list(battle.team.values()) if own else list(battle.opponent_team.values())
+            list(team_override)
+            if team_override is not None
+            else (
+                list(battle.team.values())
+                if own
+                else list(battle.opponent_team.values())
+            )
         )
         active_list = battle.active_pokemon if own else battle.opponent_active_pokemon
         active_lookup = {
