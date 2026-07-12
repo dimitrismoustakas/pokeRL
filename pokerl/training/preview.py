@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from ..model.agent import PokeAgent
+from .cuda_execution import cuda_model_execution
 
 
 @dataclass
@@ -24,12 +25,14 @@ class TeamPreviewBatcher:
 
     _COALESCE_WINDOW_SEC = 0.005
     _TARGET_BATCH_SIZE = 8
+    _CLOSE_TIMEOUT_SEC = 60.0
 
     def __init__(self, agent: PokeAgent, device: torch.device):
         self._agent = agent
         self._device = device
         self._pending: list[_PreviewRequest] = []
         self._closed = False
+        self._fatal_error: BaseException | None = None
         self._condition = Condition()
         self._thread = Thread(target=self._run, name="team-preview-batcher", daemon=True)
         self._thread.start()
@@ -40,28 +43,52 @@ class TeamPreviewBatcher:
     def submit(self, obs: dict[str, np.ndarray]) -> Future:
         future: Future = Future()
         with self._condition:
+            if self._fatal_error is not None:
+                raise RuntimeError("TeamPreviewBatcher worker failed.") from self._fatal_error
             if self._closed:
                 raise RuntimeError("TeamPreviewBatcher is closed.")
+            if not self._thread.is_alive():
+                raise RuntimeError("TeamPreviewBatcher worker stopped unexpectedly.")
             self._pending.append(_PreviewRequest(obs=obs, future=future))
             self._condition.notify()
         return future
 
     def close(self) -> None:
         with self._condition:
-            if self._closed:
-                return
             self._closed = True
             pending = list(self._pending)
             self._pending.clear()
             self._condition.notify_all()
 
         for request in pending:
-            request.future.set_exception(RuntimeError("TeamPreviewBatcher closed."))
+            if not request.future.done():
+                request.future.set_exception(RuntimeError("TeamPreviewBatcher closed."))
 
         if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=self._CLOSE_TIMEOUT_SEC)
+        if self._thread.is_alive():
+            raise RuntimeError(
+                "TeamPreviewBatcher worker did not stop within "
+                f"{self._CLOSE_TIMEOUT_SEC:g} seconds."
+            )
 
     def _run(self) -> None:
+        try:
+            self._run_loop()
+        except BaseException as exc:
+            with self._condition:
+                self._fatal_error = exc
+                self._closed = True
+                pending = list(self._pending)
+                self._pending.clear()
+                self._condition.notify_all()
+            for request in pending:
+                if not request.future.done():
+                    request.future.set_exception(
+                        RuntimeError("TeamPreviewBatcher worker failed.")
+                    )
+
+    def _run_loop(self) -> None:
         while True:
             with self._condition:
                 while not self._pending and not self._closed:
@@ -78,15 +105,35 @@ class TeamPreviewBatcher:
                 batch = self._pending
                 self._pending = []
 
+            batch = [
+                request
+                for request in batch
+                if request.future.set_running_or_notify_cancel()
+            ]
+            if not batch:
+                continue
+
             try:
-                obs_batch = {
-                    key: torch.from_numpy(np.stack([request.obs[key] for request in batch])).to(self._device)
-                    for key in batch[0].obs
-                }
-                with torch.inference_mode():
-                    picks = self._agent.team_preview(obs_batch)["picks"].cpu().numpy()
+                with cuda_model_execution(self._device):
+                    if getattr(self._agent, "training", False):
+                        raise RuntimeError(
+                            "TeamPreviewBatcher cannot run while the live policy is in training mode."
+                        )
+                    obs_batch = {
+                        key: torch.from_numpy(np.stack([request.obs[key] for request in batch])).to(self._device)
+                        for key in batch[0].obs
+                    }
+                    with torch.inference_mode():
+                        picks = self._agent.team_preview(
+                            obs_batch,
+                            include_value=False,
+                            include_policy_stats=False,
+                            include_opponent_preview=False,
+                        )["picks"].cpu().numpy()
                 for index, request in enumerate(batch):
-                    request.future.set_result(picks[index])
+                    if not request.future.done():
+                        request.future.set_result(picks[index])
             except Exception as exc:
                 for request in batch:
-                    request.future.set_exception(exc)
+                    if not request.future.done():
+                        request.future.set_exception(exc)

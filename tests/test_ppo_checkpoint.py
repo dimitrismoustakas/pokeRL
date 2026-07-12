@@ -54,7 +54,10 @@ def test_league_checkpoint_is_marked_as_league(tmp_path) -> None:
     league = object.__new__(League)
     league.config = config
     league.checkpoints = deque(maxlen=config.league_size)
-    league._inference = SimpleNamespace(prune_checkpoints=lambda keep_paths: None)
+    league._inference = SimpleNamespace(
+        prune_checkpoints=lambda keep_paths: None,
+        prefetch_checkpoint=lambda checkpoint_path: None,
+    )
 
     league.add_checkpoint(TinyAgent(), step=7)
 

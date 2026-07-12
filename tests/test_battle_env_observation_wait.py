@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from pokerl.env.showdown_env import BattleEnv, _OBSERVATION_POLL_SECONDS
+from pokerl.env.showdown_env import (
+    BattleEnv,
+    ShowdownPlayer,
+    _OBSERVATION_POLL_SECONDS,
+    _PlayerObservation,
+)
 
 
 class _ObservationQueue:
@@ -46,7 +51,9 @@ class _ActionQueue:
         self.cleared = True
 
 
-def _make_step_env(queue: _ObservationQueue, battle_task: Future, *, timeout: float = 30.0):
+def _make_step_env(
+    queue: _ObservationQueue, battle_task: Future, *, timeout: float = 30.0
+):
     env = object.__new__(BattleEnv)
     env._closed = False
     env._timing = SimpleNamespace(enabled=False)
@@ -69,7 +76,10 @@ def test_get_player_observation_polls_until_observation_while_task_runs() -> Non
     queue = _ObservationQueue(TimeoutError(), item)
     env = _make_env(queue, Future())
 
-    assert env._get_player_observation("step observation") is item
+    observation = env._get_player_observation("step observation")
+
+    assert observation.request_id is None
+    assert tuple(observation) == item
     assert queue.timeouts == [_OBSERVATION_POLL_SECONDS, _OBSERVATION_POLL_SECONDS]
 
 
@@ -118,6 +128,111 @@ def test_step_waits_for_terminal_battle_task_before_returning_done() -> None:
     assert len(env.player.action_queue.items) == 1
 
 
+def test_step_submits_action_to_matching_player_request() -> None:
+    task = Future()
+    battle = SimpleNamespace(battle_tag="battle-test", turn=2)
+    next_observation = _PlayerObservation(
+        request_id=43,
+        obs={},
+        mask={},
+        reward=0.0,
+        done=False,
+        battle=battle,
+    )
+    queue = _ObservationQueue(next_observation)
+    env = _make_step_env(queue, task)
+    env._pending_player_request_id = 42
+    submitted = []
+
+    def submit_action(request_id, action, *, timeout=None):
+        submitted.append((request_id, action.copy(), timeout))
+
+    env.player.submit_action = submit_action
+
+    action = np.asarray([4, 1, 0], dtype=np.int64)
+    _obs, _mask, reward, done, info = env.step(action)
+
+    assert reward == 0.0
+    assert done is False
+    assert info["battle_tag"] == "battle-test"
+    assert env._pending_player_request_id == 43
+    assert len(env.player.action_queue.items) == 0
+    assert submitted[0][0] == 42
+    np.testing.assert_array_equal(submitted[0][1], action)
+    assert submitted[0][2] == 30.0
+
+
+def test_step_action_submit_timeout_includes_diagnostics() -> None:
+    task = Future()
+    queue = _ObservationQueue()
+    env = _make_step_env(queue, task, timeout=12.0)
+    env._pending_player_request_id = 42
+    env._describe_pending_battle_tasks = lambda: "loop diagnostic stack"
+
+    def submit_action(request_id, action, *, timeout=None):
+        assert timeout == 12.0
+        raise TimeoutError()
+
+    env.player.submit_action = submit_action
+
+    with pytest.raises(TimeoutError) as exc_info:
+        env.step(np.asarray([4, 1, 0], dtype=np.int64))
+
+    message = str(exc_info.value)
+    assert "BattleEnv agent action submission" in message
+    assert "request_id=42" in message
+    assert "action=[4, 1, 0]" in message
+    assert "loop diagnostic stack" in message
+    assert env._pending_player_request_id == 42
+
+
+@pytest.mark.asyncio
+async def test_showdown_player_submit_action_resolves_matching_request() -> None:
+    action = np.asarray([4, 1, 0], dtype=np.int64)
+    fake_player = SimpleNamespace(
+        _pending_action_request_id=7,
+        _pending_action_future=asyncio.get_running_loop().create_future(),
+    )
+
+    await ShowdownPlayer._submit_action(fake_player, 7, action)
+
+    np.testing.assert_array_equal(fake_player._pending_action_future.result(), action)
+
+
+@pytest.mark.asyncio
+async def test_showdown_player_submit_action_rejects_wrong_request() -> None:
+    fake_player = SimpleNamespace(
+        _pending_action_request_id=7,
+        _pending_action_future=asyncio.get_running_loop().create_future(),
+    )
+
+    with pytest.raises(RuntimeError, match="waiting for request 7"):
+        await ShowdownPlayer._submit_action(
+            fake_player,
+            8,
+            np.asarray([4, 1, 0], dtype=np.int64),
+        )
+
+    assert not fake_player._pending_action_future.done()
+
+
+@pytest.mark.asyncio
+async def test_showdown_player_finished_battle_resolves_pending_action() -> None:
+    battle = SimpleNamespace(finished=True)
+    future = asyncio.get_running_loop().create_future()
+    fake_player = SimpleNamespace(
+        _pending_finished_battle=None,
+        _pending_action_future=future,
+        _pending_action_battle=battle,
+    )
+
+    ShowdownPlayer._battle_finished_callback(fake_player, battle)
+
+    assert fake_player._pending_finished_battle is battle
+    assert future.done()
+    assert future.result() is None
+
+
 def test_step_surfaces_terminal_battle_task_failure() -> None:
     task = Future()
     task.set_exception(RuntimeError("finalizer failed"))
@@ -125,7 +240,9 @@ def test_step_surfaces_terminal_battle_task_failure() -> None:
     queue = _ObservationQueue(({}, {}, -1.0, True, battle))
     env = _make_step_env(queue, task)
 
-    with pytest.raises(RuntimeError, match="Battle task failed after terminal") as exc_info:
+    with pytest.raises(
+        RuntimeError, match="Battle task failed after terminal"
+    ) as exc_info:
         env.step(np.asarray([0, 0, 0], dtype=np.int64))
 
     assert isinstance(exc_info.value.__cause__, RuntimeError)
@@ -197,6 +314,7 @@ def test_close_does_not_mask_existing_training_exception() -> None:
     env._battle_task = FailingTask()
     env._loop = None
     env._loop_thread = loop_thread
+    env._owns_loop_thread = True
 
     env.close()
 

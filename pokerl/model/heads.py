@@ -19,6 +19,18 @@ from ..env.actions import (
 from ..env.observation import FIELD_TIMER_CAPS, FIELD_TURN_OFFSET, TERASTALLIZED_OFFSET
 
 
+def _sample_categorical_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Sample from categorical logits with the Gumbel-max trick.
+
+    If ``E`` is exponential(1), ``-log(E)`` is a standard Gumbel sample.
+    This is distribution-equivalent to multinomial sampling from softmax
+    probabilities while avoiding an unnecessary softmax.
+    """
+    sample_logits = logits.detach()
+    exponential = torch.empty_like(sample_logits).exponential_()
+    return (sample_logits - exponential.log()).argmax(dim=1)
+
+
 class MaskedSetAttention(nn.Module):
     """Query-conditioned pooling over a masked set of pokemon representations."""
 
@@ -46,8 +58,25 @@ class MaskedSetAttention(nn.Module):
                 f"MaskedSetAttention expected mask shape {(batch_size, num_items)}, got {tuple(mask.shape)}."
             )
 
+        key_proj, values = self._project_items(items)
+        return self._pool_projected(query, key_proj, values, mask)
+
+    def _project_items(
+        self,
+        items: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project a set once so multiple queries can share the result."""
+        return self.key_proj(items), self.value_proj(items)
+
+    def _pool_projected(
+        self,
+        query: torch.Tensor,
+        key_proj: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Pool already-projected items for one query."""
         query_proj = self.query_proj(query).unsqueeze(1)
-        key_proj = self.key_proj(items)
         scores = (query_proj * key_proj).sum(dim=-1) / self.scale
 
         if mask is not None:
@@ -57,9 +86,10 @@ class MaskedSetAttention(nn.Module):
         if mask is not None:
             weights = weights.masked_fill(mask, 0.0)
         weights_sum = weights.sum(dim=1, keepdim=True)
-        weights = torch.where(weights_sum > 0, weights / weights_sum.clamp(min=1e-8), weights)
+        weights = torch.where(
+            weights_sum > 0, weights / weights_sum.clamp(min=1e-8), weights
+        )
 
-        values = self.value_proj(items)
         return torch.bmm(weights.unsqueeze(1), values).squeeze(1)
 
 
@@ -100,6 +130,7 @@ class ActionHead(nn.Module):
         self.target_emb = nn.Embedding(NUM_TARGETS + 1, hidden_dim)
         self.switch_slot_emb = nn.Embedding(MAX_TEAM_SLOTS + 1, hidden_dim)
         self._static_action_features_cache: torch.Tensor | None = None
+        self._static_action_features_cache_key: tuple[object, ...] | None = None
 
         self.query1 = nn.Sequential(
             nn.Linear(context_dim + pokemon_dim * 4, hidden_dim),
@@ -120,7 +151,10 @@ class ActionHead(nn.Module):
         )
         self.tera_query = nn.Sequential(
             nn.Linear(
-                context_dim + pokemon_dim * 4 + hidden_dim * 2 + self._MATCHUP_FEATURE_DIM * 2,
+                context_dim
+                + pokemon_dim * 4
+                + hidden_dim * 2
+                + self._MATCHUP_FEATURE_DIM * 2,
                 hidden_dim,
             ),
             nn.ReLU(),
@@ -147,10 +181,18 @@ class ActionHead(nn.Module):
         metadata = self._build_action_metadata()
         self.register_buffer("_action_ids", metadata["action_ids"], persistent=False)
         self.register_buffer("_action_kind", metadata["kind"], persistent=False)
-        self.register_buffer("_action_move_slot", metadata["move_slot"], persistent=False)
-        self.register_buffer("_action_target_slot", metadata["target_slot"], persistent=False)
-        self.register_buffer("_action_switch_slot", metadata["switch_slot"], persistent=False)
-        self.register_buffer("_action_is_switch", metadata["is_switch"], persistent=False)
+        self.register_buffer(
+            "_action_move_slot", metadata["move_slot"], persistent=False
+        )
+        self.register_buffer(
+            "_action_target_slot", metadata["target_slot"], persistent=False
+        )
+        self.register_buffer(
+            "_action_switch_slot", metadata["switch_slot"], persistent=False
+        )
+        self.register_buffer(
+            "_action_is_switch", metadata["is_switch"], persistent=False
+        )
         self.register_buffer("_action_is_move", metadata["is_move"], persistent=False)
 
         self._has_explicit_metadata = all(
@@ -192,7 +234,9 @@ class ActionHead(nn.Module):
         )
         self.register_buffer(
             "_move_target_flags",
-            self._ensure_float_buffer(move_target_flags, dims=2, width=self._TARGET_FLAG_DIM),
+            self._ensure_float_buffer(
+                move_target_flags, dims=2, width=self._TARGET_FLAG_DIM
+            ),
             persistent=False,
         )
         self.register_buffer(
@@ -203,6 +247,7 @@ class ActionHead(nn.Module):
 
     def _apply(self, fn):
         self._static_action_features_cache = None
+        self._static_action_features_cache_key = None
         return super()._apply(fn)
 
     def forward(
@@ -257,7 +302,22 @@ class ActionHead(nn.Module):
         )
 
         base_query1 = self.query1(torch.cat([context, rep1, rep2, opp1, opp2], dim=-1))
-        reserve_summary1 = self.reserve_attention(base_query1, opp_team_reps, opp_reserve_mask)
+        reserve_item_projections = None
+        if not torch.is_grad_enabled():
+            reserve_item_projections = self.reserve_attention._project_items(
+                opp_team_reps
+            )
+            reserve_summary1 = self.reserve_attention._pool_projected(
+                base_query1,
+                *reserve_item_projections,
+                opp_reserve_mask,
+            )
+        else:
+            reserve_summary1 = self.reserve_attention(
+                base_query1,
+                opp_team_reps,
+                opp_reserve_mask,
+            )
         query1 = self.query1_fuse(torch.cat([base_query1, reserve_summary1], dim=-1))
         logits1 = self._score_actions(
             query1,
@@ -276,14 +336,21 @@ class ActionHead(nn.Module):
             include_stats=include_policy_stats,
         )
 
-        if validate_actions and not mask1.gather(1, a1.unsqueeze(1)).squeeze(1).all():
+        # A sampled action comes directly from masked logits. Re-reading its
+        # legality with a Python boolean would only add a CUDA-to-host barrier;
+        # validation remains available for externally supplied PPO actions.
+        validate_supplied_actions = validate_actions and actions is not None
+        if (
+            validate_supplied_actions
+            and not mask1.gather(1, a1.unsqueeze(1)).squeeze(1).all()
+        ):
             raise RuntimeError(
                 "ActionHead received an illegal first-slot action for the current joint mask."
             )
 
         batch_indices = torch.arange(context.shape[0], device=context.device)
         mask2 = joint_masks[batch_indices, a1 + 1]
-        if validate_actions and not mask2.any(dim=1).all():
+        if validate_supplied_actions and not mask2.any(dim=1).all():
             raise RuntimeError(
                 "ActionHead received an empty conditional joint action mask for pokemon 2. "
                 "This means build_joint_action_mask() produced an inconsistent legality table."
@@ -291,8 +358,21 @@ class ActionHead(nn.Module):
 
         a1_emb = self.action_id_emb(a1)
         chosen_features_1 = matchup_features_1[batch_indices, a1]
-        base_query2 = self.query2(torch.cat([context, rep2, rep1, opp1, opp2, a1_emb], dim=-1))
-        reserve_summary2 = self.reserve_attention(base_query2, opp_team_reps, opp_reserve_mask)
+        base_query2 = self.query2(
+            torch.cat([context, rep2, rep1, opp1, opp2, a1_emb], dim=-1)
+        )
+        if reserve_item_projections is None:
+            reserve_summary2 = self.reserve_attention(
+                base_query2,
+                opp_team_reps,
+                opp_reserve_mask,
+            )
+        else:
+            reserve_summary2 = self.reserve_attention._pool_projected(
+                base_query2,
+                *reserve_item_projections,
+                opp_reserve_mask,
+            )
         query2 = self.query2_fuse(torch.cat([base_query2, reserve_summary2], dim=-1))
         logits2 = self._score_actions(
             query2,
@@ -311,7 +391,10 @@ class ActionHead(nn.Module):
             include_stats=include_policy_stats,
         )
 
-        if validate_actions and not mask2.gather(1, a2.unsqueeze(1)).squeeze(1).all():
+        if (
+            validate_supplied_actions
+            and not mask2.gather(1, a2.unsqueeze(1)).squeeze(1).all()
+        ):
             raise RuntimeError(
                 "ActionHead received an illegal second-slot action for the current joint mask."
             )
@@ -330,7 +413,17 @@ class ActionHead(nn.Module):
         )
         tera_query = self.tera_query(
             torch.cat(
-                [context, rep1, rep2, opp1, opp2, a1_emb, a2_emb, chosen_features_1, chosen_features_2],
+                [
+                    context,
+                    rep1,
+                    rep2,
+                    opp1,
+                    opp2,
+                    a1_emb,
+                    a2_emb,
+                    chosen_features_1,
+                    chosen_features_2,
+                ],
                 dim=-1,
             )
         )
@@ -341,23 +434,32 @@ class ActionHead(nn.Module):
             tera_entropy = -(tera_probs * tera_log_probs).sum(dim=-1)
         else:
             tera_log_probs = None
-            tera_probs = torch.softmax(tera_logits, dim=-1)
             tera_entropy = None
 
         if actions is None:
-            tera_choice = tera_logits.argmax(dim=1) if greedy else torch.multinomial(tera_probs, 1).squeeze(1)
+            tera_choice = (
+                tera_logits.argmax(dim=1)
+                if greedy
+                else _sample_categorical_logits(tera_logits)
+            )
             if tera_exploration_prob > 0.0 and not greedy:
                 # Only explore when there is a real tera choice (>= 2 valid options).
                 # Otherwise tera_mask is [True, False, False] and uniform == policy.
                 has_choice = tera_mask.sum(dim=1) >= 2
                 explore = (
-                    torch.rand(context.shape[0], device=context.device) < tera_exploration_prob
+                    torch.rand(context.shape[0], device=context.device)
+                    < tera_exploration_prob
                 ) & has_choice
-                uniform_logits = torch.zeros_like(tera_logits).masked_fill(~tera_mask, -1e8)
-                uniform_probs = torch.softmax(uniform_logits, dim=-1)
-                uniform_sample = torch.multinomial(uniform_probs, 1).squeeze(1)
+                uniform_logits = torch.zeros_like(tera_logits).masked_fill(
+                    ~tera_mask, -1e8
+                )
+                uniform_sample = _sample_categorical_logits(uniform_logits)
                 tera_choice = torch.where(explore, uniform_sample, tera_choice)
-            if tera_force_delay_prob > 0.0 and tera_force_delay_max_turn > 0 and not greedy:
+            if (
+                tera_force_delay_prob > 0.0
+                and tera_force_delay_max_turn > 0
+                and not greedy
+            ):
                 early_turn = self._early_turn_mask(
                     battle_obs=battle_obs,
                     batch_size=batch_size,
@@ -365,13 +467,20 @@ class ActionHead(nn.Module):
                     max_turn=tera_force_delay_max_turn,
                 )
                 force_delay = (
-                    torch.rand(batch_size, device=device) < tera_force_delay_prob
-                ) & early_turn & (tera_choice != TERA_NONE)
-                tera_choice = torch.where(force_delay, torch.zeros_like(tera_choice), tera_choice)
+                    (torch.rand(batch_size, device=device) < tera_force_delay_prob)
+                    & early_turn
+                    & (tera_choice != TERA_NONE)
+                )
+                tera_choice = torch.where(
+                    force_delay, torch.zeros_like(tera_choice), tera_choice
+                )
         else:
             tera_choice = actions[:, 2]
 
-        if validate_actions and not tera_mask.gather(1, tera_choice.unsqueeze(1)).squeeze(1).all():
+        if (
+            validate_supplied_actions
+            and not tera_mask.gather(1, tera_choice.unsqueeze(1)).squeeze(1).all()
+        ):
             raise RuntimeError(
                 "ActionHead received an illegal tera choice for the current joint action pair."
             )
@@ -380,9 +489,18 @@ class ActionHead(nn.Module):
             "actions": torch.stack([a1, a2, tera_choice], dim=1),
         }
         if include_policy_stats:
-            if tera_log_probs is None or log_prob1 is None or log_prob2 is None or entropy1 is None or entropy2 is None or tera_entropy is None:
+            if (
+                tera_log_probs is None
+                or log_prob1 is None
+                or log_prob2 is None
+                or entropy1 is None
+                or entropy2 is None
+                or tera_entropy is None
+            ):
                 raise RuntimeError("ActionHead policy stats were not computed.")
-            tera_log_prob = tera_log_probs.gather(1, tera_choice.unsqueeze(1)).squeeze(1)
+            tera_log_prob = tera_log_probs.gather(1, tera_choice.unsqueeze(1)).squeeze(
+                1
+            )
             result["log_prob"] = log_prob1 + log_prob2 + tera_log_prob
             result["entropy"] = entropy1 + entropy2 + tera_entropy
         return result
@@ -399,7 +517,11 @@ class ActionHead(nn.Module):
             log_probs = torch.log_softmax(logits, dim=-1)
             probs = log_probs.exp()
             if actions is None:
-                selected = logits.argmax(dim=1) if greedy else torch.multinomial(probs, 1).squeeze(1)
+                selected = (
+                    logits.argmax(dim=1)
+                    if greedy
+                    else _sample_categorical_logits(logits)
+                )
             else:
                 selected = actions
             selected_log_prob = log_probs.gather(1, selected.unsqueeze(1)).squeeze(1)
@@ -410,8 +532,7 @@ class ActionHead(nn.Module):
             if greedy:
                 selected = logits.argmax(dim=1)
             else:
-                probs = torch.softmax(logits, dim=-1)
-                selected = torch.multinomial(probs, 1).squeeze(1)
+                selected = _sample_categorical_logits(logits)
         else:
             selected = actions
         return selected, None, None
@@ -445,23 +566,47 @@ class ActionHead(nn.Module):
         query_features = query.unsqueeze(1).expand(-1, self.num_actions, -1)
         action_features = action_features.unsqueeze(0).expand(query.shape[0], -1, -1)
         entity_features = self.entity_proj(
-            self._dynamic_action_entities(actor_rep, partner_rep, own_team_reps, opp_active_reps)
+            self._dynamic_action_entities(
+                actor_rep, partner_rep, own_team_reps, opp_active_reps
+            )
         )
         matchup_emb = self.matchup_proj(matchup_features)
         return self.score(
-            torch.cat([query_features, action_features, entity_features, matchup_emb], dim=-1)
+            torch.cat(
+                [query_features, action_features, entity_features, matchup_emb], dim=-1
+            )
         ).squeeze(-1)
 
     def _static_action_features(self) -> torch.Tensor:
-        cache_allowed = (
-            not self.training
-            and not self.action_id_emb.weight.requires_grad
-            and not self.kind_emb.weight.requires_grad
-            and not self.move_slot_emb.weight.requires_grad
-            and not self.target_emb.weight.requires_grad
-            and not self.switch_slot_emb.weight.requires_grad
+        parameters = (
+            self.action_id_emb.weight,
+            self.kind_emb.weight,
+            self.move_slot_emb.weight,
+            self.target_emb.weight,
+            self.switch_slot_emb.weight,
         )
-        if cache_allowed and self._static_action_features_cache is not None:
+        cache_allowed = not torch.is_grad_enabled() or (
+            not self.training
+            and all(not parameter.requires_grad for parameter in parameters)
+        )
+        cache_key = (
+            tuple(
+                (
+                    id(parameter),
+                    parameter._version,
+                    parameter.device,
+                    parameter.dtype,
+                )
+                for parameter in parameters
+            )
+            if cache_allowed
+            else None
+        )
+        if (
+            cache_allowed
+            and self._static_action_features_cache is not None
+            and self._static_action_features_cache_key == cache_key
+        ):
             return self._static_action_features_cache
 
         action_ids = self._action_ids
@@ -478,6 +623,7 @@ class ActionHead(nn.Module):
         )
         if cache_allowed:
             self._static_action_features_cache = features
+            self._static_action_features_cache_key = cache_key
         return features
 
     def _dynamic_action_entities(
@@ -501,14 +647,20 @@ class ActionHead(nn.Module):
             ],
             dim=1,
         )
-        target_indices = self._action_target_slot.view(1, self.num_actions, 1).expand(batch_size, -1, pokemon_dim)
+        target_indices = self._action_target_slot.view(1, self.num_actions, 1).expand(
+            batch_size, -1, pokemon_dim
+        )
         target_entities = target_bank.gather(1, target_indices)
 
         switch_bank = torch.cat([own_team_reps, zero_rep.unsqueeze(1)], dim=1)
-        switch_indices = self._action_switch_slot.view(1, self.num_actions, 1).expand(batch_size, -1, pokemon_dim)
+        switch_indices = self._action_switch_slot.view(1, self.num_actions, 1).expand(
+            batch_size, -1, pokemon_dim
+        )
         switch_entities = switch_bank.gather(1, switch_indices)
 
-        is_switch = self._action_is_switch.view(1, self.num_actions, 1).to(device=actor_rep.device)
+        is_switch = self._action_is_switch.view(1, self.num_actions, 1).to(
+            device=actor_rep.device
+        )
         return torch.where(is_switch, switch_entities, target_entities)
 
     def _matchup_context(
@@ -538,11 +690,21 @@ class ActionHead(nn.Module):
 
         own_active_indices = battle_obs["own_active_indices"]
         opp_active_indices = battle_obs["opp_active_indices"]
-        own_types_active = self._gather_team_slots(battle_obs["own_types"], own_active_indices)
-        own_cont_active = self._gather_team_slots(battle_obs["own_continuous"], own_active_indices)
-        opp_types_active = self._gather_team_slots(battle_obs["opp_types"], opp_active_indices)
-        opp_cont_active = self._gather_team_slots(battle_obs["opp_continuous"], opp_active_indices)
-        opp_def_type_1, opp_def_type_2 = self._defensive_type_pair(opp_types_active, opp_cont_active)
+        own_types_active = self._gather_team_slots(
+            battle_obs["own_types"], own_active_indices
+        )
+        own_cont_active = self._gather_team_slots(
+            battle_obs["own_continuous"], own_active_indices
+        )
+        opp_types_active = self._gather_team_slots(
+            battle_obs["opp_types"], opp_active_indices
+        )
+        opp_cont_active = self._gather_team_slots(
+            battle_obs["opp_continuous"], opp_active_indices
+        )
+        opp_def_type_1, opp_def_type_2 = self._defensive_type_pair(
+            opp_types_active, opp_cont_active
+        )
         opp_present = battle_obs["opp_active_present"].to(dtype=torch.bool)
 
         action_is_move = self._action_is_move.view(1, self.num_actions)
@@ -559,7 +721,9 @@ class ActionHead(nn.Module):
             "opp_def_type_1": opp_def_type_1,
             "opp_def_type_2": opp_def_type_2,
             "opp_present": opp_present,
-            "live_foe_count": opp_present.to(dtype=torch.float32).sum(dim=1, keepdim=True),
+            "live_foe_count": opp_present.to(dtype=torch.float32).sum(
+                dim=1, keepdim=True
+            ),
             "move_slots": self._action_move_slot.clamp(max=NUM_MOVES - 1)
             .view(1, self.num_actions)
             .expand(batch_size, -1),
@@ -567,7 +731,9 @@ class ActionHead(nn.Module):
             "is_move_bool": action_is_move,
             "is_move": action_is_move_float.expand(batch_size, -1),
             "is_switch": action_is_switch_float.expand(batch_size, -1),
-            "is_pass": (1.0 - action_is_move_float - action_is_switch_float).expand(batch_size, -1),
+            "is_pass": (1.0 - action_is_move_float - action_is_switch_float).expand(
+                batch_size, -1
+            ),
             "no_target_move": action_is_move & (action_target_slot == TARGET_NONE),
             "zero_long": torch.zeros(batch_size, dtype=torch.long, device=device),
             "zero_bool": torch.zeros(batch_size, dtype=torch.bool, device=device),
@@ -600,18 +766,28 @@ class ActionHead(nn.Module):
         own_cont_active = matchup_context["own_cont_active"]
 
         actor_indices = own_active_indices[:, actor_slot]
-        actor_moves = self._gather_team_rows(matchup_context["own_moves"], actor_indices)
+        actor_moves = self._gather_team_rows(
+            matchup_context["own_moves"], actor_indices
+        )
         actor_types = own_types_active[:, actor_slot]
         actor_continuous = own_cont_active[:, actor_slot]
-        actor_present = self._active_slot_present_from_context(matchup_context, actor_slot)
+        actor_present = self._active_slot_present_from_context(
+            matchup_context, actor_slot
+        )
 
         partner_slot = 1 - actor_slot
         partner_types = own_types_active[:, partner_slot]
         partner_continuous = own_cont_active[:, partner_slot]
-        partner_present = self._active_slot_present_from_context(matchup_context, partner_slot)
+        partner_present = self._active_slot_present_from_context(
+            matchup_context, partner_slot
+        )
 
-        actor_def_type_1, actor_def_type_2 = self._defensive_type_pair(actor_types, actor_continuous)
-        partner_def_type_1, partner_def_type_2 = self._defensive_type_pair(partner_types, partner_continuous)
+        actor_def_type_1, actor_def_type_2 = self._defensive_type_pair(
+            actor_types, actor_continuous
+        )
+        partner_def_type_1, partner_def_type_2 = self._defensive_type_pair(
+            partner_types, partner_continuous
+        )
         opp_def_type_1 = matchup_context["opp_def_type_1"]
         opp_def_type_2 = matchup_context["opp_def_type_2"]
         opp_present = matchup_context["opp_present"]
@@ -639,27 +815,6 @@ class ActionHead(nn.Module):
             actor_continuous=actor_continuous,
             can_tera_slot=can_tera_slot,
         )
-
-        opp1_eff = self._type_effectiveness(move_types, opp_def_type_1[:, 0:1], opp_def_type_2[:, 0:1])
-        opp2_eff = self._type_effectiveness(move_types, opp_def_type_1[:, 1:2], opp_def_type_2[:, 1:2])
-        self_eff = self._type_effectiveness(move_types, actor_def_type_1.unsqueeze(1), actor_def_type_2.unsqueeze(1))
-        partner_eff = self._type_effectiveness(
-            move_types,
-            partner_def_type_1.unsqueeze(1),
-            partner_def_type_2.unsqueeze(1),
-        )
-
-        live_foe_count = matchup_context["live_foe_count"]
-        foe_mean_eff = (
-            opp1_eff * opp_present[:, 0:1].to(dtype=opp1_eff.dtype)
-            + opp2_eff * opp_present[:, 1:2].to(dtype=opp2_eff.dtype)
-        ) / live_foe_count.clamp(min=1.0)
-        foe_mean_eff = torch.where(live_foe_count > 0, foe_mean_eff, torch.ones_like(foe_mean_eff))
-        foe_best_eff = torch.maximum(
-            torch.where(opp_present[:, 0:1], opp1_eff, torch.zeros_like(opp1_eff)),
-            torch.where(opp_present[:, 1:2], opp2_eff, torch.zeros_like(opp2_eff)),
-        )
-        foe_best_eff = torch.where(live_foe_count > 0, foe_best_eff, torch.ones_like(foe_best_eff))
 
         target_type_1_bank = torch.stack(
             [
@@ -698,8 +853,57 @@ class ActionHead(nn.Module):
         target_type_1 = target_type_1_bank.gather(1, target_indices)
         target_type_2 = target_type_2_bank.gather(1, target_indices)
         target_present = target_present_bank.gather(1, target_indices)
-        targeted_eff = self._type_effectiveness(move_types, target_type_1, target_type_2)
-        targeted_eff = torch.where(target_present, targeted_eff, torch.ones_like(targeted_eff))
+
+        # All five effectiveness queries share the same move ids. Adding a
+        # target axis lets one set of lookup/pointwise kernels evaluate them
+        # without changing the per-element lookup or multiplication order.
+        target_type_1_queries = torch.stack(
+            [
+                opp_def_type_1[:, 0:1].expand(-1, self.num_actions),
+                opp_def_type_1[:, 1:2].expand(-1, self.num_actions),
+                actor_def_type_1.unsqueeze(1).expand(-1, self.num_actions),
+                partner_def_type_1.unsqueeze(1).expand(-1, self.num_actions),
+                target_type_1,
+            ],
+            dim=-1,
+        )
+        target_type_2_queries = torch.stack(
+            [
+                opp_def_type_2[:, 0:1].expand(-1, self.num_actions),
+                opp_def_type_2[:, 1:2].expand(-1, self.num_actions),
+                actor_def_type_2.unsqueeze(1).expand(-1, self.num_actions),
+                partner_def_type_2.unsqueeze(1).expand(-1, self.num_actions),
+                target_type_2,
+            ],
+            dim=-1,
+        )
+        effectiveness = self._type_effectiveness(
+            move_types.unsqueeze(-1),
+            target_type_1_queries,
+            target_type_2_queries,
+        )
+        opp1_eff, opp2_eff, self_eff, partner_eff, targeted_eff = effectiveness.unbind(
+            dim=-1
+        )
+        targeted_eff = torch.where(
+            target_present, targeted_eff, torch.ones_like(targeted_eff)
+        )
+
+        live_foe_count = matchup_context["live_foe_count"]
+        foe_mean_eff = (
+            opp1_eff * opp_present[:, 0:1].to(dtype=opp1_eff.dtype)
+            + opp2_eff * opp_present[:, 1:2].to(dtype=opp2_eff.dtype)
+        ) / live_foe_count.clamp(min=1.0)
+        foe_mean_eff = torch.where(
+            live_foe_count > 0, foe_mean_eff, torch.ones_like(foe_mean_eff)
+        )
+        foe_best_eff = torch.maximum(
+            torch.where(opp_present[:, 0:1], opp1_eff, torch.zeros_like(opp1_eff)),
+            torch.where(opp_present[:, 1:2], opp2_eff, torch.zeros_like(opp2_eff)),
+        )
+        foe_best_eff = torch.where(
+            live_foe_count > 0, foe_best_eff, torch.ones_like(foe_best_eff)
+        )
 
         no_target_move = matchup_context["no_target_move"]
         no_target_eff = torch.ones_like(targeted_eff)
@@ -708,12 +912,16 @@ class ActionHead(nn.Module):
             foe_mean_eff,
             no_target_eff,
         )
-        no_target_eff = torch.where(target_flags[..., 2] > 0, partner_eff, no_target_eff)
+        no_target_eff = torch.where(
+            target_flags[..., 2] > 0, partner_eff, no_target_eff
+        )
         no_target_eff = torch.where(target_flags[..., 3] > 0, self_eff, no_target_eff)
         current_target_eff = torch.where(no_target_move, no_target_eff, targeted_eff)
 
         current_power = base_power * current_stab * current_target_eff / 4.0
-        tera_power_gain = base_power * current_target_eff * (post_tera_stab - current_stab) / 4.0
+        tera_power_gain = (
+            base_power * current_target_eff * (post_tera_stab - current_stab) / 4.0
+        )
         target_eff_scaled = current_target_eff / 4.0
         foe_best_scaled = foe_best_eff / 4.0
         foe_mean_scaled = foe_mean_eff / 4.0
@@ -732,7 +940,10 @@ class ActionHead(nn.Module):
                 (current_stab - 1.0) * is_move,
                 (post_tera_stab - current_stab) * is_move,
                 (current_target_eff == 0).to(dtype=torch.float32) * is_move,
-                ((current_target_eff > 0) & (current_target_eff < 1)).to(dtype=torch.float32) * is_move,
+                ((current_target_eff > 0) & (current_target_eff < 1)).to(
+                    dtype=torch.float32
+                )
+                * is_move,
                 (current_target_eff > 1).to(dtype=torch.float32) * is_move,
                 target_eff_scaled * is_move,
                 foe_best_scaled * is_move,
@@ -770,16 +981,22 @@ class ActionHead(nn.Module):
         type_1 = actor_types[:, 0:1]
         type_2 = actor_types[:, 1:2]
         tera_type = actor_types[:, 2:3]
-        original_match = (move_types == type_1) | ((type_2 != 0) & (move_types == type_2))
+        original_match = (move_types == type_1) | (
+            (type_2 != 0) & (move_types == type_2)
+        )
         tera_match = (tera_type != 0) & (move_types == tera_type)
-        terastallized = actor_continuous[:, TERASTALLIZED_OFFSET:TERASTALLIZED_OFFSET + 1] > 0.5
+        terastallized = (
+            actor_continuous[:, TERASTALLIZED_OFFSET : TERASTALLIZED_OFFSET + 1] > 0.5
+        )
 
         current = torch.ones_like(move_types, dtype=torch.float32)
         current = torch.where(original_match, torch.full_like(current, 1.5), current)
         terastallized_stab = torch.where(
             tera_match & original_match,
             torch.full_like(current, 2.0),
-            torch.where(tera_match | original_match, torch.full_like(current, 1.5), current),
+            torch.where(
+                tera_match | original_match, torch.full_like(current, 1.5), current
+            ),
         )
         current = torch.where(terastallized, terastallized_stab, current)
 
@@ -789,7 +1006,11 @@ class ActionHead(nn.Module):
             torch.where(
                 tera_match & original_match,
                 torch.full_like(current, 2.0),
-                torch.where(tera_match | original_match, torch.full_like(current, 1.5), torch.ones_like(current)),
+                torch.where(
+                    tera_match | original_match,
+                    torch.full_like(current, 1.5),
+                    torch.ones_like(current),
+                ),
             ),
             current,
         )
@@ -801,12 +1022,20 @@ class ActionHead(nn.Module):
         target_type_1: torch.Tensor,
         target_type_2: torch.Tensor,
     ) -> torch.Tensor:
-        move_types = move_types.clamp(min=0, max=self._type_effectiveness_lookup.shape[0] - 1)
-        target_type_1 = target_type_1.clamp(min=0, max=self._type_effectiveness_lookup.shape[1] - 1)
-        target_type_2 = target_type_2.clamp(min=0, max=self._type_effectiveness_lookup.shape[1] - 1)
+        move_types = move_types.clamp(
+            min=0, max=self._type_effectiveness_lookup.shape[0] - 1
+        )
+        target_type_1 = target_type_1.clamp(
+            min=0, max=self._type_effectiveness_lookup.shape[1] - 1
+        )
+        target_type_2 = target_type_2.clamp(
+            min=0, max=self._type_effectiveness_lookup.shape[1] - 1
+        )
         multiplier_1 = self._type_effectiveness_lookup[move_types, target_type_1]
         multiplier_2 = self._type_effectiveness_lookup[move_types, target_type_2]
-        multiplier_2 = torch.where(target_type_2 != 0, multiplier_2, torch.ones_like(multiplier_1))
+        multiplier_2 = torch.where(
+            target_type_2 != 0, multiplier_2, torch.ones_like(multiplier_1)
+        )
         multiplier = multiplier_1 * multiplier_2
         return torch.where(move_types != 0, multiplier, torch.ones_like(multiplier))
 
@@ -818,12 +1047,16 @@ class ActionHead(nn.Module):
         tera_type = types[..., 2]
         terastallized = continuous[..., TERASTALLIZED_OFFSET] > 0.5
         type_1 = torch.where(terastallized, tera_type, types[..., 0])
-        type_2 = torch.where(terastallized, torch.zeros_like(types[..., 1]), types[..., 1])
+        type_2 = torch.where(
+            terastallized, torch.zeros_like(types[..., 1]), types[..., 1]
+        )
         return type_1, type_2
 
     @staticmethod
     def _gather_team_rows(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        gather_index = indices.view(indices.shape[0], 1, *([1] * (values.ndim - 2))).expand(-1, 1, *values.shape[2:])
+        gather_index = indices.view(
+            indices.shape[0], 1, *([1] * (values.ndim - 2))
+        ).expand(-1, 1, *values.shape[2:])
         return values.gather(1, gather_index).squeeze(1)
 
     @staticmethod
@@ -840,7 +1073,11 @@ class ActionHead(nn.Module):
         key = f"{side_prefix}_active_present"
         if key not in battle_obs:
             batch_size = battle_obs[f"{side_prefix}_active_indices"].shape[0]
-            return torch.ones(batch_size, dtype=torch.bool, device=battle_obs[f"{side_prefix}_active_indices"].device)
+            return torch.ones(
+                batch_size,
+                dtype=torch.bool,
+                device=battle_obs[f"{side_prefix}_active_indices"].device,
+            )
         return battle_obs[key][:, slot].to(dtype=torch.bool)
 
     @staticmethod
@@ -888,7 +1125,11 @@ class ActionHead(nn.Module):
             action_ids.append(action_idx)
             kinds.append(kind_lookup[kind])
             move_slots.append(slot_idx if kind == "move" else move_none_slot)
-            target_slots.append(target_idx if kind == "move" else (TARGET_NONE if kind == "pass" else target_none_slot))
+            target_slots.append(
+                target_idx
+                if kind == "move"
+                else (TARGET_NONE if kind == "pass" else target_none_slot)
+            )
             switch_slots.append(slot_idx if kind == "switch" else switch_none_slot)
             is_switch.append(kind == "switch")
             is_move.append(kind == "move")
@@ -910,7 +1151,9 @@ class TeamPreviewHead(nn.Module):
     def __init__(self, pokemon_dim: int, context_dim: int, pick_size: int = 4):
         super().__init__()
         if pick_size < 2:
-            raise ValueError("TeamPreviewHead requires pick_size >= 2 so it can choose a lead pair.")
+            raise ValueError(
+                "TeamPreviewHead requires pick_size >= 2 so it can choose a lead pair."
+            )
         self.pick_size = pick_size
         self.opponent_attention = MaskedSetAttention(context_dim, pokemon_dim, 128)
         self.bring_score = nn.Sequential(
@@ -935,10 +1178,13 @@ class TeamPreviewHead(nn.Module):
         opponent_mask: torch.Tensor | None = None,
         picks: torch.Tensor | None = None,
         greedy: bool = False,
+        include_policy_stats: bool = True,
     ) -> dict[str, torch.Tensor]:
         batch, team_size, pdim = pokemon_reps.shape
         if team_mask is None:
-            available = torch.ones(batch, team_size, dtype=torch.bool, device=context.device)
+            available = torch.ones(
+                batch, team_size, dtype=torch.bool, device=context.device
+            )
         else:
             available = ~team_mask.clone()
         if (available.sum(dim=1) < self.pick_size).any():
@@ -947,7 +1193,9 @@ class TeamPreviewHead(nn.Module):
             )
 
         canonical_bring = None if picks is None else picks.sort(dim=1).values
-        team_positions = torch.arange(team_size, device=context.device).view(1, team_size)
+        team_positions = torch.arange(team_size, device=context.device).view(
+            1, team_size
+        )
 
         bring_log_probs: list[torch.Tensor] = []
         bring_entropies: list[torch.Tensor] = []
@@ -958,29 +1206,57 @@ class TeamPreviewHead(nn.Module):
 
         for step in range(self.pick_size):
             ctx = self.context_proj(torch.cat([context, picked_sum], dim=-1))
-            opponent_summary = self.opponent_attention(ctx, opponent_reps, opponent_mask)
+            opponent_summary = self.opponent_attention(
+                ctx, opponent_reps, opponent_mask
+            )
 
             ctx_expanded = ctx.unsqueeze(1).expand(-1, team_size, -1)
             opponent_expanded = opponent_summary.unsqueeze(1).expand(-1, team_size, -1)
-            bring_inputs = torch.cat([pokemon_reps, ctx_expanded, opponent_expanded], dim=-1)
+            bring_inputs = torch.cat(
+                [pokemon_reps, ctx_expanded, opponent_expanded], dim=-1
+            )
             bring_scores = self.bring_score(bring_inputs).squeeze(-1)
             picks_left = self.pick_size - step
-            suffix_available = torch.cumsum(remaining.flip(1).to(dtype=torch.int64), dim=1).flip(1)
-            valid = remaining & (team_positions >= next_min_index) & (suffix_available >= picks_left)
+            suffix_available = torch.cumsum(
+                remaining.flip(1).to(dtype=torch.int64), dim=1
+            ).flip(1)
+            valid = (
+                remaining
+                & (team_positions >= next_min_index)
+                & (suffix_available >= picks_left)
+            )
             bring_scores = bring_scores.masked_fill(~valid, -1e8)
-            dist = torch.distributions.Categorical(logits=bring_scores)
+            if include_policy_stats:
+                bring_log_probs_step = torch.log_softmax(bring_scores, dim=1)
+                bring_probs_step = bring_log_probs_step.exp()
 
             if canonical_bring is None:
-                chosen = bring_scores.argmax(dim=1) if greedy else dist.sample()
+                chosen = (
+                    bring_scores.argmax(dim=1)
+                    if greedy
+                    else _sample_categorical_logits(bring_scores)
+                )
             else:
                 chosen = canonical_bring[:, step]
 
-            if not valid.gather(1, chosen.unsqueeze(1)).squeeze(1).all():
-                raise RuntimeError("TeamPreviewHead received an invalid canonical bring target.")
+            # Sampled picks come from the masked scores above. Only external
+            # training labels need a host-visible validity check.
+            if (
+                picks is not None
+                and not valid.gather(1, chosen.unsqueeze(1)).squeeze(1).all()
+            ):
+                raise RuntimeError(
+                    "TeamPreviewHead received an invalid canonical bring target."
+                )
 
             bring_picks.append(chosen)
-            bring_log_probs.append(dist.log_prob(chosen))
-            bring_entropies.append(dist.entropy())
+            if include_policy_stats:
+                bring_log_probs.append(
+                    bring_log_probs_step.gather(1, chosen.unsqueeze(1)).squeeze(1)
+                )
+                bring_entropies.append(
+                    -(bring_probs_step * bring_log_probs_step).sum(dim=1)
+                )
 
             remaining.scatter_(1, chosen.unsqueeze(1), False)
             next_min_index = chosen.unsqueeze(1) + 1
@@ -991,61 +1267,106 @@ class TeamPreviewHead(nn.Module):
             picked_sum = picked_sum + chosen_rep
 
         bring_picks_tensor = torch.stack(bring_picks, dim=1)
-        bring_log_prob = torch.stack(bring_log_probs, dim=1).sum(dim=1)
-        bring_entropy = torch.stack(bring_entropies, dim=1).sum(dim=1)
 
-        bring_mask = torch.zeros(batch, team_size, dtype=torch.bool, device=context.device)
+        bring_mask = torch.zeros(
+            batch, team_size, dtype=torch.bool, device=context.device
+        )
         bring_mask.scatter_(1, bring_picks_tensor, True)
         bring_summary = picked_sum / float(self.pick_size)
-        lead_context = self.lead_context_proj(torch.cat([context, bring_summary], dim=-1))
-        lead_opponent_summary = self.opponent_attention(lead_context, opponent_reps, opponent_mask)
+        lead_context = self.lead_context_proj(
+            torch.cat([context, bring_summary], dim=-1)
+        )
+        lead_opponent_summary = self.opponent_attention(
+            lead_context, opponent_reps, opponent_mask
+        )
 
         left = pokemon_reps.unsqueeze(2).expand(-1, team_size, team_size, -1)
         right = pokemon_reps.unsqueeze(1).expand(-1, team_size, team_size, -1)
-        bring_expanded = bring_summary.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
-        opponent_expanded = lead_opponent_summary.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
-        lead_context_expanded = lead_context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        bring_expanded = (
+            bring_summary.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        )
+        opponent_expanded = (
+            lead_opponent_summary.unsqueeze(1)
+            .unsqueeze(2)
+            .expand(-1, team_size, team_size, -1)
+        )
+        lead_context_expanded = (
+            lead_context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        )
         lead_pair_logits = self.lead_pair_score(
-            torch.cat([left, right, bring_expanded, opponent_expanded, lead_context_expanded], dim=-1)
+            torch.cat(
+                [left, right, bring_expanded, opponent_expanded, lead_context_expanded],
+                dim=-1,
+            )
         ).squeeze(-1)
 
-        invalid_pairs = torch.eye(team_size, dtype=torch.bool, device=context.device).unsqueeze(0)
-        invalid_pairs = invalid_pairs | (~bring_mask).unsqueeze(1) | (~bring_mask).unsqueeze(2)
+        invalid_pairs = torch.eye(
+            team_size, dtype=torch.bool, device=context.device
+        ).unsqueeze(0)
+        invalid_pairs = (
+            invalid_pairs | (~bring_mask).unsqueeze(1) | (~bring_mask).unsqueeze(2)
+        )
         if team_mask is not None:
-            invalid_pairs = invalid_pairs | team_mask.unsqueeze(1) | team_mask.unsqueeze(2)
-        lead_pair_logits = lead_pair_logits.masked_fill(invalid_pairs, -1e8).reshape(batch, team_size * team_size)
-        lead_dist = torch.distributions.Categorical(logits=lead_pair_logits)
+            invalid_pairs = (
+                invalid_pairs | team_mask.unsqueeze(1) | team_mask.unsqueeze(2)
+            )
+        lead_pair_logits = lead_pair_logits.masked_fill(invalid_pairs, -1e8).reshape(
+            batch, team_size * team_size
+        )
 
         if picks is None:
-            chosen_pair = lead_pair_logits.argmax(dim=1) if greedy else lead_dist.sample()
+            chosen_pair = (
+                lead_pair_logits.argmax(dim=1)
+                if greedy
+                else _sample_categorical_logits(lead_pair_logits)
+            )
         else:
             chosen_pair = picks[:, 0] * team_size + picks[:, 1]
 
         valid_pairs = (~invalid_pairs).reshape(batch, team_size * team_size)
-        if not valid_pairs.gather(1, chosen_pair.unsqueeze(1)).squeeze(1).all():
+        if (
+            picks is not None
+            and not valid_pairs.gather(1, chosen_pair.unsqueeze(1)).squeeze(1).all()
+        ):
             raise RuntimeError("TeamPreviewHead received an invalid lead pair target.")
 
-        lead_log_prob = lead_dist.log_prob(chosen_pair)
-        lead_entropy = lead_dist.entropy()
-        lead_pair = torch.stack([chosen_pair // team_size, chosen_pair % team_size], dim=1)
+        lead_pair = torch.stack(
+            [chosen_pair // team_size, chosen_pair % team_size], dim=1
+        )
 
         remaining_bring_mask = bring_mask.clone()
         remaining_bring_mask.scatter_(1, lead_pair, False)
-        bench_tail = team_positions.expand(batch, -1).masked_fill(~remaining_bring_mask, team_size)
+        bench_tail = team_positions.expand(batch, -1).masked_fill(
+            ~remaining_bring_mask, team_size
+        )
         bench_tail = bench_tail.sort(dim=1).values[:, : self.pick_size - 2]
         final_picks = torch.cat([lead_pair, bench_tail], dim=1)
 
-        return {
+        result = {
             "bring_picks": bring_picks_tensor,
             "lead_pair": lead_pair,
             "picks": final_picks,
-            "bring_log_prob": bring_log_prob,
-            "lead_log_prob": lead_log_prob,
-            "log_prob": bring_log_prob + lead_log_prob,
-            "bring_entropy": bring_entropy,
-            "lead_entropy": lead_entropy,
-            "entropy": bring_entropy + lead_entropy,
         }
+        if include_policy_stats:
+            bring_log_prob = torch.stack(bring_log_probs, dim=1).sum(dim=1)
+            bring_entropy = torch.stack(bring_entropies, dim=1).sum(dim=1)
+            lead_log_probs = torch.log_softmax(lead_pair_logits, dim=1)
+            lead_probs = lead_log_probs.exp()
+            lead_log_prob = lead_log_probs.gather(1, chosen_pair.unsqueeze(1)).squeeze(
+                1
+            )
+            lead_entropy = -(lead_probs * lead_log_probs).sum(dim=1)
+            result.update(
+                {
+                    "bring_log_prob": bring_log_prob,
+                    "lead_log_prob": lead_log_prob,
+                    "log_prob": bring_log_prob + lead_log_prob,
+                    "bring_entropy": bring_entropy,
+                    "lead_entropy": lead_entropy,
+                    "entropy": bring_entropy + lead_entropy,
+                }
+            )
+        return result
 
 
 class OpponentPreviewHead(nn.Module):
@@ -1072,17 +1393,29 @@ class OpponentPreviewHead(nn.Module):
     ) -> dict[str, torch.Tensor]:
         batch_size, team_size, pokemon_dim = pokemon_reps.shape
         context_expanded = context.unsqueeze(1).expand(-1, team_size, -1)
-        bring_logits = self.bring_score(torch.cat([pokemon_reps, context_expanded], dim=-1)).squeeze(-1)
+        bring_logits = self.bring_score(
+            torch.cat([pokemon_reps, context_expanded], dim=-1)
+        ).squeeze(-1)
 
         left = pokemon_reps.unsqueeze(2).expand(-1, team_size, team_size, -1)
         right = pokemon_reps.unsqueeze(1).expand(-1, team_size, team_size, -1)
-        pair_context = context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
-        lead_pair_logits = self.lead_pair_score(torch.cat([left, right, pair_context], dim=-1)).squeeze(-1)
+        pair_context = (
+            context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
+        )
+        lead_pair_logits = self.lead_pair_score(
+            torch.cat([left, right, pair_context], dim=-1)
+        ).squeeze(-1)
 
-        invalid_pairs = torch.eye(team_size, dtype=torch.bool, device=context.device).unsqueeze(0)
+        invalid_pairs = torch.eye(
+            team_size, dtype=torch.bool, device=context.device
+        ).unsqueeze(0)
         if team_mask is not None:
-            invalid_pairs = invalid_pairs | team_mask.unsqueeze(1) | team_mask.unsqueeze(2)
-        lead_pair_logits = lead_pair_logits.masked_fill(invalid_pairs, -1e8).reshape(batch_size, team_size * team_size)
+            invalid_pairs = (
+                invalid_pairs | team_mask.unsqueeze(1) | team_mask.unsqueeze(2)
+            )
+        lead_pair_logits = lead_pair_logits.masked_fill(invalid_pairs, -1e8).reshape(
+            batch_size, team_size * team_size
+        )
 
         return {
             "opponent_bring_logits": bring_logits,
@@ -1195,8 +1528,12 @@ class ValueHead(nn.Module):
 
     def __init__(self, context_dim: int, pokemon_dim: int, hidden_dim: int = 256):
         super().__init__()
-        self.own_bench_attention = MaskedSetAttention(context_dim, pokemon_dim, hidden_dim)
-        self.opp_bench_attention = MaskedSetAttention(context_dim, pokemon_dim, hidden_dim)
+        self.own_bench_attention = MaskedSetAttention(
+            context_dim, pokemon_dim, hidden_dim
+        )
+        self.opp_bench_attention = MaskedSetAttention(
+            context_dim, pokemon_dim, hidden_dim
+        )
         self.mlp = nn.Sequential(
             nn.Linear(context_dim + 2 * pokemon_dim, hidden_dim),
             nn.ReLU(),

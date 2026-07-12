@@ -2,13 +2,13 @@
 
 The model acts in a fixed discrete space. Single-slot move targets come from
 ``poke-env``'s request-aware Showdown target resolver, and joint legality is
-still delegated to ``DoubleBattleOrder.join_orders``.
+derived directly from the indexed slot orders.
 """
 
 from dataclasses import dataclass
 
 from poke_env.battle import DoubleBattle, Move
-from poke_env.player import DoubleBattleOrder, PassBattleOrder, SingleBattleOrder, SkippedBattleOrder
+from poke_env.player import PassBattleOrder, SingleBattleOrder, SkippedBattleOrder
 
 import numpy as np
 
@@ -66,8 +66,6 @@ class LegalActionState:
 class _SlotActionState:
     action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder]
     mask: np.ndarray
-    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder]
-    action_by_order_id: dict[int, int]
 
 
 def decode_action(action_idx: int) -> tuple[str, int, int]:
@@ -159,6 +157,26 @@ def build_policy_action_masks(
     }
 
 
+def is_default_only_action_state(action_state: LegalActionState) -> bool:
+    """Return true when Showdown only accepts the implicit default order.
+
+    These requests do not represent a policy decision. Routing them through the
+    neural policy adds avoidable queue pressure and can block local protocol
+    dispatch behind inference that cannot affect the emitted order.
+    """
+    slot_one_orders, slot_two_orders = action_state.slot_action_orders
+    if set(slot_one_orders) != {PASS_ACTION} or set(slot_two_orders) != {PASS_ACTION}:
+        return False
+    if np.any(action_state.can_tera):
+        return False
+    joint_mask = action_state.joint_mask
+    return (
+        int(joint_mask.sum()) == 2
+        and bool(joint_mask[FIRST_SLOT_MASK_ROW, PASS_ACTION])
+        and bool(joint_mask[PASS_ACTION + 1, PASS_ACTION])
+    )
+
+
 def empty_action_masks() -> dict[str, np.ndarray]:
     """Return a pass-only legality table used for finished battles."""
     joint_mask = np.zeros((ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
@@ -176,28 +194,35 @@ def _build_joint_mask(
 ) -> np.ndarray:
     joint_mask = np.zeros((ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
 
-    joined_orders = DoubleBattleOrder.join_orders(
-        slot_states[0].joined_orders,
-        slot_states[1].joined_orders,
-    )
-    if not joined_orders:
+    # The slot builders only create ordinary moves, switches, and pass/skip
+    # orders.  For those orders, DoubleBattleOrder.join_orders() is equivalent
+    # to the Cartesian product below with two exclusions: both slots cannot
+    # switch to the same Pokemon, and two explicit pass orders are not a real
+    # joint choice. A skipped slot is distinct from an explicit pass and may be
+    # paired with one. Building the boolean table directly avoids allocating a
+    # DoubleBattleOrder for every candidate pair on every policy decision.
+    legal_pairs = np.logical_and.outer(slot_states[0].mask, slot_states[1].mask)
+    switch_actions = np.arange(SWITCH_OFFSET, PASS_ACTION)
+    legal_pairs[switch_actions, switch_actions] = False
+    first_pass = slot_states[0].action_orders.get(PASS_ACTION)
+    second_pass = slot_states[1].action_orders.get(PASS_ACTION)
+    if isinstance(first_pass, PassBattleOrder) and isinstance(second_pass, PassBattleOrder):
+        legal_pairs[PASS_ACTION, PASS_ACTION] = False
+
+    if not np.any(legal_pairs):
         if (
             set(slot_states[0].action_orders) == {PASS_ACTION}
             and set(slot_states[1].action_orders) == {PASS_ACTION}
         ):
-            joint_mask[FIRST_SLOT_MASK_ROW, PASS_ACTION] = True
-            joint_mask[PASS_ACTION + 1, PASS_ACTION] = True
-            return joint_mask
-        raise RuntimeError(
-            "poke-env produced no legal joined doubles orders for the current request. "
-            "This indicates the request state and action mapping are inconsistent."
-        )
+            legal_pairs[PASS_ACTION, PASS_ACTION] = True
+        else:
+            raise RuntimeError(
+                "poke-env produced no legal joined doubles orders for the current request. "
+                "This indicates the request state and action mapping are inconsistent."
+            )
 
-    for order in joined_orders:
-        a1 = slot_states[0].action_by_order_id[id(order.first_order)]
-        a2 = slot_states[1].action_by_order_id[id(order.second_order)]
-        joint_mask[FIRST_SLOT_MASK_ROW, a1] = True
-        joint_mask[a1 + 1, a2] = True
+    joint_mask[FIRST_SLOT_MASK_ROW] = np.any(legal_pairs, axis=1)
+    joint_mask[1:] = legal_pairs
 
     return joint_mask
 
@@ -264,8 +289,6 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
     trapped = getattr(battle, "trapped", [False, False])
     force_switch = battle.force_switch
     action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder] = {}
-    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder] = []
-    action_by_order_id: dict[int, int] = {}
     mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
 
     if any(force_switch) and not force_switch[slot]:
@@ -282,8 +305,6 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
                 )
             _add_order(
                 action_orders=action_orders,
-                action_by_order_id=action_by_order_id,
-                joined_orders=joined_orders,
                 mask=mask,
                 action_idx=SWITCH_OFFSET + team_slot,
                 order=SingleBattleOrder(pokemon),
@@ -293,14 +314,12 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
     if all(force_switch) and len(battle.available_switches[0]) == 1:
         _add_order(
             action_orders=action_orders,
-            action_by_order_id=action_by_order_id,
-            joined_orders=joined_orders,
             mask=mask,
             action_idx=PASS_ACTION,
             order=PassBattleOrder(),
             slot=slot,
         )
-        return _finalize_slot_state(action_orders, mask, joined_orders, action_by_order_id)
+        return _SlotActionState(action_orders=action_orders, mask=mask)
 
     active_pokemon = battle.active_pokemon[slot]
     if active_pokemon is not None and not force_switch[slot]:
@@ -311,8 +330,6 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
                 action_idx = move_idx * NUM_TARGETS + target_idx
                 _add_order(
                     action_orders=action_orders,
-                    action_by_order_id=action_by_order_id,
-                    joined_orders=joined_orders,
                     mask=mask,
                     action_idx=action_idx,
                     order=SingleBattleOrder(hydrated_move, move_target=target_loc),
@@ -321,7 +338,7 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
 
     if not action_orders:
         return _build_pass_slot_state(mask, explicit=bool(force_switch[slot]))
-    return _finalize_slot_state(action_orders, mask, joined_orders, action_by_order_id)
+    return _SlotActionState(action_orders=action_orders, mask=mask)
 
 
 def _build_pass_slot_state(mask: np.ndarray, *, explicit: bool) -> _SlotActionState:
@@ -331,30 +348,12 @@ def _build_pass_slot_state(mask: np.ndarray, *, explicit: bool) -> _SlotActionSt
     return _SlotActionState(
         action_orders=action_orders,
         mask=mask,
-        joined_orders=[pass_order],
-        action_by_order_id={id(pass_order): PASS_ACTION},
-    )
-
-
-def _finalize_slot_state(
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
-    mask: np.ndarray,
-    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
-    action_by_order_id: dict[int, int],
-) -> _SlotActionState:
-    return _SlotActionState(
-        action_orders=action_orders,
-        mask=mask,
-        joined_orders=joined_orders,
-        action_by_order_id=action_by_order_id,
     )
 
 
 def _add_order(
     *,
     action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
-    action_by_order_id: dict[int, int],
-    joined_orders: list[SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
     mask: np.ndarray,
     action_idx: int,
     order: SingleBattleOrder | PassBattleOrder | SkippedBattleOrder,
@@ -372,8 +371,6 @@ def _add_order(
 
     action_orders[action_idx] = order
     mask[action_idx] = True
-    joined_orders.append(order)
-    action_by_order_id[id(order)] = action_idx
 
 
 def _request_move_entry(move: Move, battle: DoubleBattle, slot: int) -> dict | None:

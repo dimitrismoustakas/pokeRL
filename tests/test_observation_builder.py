@@ -273,6 +273,58 @@ def test_observation_builder_raises_when_active_pokemon_is_missing_from_team() -
         builder.build(battle)
 
 
+def test_observation_builder_keeps_unmatched_visible_opponent_active() -> None:
+    gd = GameData(gen=9)
+    builder = ObservationBuilder(gd, team_size=6)
+
+    visible_active = _pokemon(
+        species="gengar",
+        moves=OrderedDict([("shadowball", _move("shadowball", 24, 24))]),
+        ability=None,
+        item=None,
+        type_1="ghost",
+        type_2="poison",
+        tera_type="ghost",
+        current_hp=100,
+        max_hp=100,
+        revealed=True,
+    )
+    tracked_opponent = _pokemon(
+        species="zoroark",
+        moves=OrderedDict(),
+        ability=None,
+        item=None,
+        type_1="dark",
+        type_2=None,
+        tera_type="poison",
+        current_hp=100,
+        max_hp=100,
+    )
+
+    battle = SimpleNamespace(
+        team=OrderedDict(),
+        opponent_team=OrderedDict([("p2:1", tracked_opponent)]),
+        active_pokemon=[None, None],
+        opponent_active_pokemon=[visible_active, None],
+        weather={},
+        fields={},
+        side_conditions={},
+        opponent_side_conditions={},
+        turn=1,
+        used_tera=False,
+        opponent_used_tera=False,
+    )
+
+    obs = builder.build(battle)
+
+    assert obs["opp_active_indices"].tolist() == [0, 0]
+    assert obs["opp_active_present"].tolist() == [True, False]
+    assert obs["opp_roles"].tolist()[:2] == [ROLE_ACTIVE_1, ROLE_BENCH]
+    assert obs["opp_species"][0] == gd.species_to_idx["gengar"]
+    assert obs["opp_species"][1] == gd.species_to_idx["zoroark"]
+    assert obs["opp_moves"][0, 0] == gd.move_to_idx["shadowball"]
+
+
 def test_team_preview_pokemon_init_keeps_preview_revealed_flag_unset() -> None:
     gd = GameData(gen=9)
 

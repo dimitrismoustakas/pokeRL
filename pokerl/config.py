@@ -39,9 +39,10 @@ class EnvConfig:
     showdown_dir: str | None = None
     worker_count: int | None = None
     battles_per_worker: int | None = None
-    pool_mode: str = "shared"
     runtime_loop_count: int | None = None
+    battle_loop_count: int | None = None
     battlestream_startup_timeout: float = 30.0
+    reset_concurrency: int | None = None
     opponent_group: int = 0
 
 
@@ -101,7 +102,7 @@ class TrainingConfig:
     # League
     league_size: int = 12
     league_update_interval: int = 10
-    league_coalesce_ms: float = 0.0
+    league_coalesce_ms: float = 5.0
 
     def __post_init__(self) -> None:
         if self.tera_exploration_decay_updates < 0:

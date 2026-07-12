@@ -1,5 +1,7 @@
+import asyncio
 import copy
 from concurrent.futures import Future
+from threading import Thread
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,6 +28,7 @@ from pokerl.env.actions import (
     build_legal_action_state,
     build_joint_action_mask,
     build_tera_action_mask,
+    is_default_only_action_state,
 )
 from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
 from pokerl.env.observation import (
@@ -62,6 +65,51 @@ def _mask(num_envs: int) -> dict[str, np.ndarray]:
         "joint": joint,
         "can_tera": np.zeros((num_envs, 2), dtype=bool),
     }
+
+
+@pytest.mark.asyncio
+async def test_async_queue_sync_get_records_item_timing() -> None:
+    timing = showdown_env_module._TimingStats(enabled=True)
+    queue = showdown_env_module._AsyncQueue(
+        asyncio.get_running_loop(),
+        sync_get=True,
+        timing=timing,
+        key_prefix="test_queue",
+    )
+
+    payload = object()
+    queue.put(payload)
+
+    assert queue.get(timeout=0.1) is payload
+    snapshot = timing.snapshot_and_reset()
+    assert snapshot["test_queue_put_calls"] == 1.0
+    assert snapshot["test_queue_get_calls"] == 1.0
+    assert snapshot["test_queue_get_wait_sec"] >= 0.0
+    assert snapshot["test_queue_item_age_sec"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_async_queue_threadsafe_put_records_loop_delay() -> None:
+    timing = showdown_env_module._TimingStats(enabled=True)
+    queue = showdown_env_module._AsyncQueue(
+        asyncio.get_running_loop(),
+        timing=timing,
+        key_prefix="test_queue",
+    )
+
+    thread = Thread(target=queue.put, args=("action",))
+    thread.start()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+
+    assert await asyncio.wait_for(queue.async_get(), timeout=1.0) == "action"
+    snapshot = timing.snapshot_and_reset()
+    assert snapshot["test_queue_threadsafe_put_calls"] == 1.0
+    assert snapshot["test_queue_threadsafe_put_completed_calls"] == 1.0
+    assert snapshot["test_queue_put_calls"] == 1.0
+    assert snapshot["test_queue_get_calls"] == 1.0
+    assert snapshot["test_queue_loop_put_delay_sec"] >= 0.0
+    assert snapshot["test_queue_item_age_sec"] >= 0.0
 
 
 def _obs_to_tensor(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -407,6 +455,38 @@ def test_ppo_head_chunking_matches_stepwise_head_evaluation() -> None:
             assert torch.equal(chunk_value, step_value)
 
 
+def _minimal_action_head_inputs():
+    head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
+    context = torch.zeros((1, 3))
+    active_reps = torch.zeros((1, 2, 2))
+    own_team_reps = torch.zeros((1, 6, 2))
+    opp_team_reps = torch.zeros((1, 6, 2))
+    opp_reserve_mask = torch.tensor(
+        [[True, True, False, False, False, False]],
+        dtype=torch.bool,
+    )
+    opp_active_reps = torch.zeros((1, 2, 2))
+    masks = {
+        "joint": torch.zeros(
+            (1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT),
+            dtype=torch.bool,
+        ),
+        "can_tera": torch.zeros((1, 2), dtype=torch.bool),
+    }
+    masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
+    masks["joint"][0, 1, 0] = True
+    return (
+        head,
+        context,
+        active_reps,
+        own_team_reps,
+        opp_team_reps,
+        opp_reserve_mask,
+        opp_active_reps,
+        masks,
+    )
+
+
 def test_action_head_uses_joint_and_tera_masks_to_coordinate_actions() -> None:
     torch.manual_seed(0)
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
@@ -473,6 +553,58 @@ def test_action_head_can_skip_policy_stats_for_frozen_opponent_inference() -> No
     assert torch.equal(out["actions"], chosen_actions)
     assert "log_prob" not in out
     assert "entropy" not in out
+
+
+def test_action_head_sampled_actions_skip_host_legality_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _minimal_action_head_inputs()
+
+    def fail_all(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("sampled actions must not run Tensor.all legality checks")
+
+    monkeypatch.setattr(torch.Tensor, "all", fail_all)
+
+    out = inputs[0](
+        *inputs[1:-1],
+        inputs[-1],
+        greedy=True,
+        include_policy_stats=False,
+    )
+
+    assert torch.equal(
+        out["actions"],
+        torch.tensor([[0, 0, TERA_NONE]], dtype=torch.long),
+    )
+
+
+def test_action_head_validates_externally_supplied_actions_by_default() -> None:
+    inputs = _minimal_action_head_inputs()
+    illegal_actions = torch.tensor([[1, 0, TERA_NONE]], dtype=torch.long)
+
+    with pytest.raises(RuntimeError, match="illegal first-slot action"):
+        inputs[0](
+            *inputs[1:-1],
+            inputs[-1],
+            actions=illegal_actions,
+            include_policy_stats=False,
+        )
+
+
+def test_action_head_allows_trusted_supplied_actions_to_skip_validation() -> None:
+    inputs = _minimal_action_head_inputs()
+    trusted_actions = torch.tensor([[1, 0, TERA_NONE]], dtype=torch.long)
+
+    out = inputs[0](
+        *inputs[1:-1],
+        inputs[-1],
+        actions=trusted_actions,
+        validate_actions=False,
+        include_policy_stats=False,
+    )
+
+    assert torch.equal(out["actions"], trusted_actions)
 
 
 def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_target() -> None:
@@ -564,6 +696,43 @@ def test_action_head_categorical_choice_matches_torch_distribution_for_evaluatio
     assert torch.equal(selected, actions)
     assert torch.allclose(log_prob, dist.log_prob(actions))
     assert torch.allclose(entropy, dist.entropy())
+
+
+def test_action_head_categorical_choice_samples_without_torch_multinomial(monkeypatch) -> None:
+    def fail_multinomial(*args, **kwargs):
+        raise AssertionError("torch.multinomial should not be used for policy sampling")
+
+    monkeypatch.setattr(torch, "multinomial", fail_multinomial)
+    torch.manual_seed(0)
+    logits = torch.tensor(
+        [
+            [1.5, -2.0, 0.25],
+            [-0.75, 0.5, 2.25],
+        ],
+        dtype=torch.float32,
+    )
+
+    selected, log_prob, entropy = ActionHead._categorical_choice(
+        logits,
+        actions=None,
+        greedy=False,
+    )
+    selected_no_stats, log_prob_no_stats, entropy_no_stats = ActionHead._categorical_choice(
+        logits,
+        actions=None,
+        greedy=False,
+        include_stats=False,
+    )
+
+    assert selected.shape == (2,)
+    assert selected.device == logits.device
+    assert torch.all((selected >= 0) & (selected < logits.shape[1]))
+    assert log_prob.shape == (2,)
+    assert entropy.shape == (2,)
+    assert selected_no_stats.shape == (2,)
+    assert torch.all((selected_no_stats >= 0) & (selected_no_stats < logits.shape[1]))
+    assert log_prob_no_stats is None
+    assert entropy_no_stats is None
 
 
 def test_action_head_force_delay_turns_early_sampled_tera_into_no_tera() -> None:
@@ -667,6 +836,72 @@ def test_team_preview_head_accepts_opponent_structure_and_greedy_mode() -> None:
     assert torch.all(out["picks"][:, 2:] == out["picks"][:, 2:].sort(dim=1).values)
 
 
+def test_team_preview_head_samples_without_torch_multinomial(monkeypatch) -> None:
+    def fail_multinomial(*args, **kwargs):
+        raise AssertionError("torch.multinomial should not be used for team-preview sampling")
+
+    monkeypatch.setattr(torch, "multinomial", fail_multinomial)
+    torch.manual_seed(0)
+    head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=3)
+    own_reps = torch.randn(2, 6, 4)
+    opp_reps = torch.randn(2, 6, 4)
+    context = torch.randn(2, 6)
+
+    out = head(own_reps, opp_reps, context, greedy=False)
+
+    assert out["picks"].shape == (2, 3)
+    assert out["log_prob"].shape == (2,)
+    assert out["entropy"].shape == (2,)
+
+
+def test_team_preview_head_sampled_picks_skip_host_legality_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_all(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("sampled picks must not run Tensor.all legality checks")
+
+    monkeypatch.setattr(torch.Tensor, "all", fail_all)
+    head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=3)
+    out = head(
+        torch.randn(2, 6, 4),
+        torch.randn(2, 6, 4),
+        torch.randn(2, 6),
+        greedy=True,
+        include_policy_stats=False,
+    )
+
+    assert out["picks"].shape == (2, 3)
+
+
+def test_team_preview_head_validates_externally_supplied_picks() -> None:
+    head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=3)
+
+    with pytest.raises(RuntimeError, match="invalid canonical bring target"):
+        head(
+            torch.randn(1, 6, 4),
+            torch.randn(1, 6, 4),
+            torch.randn(1, 6),
+            picks=torch.tensor([[0, 0, 1]], dtype=torch.long),
+        )
+
+
+def test_team_preview_head_can_return_picks_without_policy_stats() -> None:
+    torch.manual_seed(0)
+    head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=3)
+    own_reps = torch.randn(2, 6, 4)
+    opp_reps = torch.randn(2, 6, 4)
+    context = torch.randn(2, 6)
+
+    out = head(own_reps, opp_reps, context, greedy=False, include_policy_stats=False)
+
+    assert out["picks"].shape == (2, 3)
+    assert out["lead_pair"].shape == (2, 2)
+    assert out["bring_picks"].shape == (2, 3)
+    assert "log_prob" not in out
+    assert "entropy" not in out
+
+
 def test_team_preview_head_preserves_lead_order_while_canonicalizing_bench_tail() -> None:
     torch.manual_seed(0)
     head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=4)
@@ -713,6 +948,29 @@ class _FakeBattle:
         self.available_switches = [[bench_one], []]
         self.last_request = {"active": [{"moves": []}, {"moves": []}]}
 
+
+class _DefaultOnlyBattle:
+    POKEMON_1_POSITION = -1
+    POKEMON_2_POSITION = -2
+    OPPONENT_1_POSITION = 1
+    OPPONENT_2_POSITION = 2
+    EMPTY_TARGET_POSITION = 0
+
+    def __init__(self) -> None:
+        self.finished = False
+        self.battle_tag = "battle-default-only"
+        self.turn = 3
+        self.force_switch = [False, False]
+        self.can_tera = [False, False]
+        self.trapped = [False, False]
+        self.active_pokemon = [None, None]
+        self.opponent_active_pokemon = [None, None]
+        self.available_moves = [[], []]
+        self.available_switches = [[], []]
+        self.team = {}
+        self.last_request = {"active": [{"moves": []}, {"moves": []}]}
+
+
 def test_switch_actions_use_stable_team_slots() -> None:
     battle = _FakeBattle()
 
@@ -747,6 +1005,29 @@ def test_legal_action_state_reuses_slot_orders(monkeypatch: pytest.MonkeyPatch) 
     assert build_joint_action_mask(battle, action_state=action_state)[FIRST_SLOT_MASK_ROW, switch_action]
     assert action_to_order(switch_action, battle, slot=0, action_state=action_state).order is battle.available_switches[0][0]
     assert calls == 2
+
+
+def test_default_only_action_state_detects_pass_only_request() -> None:
+    action_state = build_legal_action_state(_DefaultOnlyBattle())
+
+    assert is_default_only_action_state(action_state)
+
+
+@pytest.mark.asyncio
+async def test_showdown_player_default_only_request_skips_observation() -> None:
+    player = ShowdownPlayer.__new__(ShowdownPlayer)
+    player._closing = False
+    player.choose_default_move = lambda: PassBattleOrder()
+    player._begin_action_request = lambda: (_ for _ in ()).throw(
+        AssertionError("default-only request should not ask the trainer for an action")
+    )
+    player._emit_battle_update = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("default-only request should not emit an observation")
+    )
+
+    order = await ShowdownPlayer._choose_move(player, _DefaultOnlyBattle())
+
+    assert isinstance(order, PassBattleOrder)
 
 
 class _FakeTargetBattle:
@@ -1116,6 +1397,33 @@ def test_battle_env_team_preview_propagates_precompute_failure() -> None:
         BattleEnv._choose_team_preview_picks(fake_env, obs)
 
 
+@pytest.mark.asyncio
+async def test_battle_env_async_team_preview_awaits_precomputed_future() -> None:
+    obs = {"context": np.array([1, 2, 3], dtype=np.int64)}
+    future: Future = Future()
+    timing = SimpleNamespace(increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None)
+    fake_env = SimpleNamespace(
+        _active_preview_obs=obs,
+        _active_preview_future=future,
+        _team_preview_batcher=None,
+        _timing=timing,
+        _ext_team_preview_fn=lambda current_obs: (_ for _ in ()).throw(AssertionError("fallback should not run")),
+        _obs_equal=lambda left, right: BattleEnv._obs_equal(left, right),
+        _record_preview_obs_mismatch=lambda actual, prepared: (_ for _ in ()).throw(
+            AssertionError("mismatch handler should not run")
+        ),
+    )
+
+    task = asyncio.create_task(BattleEnv._choose_team_preview_picks_async(fake_env, obs))
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    expected = np.array([0, 1, 2, 3], dtype=np.int64)
+    future.set_result(expected)
+
+    np.testing.assert_array_equal(await asyncio.wait_for(task, timeout=0.2), expected)
+
+
 def test_finished_battle_update_skips_legality_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
     queued = []
     timing = SimpleNamespace(increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None)
@@ -1180,9 +1488,10 @@ def test_emit_pending_finished_battle_enqueues_terminal_observation(
         _pending_action_state=None,
         _pending_action_battle=None,
     )
-    fake_player._emit_battle_update = lambda battle: ShowdownPlayer._emit_battle_update(
+    fake_player._emit_battle_update = lambda battle, request_id=None: ShowdownPlayer._emit_battle_update(
         fake_player,
         battle,
+        request_id=request_id,
     )
     battle = SimpleNamespace(battle_tag="battle-1", turn=7, finished=True, won=True, lost=False)
     fake_player._pending_finished_battle = battle
@@ -1203,7 +1512,21 @@ def test_emit_pending_finished_battle_enqueues_terminal_observation(
     assert queued_battle is battle
 
 
-def test_league_player_team_preview_propagates_precompute_failure() -> None:
+def test_league_player_finished_battle_cancels_pending_inference() -> None:
+    battle = SimpleNamespace(finished=True)
+    future: Future = Future()
+    fake_player = SimpleNamespace(
+        _pending_action_future=future,
+        _pending_action_battle=battle,
+    )
+
+    LeaguePlayer._battle_finished_callback(fake_player, battle)
+
+    assert future.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_league_player_team_preview_propagates_precompute_failure() -> None:
     obs = {"context": np.array([1, 2, 3], dtype=np.int64)}
     future: Future = Future()
     future.set_exception(RuntimeError("opponent preview batch failed"))
@@ -1226,16 +1549,20 @@ def test_league_player_team_preview_propagates_precompute_failure() -> None:
     )
 
     with pytest.raises(RuntimeError, match="opponent preview batch failed"):
-        LeaguePlayer.teampreview(fake_player, battle=object())
+        await LeaguePlayer._teampreview(fake_player, battle=object())
 
 
-def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeInferenceService:
         def __init__(self) -> None:
             self.hidden_inputs: list[torch.Tensor | None] = []
             self.step = 0
 
         def infer_action(self, checkpoint_path, obs, masks, hidden, timing=None):
+            return self.submit_action(checkpoint_path, obs, masks, hidden, timing=timing).result()
+
+        def submit_action(self, checkpoint_path, obs, masks, hidden, timing=None):
             self.step += 1
             self.hidden_inputs.append(None if hidden is None else hidden[0].clone())
             next_value = float(10 + self.step)
@@ -1243,7 +1570,9 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
                 torch.full((1, 1, 1), next_value),
                 torch.full((1, 1, 1), next_value + 100),
             )
-            return np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden
+            future: Future = Future()
+            future.set_result((np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden))
+            return future
 
     fake_service = _FakeInferenceService()
     build_calls = []
@@ -1262,6 +1591,11 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
     )
     player._pending_hidden = None
     player._pending_decision_key = None
+    player._inflight_decision_key = None
+    player._pending_order = None
+    player._pending_action_future = None
+    player._pending_action_battle = None
+    player._pending_action_started_at = None
     player._last_actions = None
     player.choose_default_move = lambda: PassBattleOrder()
     monkeypatch.setattr(
@@ -1297,15 +1631,147 @@ def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: py
     retry_battle = SimpleNamespace(state=1, turn=1, **battle_kwargs)
     next_battle = SimpleNamespace(state=2, turn=2, **battle_kwargs)
 
-    LeaguePlayer.choose_move(player, retry_battle)
-    LeaguePlayer.choose_move(player, retry_battle)
-    LeaguePlayer.choose_move(player, next_battle)
+    await LeaguePlayer.choose_move(player, retry_battle)
+    await LeaguePlayer.choose_move(player, retry_battle)
+    await LeaguePlayer.choose_move(player, next_battle)
 
-    assert fake_service.step == 3
-    assert build_calls == [1, 1, 2]
+    assert fake_service.step == 2
+    assert build_calls == [1, 2]
     assert torch.equal(fake_service.hidden_inputs[0], torch.full((1, 1, 1), 1.0))
-    assert torch.equal(fake_service.hidden_inputs[1], torch.full((1, 1, 1), 1.0))
-    assert torch.equal(fake_service.hidden_inputs[2], torch.full((1, 1, 1), 12.0))
+    assert torch.equal(fake_service.hidden_inputs[1], torch.full((1, 1, 1), 11.0))
+
+
+@pytest.mark.asyncio
+async def test_league_player_reuses_inflight_same_state_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeInferenceService:
+        def __init__(self) -> None:
+            self.future: Future = Future()
+            self.submit_calls = 0
+            self.hidden_inputs: list[torch.Tensor | None] = []
+
+        def submit_action(self, checkpoint_path, obs, masks, hidden, timing=None):
+            self.submit_calls += 1
+            self.hidden_inputs.append(None if hidden is None else hidden[0].clone())
+            return self.future
+
+    fake_service = _FakeInferenceService()
+    build_calls = []
+
+    def _build_obs(battle):
+        build_calls.append(battle.state)
+        return {"context": np.array([battle.state], dtype=np.int64)}
+
+    player = LeaguePlayer.__new__(LeaguePlayer)
+    player.checkpoint_path = "checkpoint.pt"
+    player.inference_service = fake_service
+    player.obs_builder = SimpleNamespace(build=_build_obs)
+    player._hidden = (
+        torch.full((1, 1, 1), 1.0),
+        torch.full((1, 1, 1), 101.0),
+    )
+    player._pending_hidden = None
+    player._pending_decision_key = None
+    player._inflight_decision_key = None
+    player._pending_order = None
+    player._pending_action_future = None
+    player._pending_action_battle = None
+    player._pending_action_started_at = None
+    player._last_actions = None
+    player._timing = None
+    player.choose_default_move = lambda: PassBattleOrder()
+    monkeypatch.setattr(
+        league_module,
+        "build_legal_action_state",
+        lambda battle: SimpleNamespace(
+            joint_mask=np.pad(
+                np.array([[True] + [False] * (ACTIONS_PER_SLOT - 1)], dtype=bool),
+                ((0, ACTIONS_PER_SLOT), (0, 0)),
+                constant_values=False,
+            ),
+            can_tera=np.array([False, False], dtype=bool),
+            slot_action_orders=({}, {}),
+            slot_masks=(np.zeros(ACTIONS_PER_SLOT, dtype=bool), np.zeros(ACTIONS_PER_SLOT, dtype=bool)),
+        ),
+    )
+    monkeypatch.setattr(
+        league_module,
+        "action_to_order",
+        lambda action_idx, battle, slot, terastallize=False, action_state=None: PassBattleOrder(),
+    )
+
+    battle = SimpleNamespace(
+        state=1,
+        finished=False,
+        battle_tag="battle-inflight",
+        turn=1,
+        active_pokemon=[SimpleNamespace(species="a"), SimpleNamespace(species="b")],
+        opponent_active_pokemon=[SimpleNamespace(species="c"), SimpleNamespace(species="d")],
+        force_switch=[False, False],
+        can_tera=[False, False],
+        trapped=[False, False],
+        last_request={"active": [{"moves": []}, {"moves": []}]},
+    )
+
+    first = asyncio.create_task(LeaguePlayer.choose_move(player, battle))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(LeaguePlayer.choose_move(player, battle))
+    await asyncio.sleep(0)
+
+    assert fake_service.submit_calls == 1
+    assert build_calls == [1]
+
+    next_hidden = (
+        torch.full((1, 1, 1), 11.0),
+        torch.full((1, 1, 1), 111.0),
+    )
+    fake_service.future.set_result((np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden))
+    order1, order2 = await asyncio.gather(first, second)
+
+    assert isinstance(order1, PassBattleOrder)
+    assert order2 is order1
+    assert fake_service.submit_calls == 1
+    assert torch.equal(fake_service.hidden_inputs[0], torch.full((1, 1, 1), 1.0))
+    assert torch.equal(player._pending_hidden[0], torch.full((1, 1, 1), 11.0))
+
+
+@pytest.mark.asyncio
+async def test_league_player_default_only_request_skips_inference() -> None:
+    class _FakeInferenceService:
+        def submit_action(self, *args, **kwargs):
+            raise AssertionError("default-only request should not submit league inference")
+
+    player = LeaguePlayer.__new__(LeaguePlayer)
+    player.checkpoint_path = "checkpoint.pt"
+    player.inference_service = _FakeInferenceService()
+    player.obs_builder = SimpleNamespace(
+        build=lambda battle: (_ for _ in ()).throw(
+            AssertionError("default-only request should not build neural observations")
+        )
+    )
+    player._hidden = (
+        torch.full((1, 1, 1), 3.0),
+        torch.full((1, 1, 1), 103.0),
+    )
+    player._pending_hidden = None
+    player._pending_decision_key = None
+    player._inflight_decision_key = None
+    player._pending_order = None
+    player._pending_action_future = None
+    player._pending_action_battle = None
+    player._pending_action_started_at = None
+    player._last_actions = None
+    player._timing = None
+    player.choose_default_move = lambda: PassBattleOrder()
+
+    order = await LeaguePlayer.choose_move(player, _DefaultOnlyBattle())
+
+    assert isinstance(order, PassBattleOrder)
+    assert player._pending_order is order
+    np.testing.assert_array_equal(
+        player._last_actions,
+        np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64),
+    )
+    assert torch.equal(player._pending_hidden[0], player._hidden[0])
 
 
 def test_league_player_decision_signature_tracks_action_request_fields() -> None:

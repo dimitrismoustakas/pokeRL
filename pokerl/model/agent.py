@@ -153,6 +153,9 @@ class PokeAgent(nn.Module):
                 provided (PPO update path).
             tera_force_delay_max_turn: latest battle turn eligible for forced
                 no-tera exploration. 0 disables it.
+            validate_actions: validate caller-supplied actions against the
+                masks. Internally sampled actions are already constrained by
+                those masks and do not require a host-side validation barrier.
             include_value: whether to compute and return the value estimate.
                 League opponents set this to false because they only need actions
                 and recurrent hidden state.
@@ -205,6 +208,9 @@ class PokeAgent(nn.Module):
         hidden=None,
         picks: torch.Tensor | None = None,
         greedy: bool = False,
+        include_value: bool = True,
+        include_policy_stats: bool = True,
+        include_opponent_preview: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for team preview (selecting 4 from 6).
 
@@ -223,21 +229,23 @@ class PokeAgent(nn.Module):
             obs.get("opp_mask"),
             picks,
             greedy,
+            include_policy_stats=include_policy_stats,
         )
-        opponent_out = self.opponent_preview_head(opp_reps, context, obs.get("opp_mask"))
-        preview_value = self.preview_value_head(
-            context,
-            own_reps,
-            opp_reps,
-            obs.get("own_mask"),
-            obs.get("opp_mask"),
-        )
-        return {
+        result = {
             **preview_out,
-            **opponent_out,
-            "preview_value": preview_value,
             "hidden": new_hidden,
         }
+        if include_opponent_preview:
+            result.update(self.opponent_preview_head(opp_reps, context, obs.get("opp_mask")))
+        if include_value:
+            result["preview_value"] = self.preview_value_head(
+                context,
+                own_reps,
+                opp_reps,
+                obs.get("own_mask"),
+                obs.get("opp_mask"),
+            )
+        return result
 
     def get_value(self, obs: dict[str, torch.Tensor], hidden=None) -> torch.Tensor:
         """Just the value estimate, for GAE computation."""
