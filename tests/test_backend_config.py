@@ -143,6 +143,14 @@ def test_float32_matmul_precision_defaults_to_highest(monkeypatch) -> None:
     assert parse_args().float32_matmul_precision == "highest"
 
 
+def test_memory_gradient_diagnostics_are_opt_in(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["train", "--diagnose-memory-gradients"])
+
+    _, _, train_config = build_configs(parse_args())
+
+    assert train_config.diagnose_memory_gradients is True
+
+
 def test_num_updates_are_additional_when_resuming() -> None:
     steps_per_update = 9_216
 

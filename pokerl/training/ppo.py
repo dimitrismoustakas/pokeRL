@@ -31,6 +31,12 @@ class PPOTrainer:
         self._trainable_params = [
             param for param in agent.parameters() if param.requires_grad
         ]
+        memory = getattr(agent, "memory", None)
+        self._memory_params = (
+            tuple(param for param in memory.parameters() if param.requires_grad)
+            if memory is not None
+            else ()
+        )
         self.global_step = 0
 
     def _make_optimizer(self) -> torch.optim.Adam:
@@ -112,6 +118,7 @@ class PPOTrainer:
         }
         num_updates = 0
         skipped_nonfinite = 0
+        memory_gradient_diagnostics: dict[str, float] = {}
 
         aux_labels_all = batch.aux_labels
         aux_label_valid_all = batch.aux_label_valid
@@ -350,9 +357,54 @@ class PPOTrainer:
                     )
                     loss = loss + self.config.aux_opp_action_coef * opp_action_loss
 
+                pending_memory_diagnostics = None
+                if (
+                    self.config.diagnose_memory_gradients
+                    and not memory_gradient_diagnostics
+                    and self._memory_params
+                ):
+                    support_tensors = []
+                    support_names = []
+                    if hidden_info_loss is not None:
+                        support_names.append("memory_grad_hidden_info_valid_slots")
+                        support_tensors.append(aux_label_valid_mb.sum())
+                    if opp_action_loss is not None:
+                        support_names.append("memory_grad_opp_action_valid_steps")
+                        support_tensors.append(opp_actions_valid_mb.sum())
+                    support_values = (
+                        torch.stack(support_tensors).detach().to(device="cpu").tolist()
+                        if support_tensors
+                        else []
+                    )
+                    support = dict(zip(support_names, support_values, strict=True))
+                    objectives = {
+                        "actor": policy_loss + self.config.entropy_coef * entropy_loss,
+                        "value": self.config.value_coef * value_loss,
+                    }
+                    if hidden_info_loss is not None:
+                        objectives["hidden_info"] = (
+                            self.config.aux_hidden_info_coef * hidden_info_loss
+                        )
+                    if opp_action_loss is not None:
+                        objectives["opp_action"] = (
+                            self.config.aux_opp_action_coef * opp_action_loss
+                        )
+                    if all(value > 0 for value in support.values()):
+                        pending_memory_diagnostics = self._gradient_diagnostics(
+                            objectives,
+                            self._memory_params,
+                            prefix="memory_grad",
+                        )
+                        pending_memory_diagnostics.update(support)
+                        pending_memory_diagnostics["memory_grad_minibatch_envs"] = (
+                            float(E_mb)
+                        )
+
                 if not self._apply_update_step(loss):
                     skipped_nonfinite += 1
                     continue
+                if pending_memory_diagnostics is not None:
+                    memory_gradient_diagnostics = pending_memory_diagnostics
 
                 with torch.no_grad():
                     approx_kl = (
@@ -385,9 +437,106 @@ class PPOTrainer:
         averaged = {
             key: (value / num_updates).item() for key, value in metric_sums.items()
         }
+        averaged.update(memory_gradient_diagnostics)
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
+
+    @staticmethod
+    def _gradient_diagnostics(
+        objectives: dict[str, torch.Tensor],
+        parameters: tuple[torch.nn.Parameter, ...],
+        *,
+        prefix: str,
+    ) -> dict[str, float]:
+        """Measure objective gradient norms/cosines without consuming the graph."""
+        gradients: dict[str, tuple[torch.Tensor | None, ...]] = {}
+        norms: dict[str, torch.Tensor] = {}
+        scalar_diagnostics: dict[str, torch.Tensor] = {}
+        reference = next(iter(objectives.values()))
+
+        for name, objective in objectives.items():
+            objective_gradients = (
+                torch.autograd.grad(
+                    objective,
+                    parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                if objective.requires_grad
+                else (None,) * len(parameters)
+            )
+            gradients[name] = objective_gradients
+            squared_norm = objective.new_zeros(())
+            for gradient in objective_gradients:
+                if gradient is not None:
+                    squared_norm = squared_norm + gradient.detach().square().sum()
+            norm = torch.sqrt(squared_norm)
+            norms[name] = norm
+            connected = any(gradient is not None for gradient in objective_gradients)
+            scalar_diagnostics[f"{prefix}_norm_{name}"] = norm
+            scalar_diagnostics[f"{prefix}_connected_{name}"] = reference.new_tensor(
+                float(connected)
+            )
+            scalar_diagnostics[f"{prefix}_nonzero_{name}"] = (norm > 0).to(
+                reference.dtype
+            )
+
+        names = tuple(objectives)
+        for left_index, left_name in enumerate(names):
+            for right_name in names[left_index + 1 :]:
+                denominator = norms[left_name] * norms[right_name]
+                dot = objectives[left_name].new_zeros(())
+                for left_gradient, right_gradient in zip(
+                    gradients[left_name],
+                    gradients[right_name],
+                    strict=True,
+                ):
+                    if left_gradient is not None and right_gradient is not None:
+                        dot = (
+                            dot
+                            + (left_gradient.detach() * right_gradient.detach()).sum()
+                        )
+                valid = denominator > 0
+                scalar_diagnostics[f"{prefix}_cos_{left_name}_{right_name}"] = (
+                    torch.where(valid, dot / denominator.clamp_min(1e-30), dot)
+                )
+                scalar_diagnostics[f"{prefix}_cos_{left_name}_{right_name}_valid"] = (
+                    valid.to(reference.dtype)
+                )
+
+        squared_total_norm = reference.new_zeros(())
+        for parameter_index in range(len(parameters)):
+            combined_gradient = None
+            for name in names:
+                gradient = gradients[name][parameter_index]
+                if gradient is not None:
+                    combined_gradient = (
+                        gradient.detach()
+                        if combined_gradient is None
+                        else combined_gradient + gradient.detach()
+                    )
+            if combined_gradient is not None:
+                squared_total_norm = (
+                    squared_total_norm + combined_gradient.square().sum()
+                )
+        combined_norm = torch.sqrt(squared_total_norm)
+        component_norm_sum = sum(norms.values(), start=reference.new_zeros(()))
+        scalar_diagnostics[f"{prefix}_norm_combined"] = combined_norm
+        scalar_diagnostics[f"{prefix}_cancellation_fraction"] = torch.where(
+            component_norm_sum > 0,
+            1.0 - combined_norm / component_norm_sum.clamp_min(1e-30),
+            component_norm_sum,
+        )
+
+        keys = tuple(scalar_diagnostics)
+        values = (
+            torch.stack([scalar_diagnostics[key] for key in keys])
+            .detach()
+            .to(device="cpu", dtype=torch.float64)
+            .tolist()
+        )
+        return dict(zip(keys, values, strict=True))
 
     @staticmethod
     def _hidden_info_loss(

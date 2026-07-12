@@ -302,6 +302,14 @@ def parse_args() -> argparse.Namespace:
         help="Coefficient on the opponent-action prediction loss (a1/a2/tera).",
     )
     parser.add_argument(
+        "--diagnose-memory-gradients",
+        action="store_true",
+        help=(
+            "Measure weighted actor/value/auxiliary gradient norms and cosine "
+            "conflicts on the shared memory for one PPO minibatch per update."
+        ),
+    )
+    parser.add_argument(
         "--league-coalesce-ms",
         type=float,
         default=None,
@@ -383,6 +391,7 @@ def build_configs(
         "tera_force_delay_max_turn": args.tera_force_delay_max_turn,
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
         "aux_opp_action_coef": args.aux_opp_action_coef,
+        "diagnose_memory_gradients": args.diagnose_memory_gradients,
     }
     for field_name, value in overrides.items():
         if value is not None:
@@ -1240,6 +1249,7 @@ def train():
             "tera_force_delay_max_turn": train_config.tera_force_delay_max_turn,
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
+            "diagnose_memory_gradients": train_config.diagnose_memory_gradients,
             "league_coalesce_ms": train_config.league_coalesce_ms,
             "league_inference_device": str(league.inference_device),
             "league_preview_inference_device": str(league.preview_inference_device),

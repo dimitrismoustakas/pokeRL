@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import pytest
 
 from pokerl.env.observation import (
     ABILITY_KNOWN_OFFSET,
@@ -93,6 +94,42 @@ def test_hidden_info_loss_matches_dense_reference() -> None:
     dense_loss = _dense_hidden_info_loss(head(opp_reps), labels, label_valid)
 
     assert torch.allclose(sparse_loss, dense_loss)
+
+
+def test_gradient_diagnostics_measure_norms_conflicts_and_preserve_graph() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    unrelated = torch.nn.Parameter(torch.tensor([3.0]))
+    objectives = {
+        "actor": (parameter * torch.tensor([1.0, 0.0])).sum(),
+        "value": (parameter * torch.tensor([0.0, 2.0])).sum(),
+        "opp_action": (parameter * torch.tensor([-1.0, 0.0])).sum(),
+        "hidden_info": unrelated.square().sum(),
+        "zero_connected": (parameter * 0.0).sum(),
+    }
+
+    diagnostics = PPOTrainer._gradient_diagnostics(
+        objectives,
+        (parameter,),
+        prefix="memory_grad",
+    )
+    sum(objectives.values()).backward()
+
+    assert diagnostics["memory_grad_norm_actor"] == pytest.approx(1.0)
+    assert diagnostics["memory_grad_norm_value"] == pytest.approx(2.0)
+    assert diagnostics["memory_grad_norm_opp_action"] == pytest.approx(1.0)
+    assert diagnostics["memory_grad_norm_hidden_info"] == pytest.approx(0.0)
+    assert diagnostics["memory_grad_connected_hidden_info"] == pytest.approx(0.0)
+    assert diagnostics["memory_grad_nonzero_hidden_info"] == pytest.approx(0.0)
+    assert diagnostics["memory_grad_connected_zero_connected"] == pytest.approx(1.0)
+    assert diagnostics["memory_grad_nonzero_zero_connected"] == pytest.approx(0.0)
+    assert diagnostics["memory_grad_norm_combined"] == pytest.approx(2.0)
+    assert diagnostics["memory_grad_cancellation_fraction"] == pytest.approx(0.5)
+    assert diagnostics["memory_grad_cos_actor_value"] == pytest.approx(0.0)
+    assert diagnostics["memory_grad_cos_actor_value_valid"] == pytest.approx(1.0)
+    assert diagnostics["memory_grad_cos_actor_opp_action"] == pytest.approx(-1.0)
+    assert diagnostics["memory_grad_cos_value_opp_action"] == pytest.approx(0.0)
+    assert diagnostics["memory_grad_cos_actor_hidden_info_valid"] == pytest.approx(0.0)
+    assert torch.equal(parameter.grad, torch.tensor([0.0, 2.0]))
 
 
 def _dense_hidden_info_loss(
