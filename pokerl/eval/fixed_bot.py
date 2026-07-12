@@ -5,19 +5,19 @@ from __future__ import annotations
 import json
 import random
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 from poke_env.battle import DoubleBattle, Pokemon
 from poke_env.data import GenData
-from poke_env.player import MaxBasePowerPlayer
+from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 from poke_env.teambuilder.teambuilder import Teambuilder
 
 from ..config import EnvConfig, ModelConfig
 from ..data import GameData, UNKNOWN_IDX
-from ..model.agent import load_state_dict_compatible
 from ..env.actions import (
     TARGET_ALLY,
     TARGET_NONE,
@@ -27,8 +27,13 @@ from ..env.actions import (
     decode_action,
     decode_tera_choice,
 )
-from ..env.showdown_env import BattleEnv, make_battlestream_configuration, make_local_account_configuration
+from ..env.showdown_env import (
+    BattleEnv,
+    make_battlestream_configuration,
+    make_local_account_configuration,
+)
 from ..team_pool import TeamPool, TeamPoolEntry
+from .metrics import outcome_summary
 from .replay import save_replay, save_replay_json
 
 
@@ -52,7 +57,9 @@ def packed_team_species(packed_team: str, *, gen: int = 9) -> list[str]:
         pokemon = Pokemon(gen=gen, teambuilder=teambuilder_pokemon)
         species_id = pokemon.species
         if species_id is None:
-            raise RuntimeError(f"Could not infer species from packed team member {teambuilder_pokemon!r}.")
+            raise RuntimeError(
+                f"Could not infer species from packed team member {teambuilder_pokemon!r}."
+            )
         species_names.append(data.pokedex.get(species_id, {}).get("name", species_id))
     return species_names
 
@@ -71,7 +78,9 @@ def _species_idx_display_lookup(game_data: GameData) -> dict[int, str]:
     return lookup
 
 
-def _species_names_from_obs(obs_species: np.ndarray, idx_lookup: dict[int, str]) -> list[str]:
+def _species_names_from_obs(
+    obs_species: np.ndarray, idx_lookup: dict[int, str]
+) -> list[str]:
     return [
         idx_lookup.get(int(species_idx), f"<species:{int(species_idx)}>")
         for species_idx in obs_species
@@ -136,7 +145,9 @@ def fixed_team_spec_from_entry(
     for name in species:
         species_id = normalize_species_id(name)
         if species_id not in species_bst_lookup:
-            raise RuntimeError(f"No BST entry found for species {name!r} ({species_id!r}).")
+            raise RuntimeError(
+                f"No BST entry found for species {name!r} ({species_id!r})."
+            )
         species_bst.append(species_bst_lookup[species_id])
 
     ranked = sorted(
@@ -199,7 +210,9 @@ def select_team_spec_by_title(
         if " ".join(entry.title.split()).casefold() == normalized_title
     ]
     if not matches:
-        raise RuntimeError(f"Could not find a team titled {title!r} in the requested pool.")
+        raise RuntimeError(
+            f"Could not find a team titled {title!r} in the requested pool."
+        )
     if len(matches) > 1:
         raise RuntimeError(f"Team title {title!r} was ambiguous in the requested pool.")
     return fixed_team_spec_from_entry(
@@ -221,11 +234,15 @@ def plan_opponent_team_specs(
     if num_games <= 0:
         return []
 
-    candidate_entries = [entry for entry in pool.entries if entry.file != model_team_spec.file]
+    candidate_entries = [
+        entry for entry in pool.entries if entry.file != model_team_spec.file
+    ]
     if not candidate_entries:
         candidate_entries = list(pool.entries)
     if not candidate_entries:
-        raise RuntimeError("Opponent team planning requires at least one team in the pool.")
+        raise RuntimeError(
+            "Opponent team planning requires at least one team in the pool."
+        )
 
     rng = random.Random(seed)
     planned_entries: list[TeamPoolEntry] = []
@@ -245,7 +262,9 @@ def plan_opponent_team_specs(
 
 
 class PlannedMatchups:
-    def __init__(self, model_team_spec: FixedTeamSpec, opponent_specs: list[FixedTeamSpec]):
+    def __init__(
+        self, model_team_spec: FixedTeamSpec, opponent_specs: list[FixedTeamSpec]
+    ):
         if not opponent_specs:
             raise ValueError("PlannedMatchups requires at least one opponent team.")
         self.model_team_spec = model_team_spec
@@ -255,7 +274,9 @@ class PlannedMatchups:
 
     def team_pair_provider(self) -> tuple[str, str]:
         if self._prepared_index >= len(self._prepared_specs):
-            raise RuntimeError("PlannedMatchups exhausted unexpectedly during evaluation.")
+            raise RuntimeError(
+                "PlannedMatchups exhausted unexpectedly during evaluation."
+            )
         opponent_spec = self._prepared_specs[self._prepared_index]
         self._prepared_index += 1
         self._active_specs.append(opponent_spec)
@@ -263,11 +284,13 @@ class PlannedMatchups:
 
     def consume_active_opponent(self) -> FixedTeamSpec:
         if not self._active_specs:
-            raise RuntimeError("No active opponent was prepared for the current evaluation battle.")
+            raise RuntimeError(
+                "No active opponent was prepared for the current evaluation battle."
+            )
         return self._active_specs.pop(0)
 
 
-class DeterministicPreviewMaxBasePowerPlayer(MaxBasePowerPlayer):
+class _DeterministicPreviewMixin:
     def __init__(self, *, species_bst_lookup: dict[str, int], pick_size: int, **kwargs):
         super().__init__(**kwargs)
         self._species_bst_lookup = species_bst_lookup
@@ -286,11 +309,39 @@ class DeterministicPreviewMaxBasePowerPlayer(MaxBasePowerPlayer):
             ranked.append((index, bst))
 
         picks = sorted(
-            index for index, _ in sorted(ranked, key=lambda item: (-item[1], item[0]))[: self._pick_size]
+            index
+            for index, _ in sorted(ranked, key=lambda item: (-item[1], item[0]))[
+                : self._pick_size
+            ]
         )
         for pick in picks:
             members[pick]._selected_in_teampreview = True
         return "/team " + "".join(str(pick + 1) for pick in picks)
+
+
+class DeterministicPreviewRandomPlayer(_DeterministicPreviewMixin, RandomPlayer):
+    """Random battle policy with the same deterministic preview rule as the other bots."""
+
+
+class DeterministicPreviewMaxBasePowerPlayer(
+    _DeterministicPreviewMixin,
+    MaxBasePowerPlayer,
+):
+    """Max-base-power battle policy with deterministic max-BST preview."""
+
+
+class DeterministicPreviewSimpleHeuristicsPlayer(
+    _DeterministicPreviewMixin,
+    SimpleHeuristicsPlayer,
+):
+    """Simple heuristic battle policy with deterministic max-BST preview."""
+
+
+_OPPONENT_PLAYER_TYPES = {
+    "random": DeterministicPreviewRandomPlayer,
+    "max-base-power": DeterministicPreviewMaxBasePowerPlayer,
+    "simple-heuristics": DeterministicPreviewSimpleHeuristicsPlayer,
+}
 
 
 class ModelPolicyController:
@@ -304,7 +355,10 @@ class ModelPolicyController:
         self.hidden = self.agent.initial_hidden(1)
 
     def choose_team_preview(self, obs: dict[str, np.ndarray]) -> dict[str, object]:
-        obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(self.device) for key, value in obs.items()}
+        obs_t = {
+            key: torch.from_numpy(value).unsqueeze(0).to(self.device)
+            for key, value in obs.items()
+        }
 
         with torch.inference_mode():
             preview_out = self.agent.team_preview(
@@ -316,30 +370,42 @@ class ModelPolicyController:
             "picks": preview_out["picks"].cpu().numpy()[0],
             "entropy": float(preview_out["entropy"].item()),
             "log_prob": float(preview_out["log_prob"].item()),
+            "opponent_bring_logits": preview_out["opponent_bring_logits"]
+            .cpu()
+            .numpy()[0],
+            "opponent_lead_pair_logits": preview_out["opponent_lead_pair_logits"]
+            .cpu()
+            .numpy()[0],
         }
 
-    def choose_action(self, obs: dict[str, np.ndarray], masks: dict[str, np.ndarray]) -> dict[str, object]:
-        obs_t = {key: torch.from_numpy(value).unsqueeze(0).to(self.device) for key, value in obs.items()}
+    def choose_action(
+        self, obs: dict[str, np.ndarray], masks: dict[str, np.ndarray]
+    ) -> dict[str, object]:
+        obs_t = {
+            key: torch.from_numpy(value).unsqueeze(0).to(self.device)
+            for key, value in obs.items()
+        }
         masks_t = {
-            key: torch.from_numpy(value).unsqueeze(0).to(device=self.device, dtype=torch.bool)
+            key: torch.from_numpy(value)
+            .unsqueeze(0)
+            .to(device=self.device, dtype=torch.bool)
             for key, value in masks.items()
         }
 
         with torch.inference_mode():
-            context, active_reps, own_reps, opp_reps, opp_active_reps = self.agent.spatial(obs_t)
-            context, new_hidden = self.agent.memory(context, self.hidden)
-            opp_bench_mask = self.agent._bench_mask(obs_t.get("opp_mask"), obs_t["opp_roles"])
-            action_out = self.agent.action_head(
-                context,
-                active_reps,
-                own_reps,
-                opp_reps,
-                opp_bench_mask,
-                opp_active_reps,
-                masks_t,
+            action_out = self.agent(
+                obs_t,
+                self.hidden,
+                action_masks=masks_t,
                 greedy=self.action_mode == "argmax",
+                include_value=False,
             )
-            self.hidden = None if new_hidden is None else tuple(state.detach() for state in new_hidden)
+            new_hidden = action_out["hidden"]
+            self.hidden = (
+                None
+                if new_hidden is None
+                else tuple(state.detach() for state in new_hidden)
+            )
             entropy = action_out["entropy"].item()
             log_prob = action_out["log_prob"].item()
             actions = action_out["actions"].cpu().numpy()[0]
@@ -354,7 +420,9 @@ class ModelPolicyController:
 def _max_legal_damaging_base_power(battle: DoubleBattle, slot: int) -> int:
     if slot >= len(battle.available_moves):
         return 0
-    return max((int(move.base_power or 0) for move in battle.available_moves[slot]), default=0)
+    return max(
+        (int(move.base_power or 0) for move in battle.available_moves[slot]), default=0
+    )
 
 
 def _classify_slot_action(
@@ -381,7 +449,9 @@ def _classify_slot_action(
             stats["switch_while_damage_available_actions"] += 1
         return stats
 
-    if slot >= len(battle.available_moves) or move_idx >= len(battle.available_moves[slot]):
+    if slot >= len(battle.available_moves) or move_idx >= len(
+        battle.available_moves[slot]
+    ):
         raise RuntimeError(
             f"Action {action_idx} decoded to move index {move_idx}, but slot {slot} only has "
             f"{len(battle.available_moves[slot]) if slot < len(battle.available_moves) else 0} legal moves."
@@ -428,6 +498,25 @@ def _classify_slot_action(
     if base_power > 0 and move_target == "ALL_ADJACENT":
         stats["ally_spread_damage_actions"] += 1
         stats["own_team_hitting_move_actions"] += 1
+
+    if base_power > 0 and target_idx in (TARGET_OPPONENT_1, TARGET_OPPONENT_2):
+        opponent_slot = 0 if target_idx == TARGET_OPPONENT_1 else 1
+        opponents = list(battle.opponent_active_pokemon)
+        target = opponents[opponent_slot] if opponent_slot < len(opponents) else None
+        if target is not None:
+            multiplier = float(target.damage_multiplier(move))
+            stats["typed_opponent_damage_actions"] += 1
+            if multiplier == 0.0:
+                stats["immune_target_damage_actions"] += 1
+            elif multiplier < 1.0:
+                stats["resisted_target_damage_actions"] += 1
+            elif multiplier > 1.0:
+                stats["super_effective_target_damage_actions"] += 1
+            else:
+                stats["neutral_target_damage_actions"] += 1
+
+    if getattr(move, "id", "") == "protect":
+        stats["protect_actions"] += 1
 
     if base_power > 0 and best_base_power > 0:
         if base_power == best_base_power:
@@ -482,6 +571,8 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
     power_comparable = int(action_stats.get("power_comparable_actions", 0))
     chosen_power_total = int(action_stats.get("chosen_base_power_total", 0))
     best_power_total = int(action_stats.get("best_legal_base_power_total", 0))
+    typed_opponent_damage = int(action_stats.get("typed_opponent_damage_actions", 0))
+    joint_decisions = int(action_stats.get("joint_decisions", 0))
 
     counts = {
         key: int(value)
@@ -490,12 +581,20 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
     }
     rates = {
         "move_rate": _safe_rate(counts.get("move_actions", 0), slot_decisions),
-        "tera_move_rate": _safe_rate(counts.get("tera_move_actions", 0), slot_decisions),
+        "tera_move_rate": _safe_rate(
+            counts.get("tera_move_actions", 0), slot_decisions
+        ),
         "switch_rate": _safe_rate(counts.get("switch_actions", 0), slot_decisions),
         "pass_rate": _safe_rate(counts.get("pass_actions", 0), slot_decisions),
-        "damaging_move_rate": _safe_rate(counts.get("damaging_move_actions", 0), slot_decisions),
-        "status_move_rate": _safe_rate(counts.get("status_move_actions", 0), slot_decisions),
-        "own_team_hitting_move_rate": _safe_rate(counts.get("own_team_hitting_move_actions", 0), slot_decisions),
+        "damaging_move_rate": _safe_rate(
+            counts.get("damaging_move_actions", 0), slot_decisions
+        ),
+        "status_move_rate": _safe_rate(
+            counts.get("status_move_actions", 0), slot_decisions
+        ),
+        "own_team_hitting_move_rate": _safe_rate(
+            counts.get("own_team_hitting_move_actions", 0), slot_decisions
+        ),
         "non_damaging_while_damage_available_rate": _safe_rate(
             counts.get("non_damaging_while_damage_available_actions", 0),
             slot_decisions,
@@ -516,12 +615,47 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
             counts.get("non_max_legal_base_power_choices", 0),
             power_comparable,
         ),
+        "protect_rate": _safe_rate(counts.get("protect_actions", 0), slot_decisions),
+        "immune_target_rate": _safe_rate(
+            counts.get("immune_target_damage_actions", 0),
+            typed_opponent_damage,
+        ),
+        "resisted_target_rate": _safe_rate(
+            counts.get("resisted_target_damage_actions", 0),
+            typed_opponent_damage,
+        ),
+        "neutral_target_rate": _safe_rate(
+            counts.get("neutral_target_damage_actions", 0),
+            typed_opponent_damage,
+        ),
+        "super_effective_target_rate": _safe_rate(
+            counts.get("super_effective_target_damage_actions", 0),
+            typed_opponent_damage,
+        ),
+        "focus_fire_turn_rate": _safe_rate(
+            counts.get("focus_fire_turns", 0),
+            joint_decisions,
+        ),
+        "double_protect_turn_rate": _safe_rate(
+            counts.get("double_protect_turns", 0),
+            joint_decisions,
+        ),
     }
 
     power = {
-        "avg_chosen_base_power_per_move_action": float(chosen_power_total / move_actions) if move_actions else 0.0,
-        "avg_best_legal_base_power_per_slot_decision": float(best_power_total / slot_decisions) if slot_decisions else 0.0,
-        "chosen_vs_best_base_power_ratio": float(chosen_power_total / best_power_total) if best_power_total else 0.0,
+        "avg_chosen_base_power_per_move_action": float(
+            chosen_power_total / move_actions
+        )
+        if move_actions
+        else 0.0,
+        "avg_best_legal_base_power_per_slot_decision": float(
+            best_power_total / slot_decisions
+        )
+        if slot_decisions
+        else 0.0,
+        "chosen_vs_best_base_power_ratio": float(chosen_power_total / best_power_total)
+        if best_power_total
+        else 0.0,
     }
     return {
         "counts": counts,
@@ -534,12 +668,17 @@ def _preview_pick_key(species: list[str]) -> str:
     return " / ".join(species)
 
 
-def _summarize_preview_results(preview_results: list[dict[str, object]]) -> dict[str, object]:
+def _summarize_preview_results(
+    preview_results: list[dict[str, object]],
+) -> dict[str, object]:
     ordered_picks = Counter()
     unordered_picks = Counter()
     species_counts = Counter()
     lead_counts = Counter()
     entropies: list[float] = []
+    preview_modes = {
+        str(result.get("preview_mode", "learned")) for result in preview_results
+    }
 
     for result in preview_results:
         picked_species = [str(species) for species in result["picked_species_ordered"]]
@@ -552,10 +691,24 @@ def _summarize_preview_results(preview_results: list[dict[str, object]]) -> dict
         entropies.append(float(result["entropy"]))
 
     total_games = len(preview_results)
-    total_slots = sum(len(result["picked_species_ordered"]) for result in preview_results)
-    total_leads = sum(min(2, len(result["picked_species_ordered"])) for result in preview_results)
+    total_slots = sum(
+        len(result["picked_species_ordered"]) for result in preview_results
+    )
+    total_leads = sum(
+        min(2, len(result["picked_species_ordered"])) for result in preview_results
+    )
+    modal_unordered_count = max(unordered_picks.values(), default=0)
+    lead_pairs = Counter(
+        _preview_pick_key(
+            [str(species) for species in result["picked_species_ordered"][:2]]
+        )
+        for result in preview_results
+    )
+    modal_lead_count = max(lead_pairs.values(), default=0)
+    preview_mode = next(iter(preview_modes)) if len(preview_modes) == 1 else "mixed"
     return {
         "games": total_games,
+        "preview_mode": preview_mode,
         "distinct_ordered_picks": len(ordered_picks),
         "distinct_unordered_picks": len(unordered_picks),
         "entropy_mean": float(np.mean(entropies)) if entropies else 0.0,
@@ -564,13 +717,109 @@ def _summarize_preview_results(preview_results: list[dict[str, object]]) -> dict
         "unordered_pick_sets": _counter_rows(unordered_picks, total_games),
         "species_pick_counts": _counter_rows(species_counts, total_slots),
         "lead_species_counts": _counter_rows(lead_counts, total_leads),
+        "opponent_conditioning": {
+            "bring_change_from_modal_rate": _safe_rate(
+                total_games - modal_unordered_count,
+                total_games,
+            ),
+            "ordered_lead_change_from_modal_rate": _safe_rate(
+                total_games - modal_lead_count,
+                total_games,
+            ),
+            "note": (
+                "For learned greedy preview with a fixed own roster, changes are caused by "
+                "the opposing roster. Learned sampled and random-preview changes also include "
+                "policy randomness; max-BST preview is opponent-independent by construction."
+            ),
+        },
     }
 
 
-def _summarize_battle_behavior(battle_results: list[dict[str, object]]) -> dict[str, object]:
+def _classify_joint_action(
+    action_descriptions: list[dict[str, object]],
+) -> Counter[str]:
+    stats: Counter[str] = Counter(joint_decisions=1)
+    if len(action_descriptions) != 2:
+        return stats
+
+    damaging_targets = [
+        int(action["target"])
+        for action in action_descriptions
+        if action.get("kind") == "move"
+        and int(action.get("base_power", 0)) > 0
+        and int(action["target"]) in (TARGET_OPPONENT_1, TARGET_OPPONENT_2)
+    ]
+    if len(damaging_targets) == 2 and len(set(damaging_targets)) == 1:
+        stats["focus_fire_turns"] += 1
+
+    if all(
+        action.get("kind") == "move" and action.get("move") == "protect"
+        for action in action_descriptions
+    ):
+        stats["double_protect_turns"] += 1
+    return stats
+
+
+def _summarize_opponent_preview_predictions(
+    preview_results: list[dict[str, object]],
+) -> dict[str, object]:
+    bring_overlaps: list[float] = []
+    lead_overlaps: list[float] = []
+    bring_exact = 0
+    ordered_lead_exact = 0
+
+    for result in preview_results:
+        predicted_bring = {
+            int(index) for index in result["predicted_opponent_bring_indices"]
+        }
+        actual_bring = {int(index) for index in result["actual_opponent_bring_indices"]}
+        predicted_lead = tuple(
+            int(index) for index in result["predicted_opponent_lead_indices"]
+        )
+        actual_lead = tuple(
+            int(index) for index in result["actual_opponent_lead_indices"]
+        )
+        bring_denominator = max(len(actual_bring), 1)
+        lead_denominator = max(len(actual_lead), 1)
+        bring_overlaps.append(len(predicted_bring & actual_bring) / bring_denominator)
+        lead_overlaps.append(
+            len(set(predicted_lead) & set(actual_lead)) / lead_denominator
+        )
+        bring_exact += int(predicted_bring == actual_bring)
+        ordered_lead_exact += int(predicted_lead == actual_lead)
+
+    games = len(preview_results)
+    return {
+        "games": games,
+        "bring_overlap_rate_mean": (
+            float(np.mean(bring_overlaps)) if bring_overlaps else 0.0
+        ),
+        "bring_exact_rate": _safe_rate(bring_exact, games),
+        "unordered_lead_overlap_rate_mean": (
+            float(np.mean(lead_overlaps)) if lead_overlaps else 0.0
+        ),
+        "ordered_lead_exact_rate": _safe_rate(ordered_lead_exact, games),
+        "six_slot_chance_baselines": {
+            "bring_overlap_rate_mean": 2.0 / 3.0,
+            "bring_exact_rate": 1.0 / 15.0,
+            "ordered_lead_exact_rate": 1.0 / 30.0,
+        },
+        "target_policy": "deterministic max-BST preview used by the fixed opponent",
+    }
+
+
+def _summarize_battle_behavior(
+    battle_results: list[dict[str, object]],
+) -> dict[str, object]:
     tera_used_games = [result for result in battle_results if result.get("tera_used")]
-    tera_unused_games = [result for result in battle_results if not result.get("tera_used")]
-    tera_turns = [int(result["first_tera_turn"]) for result in tera_used_games if result.get("first_tera_turn")]
+    tera_unused_games = [
+        result for result in battle_results if not result.get("tera_used")
+    ]
+    tera_turns = [
+        int(result["first_tera_turn"])
+        for result in tera_used_games
+        if result.get("first_tera_turn")
+    ]
     tera_turn_counts = Counter(tera_turns)
     switch_counts = [int(result.get("switch_actions", 0)) for result in battle_results]
 
@@ -594,7 +843,9 @@ def _summarize_battle_behavior(battle_results: list[dict[str, object]]) -> dict[
             }
             for turn, count in sorted(tera_turn_counts.items())
         ],
-        "avg_switch_actions_per_game": float(np.mean(switch_counts)) if switch_counts else 0.0,
+        "avg_switch_actions_per_game": float(np.mean(switch_counts))
+        if switch_counts
+        else 0.0,
     }
 
 
@@ -619,6 +870,8 @@ def evaluate_policy_vs_fixed_bot(
     action_mode: str,
     seed: int,
     max_turns: int,
+    opponent_kind: str = "max-base-power",
+    preview_mode: str = "learned",
     replay_dir: str | None = None,
     replay_count: int = 1,
 ) -> dict[str, object]:
@@ -626,6 +879,18 @@ def evaluate_policy_vs_fixed_bot(
         raise ValueError(
             "Fixed-bot evaluation now expects real preview semantics: team_size must be greater than pick_size."
         )
+    if opponent_kind not in _OPPONENT_PLAYER_TYPES:
+        choices = ", ".join(sorted(_OPPONENT_PLAYER_TYPES))
+        raise ValueError(
+            f"Unknown opponent_kind={opponent_kind!r}; choose from {choices}."
+        )
+    if preview_mode not in {"learned", "max-bst", "random"}:
+        raise ValueError(
+            f"Unknown preview_mode={preview_mode!r}; choose from learned, max-bst, random."
+        )
+
+    random.seed(seed)
+    preview_rng = random.Random(seed + 1_000_003)
 
     policy = ModelPolicyController(agent, device=device, action_mode=action_mode)
     game_data = GameData(gen=9)
@@ -643,12 +908,36 @@ def evaluate_policy_vs_fixed_bot(
 
     def live_team_preview(obs: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
         preview_out = policy.choose_team_preview(obs)
-        picks = np.asarray(preview_out["picks"], dtype=np.int64)
+        learned_picks = np.asarray(preview_out["picks"], dtype=np.int64)
+        if preview_mode == "learned":
+            picks = learned_picks
+        elif preview_mode == "max-bst":
+            picks = np.asarray(model_team_spec.max_bst_pick_indices, dtype=np.int64)
+        else:
+            own_mask = np.asarray(
+                obs.get("own_mask", np.zeros(env_config.team_size, dtype=bool)),
+                dtype=bool,
+            )
+            available = [int(index) for index in np.flatnonzero(~own_mask).tolist()]
+            picks = np.asarray(
+                preview_rng.sample(available, k=env_config.pick_size),
+                dtype=np.int64,
+            )
         preview_records.append(
             {
                 "picks": picks.copy(),
+                "learned_picks": learned_picks.copy(),
+                "preview_mode": preview_mode,
                 "entropy": float(preview_out["entropy"]),
                 "log_prob": float(preview_out["log_prob"]),
+                "opponent_bring_logits": np.asarray(
+                    preview_out["opponent_bring_logits"],
+                    dtype=np.float32,
+                ),
+                "opponent_lead_pair_logits": np.asarray(
+                    preview_out["opponent_lead_pair_logits"],
+                    dtype=np.float32,
+                ),
             }
         )
         return picks, "/team " + "".join(str(int(pick) + 1) for pick in picks)
@@ -657,7 +946,8 @@ def evaluate_policy_vs_fixed_bot(
         return matchups.team_pair_provider()
 
     def opponent_factory(loop):
-        return DeterministicPreviewMaxBasePowerPlayer(
+        opponent_type = _OPPONENT_PLAYER_TYPES[opponent_kind]
+        return opponent_type(
             account_configuration=make_local_account_configuration("fixedbot"),
             battle_format=env_config.battle_format,
             server_configuration=make_battlestream_configuration(env_config),
@@ -678,7 +968,6 @@ def evaluate_policy_vs_fixed_bot(
         },
     )
 
-    wins = 0
     battle_turns: list[int] = []
     decision_steps: list[int] = []
     entropies: list[float] = []
@@ -695,7 +984,9 @@ def evaluate_policy_vs_fixed_bot(
             obs, masks = env.reset()
             opponent_spec = matchups.consume_active_opponent()
             if not preview_records:
-                raise RuntimeError("Model team preview did not run before the first observation arrived.")
+                raise RuntimeError(
+                    "Model team preview did not run before the first observation arrived."
+                )
             preview_record = preview_records.pop(0)
             done = False
             reward = 0.0
@@ -712,14 +1003,18 @@ def evaluate_policy_vs_fixed_bot(
                     )
                 battle = env.last_battle
                 if battle is None:
-                    raise RuntimeError("BattleEnv returned no active battle during evaluation.")
+                    raise RuntimeError(
+                        "BattleEnv returned no active battle during evaluation."
+                    )
 
                 action_out = policy.choose_action(obs, masks)
                 actions = np.asarray(action_out["actions"], dtype=np.int64)
                 tera_choice = int(actions[2])
                 entropies.append(float(action_out["entropy"]))
                 for slot, action_idx in enumerate(actions[:2]):
-                    slot_stats = _classify_slot_action(battle, slot, int(action_idx), tera_choice)
+                    slot_stats = _classify_slot_action(
+                        battle, slot, int(action_idx), tera_choice
+                    )
                     action_stats.update(slot_stats)
                     battle_action_stats.update(slot_stats)
 
@@ -727,7 +1022,12 @@ def evaluate_policy_vs_fixed_bot(
                     _describe_slot_action(battle, 0, int(actions[0]), tera_choice),
                     _describe_slot_action(battle, 1, int(actions[1]), tera_choice),
                 ]
-                if first_tera_turn is None and any(description["tera"] for description in action_descriptions):
+                joint_stats = _classify_joint_action(action_descriptions)
+                action_stats.update(joint_stats)
+                battle_action_stats.update(joint_stats)
+                if first_tera_turn is None and any(
+                    description["tera"] for description in action_descriptions
+                ):
                     first_tera_turn = int(getattr(battle, "turn", 0))
                     first_tera_step = step_count + 1
                 trace.append(
@@ -743,34 +1043,72 @@ def evaluate_policy_vs_fixed_bot(
                 step_count += 1
 
             won = reward > 0
-            wins += int(won)
-            battle_turn = int(info.get("battle_turn", getattr(env.last_battle, "turn", 0)))
+            drawn = reward == 0
+            battle_turn = int(
+                info.get("battle_turn", getattr(env.last_battle, "turn", 0))
+            )
             battle_turns.append(battle_turn)
             decision_steps.append(step_count)
 
             if "team_preview_obs" not in info or "team_preview_picks" not in info:
-                raise RuntimeError("Evaluation battle finished without team preview metadata.")
+                raise RuntimeError(
+                    "Evaluation battle finished without team preview metadata."
+                )
             preview_obs = info["team_preview_obs"]
             preview_picks = np.asarray(info["team_preview_picks"], dtype=np.int64)
             if not np.array_equal(preview_picks, preview_record["picks"]):
-                raise RuntimeError("Recorded model team preview picks disagreed with the episode summary.")
+                raise RuntimeError(
+                    "Recorded model team preview picks disagreed with the episode summary."
+                )
 
-            own_preview_species = _species_names_from_obs(preview_obs["own_species"], species_idx_lookup)
-            opponent_preview_species = _species_names_from_obs(preview_obs["opp_species"], species_idx_lookup)
-            picked_species_ordered = [own_preview_species[int(index)] for index in preview_picks]
+            own_preview_species = _species_names_from_obs(
+                preview_obs["own_species"], species_idx_lookup
+            )
+            opponent_preview_species = _species_names_from_obs(
+                preview_obs["opp_species"], species_idx_lookup
+            )
+            picked_species_ordered = [
+                own_preview_species[int(index)] for index in preview_picks
+            ]
+            predicted_opponent_bring = sorted(
+                int(index)
+                for index in np.argsort(
+                    -preview_record["opponent_bring_logits"],
+                    kind="stable",
+                )[: env_config.pick_size]
+            )
+            predicted_opponent_lead_flat = int(
+                np.argmax(preview_record["opponent_lead_pair_logits"])
+            )
+            predicted_opponent_lead = [
+                predicted_opponent_lead_flat // env_config.team_size,
+                predicted_opponent_lead_flat % env_config.team_size,
+            ]
+            actual_opponent_bring = list(opponent_spec.max_bst_pick_indices)
+            actual_opponent_lead = actual_opponent_bring[:2]
             preview_result = {
                 "pick_indices": [int(index) for index in preview_picks.tolist()],
+                "learned_pick_indices": [
+                    int(index) for index in preview_record["learned_picks"].tolist()
+                ],
+                "preview_mode": preview_mode,
                 "picked_species_ordered": picked_species_ordered,
                 "picked_species_sorted": sorted(picked_species_ordered),
                 "entropy": float(preview_record["entropy"]),
                 "log_prob": float(preview_record["log_prob"]),
                 "opponent_preview_species": opponent_preview_species,
+                "predicted_opponent_bring_indices": predicted_opponent_bring,
+                "actual_opponent_bring_indices": actual_opponent_bring,
+                "predicted_opponent_lead_indices": predicted_opponent_lead,
+                "actual_opponent_lead_indices": actual_opponent_lead,
             }
             preview_results.append(preview_result)
 
             battle_result = {
                 "game": game_index + 1,
                 "won": bool(won),
+                "drawn": bool(drawn),
+                "outcome": "win" if won else ("draw" if drawn else "loss"),
                 "reward": float(reward),
                 "battle_turn": battle_turn,
                 "decision_steps": step_count,
@@ -789,7 +1127,9 @@ def evaluate_policy_vs_fixed_bot(
             if replay_path_obj is not None and len(replay_artifacts) < replay_count:
                 battle = env.last_battle
                 if battle is None:
-                    raise RuntimeError("Expected a completed battle when saving a replay artifact.")
+                    raise RuntimeError(
+                        "Expected a completed battle when saving a replay artifact."
+                    )
                 replay_html = save_replay(battle, str(replay_path_obj))
                 replay_json = save_replay_json(battle, str(replay_path_obj))
                 trace_path = replay_path_obj / f"{_battle_tag_slug(battle)}_trace.json"
@@ -811,21 +1151,29 @@ def evaluate_policy_vs_fixed_bot(
                     }
                 )
 
-        losses = num_games - wins
+        outcomes = outcome_summary(
+            [float(result["reward"]) for result in battle_results]
+        )
         return {
             "games": num_games,
-            "opponent_kind": "max-base-power",
+            "opponent_kind": opponent_kind,
+            "preview_mode": preview_mode,
             "team_size": env_config.team_size,
             "pick_size": env_config.pick_size,
-            "distinct_opponent_teams": len({result["opponent_title"] for result in battle_results}),
-            "wins": wins,
-            "losses": losses,
-            "win_rate": float(wins / num_games) if num_games else 0.0,
+            "distinct_opponent_teams": len(
+                {result["opponent_title"] for result in battle_results}
+            ),
+            **outcomes,
             "avg_battle_turns": float(np.mean(battle_turns)) if battle_turns else 0.0,
-            "avg_decision_steps": float(np.mean(decision_steps)) if decision_steps else 0.0,
+            "avg_decision_steps": float(np.mean(decision_steps))
+            if decision_steps
+            else 0.0,
             "action_entropy_mean": float(np.mean(entropies)) if entropies else 0.0,
             "action_entropy_std": float(np.std(entropies)) if entropies else 0.0,
             "preview_summary": _summarize_preview_results(preview_results),
+            "opponent_preview_prediction": _summarize_opponent_preview_predictions(
+                preview_results
+            ),
             "action_breakdown": _summarize_action_stats(action_stats),
             "battle_behavior": _summarize_battle_behavior(battle_results),
             "battle_results": battle_results,
@@ -846,8 +1194,45 @@ def load_agent_for_evaluation(
 
     agent = PokeAgent(model_config, game_data).to(device)
     if checkpoint_path is not None:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        load_state_dict_compatible(agent, checkpoint["agent"])
+        checkpoint = torch.load(
+            checkpoint_path, map_location=device, weights_only=False
+        )
+        if not isinstance(checkpoint, Mapping) or not isinstance(
+            checkpoint.get("agent"), Mapping
+        ):
+            raise ValueError(
+                f"Evaluation checkpoint {checkpoint_path!r} must contain an agent state mapping."
+            )
+
+        metadata = checkpoint.get("model_metadata")
+        if metadata is not None:
+            if not isinstance(metadata, Mapping):
+                raise ValueError(
+                    f"Evaluation checkpoint {checkpoint_path!r} has invalid model metadata."
+                )
+            checkpoint_config = metadata.get("model_config")
+            expected_config = {
+                "type": f"{type(model_config).__module__}.{type(model_config).__qualname__}",
+                "values": asdict(model_config),
+            }
+            if checkpoint_config != expected_config:
+                raise ValueError(
+                    f"Evaluation checkpoint {checkpoint_path!r} model config does not match "
+                    "the evaluator architecture."
+                )
+            if metadata.get("game_data_signature") != agent.game_data_signature:
+                raise ValueError(
+                    f"Evaluation checkpoint {checkpoint_path!r} game-data vocabulary does "
+                    "not match the evaluator."
+                )
+
+        try:
+            agent.load_state_dict(checkpoint["agent"], strict=True)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Evaluation checkpoint {checkpoint_path!r} does not exactly match the "
+                f"evaluator model: {exc}"
+            ) from exc
     agent.eval()
     agent.requires_grad_(False)
     return agent

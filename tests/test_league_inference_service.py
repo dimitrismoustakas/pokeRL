@@ -596,6 +596,7 @@ def test_league_battle_inference_synchronizes_before_publishing_device_samples(
         ("publish", "1"),
     ]
     assert agent.kwargs == {
+        "greedy": False,
         "include_value": False,
         "include_policy_stats": False,
     }

@@ -1,9 +1,10 @@
-"""Evaluate a random or trained policy against a fixed max-BST max-power bot."""
+"""Evaluate a random or trained policy against a reproducible fixed-bot panel."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 import numpy as np
@@ -27,19 +28,55 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate pokeRL against a MaxBasePowerPlayer using real 6-to-4 team preview battles."
+        description="Evaluate pokeRL against a fixed bot using real 6-to-4 team preview battles."
     )
-    parser.add_argument("--checkpoint", default=None, help="Optional checkpoint path; omit for random initialization.")
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional checkpoint path; omit for random initialization.",
+    )
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
-    parser.add_argument("--battle-format", default="gen9vgc2026regf", help="Showdown battle format.")
-    parser.add_argument("--showdown-dir", default=None, help="Pokemon Showdown checkout for local BattleStream.")
-    parser.add_argument("--worker-count", type=int, default=None, help="Local BattleStream worker count.")
-    parser.add_argument("--battles-per-worker", type=int, default=None, help="Max concurrent local battles per worker.")
-    parser.add_argument("--runtime-loop-count", type=int, default=None, help="Local BattleStream runtime loop count.")
+    parser.add_argument(
+        "--battle-format", default="gen9vgc2026regf", help="Showdown battle format."
+    )
+    parser.add_argument(
+        "--showdown-dir",
+        default=None,
+        help="Pokemon Showdown checkout for local BattleStream.",
+    )
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=None,
+        help="Local BattleStream worker count.",
+    )
+    parser.add_argument(
+        "--battles-per-worker",
+        type=int,
+        default=None,
+        help="Max concurrent local battles per worker.",
+    )
+    parser.add_argument(
+        "--runtime-loop-count",
+        type=int,
+        default=None,
+        help="Local BattleStream runtime loop count.",
+    )
+    parser.add_argument(
+        "--opponent",
+        choices=["random", "max-base-power", "simple-heuristics"],
+        default="max-base-power",
+        help="Fixed battle policy. All choices use the same deterministic max-BST preview.",
+    )
     parser.add_argument(
         "--team-pool-format",
         default="gen9vgc2026regf",
         help="Load teams from data/team_pools/<format>/manifest.json.",
+    )
+    parser.add_argument(
+        "--team-pool-manifest",
+        default=None,
+        help="Optional explicit team-pool manifest; overrides --team-pool-format.",
     )
     parser.add_argument(
         "--team-pool-subset",
@@ -47,21 +84,44 @@ def parse_args() -> argparse.Namespace:
         default="pool",
         help="Which manifest subset to use for both the fixed model roster and the varied opponent teams.",
     )
-    parser.add_argument("--team-pool-seed", type=int, default=0, help="Seed used when loading the team pool.")
+    parser.add_argument(
+        "--team-pool-seed",
+        type=int,
+        default=0,
+        help="Seed used when loading the team pool.",
+    )
     parser.add_argument(
         "--model-team-title",
         default=None,
         help="Optional exact team title to use as the model's fixed 6-mon roster. Defaults to the strongest pool team.",
     )
-    parser.add_argument("--games", type=int, default=32, help="Number of evaluation battles.")
+    parser.add_argument(
+        "--games", type=int, default=32, help="Number of evaluation battles."
+    )
     parser.add_argument(
         "--action-mode",
         choices=["sample", "argmax"],
         default="argmax",
         help="Whether to sample from the policy or play greedily.",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Torch/numpy seed for evaluation reproducibility.")
-    parser.add_argument("--max-turns", type=int, default=200, help="Fail if a battle exceeds this many decisions.")
+    parser.add_argument(
+        "--preview-mode",
+        choices=["learned", "max-bst", "random"],
+        default="learned",
+        help="Team-preview policy; battle actions always come from the checkpoint.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Python/Torch/numpy seed. Showdown battle RNG is not yet seed-controlled.",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=200,
+        help="Fail if a battle exceeds this many decisions.",
+    )
     parser.add_argument(
         "--replay-dir",
         default=None,
@@ -100,6 +160,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    random.seed(args.seed)
 
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
@@ -117,7 +178,11 @@ def main() -> None:
     game_data = GameData(gen=9)
     species_bst_lookup = build_species_bst_lookup(gen=game_data.gen)
 
-    manifest_path = default_team_pool_manifest_path(REPO_ROOT, args.team_pool_format)
+    manifest_path = (
+        Path(args.team_pool_manifest)
+        if args.team_pool_manifest
+        else default_team_pool_manifest_path(REPO_ROOT, args.team_pool_format)
+    )
     team_pool = load_team_pool(
         manifest_path,
         subset=args.team_pool_subset,
@@ -151,7 +216,8 @@ def main() -> None:
             "showdown_dir": env_config.showdown_dir,
             "games": args.games,
             "action_mode": args.action_mode,
-            "opponent": "max-base-power",
+            "preview_mode": args.preview_mode,
+            "opponent": args.opponent,
             "team_size": env_config.team_size,
             "pick_size": env_config.pick_size,
             "seed": args.seed,
@@ -172,6 +238,8 @@ def main() -> None:
             action_mode=args.action_mode,
             seed=args.seed,
             max_turns=args.max_turns,
+            opponent_kind=args.opponent,
+            preview_mode=args.preview_mode,
             replay_dir=args.replay_dir,
             replay_count=args.replay_count,
         ),

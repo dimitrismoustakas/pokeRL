@@ -150,6 +150,7 @@ class PokeAgent(nn.Module):
         tera_exploration_prob: float = 0.0,
         tera_force_delay_prob: float = 0.0,
         tera_force_delay_max_turn: int = 0,
+        greedy: bool = False,
         validate_actions: bool = True,
         include_value: bool = True,
         include_policy_stats: bool = True,
@@ -171,6 +172,8 @@ class PokeAgent(nn.Module):
                 distribution when evaluating supplied actions.
             tera_force_delay_max_turn: latest battle turn eligible for forced
                 no-tera exploration. 0 disables it.
+            greedy: choose the highest-probability legal actions instead of
+                sampling when actions are not supplied.
             validate_actions: validate caller-supplied actions against the
                 masks. Internally sampled actions are already constrained by
                 those masks and do not require a host-side validation barrier.
@@ -197,6 +200,7 @@ class PokeAgent(nn.Module):
             opp_active_reps,
             action_masks,
             actions,
+            greedy=greedy,
             battle_obs=obs,
             tera_exploration_prob=tera_exploration_prob,
             tera_force_delay_prob=tera_force_delay_prob,

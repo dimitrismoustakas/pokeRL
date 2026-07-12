@@ -17,7 +17,7 @@ import torch
 from poke_env.battle import DoubleBattle
 from poke_env.player import DoubleBattleOrder, PassBattleOrder, Player
 
-from ..model.agent import PokeAgent, load_state_dict_compatible
+from ..model.agent import PokeAgent
 from ..data import GameData
 from ..config import TrainingConfig, EnvConfig
 from ..env.observation import (
@@ -123,6 +123,8 @@ class _LeagueInferenceService:
         agent_template: PokeAgent,
         device: torch.device,
         coalesce_window_sec: float,
+        *,
+        greedy: bool = False,
     ):
         self._agent_template = copy.deepcopy(agent_template).to(torch.device("cpu"))
         self._agent_template.eval()
@@ -130,6 +132,7 @@ class _LeagueInferenceService:
         self._device = device
         self._cuda_stream: torch.cuda.Stream | None = None
         self._coalesce_window_sec = max(0.0, coalesce_window_sec)
+        self._greedy = greedy
         self._models: dict[str, PokeAgent] = {}
         self._host_batch_buffers: dict[str, _HostBatchBuffers] = {}
         self._device_batch_buffers: dict[str, _DeviceBatchBuffers] = {}
@@ -889,6 +892,7 @@ class _LeagueInferenceService:
                     obs_batch,
                     hidden_batch,
                     action_masks=masks_batch,
+                    greedy=getattr(self, "_greedy", False),
                     include_value=False,
                     include_policy_stats=False,
                 )
@@ -994,6 +998,7 @@ class _LeagueInferenceService:
             with torch.inference_mode(), self._device_execution_context():
                 picks_tensor = agent.team_preview(
                     obs_batch,
+                    greedy=getattr(self, "_greedy", False),
                     include_value=False,
                     include_policy_stats=False,
                     include_opponent_preview=False,
@@ -1068,7 +1073,13 @@ class _LeagueInferenceService:
     def _load_agent(self, checkpoint_path: str) -> PokeAgent:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         agent_copy = copy.deepcopy(self._agent_template)
-        load_state_dict_compatible(agent_copy, checkpoint["agent"])
+        try:
+            agent_copy.load_state_dict(checkpoint["agent"], strict=True)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"League checkpoint {checkpoint_path!r} does not exactly match the "
+                f"current agent architecture: {exc}"
+            ) from exc
         with cuda_model_execution(self._device):
             agent_copy.to(self._device)
         agent_copy.eval()
@@ -1675,6 +1686,7 @@ class League:
         device: torch.device,
         *,
         rng: random.Random | None = None,
+        inference_greedy: bool = False,
     ):
         self.config = config
         self.env_config = env_config
@@ -1693,6 +1705,7 @@ class League:
             agent_template,
             self.inference_device,
             coalesce_window_sec=config.league_coalesce_ms / 1000.0,
+            greedy=inference_greedy,
         )
         if self.preview_inference_device == self.inference_device:
             self._preview_inference = self._inference
@@ -1701,6 +1714,7 @@ class League:
                 agent_template,
                 self.preview_inference_device,
                 coalesce_window_sec=config.league_coalesce_ms / 1000.0,
+                greedy=inference_greedy,
             )
 
     def add_checkpoint(self, agent: PokeAgent, step: int):
