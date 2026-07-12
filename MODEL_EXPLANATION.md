@@ -84,7 +84,7 @@ synthetic preview observation
 
 The spatial encoder, memory module, and their weights are shared between battle turns and team preview — only the heads differ.
 
-During PPO updates, two additional auxiliary heads provide dense supervised signal without changing rewards or inference-time action selection: `HiddenInfoHead` predicts eventually revealed opponent item / ability / tera type / move set from `opp_reps`, and `OpponentActionHead` predicts the opponent's observed `(a1, a2, tera)` from `memory_out` plus both sides' active reps.
+During PPO updates, two additional auxiliary heads provide dense supervised signal without changing rewards or inference-time action selection. `HiddenInfoHead` predicts the selected opponent's exact item / ability / tera type / move set from `opp_reps` plus recurrent `memory_out`; `OpponentActionHead` predicts the opponent's observed `(a1, a2, tera)` from `memory_out` plus both sides' active reps. Exact packed-team attributes are trainer-only terminal targets and are never added to policy observations or inference outputs.
 
 ---
 
@@ -402,7 +402,7 @@ The tera mask is **derived internally** inside `ActionHead.forward(...)` from `m
 
 Uniform-over-valid exploration is complemented by targeted early-turn delay. If `tera_force_delay_prob > 0`, the rollout path can convert a sampled tera action into `no tera` through `tera_force_delay_max_turn`. This does not change the model architecture or reward; it directly creates delayed-tera trajectories so the value function and policy can compare "tera now" against "save tera".
 
-The stored log-prob for the taken action is always computed under the **policy** distribution (not the mixed behavior distribution), so PPO's importance ratio is slightly off-policy. For small, decayed probabilities this is kept within the clip window. Exploration is only active on the rollout path (`actions is None`); the PPO update path passes stored actions and is unaffected.
+Rollout sampling and PPO evaluation use the same exact **behavior distribution**. First, the learned tera distribution `q` is mixed with uniform-over-valid exploration: `q_eps = (1 - epsilon) q + epsilon U`. On an eligible early turn, force-delay moves probability mass from the two tera actions to `no tera`: `b(no tera) = q_eps(no tera) + d * (1 - q_eps(no tera))` and `b(tera slot) = (1 - d) * q_eps(tera slot)`. The rollout stores `log b(a)`, and PPO recomputes `log b(a)` with the rollout's fixed `epsilon`, `d`, and turn window. This gives a ratio of one before any intervening parameter update and remains the correct importance-sampling denominator when the current-rollout team-preview step runs first. Greedy play and ordinary evaluation continue to use the unmodified learned distribution `q`.
 
 Epsilon decays linearly from `tera_exploration_start = 0.15` to `tera_exploration_end = 0.02` across `tera_exploration_decay_updates = 2000` PPO updates.
 
@@ -413,7 +413,7 @@ Forced delay decays linearly from `tera_force_delay_start = 0.40` to `tera_force
 ```
 {
   "actions":  (batch, 3),   # [a1, a2, tera_choice]
-  "log_prob": (batch,),     # log π(a1) + log π(a2 | a1) + log π(tera | a1, a2)
+  "log_prob": (batch,),     # slot policy log-probs + tera behavior log-prob during exploration
   "entropy":  (batch,),     # sum of the three entropies
 }
 ```
@@ -492,7 +492,7 @@ The gradients from the auxiliary losses flow back through the shared encoder sta
 
 Two battle-turn auxiliary heads also live in [pokerl/model/heads.py](pokerl/model/heads.py), but they do not get separate architecture sections because they are training-only heads rather than action-path components:
 
-- `HiddenInfoHead` maps `opp_reps` to item, ability, tera-type, and move-set logits for each opponent pokemon. Labels come from the post-step terminal observation when an episode completes and are copied backward across that episode's timesteps in the rollout buffer.
+- `HiddenInfoHead` adds a projected recurrent context to each `opp_rep`, then predicts item, ability, tera type, and move set for each opponent pokemon. The projection is initialized to exactly zero, so introducing the recurrent path does not change existing head outputs; after it learns, belief-state gradients can reach memory. Exact labels for only the opponent's selected four come from the simulator's already-assigned packed team at episode completion and are copied backward across that episode's timesteps by stable public roster identity. The unselected two are masked.
 - `OpponentActionHead` maps `[memory_out, opp_active_0, opp_active_1, own_active_0, own_active_1]` to three categorical predictions for the opponent's observed `a1`, `a2`, and tera choice. Non-league opponents have no labels and are masked out.
 
 ### 3.11 Stat-based embedding initialization
@@ -644,7 +644,7 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
    ```
 
    **Battle-turn auxiliary losses:**
-   - `hidden_info_loss`: masked CE/BCE for opponent item, ability, tera type, and revealed move set using completed-episode labels aligned by stable public roster identity. Ambiguous identities and pokemon not publicly present at that timestep are excluded.
+   - `hidden_info_loss`: masked CE/BCE for the selected opponent's exact item, ability, tera type, and move set using trainer-private completed-episode labels aligned by stable public roster identity. The unselected two, ambiguous identities, and pokemon not publicly present at that timestep are excluded. Metrics report exact-label episode coverage, valid selected slots per labeled step, public-slot coverage, and labeled-step coverage.
    - `opp_action_loss`: masked CE for the league opponent's observed `(a1, a2, tera)` this turn.
 
    **Total:** `loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss + aux_hidden_info_coef * hidden_info_loss + aux_opp_action_coef * opp_action_loss`, with `value_coef=0.5`, `entropy_coef=0.01`, and both auxiliary coefficients defaulting to `0.25`.
@@ -661,6 +661,8 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
 
 **Diagnostic:** approximate KL divergence `((ratio - 1) - log_ratio).mean()` — useful for checking whether the policy is updating too aggressively.
 
+**Trainer checkpoints:** resume checkpoints use a strict versioned format and are written through an atomic temporary-file replacement. Each is cross-checked by a unique ID against its own `<checkpoint>.league_state.json` companion. Together they contain the exact agent state, model class/configuration, categorical-vocabulary fingerprint and tensor schema, Adam state, global step, Python/NumPy/PyTorch CPU and CUDA RNG states, league membership/RNG, and team-pool identity/RNG. Resume rejects legacy formats and any missing, unexpected, shape-, dtype-, layout-, class-, model-config, vocabulary, companion-ID, or team-pool mismatch; it never silently loads a compatible subset or resets Adam. League checkpoints remain lightweight agent snapshots and cannot be passed to `--resume`.
+
 ### 5.4 Team Preview Update
 
 `PPOTrainer.update_team_preview()` runs REINFORCE-with-baseline for preview decisions, because they happen once per battle (not per turn) and receive the final sparse reward much later than any individual action.
@@ -673,7 +675,7 @@ value_loss = 0.5 * ((preview_value - episode_reward) ** 2).mean()
 
 The **preview value head** is a dedicated `ValueHead` instance used only as the REINFORCE baseline. Using the same battle-turn value head would be awkward because it is trained on per-turn state-value, whereas the preview head needs to predict the final return from a synthetic preview state.
 
-**Accumulation:** preview samples are collected across `team_preview_update_interval = 8` PPO updates before a gradient step runs. Completed episodes per update are few (tens), so batching several updates together gives the REINFORCE loss a usable sample size. The accumulator is capped at `team_preview_max_samples = 1024`; oldest samples are dropped on overflow.
+**On-policy sampling:** every batched preview decision is tagged with the live policy version that produced it. When a battle spans an optimizer boundary, its eventual preview sample is excluded instead of training against newer weights. Current-version samples are updated before the battle-policy PPO step; if more than `team_preview_max_samples = 1024` are available, a deterministic uniform sample without replacement is used. Summaries report current samples available, samples used, and stale boundary samples excluded. This avoids both stale supervision and the recency bias caused by dropping the oldest accumulated samples.
 
 **Auxiliary losses:**
 
@@ -772,7 +774,9 @@ Training against a fixed opponent (random, max-power greedy) produces a policy t
 
 ### 8.2 League structure
 
-A rolling pool of up to `league_size = 12` frozen past checkpoints. Every `league_update_interval = 10` PPO updates, `add_checkpoint(...)` snapshots the current policy to `checkpoint_dir/league/step_<global_step>.pt` and appends it to the pool. When the pool is full, the oldest checkpoint is evicted (`deque(maxlen=league_size)`).
+A rolling pool of up to `league_size = 12` frozen past checkpoints. Every `league_update_interval = 10` PPO updates, `add_checkpoint(...)` snapshots the current policy to `checkpoint_dir/league/step_<global_step>.pt` and appends it to the pool. When the pool is full, the oldest checkpoint is evicted (`deque(maxlen=league_size)`). Opponent groups are resampled independently every `league_refresh_interval = 1` update. On updates where both happen, the snapshot is added first, so the newly frozen policy is immediately eligible for assignment.
+
+The default two opponent groups preserve large inference batches within an update, while the faster refresh cadence supplies diversity across updates. Run summaries record the checkpoints assigned and actually observed, plus wins, losses, and draws per checkpoint and across the run.
 
 **Sampling policy** ([league.py:549-562](pokerl/training/league.py#L549-L562)): 70% chance to sample from the *recent half*, 30% from the *older half*. Balances:
 
@@ -855,8 +859,7 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `team_preview_value_coef` | 0.5 | preview value-loss weight |
 | `team_preview_bring_coef` | 0.1 | bring-prediction aux weight |
 | `team_preview_lead_coef` | 0.05 | lead-prediction aux weight |
-| `team_preview_update_interval` | 8 | flush preview accumulator every N PPO updates |
-| `team_preview_max_samples` | 1024 | accumulator cap (oldest dropped first) |
+| `team_preview_max_samples` | 1024 | uniform current-rollout preview sample cap |
 | `aux_hidden_info_coef` | 0.25 | hidden-info prediction aux weight |
 | `aux_opp_action_coef` | 0.25 | opponent-action prediction aux weight |
 | `diagnose_memory_gradients` | `False` | opt-in one-minibatch norms/cosines for weighted battle-PPO gradients on shared memory |
@@ -877,7 +880,9 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `checkpoint_dir` | `"checkpoints"` | where to write checkpoints |
 | `league_size` | 12 | max past checkpoints |
 | `league_update_interval` | 10 | save to league every N updates |
-| `league_coalesce_ms` | 10.0 | inference coalescing window (ms) |
+| `league_refresh_interval` | 1 | resample opponent groups every N updates |
+| `league_coalesce_ms` | 5.0 | inference coalescing window (ms) |
+| `seed` | 0 | master seed used to derive recorded learner, league, and team streams |
 
 ---
 
@@ -915,7 +920,7 @@ Default is full BPTT across the rollout (`bptt_chunk_steps=None`), so gradients 
 
 ### 10.5 Opponent belief modeling is supervised only, not yet consumed
 
-The network sees revealed moves / items / abilities as they appear. `HiddenInfoHead` and `OpponentActionHead` now train the shared encoder to predict eventually revealed opponent attributes and the opponent's current action, but the policy does not yet consume those distributions directly.
+The network sees revealed moves / items / abilities as they appear. `HiddenInfoHead` now conditions its selected-team predictions on recurrent context, and `OpponentActionHead` trains the same memory to predict the opponent's current action, but the policy does not yet consume either head's output distribution directly.
 
 **Fix direction:** feed the opponent-action and hidden-info distributions back into the action head so the policy best-responds to the distribution, not just to the raw recurrent state.
 
@@ -974,7 +979,7 @@ The agent must discover hazard, weather, and terrain strategies entirely from sc
 │  │  (trained)   │                                                      │
 │  └──────────────┘                                                      │
 │         │                                                              │
-│         │ every 8 updates (accumulated)                                │
+│         │ current rollout, before battle PPO                            │
 │         ↓                                                              │
 │  ┌──────────────────────────────────────────────────────────────┐      │
 │  │  PPOTrainer.update_team_preview()                            │      │

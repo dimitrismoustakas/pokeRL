@@ -20,9 +20,9 @@ Heuristic opponents (random, max-power, scripted) are deliberately excluded here
 
 ## 2. Current state
 
-- Rolling pool of `league_size = 12` checkpoints, snapshot every `league_update_interval = 10` PPO updates. Pool spans at most ~120 updates of history; oldest evicted on overflow.
-- Sampling: 70% from the recent half, 30% from the older half. Uniform within each half. No per-opponent tracking.
-- No evaluation harness that could detect cycling if it were happening.
+- Rolling pool of `league_size = 12` checkpoints, snapshot every `league_update_interval = 10` PPO updates. Pool spans at most ~120 updates of history; oldest evicted on overflow. The default two opponent groups are resampled every update independently of snapshot creation.
+- Sampling: 70% from the recent half, 30% from the older half. Uniform within each half. Outcomes are tracked per opponent for diagnosis, but they do not yet change sampling weights.
+- Training summaries now record wins, losses, and draws by opponent checkpoint, but anchor evaluation is still a manual offline step rather than a periodic checkpoint panel that can reliably detect cycling.
 
 So the primary gap is **diagnostic**: we don't currently have the data to tell whether the naive setup is working.
 

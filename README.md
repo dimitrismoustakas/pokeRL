@@ -44,6 +44,8 @@ $env:POKERL_SHOWDOWN_DIR = "C:\path\to\pokemon-showdown"
 
 Training logs include rollout time, PPO update time, completed episodes, average completed battle duration, and average completed battle turns for the current update.
 
+`--resume` accepts only versioned trainer checkpoints produced by the exact same model class, configuration, categorical vocabulary, and tensor schema. Trainer checkpoints and their uniquely paired league-state files are atomically replaced and cross-checked; together they restore Adam, global step, Python/NumPy/PyTorch RNG, league sampling, and team-pool sampling. Lightweight league snapshots are evaluation/opponent artifacts and cannot resume training.
+
 To train on a fixed Regulation F pool with team preview (bring 4 of 6):
 
 ```powershell
@@ -61,6 +63,14 @@ To tune how many frozen opponents are shared across the env batch:
 ```powershell
 & .\.venv\Scripts\python.exe .\scripts\train.py --device cpu --num-envs 16 --opponent-groups 2
 ```
+
+The two opponent groups are resampled every update by default, while a new
+frozen policy is added to the league every 10 updates. This increases opponent
+variety over time without splitting each update into smaller inference batches.
+Use `--league-refresh-interval` and `--league-update-interval` to tune the two
+cadences independently. `--seed` records and derives separate league and team
+sampling streams; asynchronous battles still do not guarantee bitwise-identical
+runs.
 
 For a short local BattleStream scaling benchmark over two rollout->PPO rounds:
 
