@@ -316,6 +316,62 @@ def test_rollout_buffer_aligns_terminal_aux_labels_by_source_identity() -> None:
     ]
 
 
+def test_rollout_buffer_batches_aux_alignment_without_overwriting_prior_episode() -> (
+    None
+):
+    device = torch.device("cpu")
+    buffer = RolloutBuffer(3, 2, _aux_obs(2, 1), _mask(2), device)
+    buffer.reset()
+    actions = torch.zeros((2, 3), dtype=torch.long)
+    masks = _obs_to_tensor(_mask(2), device)
+    zeros = torch.zeros(2)
+
+    first_terminal = _aux_obs(2, 0)
+    first_terminal["opp_item"][0].fill(10)
+    buffer.add(
+        _obs_to_tensor(_aux_obs(2, 1), device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        zeros,
+        torch.tensor([True, False]),
+        aux_label_obs=_obs_to_tensor(first_terminal, device),
+        done_env_indices=[0],
+    )
+    buffer.add(
+        _obs_to_tensor(_aux_obs(2, 2), device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        zeros,
+        torch.tensor([False, False]),
+    )
+
+    final_terminal = _aux_obs(2, 0)
+    final_terminal["opp_item"][0].fill(20)
+    final_terminal["opp_item"][1].fill(30)
+    buffer.add(
+        _obs_to_tensor(_aux_obs(2, 3), device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        zeros,
+        torch.tensor([True, True]),
+        aux_label_obs=_obs_to_tensor(final_terminal, device),
+        done_env_indices=[0, 1],
+    )
+
+    batch = buffer.compute_gae(torch.zeros(2))
+
+    assert batch.aux_labels["opp_item"][:, 0, 0].tolist() == [10, 20, 20]
+    assert batch.aux_labels["opp_item"][:, 1, 0].tolist() == [30, 30, 30]
+    assert batch.aux_label_valid[:, 0, 0].tolist() == [True, True, True]
+    assert batch.aux_label_valid[:, 1, 0].tolist() == [True, True, True]
+
+
 def test_rollout_buffer_requires_a_complete_rollout_before_gae() -> None:
     device = torch.device("cpu")
     num_steps = 2

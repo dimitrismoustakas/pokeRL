@@ -198,15 +198,14 @@ class RolloutBuffer:
                 done_envs = done_env_indices
             if len(done_envs) > 0:
                 label_obs = aux_label_obs if aux_label_obs is not None else obs
-                for env_idx_raw in done_envs:
-                    env_idx = int(env_idx_raw)
-                    start = self._episode_start[env_idx]
-                    self._fill_aligned_aux_labels(
-                        start=start,
-                        end=slot + 1,
-                        env_idx=env_idx,
-                        label_obs=label_obs,
-                    )
+                env_indices = [int(env_idx) for env_idx in done_envs]
+                self._fill_aligned_aux_labels(
+                    starts=[self._episode_start[env_idx] for env_idx in env_indices],
+                    end=slot + 1,
+                    env_indices=env_indices,
+                    label_obs=label_obs,
+                )
+                for env_idx in env_indices:
                     self._episode_start[env_idx] = slot + 1
 
         self.step += 1
@@ -214,35 +213,74 @@ class RolloutBuffer:
     def _fill_aligned_aux_labels(
         self,
         *,
-        start: int,
+        starts: list[int],
         end: int,
-        env_idx: int,
+        env_indices: list[int],
         label_obs: dict[str, torch.Tensor],
     ) -> None:
-        current_identity = self._obs[self.AUX_IDENTITY_KEY][start:end, env_idx]
-        terminal_identity = label_obs[self.AUX_IDENTITY_KEY][env_idx].detach()
-        current_present = ~self._obs["opp_mask"][start:end, env_idx]
-        terminal_present = ~label_obs["opp_mask"][env_idx].detach()
+        lengths = [end - start for start in starts]
+        flat_times_cpu = torch.cat(
+            [torch.arange(start, end, dtype=torch.int64) for start in starts]
+        )
+        env_indices_cpu = torch.tensor(env_indices, dtype=torch.int64)
+        lengths_cpu = torch.tensor(lengths, dtype=torch.int64)
+        flat_envs_cpu = env_indices_cpu.repeat_interleave(lengths_cpu)
+        terminal_rows_cpu = torch.arange(
+            len(env_indices),
+            dtype=torch.int64,
+        ).repeat_interleave(lengths_cpu)
 
-        matches = current_identity.unsqueeze(-1).eq(terminal_identity.view(1, 1, -1))
+        flat_times = flat_times_cpu.to(device=self.device)
+        flat_envs = flat_envs_cpu.to(device=self.device)
+        terminal_rows = terminal_rows_cpu.to(device=self.device)
+        done_envs = env_indices_cpu.to(device=self.device)
+
+        current_identity = self._obs[self.AUX_IDENTITY_KEY][flat_times, flat_envs]
+        terminal_identity = (
+            label_obs[self.AUX_IDENTITY_KEY]
+            .index_select(
+                0,
+                done_envs,
+            )
+            .index_select(0, terminal_rows)
+        )
+        current_present = ~self._obs["opp_mask"][flat_times, flat_envs]
+        terminal_present = ~label_obs["opp_mask"].index_select(
+            0,
+            done_envs,
+        ).index_select(0, terminal_rows)
+
+        matches = current_identity.unsqueeze(-1).eq(terminal_identity.unsqueeze(-2))
         matches &= current_present.unsqueeze(-1)
-        matches &= terminal_present.view(1, 1, -1)
+        matches &= terminal_present.unsqueeze(-2)
         matches &= current_identity.unsqueeze(-1).ge(0)
         unique_match = matches.sum(dim=-1).eq(1)
         terminal_indices = matches.to(torch.int64).argmax(dim=-1)
+        pair_indices = torch.arange(
+            terminal_indices.shape[0],
+            device=self.device,
+        ).unsqueeze(-1)
 
         for key in self.AUX_LABEL_KEYS:
-            terminal_value = label_obs[key][env_idx].detach()
-            aligned_value = terminal_value[terminal_indices]
+            terminal_value = (
+                label_obs[key]
+                .index_select(
+                    0,
+                    done_envs,
+                )
+                .index_select(0, terminal_rows)
+            )
+            aligned_value = terminal_value[pair_indices, terminal_indices]
             trailing_dims = aligned_value.ndim - unique_match.ndim
             valid_value = unique_match.reshape(
                 *unique_match.shape,
                 *((1,) * trailing_dims),
             ).expand_as(aligned_value)
-            self._aux_labels[key][start:end, env_idx].copy_(
-                aligned_value.masked_fill(~valid_value, 0)
+            self._aux_labels[key][flat_times, flat_envs] = aligned_value.masked_fill(
+                ~valid_value,
+                0,
             )
-        self._aux_label_valid[start:end, env_idx].copy_(unique_match)
+        self._aux_label_valid[flat_times, flat_envs] = unique_match
 
     def compute_gae(
         self,
