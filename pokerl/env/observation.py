@@ -9,6 +9,7 @@ from poke_env.battle import (
     Effect,
     Field,
     Pokemon,
+    PublicBattleEventKind,
     SideCondition,
     Status,
     Weather,
@@ -18,6 +19,16 @@ from poke_env.data.normalize import to_id_str
 from poke_env.teambuilder.teambuilder import Teambuilder
 
 from ..data import GameData, UNKNOWN_IDX
+from .actions import (
+    INTENT_MOVE,
+    INTENT_SWITCH,
+    SemanticActionIntent,
+    TARGET_ALLY,
+    TARGET_NONE,
+    TARGET_OPPONENT_1,
+    TARGET_OPPONENT_2,
+    TARGET_SELF,
+)
 
 
 NUM_STATUS = 7
@@ -132,6 +143,25 @@ ROLE_ACTIVE_2 = 1
 ROLE_BENCH = 2
 _ILLUSION_SPECIES = frozenset(("zoroark", "zoroarkhisui"))
 
+MAX_RECENT_EVENTS = 12
+EVENT_PAD = 0
+EVENT_KIND_TO_INDEX = {
+    PublicBattleEventKind.MOVE: 1,
+    PublicBattleEventKind.SWITCH: 2,
+    PublicBattleEventKind.DRAG: 3,
+    PublicBattleEventKind.CANT: 4,
+    PublicBattleEventKind.FAINT: 5,
+    PublicBattleEventKind.TERA: 6,
+}
+NUM_EVENT_KINDS = 7
+POSITION_UNKNOWN = 0
+POSITION_OWN_1 = 1
+POSITION_OWN_2 = 2
+POSITION_OPP_1 = 3
+POSITION_OPP_2 = 4
+POSITION_IMPLICIT = 5
+NUM_EVENT_POSITIONS = 6
+
 assert (
     1
     + NUM_STATUS
@@ -156,7 +186,11 @@ class ObservationBuilder:
         self.gd = game_data
         self.team_size = team_size
 
-    def build(self, battle: DoubleBattle) -> dict[str, np.ndarray]:
+    def build(
+        self,
+        battle: DoubleBattle,
+        previous_intent: SemanticActionIntent | None = None,
+    ) -> dict[str, np.ndarray]:
         """Convert a battle state to a dict of numpy arrays."""
         obs = {}
 
@@ -189,7 +223,123 @@ class ObservationBuilder:
         obs["own_active_present"] = own_active_present
         obs["opp_active_indices"] = opp_active_indices
         obs["opp_active_present"] = opp_active_present
+        self._encode_transition_history(battle, previous_intent, obs)
         return obs
+
+    def _encode_transition_history(
+        self,
+        battle: DoubleBattle,
+        previous_intent: SemanticActionIntent | None,
+        obs: dict[str, np.ndarray],
+    ) -> None:
+        event_kind = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_actor = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_target = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_move = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_species = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_tera_type = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_flags = np.zeros((MAX_RECENT_EVENTS, 3), dtype=np.float32)
+        event_mask = np.ones(MAX_RECENT_EVENTS, dtype=bool)
+        event_meta = np.zeros(3, dtype=np.float32)
+
+        segment = getattr(battle, "recent_public_events", None)
+        if segment is not None and segment.valid:
+            player_role = getattr(battle, "player_role", None)
+            events = segment.events[:MAX_RECENT_EVENTS]
+            for index, event in enumerate(events):
+                event_kind[index] = EVENT_KIND_TO_INDEX[event.kind]
+                event_actor[index] = self._public_position(event.actor, player_role)
+                event_target[index] = self._public_position(event.target, player_role)
+                if event.move:
+                    event_move[index] = self.gd.move_to_idx.get(
+                        to_id_str(event.move), UNKNOWN_IDX
+                    )
+                if event.kind in {
+                    PublicBattleEventKind.SWITCH,
+                    PublicBattleEventKind.DRAG,
+                } and event.details:
+                    switched = Pokemon(gen=self.gd.gen, details=event.details)
+                    event_species[index] = self._species_idx(switched)
+                if event.kind is PublicBattleEventKind.TERA and event.details:
+                    event_tera_type[index] = self.gd.type_to_idx.get(
+                        to_id_str(event.details), UNKNOWN_IDX
+                    )
+                event_flags[index] = (event.failed, event.missed, event.spread)
+                event_mask[index] = False
+            event_meta[:] = (
+                1.0,
+                float(segment.partial),
+                min(segment.overflow_count, MAX_RECENT_EVENTS)
+                / float(MAX_RECENT_EVENTS),
+            )
+
+        own_kind = np.zeros(2, dtype=np.int64)
+        own_move = np.zeros(2, dtype=np.int64)
+        own_target = np.zeros(2, dtype=np.int64)
+        own_switch_species = np.zeros(2, dtype=np.int64)
+        own_tera = np.zeros(2, dtype=bool)
+        own_valid = np.zeros(2, dtype=bool)
+        if previous_intent is not None:
+            for slot, intent in enumerate(previous_intent.slots):
+                own_kind[slot] = intent.kind
+                if intent.kind == INTENT_MOVE and intent.move_id:
+                    own_move[slot] = self.gd.move_to_idx.get(
+                        to_id_str(intent.move_id), UNKNOWN_IDX
+                    )
+                    own_target[slot] = self._intent_target_position(
+                        intent.target, slot
+                    )
+                elif intent.kind == INTENT_SWITCH and intent.switch_species:
+                    own_switch_species[slot] = self.gd.species_to_idx.get(
+                        to_id_str(intent.switch_species), UNKNOWN_IDX
+                    )
+                own_tera[slot] = intent.terastallize
+                own_valid[slot] = True
+
+        obs["recent_event_kind"] = event_kind
+        obs["recent_event_actor"] = event_actor
+        obs["recent_event_target"] = event_target
+        obs["recent_event_move"] = event_move
+        obs["recent_event_species"] = event_species
+        obs["recent_event_tera_type"] = event_tera_type
+        obs["recent_event_flags"] = event_flags
+        obs["recent_event_mask"] = event_mask
+        obs["recent_event_meta"] = event_meta
+        obs["prev_own_kind"] = own_kind
+        obs["prev_own_move"] = own_move
+        obs["prev_own_target"] = own_target
+        obs["prev_own_switch_species"] = own_switch_species
+        obs["prev_own_tera"] = own_tera
+        obs["prev_own_valid"] = own_valid
+
+    @staticmethod
+    def _public_position(identifier: str | None, player_role: str | None) -> int:
+        if not identifier or player_role not in {"p1", "p2"}:
+            return POSITION_UNKNOWN
+        prefix = identifier[:3]
+        if len(prefix) != 3 or prefix[:2] not in {"p1", "p2"}:
+            return POSITION_UNKNOWN
+        slot = prefix[2]
+        if slot not in {"a", "b"}:
+            return POSITION_UNKNOWN
+        own = prefix[:2] == player_role
+        if own:
+            return POSITION_OWN_1 if slot == "a" else POSITION_OWN_2
+        return POSITION_OPP_1 if slot == "a" else POSITION_OPP_2
+
+    @staticmethod
+    def _intent_target_position(target: int, actor_slot: int) -> int:
+        if target == TARGET_OPPONENT_1:
+            return POSITION_OPP_1
+        if target == TARGET_OPPONENT_2:
+            return POSITION_OPP_2
+        if target == TARGET_SELF:
+            return POSITION_OWN_1 if actor_slot == 0 else POSITION_OWN_2
+        if target == TARGET_ALLY:
+            return POSITION_OWN_2 if actor_slot == 0 else POSITION_OWN_1
+        if target == TARGET_NONE:
+            return POSITION_IMPLICIT
+        return POSITION_UNKNOWN
 
     def _public_opponent_team(
         self,

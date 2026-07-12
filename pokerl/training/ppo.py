@@ -19,6 +19,10 @@ from ..env.observation import (
     TERA_KNOWN_OFFSET,
 )
 from ..model.agent import PokeAgent
+from .aux_metrics import (
+    hidden_info_belief_additive_metrics,
+    opponent_action_additive_metrics,
+)
 from .rollout import RolloutBatch
 
 
@@ -320,14 +324,23 @@ class PPOTrainer:
             "policy_loss": torch.zeros((), device=self.device),
             "value_loss": torch.zeros((), device=self.device),
             "entropy": torch.zeros((), device=self.device),
+            "action_entropy": torch.zeros((), device=self.device),
             "approx_kl": torch.zeros((), device=self.device),
+            "clip_fraction": torch.zeros((), device=self.device),
+            "value_clip_fraction": torch.zeros((), device=self.device),
         }
+        max_approx_kl = torch.zeros((), device=self.device)
         base_tera_entropy_sum = torch.zeros((), device=self.device)
+        base_tera_gate_entropy_sum = torch.zeros((), device=self.device)
+        base_tera_slot_entropy_sum = torch.zeros((), device=self.device)
+        base_tera_use_prob_sum = torch.zeros((), device=self.device)
         base_tera_none_prob_sum = torch.zeros((), device=self.device)
         base_tera_real_choice_evaluations = torch.zeros((), device=self.device)
+        base_tera_slot_choice_evaluations = torch.zeros((), device=self.device)
         num_updates = 0
         skipped_nonfinite = 0
         memory_gradient_diagnostics: dict[str, float] = {}
+        aux_diagnostic_sums: dict[str, float] = {}
         initial_policy_shift: dict[str, torch.Tensor] = {}
 
         aux_labels_all = batch.aux_labels
@@ -429,9 +442,14 @@ class PPOTrainer:
                 # whole rollout minibatch at once.
                 all_log_probs: list[torch.Tensor] = []
                 all_entropies: list[torch.Tensor] = []
+                all_action_entropies: list[torch.Tensor] = []
                 all_base_tera_entropies: list[torch.Tensor] = []
+                all_base_tera_gate_entropies: list[torch.Tensor] = []
+                all_base_tera_slot_entropies: list[torch.Tensor] = []
+                all_base_tera_use_probs: list[torch.Tensor] = []
                 all_base_tera_none_probs: list[torch.Tensor] = []
                 all_base_tera_real_choices: list[torch.Tensor] = []
+                all_base_tera_slot_choices: list[torch.Tensor] = []
                 all_values: list[torch.Tensor] = []
                 head_chunk_steps = max(1, min(T, self._HEAD_BATCH_TARGET // E_mb))
                 for start in range(0, T, head_chunk_steps):
@@ -478,8 +496,6 @@ class PPOTrainer:
                             for key, value in mb_obs_seq.items()
                         },
                         tera_exploration_prob=batch.tera_exploration_prob,
-                        tera_force_delay_prob=batch.tera_force_delay_prob,
-                        tera_force_delay_max_turn=(batch.tera_force_delay_max_turn),
                         validate_actions=False,
                     )
                     value_t = self.agent.value_head(
@@ -495,18 +511,34 @@ class PPOTrainer:
 
                     all_log_probs.append(action_out["log_prob"])
                     all_entropies.append(action_out["entropy"])
+                    all_action_entropies.append(action_out["action_entropy"])
                     all_base_tera_entropies.append(action_out["base_tera_entropy"])
+                    all_base_tera_gate_entropies.append(
+                        action_out["base_tera_gate_entropy"]
+                    )
+                    all_base_tera_slot_entropies.append(
+                        action_out["base_tera_slot_entropy"]
+                    )
+                    all_base_tera_use_probs.append(action_out["base_tera_use_prob"])
                     all_base_tera_none_probs.append(action_out["base_tera_none_prob"])
                     all_base_tera_real_choices.append(
                         action_out["base_tera_has_real_choice"]
+                    )
+                    all_base_tera_slot_choices.append(
+                        action_out["base_tera_has_slot_choice"]
                     )
                     all_values.append(value_t)
 
                 log_probs_flat = torch.cat(all_log_probs)
                 entropies_flat = torch.cat(all_entropies)
+                action_entropies_flat = torch.cat(all_action_entropies)
                 base_tera_entropies_flat = torch.cat(all_base_tera_entropies)
+                base_tera_gate_entropies_flat = torch.cat(all_base_tera_gate_entropies)
+                base_tera_slot_entropies_flat = torch.cat(all_base_tera_slot_entropies)
+                base_tera_use_probs_flat = torch.cat(all_base_tera_use_probs)
                 base_tera_none_probs_flat = torch.cat(all_base_tera_none_probs)
                 base_tera_real_choices_flat = torch.cat(all_base_tera_real_choices)
+                base_tera_slot_choices_flat = torch.cat(all_base_tera_slot_choices)
                 values_flat = torch.cat(all_values)
 
                 # Policy loss (clipped surrogate objective).
@@ -564,12 +596,42 @@ class PPOTrainer:
                     ).mean()
                 )
 
-                entropy_loss = -entropies_flat.mean()
+                # Battle actions, the use-now gate, and the conditional slot
+                # choice have independent entropy coefficients. Conditional
+                # slot entropy is optimized only when both slots are eligible,
+                # and therefore cannot itself pressure the gate to use Tera.
+                action_entropy_loss = -action_entropies_flat.mean()
+                base_tera_real_choice_weights = base_tera_real_choices_flat.to(
+                    base_tera_entropies_flat.dtype
+                )
+                base_tera_gate_support = base_tera_real_choice_weights.sum().clamp_min(
+                    1.0
+                )
+                tera_gate_entropy_loss = (
+                    -(
+                        base_tera_gate_entropies_flat * base_tera_real_choice_weights
+                    ).sum()
+                    / base_tera_gate_support
+                )
+                base_tera_slot_choice_weights = base_tera_slot_choices_flat.to(
+                    base_tera_slot_entropies_flat.dtype
+                )
+                base_tera_slot_support = base_tera_slot_choice_weights.sum().clamp_min(
+                    1.0
+                )
+                tera_slot_entropy_loss = (
+                    -(
+                        base_tera_slot_entropies_flat * base_tera_slot_choice_weights
+                    ).sum()
+                    / base_tera_slot_support
+                )
 
                 loss = (
                     policy_loss
                     + self.config.value_coef * value_loss
-                    + self.config.entropy_coef * entropy_loss
+                    + self.config.entropy_coef * action_entropy_loss
+                    + self.config.tera_gate_entropy_coef * tera_gate_entropy_loss
+                    + self.config.tera_slot_entropy_coef * tera_slot_entropy_loss
                 )
 
                 # --- Aux losses ---
@@ -580,6 +642,8 @@ class PPOTrainer:
                 # labels come from the buffer's retroactive fill on done.
                 hidden_info_loss = None
                 opp_action_loss = None
+                hidden_info_out = None
+                opp_action_out = None
                 if hidden_info_enabled:
                     aux_labels_mb = {
                         key: value[:, mb_envs] for key, value in aux_labels_all.items()
@@ -611,6 +675,29 @@ class PPOTrainer:
                     )
                     loss = loss + self.config.aux_opp_action_coef * opp_action_loss
 
+                pending_aux_diagnostics: dict[str, float] = {}
+                if epoch == self.config.num_epochs - 1:
+                    if hidden_info_out is not None:
+                        pending_aux_diagnostics.update(
+                            hidden_info_belief_additive_metrics(
+                                hidden_info_out,
+                                aux_labels_mb,
+                                aux_label_valid_mb,
+                                mb_obs_seq,
+                            )
+                        )
+                    if opp_action_out is not None:
+                        pending_aux_diagnostics.update(
+                            opponent_action_additive_metrics(
+                                {
+                                    key: value.reshape(T, E_mb, value.shape[-1])
+                                    for key, value in opp_action_out.items()
+                                },
+                                opp_actions_mb,
+                                opp_actions_valid_mb,
+                            )
+                        )
+
                 pending_memory_diagnostics = None
                 if (
                     self.config.diagnose_memory_gradients
@@ -632,7 +719,14 @@ class PPOTrainer:
                     )
                     support = dict(zip(support_names, support_values, strict=True))
                     objectives = {
-                        "actor": policy_loss + self.config.entropy_coef * entropy_loss,
+                        "actor": (
+                            policy_loss
+                            + self.config.entropy_coef * action_entropy_loss
+                            + self.config.tera_gate_entropy_coef
+                            * tera_gate_entropy_loss
+                            + self.config.tera_slot_entropy_coef
+                            * tera_slot_entropy_loss
+                        ),
                         "value": self.config.value_coef * value_loss,
                     }
                     if hidden_info_loss is not None:
@@ -667,6 +761,8 @@ class PPOTrainer:
                     continue
                 if pending_memory_diagnostics is not None:
                     memory_gradient_diagnostics = pending_memory_diagnostics
+                for key, value in pending_aux_diagnostics.items():
+                    aux_diagnostic_sums[key] = aux_diagnostic_sums.get(key, 0.0) + value
 
                 with torch.no_grad():
                     approx_kl = (
@@ -678,9 +774,25 @@ class PPOTrainer:
                     ).mean()
                     metric_sums["policy_loss"].add_(policy_loss.detach())
                     metric_sums["value_loss"].add_(value_loss.detach())
-                    metric_sums["entropy"].add_((-entropy_loss).detach())
+                    metric_sums["entropy"].add_(entropies_flat.mean().detach())
+                    metric_sums["action_entropy"].add_((-action_entropy_loss).detach())
                     base_tera_entropy_sum.add_(
                         base_tera_entropies_flat[base_tera_real_choices_flat]
+                        .sum()
+                        .detach()
+                    )
+                    base_tera_gate_entropy_sum.add_(
+                        base_tera_gate_entropies_flat[base_tera_real_choices_flat]
+                        .sum()
+                        .detach()
+                    )
+                    base_tera_slot_entropy_sum.add_(
+                        base_tera_slot_entropies_flat[base_tera_slot_choices_flat]
+                        .sum()
+                        .detach()
+                    )
+                    base_tera_use_prob_sum.add_(
+                        base_tera_use_probs_flat[base_tera_real_choices_flat]
                         .sum()
                         .detach()
                     )
@@ -692,7 +804,21 @@ class PPOTrainer:
                     base_tera_real_choice_evaluations.add_(
                         base_tera_real_choices_flat.sum().detach()
                     )
+                    base_tera_slot_choice_evaluations.add_(
+                        base_tera_slot_choices_flat.sum().detach()
+                    )
                     metric_sums["approx_kl"].add_(approx_kl)
+                    max_approx_kl = torch.maximum(max_approx_kl, approx_kl)
+                    metric_sums["clip_fraction"].add_(
+                        ((ratio - 1.0).abs() > self.config.clip_eps)
+                        .to(torch.float32)
+                        .mean()
+                    )
+                    metric_sums["value_clip_fraction"].add_(
+                        ((values_flat - mb_values_old).abs() > self.config.clip_eps)
+                        .to(torch.float32)
+                        .mean()
+                    )
                     if hidden_info_enabled:
                         metric_sums["aux_hidden_info_loss"].add_(
                             hidden_info_loss.detach()
@@ -715,10 +841,38 @@ class PPOTrainer:
         averaged.update(
             {key: value.item() for key, value in initial_policy_shift.items()}
         )
+        averaged["max_approx_kl"] = max_approx_kl.item()
+        returns_variance = returns_seq.var(unbiased=False)
+        averaged["value_explained_variance"] = (
+            (
+                1.0
+                - (returns_seq - values_old_seq).var(unbiased=False)
+                / returns_variance.clamp_min(1e-8)
+            ).item()
+            if returns_variance.item() > 0.0
+            else 0.0
+        )
         base_tera_support = base_tera_real_choice_evaluations.item()
         averaged["base_tera_real_choice_evaluations"] = base_tera_support
         averaged["base_tera_entropy"] = (
             base_tera_entropy_sum.item() / base_tera_support
+            if base_tera_support > 0
+            else 0.0
+        )
+        averaged["base_tera_gate_entropy"] = (
+            base_tera_gate_entropy_sum.item() / base_tera_support
+            if base_tera_support > 0
+            else 0.0
+        )
+        base_tera_slot_support = base_tera_slot_choice_evaluations.item()
+        averaged["base_tera_slot_choice_evaluations"] = base_tera_slot_support
+        averaged["base_tera_slot_entropy"] = (
+            base_tera_slot_entropy_sum.item() / base_tera_slot_support
+            if base_tera_slot_support > 0
+            else 0.0
+        )
+        averaged["base_tera_use_prob"] = (
+            base_tera_use_prob_sum.item() / base_tera_support
             if base_tera_support > 0
             else 0.0
         )
@@ -729,10 +883,44 @@ class PPOTrainer:
         )
         if aux_labels_all:
             averaged.update(hidden_info_coverage_metrics)
+        averaged.update(self._finalize_aux_diagnostics(aux_diagnostic_sums))
         averaged.update(memory_gradient_diagnostics)
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
+
+    @staticmethod
+    def _finalize_aux_diagnostics(sums: Mapping[str, float]) -> dict[str, float]:
+        """Convert additive auxiliary sufficient statistics to readable metrics."""
+        result: dict[str, float] = {}
+        for task in ("item", "ability", "tera"):
+            prefix = f"aux_{task}_unknown"
+            count = sums.get(f"{prefix}_count", 0.0)
+            result[f"{prefix}_count"] = count
+            for source, target in (
+                ("top1_correct", "top1_accuracy"),
+                ("nll_sum", "nll"),
+                ("brier_sum", "brier"),
+            ):
+                numerator = sums.get(f"{prefix}_{source}", 0.0)
+                result[f"{prefix}_{target}"] = numerator / count if count > 0.0 else 0.0
+
+        move_count = sums.get("aux_move_unknown_recall_at_4_count", 0.0)
+        result["aux_move_unknown_recall_at_4_count"] = move_count
+        result["aux_move_unknown_recall_at_4"] = (
+            sums.get("aux_move_unknown_recall_at_4_correct", 0.0) / move_count
+            if move_count > 0.0
+            else 0.0
+        )
+
+        for component in ("a1", "a2", "tera"):
+            prefix = f"opp_action_{component}"
+            count = sums.get(f"{prefix}_count", 0.0)
+            result[f"{prefix}_count"] = count
+            result[f"{prefix}_top1_accuracy"] = (
+                sums.get(f"{prefix}_top1_correct", 0.0) / count if count > 0.0 else 0.0
+            )
+        return result
 
     @staticmethod
     def _hidden_info_coverage_metrics(
@@ -1006,65 +1194,130 @@ class PPOTrainer:
 
         Returns a dict of preview-loss metrics for logging.
         """
-        obs_batch = {
-            k: torch.from_numpy(np.stack([d[0][k] for d in data])).to(self.device)
-            for k in data[0][0]
+        if not data:
+            raise ValueError("Team-preview update requires at least one sample.")
+
+        sample_count = len(data)
+        chunk_size = min(self.config.preview_update_minibatch_size, sample_count)
+        # Bring supervision is normalized over valid Pokemon slots rather than
+        # samples. Compute its global denominator up front so chunks reproduce
+        # the exact full-batch objective even when masks differ between them.
+        valid_bring_slots = sum(
+            int(np.count_nonzero(~np.asarray(sample[0]["opp_mask"], dtype=bool)))
+            for sample in data
+        )
+        bring_denominator = float(max(valid_bring_slots, 1))
+
+        metric_sums = {
+            "policy": torch.zeros((), device=self.device),
+            "value": torch.zeros((), device=self.device),
+            "entropy": torch.zeros((), device=self.device),
+            "bring": torch.zeros((), device=self.device),
+            "lead": torch.zeros((), device=self.device),
         }
-        picks_batch = (
-            torch.from_numpy(np.stack([d[1] for d in data])).long().to(self.device)
-        )
-        rewards_batch = torch.tensor(
-            [d[2] for d in data], dtype=torch.float32, device=self.device
-        )
-        opponent_picks_batch = (
-            torch.from_numpy(np.stack([d[3] for d in data])).long().to(self.device)
-        )
+        self.optimizer.zero_grad(set_to_none=True)
 
-        out = self.agent.team_preview(obs_batch, picks=picks_batch)
-        log_prob = out["log_prob"]
-        entropy = out["entropy"]
-        baselines = out["preview_value"]
-        bring_logits = out["opponent_bring_logits"]
-        lead_pair_logits = out["opponent_lead_pair_logits"]
+        for start in range(0, sample_count, chunk_size):
+            chunk = data[start : start + chunk_size]
+            obs_batch = {
+                key: torch.from_numpy(
+                    np.stack([sample[0][key] for sample in chunk])
+                ).to(self.device)
+                for key in chunk[0][0]
+            }
+            picks_batch = torch.from_numpy(
+                np.stack([sample[1] for sample in chunk])
+            ).to(device=self.device, dtype=torch.long)
+            rewards_batch = torch.tensor(
+                [sample[2] for sample in chunk],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            opponent_picks_batch = torch.from_numpy(
+                np.stack([sample[3] for sample in chunk])
+            ).to(device=self.device, dtype=torch.long)
 
-        # Preview actor-critic: use a dedicated preview value head as the baseline.
-        advantages = rewards_batch - baselines.detach()
-        policy_loss = -(log_prob * advantages).mean()
-        entropy_bonus = self.config.entropy_coef * entropy.mean()
-        value_loss = 0.5 * (baselines - rewards_batch).pow(2).mean()
+            out = self.agent.team_preview(obs_batch, picks=picks_batch)
+            log_prob = out["log_prob"]
+            entropy = out["entropy"]
+            baselines = out["preview_value"]
+            bring_logits = out["opponent_bring_logits"]
+            lead_pair_logits = out["opponent_lead_pair_logits"]
 
-        team_size = bring_logits.shape[1]
-        bring_targets = torch.zeros_like(bring_logits)
-        bring_targets.scatter_(1, opponent_picks_batch, 1.0)
-        valid_slots = (~obs_batch["opp_mask"]).to(bring_logits.dtype)
-        bring_loss_raw = F.binary_cross_entropy_with_logits(
-            bring_logits, bring_targets, reduction="none"
+            # Accumulate globally normalized sums. Calling backward on each
+            # scaled chunk frees its activations while producing precisely one
+            # full-batch gradient for the optimizer step below.
+            advantages = rewards_batch - baselines.detach()
+            policy_sum = -(log_prob * advantages).sum()
+            entropy_sum = entropy.sum()
+            value_sum = 0.5 * (baselines - rewards_batch).pow(2).sum()
+
+            team_size = bring_logits.shape[1]
+            bring_targets = torch.zeros_like(bring_logits)
+            bring_targets.scatter_(1, opponent_picks_batch, 1.0)
+            valid_slots = (~obs_batch["opp_mask"]).to(bring_logits.dtype)
+            bring_sum = (
+                F.binary_cross_entropy_with_logits(
+                    bring_logits,
+                    bring_targets,
+                    reduction="none",
+                )
+                * valid_slots
+            ).sum()
+
+            lead_targets = (
+                opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
+            )
+            lead_sum = F.cross_entropy(
+                lead_pair_logits,
+                lead_targets,
+                reduction="sum",
+            )
+
+            chunk_loss = (
+                policy_sum / sample_count
+                - self.config.entropy_coef * entropy_sum / sample_count
+                + self.config.team_preview_value_coef * value_sum / sample_count
+                + self.config.team_preview_bring_coef * bring_sum / bring_denominator
+                + self.config.team_preview_lead_coef * lead_sum / sample_count
+            )
+            if not torch.isfinite(chunk_loss).item():
+                self.optimizer.zero_grad(set_to_none=True)
+                return {"team_preview_skipped_nonfinite": 1.0}
+            chunk_loss.backward()
+
+            metric_sums["policy"].add_(policy_sum.detach())
+            metric_sums["value"].add_(value_sum.detach())
+            metric_sums["entropy"].add_(entropy_sum.detach())
+            metric_sums["bring"].add_(bring_sum.detach())
+            metric_sums["lead"].add_(lead_sum.detach())
+
+        total_norm = nn.utils.clip_grad_norm_(
+            self._trainable_params,
+            self.config.max_grad_norm,
         )
-        bring_loss = (bring_loss_raw * valid_slots).sum() / valid_slots.sum().clamp(
-            min=1.0
-        )
+        if not torch.isfinite(total_norm).item():
+            self.optimizer.zero_grad(set_to_none=True)
+            return {"team_preview_skipped_nonfinite": 1.0}
+        self.optimizer.step()
 
-        lead_targets = (
-            opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
-        )
-        lead_loss = F.cross_entropy(lead_pair_logits, lead_targets)
-
+        policy_loss = metric_sums["policy"] / sample_count
+        value_loss = metric_sums["value"] / sample_count
+        entropy_mean = metric_sums["entropy"] / sample_count
+        bring_loss = metric_sums["bring"] / bring_denominator
+        lead_loss = metric_sums["lead"] / sample_count
         loss = (
             policy_loss
-            - entropy_bonus
+            - self.config.entropy_coef * entropy_mean
             + self.config.team_preview_value_coef * value_loss
             + self.config.team_preview_bring_coef * bring_loss
             + self.config.team_preview_lead_coef * lead_loss
         )
-
-        if not self._apply_update_step(loss):
-            return {"team_preview_skipped_nonfinite": 1.0}
-
         return {
             "team_preview_loss": loss.item(),
             "team_preview_policy_loss": policy_loss.item(),
             "team_preview_value_loss": value_loss.item(),
-            "team_preview_entropy": entropy.mean().item(),
+            "team_preview_entropy": entropy_mean.item(),
             "team_preview_bring_loss": bring_loss.item(),
             "team_preview_lead_loss": lead_loss.item(),
         }

@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..env.actions import (
     ACTIONS_PER_SLOT,
@@ -16,7 +17,7 @@ from ..env.actions import (
     TERA_NONE,
     decode_action,
 )
-from ..env.observation import FIELD_TIMER_CAPS, FIELD_TURN_OFFSET, TERASTALLIZED_OFFSET
+from ..env.observation import TERASTALLIZED_OFFSET
 
 
 def _sample_categorical_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -106,6 +107,7 @@ class ActionHead(nn.Module):
 
     _MATCHUP_FEATURE_DIM = 22
     _TARGET_FLAG_DIM = 6
+    _INITIAL_TERA_USE_PROB = 0.20
 
     def __init__(
         self,
@@ -172,10 +174,20 @@ class ActionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        # Factor Tera into an optimal-stopping-style gate (use now vs wait)
+        # and a conditional slot choice. The resulting marginal is still the
+        # exact three-choice distribution {none, slot 0, slot 1} consumed by
+        # the environment and PPO.
         self.tera_score = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, NUM_TERA_CHOICES),
+        )
+        self.tera_gate_score = nn.Linear(hidden_dim, 1)
+        self.tera_slot_score = nn.Linear(hidden_dim, NUM_TERA_CHOICES - 1)
+        nn.init.zeros_(self.tera_gate_score.weight)
+        nn.init.constant_(
+            self.tera_gate_score.bias,
+            math.log(self._INITIAL_TERA_USE_PROB / (1.0 - self._INITIAL_TERA_USE_PROB)),
         )
 
         metadata = self._build_action_metadata()
@@ -263,8 +275,6 @@ class ActionHead(nn.Module):
         greedy: bool = False,
         battle_obs: dict[str, torch.Tensor] | None = None,
         tera_exploration_prob: float = 0.0,
-        tera_force_delay_prob: float = 0.0,
-        tera_force_delay_max_turn: int = 0,
         validate_actions: bool = True,
         include_policy_stats: bool = True,
     ) -> dict[str, torch.Tensor]:
@@ -427,58 +437,45 @@ class ActionHead(nn.Module):
                 dim=-1,
             )
         )
-        tera_logits = self.tera_score(tera_query).masked_fill(~tera_mask, -1e8)
+        tera_hidden = self.tera_score(tera_query)
+        tera_gate_logits = self.tera_gate_score(tera_hidden).squeeze(-1)
+        tera_slot_logits = self.tera_slot_score(tera_hidden)
+        (
+            base_tera_log_probs,
+            base_tera_probs,
+            base_tera_entropy,
+            base_tera_gate_entropy,
+            base_tera_slot_entropy,
+            base_tera_use_prob,
+        ) = self._factorized_tera_distribution(
+            tera_gate_logits,
+            tera_slot_logits,
+            tera_mask[:, 1:],
+        )
         self._validate_exploration_probability(
             "tera_exploration_prob",
             tera_exploration_prob,
         )
-        self._validate_exploration_probability(
-            "tera_force_delay_prob",
-            tera_force_delay_prob,
-        )
-        if include_policy_stats:
-            base_tera_log_probs = torch.log_softmax(tera_logits, dim=-1)
-            base_tera_probs = base_tera_log_probs.exp()
-            base_tera_entropy = -(base_tera_probs * base_tera_log_probs).sum(dim=-1)
-        else:
-            base_tera_log_probs = None
-            base_tera_probs = None
-            base_tera_entropy = None
-        use_tera_behavior_policy = not greedy and (
-            tera_exploration_prob > 0.0
-            or (tera_force_delay_prob > 0.0 and tera_force_delay_max_turn > 0)
-        )
+        use_tera_behavior_policy = not greedy and tera_exploration_prob > 0.0
         if use_tera_behavior_policy:
-            early_turn = self._early_turn_mask(
-                battle_obs=battle_obs,
-                batch_size=batch_size,
-                device=device,
-                max_turn=tera_force_delay_max_turn,
-            )
             tera_log_probs, tera_probs = self._tera_behavior_distribution(
-                tera_logits,
+                base_tera_log_probs,
                 tera_mask,
-                early_turn=early_turn,
                 exploration_prob=tera_exploration_prob,
-                force_delay_prob=tera_force_delay_prob,
             )
             tera_sampling_logits = tera_log_probs
             tera_entropy = (
                 self._entropy_from_probs(tera_probs) if include_policy_stats else None
             )
-        elif include_policy_stats:
+        else:
             tera_log_probs = base_tera_log_probs
             tera_probs = base_tera_probs
-            tera_sampling_logits = tera_logits
-            tera_entropy = base_tera_entropy
-        else:
-            tera_log_probs = None
-            tera_sampling_logits = tera_logits
-            tera_entropy = None
+            tera_sampling_logits = base_tera_log_probs
+            tera_entropy = base_tera_entropy if include_policy_stats else None
 
         if actions is None:
             tera_choice = (
-                tera_logits.argmax(dim=1)
+                base_tera_log_probs.argmax(dim=1)
                 if greedy
                 else _sample_categorical_logits(tera_sampling_logits)
             )
@@ -510,35 +507,121 @@ class ActionHead(nn.Module):
                 1
             )
             result["log_prob"] = log_prob1 + log_prob2 + tera_log_prob
+            result["action_entropy"] = entropy1 + entropy2
             result["entropy"] = entropy1 + entropy2 + tera_entropy
             result["base_tera_entropy"] = base_tera_entropy
+            result["base_tera_gate_entropy"] = base_tera_gate_entropy
+            result["base_tera_slot_entropy"] = base_tera_slot_entropy
+            result["base_tera_use_prob"] = base_tera_use_prob
             result["base_tera_none_prob"] = base_tera_probs[:, TERA_NONE]
             result["base_tera_has_real_choice"] = tera_mask.sum(dim=-1) >= 2
+            result["base_tera_has_slot_choice"] = tera_mask[:, 1:].sum(dim=-1) >= 2
         return result
+
+    @staticmethod
+    def _factorized_tera_distribution(
+        gate_logits: torch.Tensor,
+        slot_logits: torch.Tensor,
+        valid_slots: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Build the exact {wait, slot 0, slot 1} marginal distribution.
+
+        ``gate_logits`` parameterizes whether to use Tera now. Conditional on
+        use, ``slot_logits`` chooses one of the currently eligible active
+        Pokemon. The returned slot entropy is conditional on using Tera; total
+        entropy is ``gate_entropy + use_probability * slot_entropy``.
+        """
+        if gate_logits.ndim != 1:
+            raise ValueError("Tera gate logits must have shape (batch,).")
+        if slot_logits.shape != valid_slots.shape or slot_logits.ndim != 2:
+            raise ValueError(
+                "Tera slot logits and validity mask must have the same 2D shape."
+            )
+        if slot_logits.shape != (gate_logits.shape[0], NUM_TERA_CHOICES - 1):
+            raise ValueError(
+                f"Tera slot logits must have shape (batch, {NUM_TERA_CHOICES - 1})."
+            )
+
+        has_real_choice = valid_slots.any(dim=-1)
+        safe_valid_slots = valid_slots.clone()
+        safe_valid_slots[~has_real_choice, 0] = True
+        masked_slot_logits = slot_logits.masked_fill(~safe_valid_slots, -torch.inf)
+        raw_slot_log_probs = torch.log_softmax(masked_slot_logits, dim=-1)
+        raw_slot_probs = raw_slot_log_probs.exp()
+        slot_probs = torch.where(valid_slots, raw_slot_probs, 0.0)
+        slot_log_probs = torch.where(
+            valid_slots,
+            raw_slot_log_probs,
+            torch.full_like(raw_slot_log_probs, -torch.inf),
+        )
+
+        gate_use_log_prob = F.logsigmoid(gate_logits)
+        gate_wait_log_prob = F.logsigmoid(-gate_logits)
+        gate_use_prob = gate_use_log_prob.exp()
+        gate_wait_prob = gate_wait_log_prob.exp()
+
+        use_prob = gate_use_prob * has_real_choice.to(gate_use_prob.dtype)
+        wait_prob = torch.where(has_real_choice, gate_wait_prob, 1.0)
+        real_log_probs = gate_use_log_prob.unsqueeze(-1) + slot_log_probs
+        base_log_probs = torch.cat(
+            (gate_wait_log_prob.unsqueeze(-1), real_log_probs), dim=-1
+        )
+        no_choice_log_probs = torch.full_like(base_log_probs, -torch.inf)
+        no_choice_log_probs[:, TERA_NONE] = 0.0
+        base_log_probs = torch.where(
+            has_real_choice.unsqueeze(-1),
+            base_log_probs,
+            no_choice_log_probs,
+        )
+        base_probs = torch.cat(
+            (wait_prob.unsqueeze(-1), use_prob.unsqueeze(-1) * slot_probs), dim=-1
+        )
+
+        gate_entropy = -(
+            gate_wait_prob * gate_wait_log_prob
+            + gate_use_prob * gate_use_log_prob
+        )
+        gate_entropy = gate_entropy * has_real_choice.to(gate_entropy.dtype)
+        slot_entropy = -torch.where(
+            valid_slots,
+            slot_probs * raw_slot_log_probs,
+            torch.zeros_like(slot_probs),
+        ).sum(dim=-1)
+        total_entropy = gate_entropy + use_prob * slot_entropy
+        return (
+            base_log_probs,
+            base_probs,
+            total_entropy,
+            gate_entropy,
+            slot_entropy,
+            use_prob,
+        )
 
     @staticmethod
     def _tera_behavior_distribution(
         base_logits: torch.Tensor,
         valid_mask: torch.Tensor,
         *,
-        early_turn: torch.Tensor,
         exploration_prob: float,
-        force_delay_prob: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return exact log-probs/probs for rollout tera exploration.
+        """Return exact factorized rollout-exploration probabilities.
 
-        The rollout first mixes the learned policy with a uniform distribution
-        over valid tera choices. On eligible early turns, force-delay then moves
-        a fixed fraction of every non-zero tera choice's mass to ``TERA_NONE``.
-        Evaluating this same marginal distribution during PPO keeps the old/new
-        ratio on-policy and equal to one before parameters change.
+        Epsilon independently mixes the Bernoulli use-now gate toward 0.5 and
+        the conditional eligible-slot policy toward uniform. Reconstructing
+        their exact three-choice marginal keeps rollout and PPO likelihoods
+        identical without a timing-specific action override.
         """
         if base_logits.ndim != 2 or base_logits.shape != valid_mask.shape:
             raise ValueError(
                 "Tera logits and validity mask must have the same 2D shape."
             )
-        if early_turn.shape != (base_logits.shape[0],):
-            raise ValueError("early_turn must have shape (batch,).")
         if base_logits.shape[1] != NUM_TERA_CHOICES:
             raise ValueError(
                 f"Expected {NUM_TERA_CHOICES} tera choices, got {base_logits.shape[1]}."
@@ -546,23 +629,32 @@ class ActionHead(nn.Module):
 
         masked_logits = base_logits.masked_fill(~valid_mask, -torch.inf)
         base_probs = torch.softmax(masked_logits, dim=-1)
-        has_real_choice = valid_mask.sum(dim=-1) >= 2
+        valid_slots = valid_mask[:, 1:]
+        has_real_choice = valid_slots.any(dim=-1)
         epsilon = has_real_choice.to(base_probs.dtype) * exploration_prob
-        uniform_probs = valid_mask.to(base_probs.dtype) / valid_mask.sum(
+        behavior_use_prob = base_probs[:, 1:].sum(dim=-1) + epsilon * (
+            0.5 - base_probs[:, 1:].sum(dim=-1)
+        )
+
+        safe_valid_slots = valid_slots.clone()
+        safe_valid_slots[~has_real_choice, 0] = True
+        base_slot_probs = torch.softmax(
+            base_logits[:, 1:].masked_fill(~safe_valid_slots, -torch.inf),
+            dim=-1,
+        )
+        base_slot_probs = torch.where(valid_slots, base_slot_probs, 0.0)
+        uniform_slot_probs = valid_slots.to(base_probs.dtype) / valid_slots.sum(
             dim=-1,
             keepdim=True,
         ).clamp_min(1)
-        behavior_probs = base_probs + epsilon.unsqueeze(-1) * (
-            uniform_probs - base_probs
+        behavior_slot_probs = base_slot_probs + epsilon.unsqueeze(-1) * (
+            uniform_slot_probs - base_slot_probs
         )
-
-        delay = early_turn.to(base_probs.dtype) * force_delay_prob
-        no_tera_prob = behavior_probs[:, TERA_NONE] + delay * (
-            1.0 - behavior_probs[:, TERA_NONE]
-        )
-        delayed_other_probs = behavior_probs[:, 1:] * (1.0 - delay.unsqueeze(-1))
         behavior_probs = torch.cat(
-            (no_tera_prob.unsqueeze(-1), delayed_other_probs),
+            (
+                (1.0 - behavior_use_prob).unsqueeze(-1),
+                behavior_use_prob.unsqueeze(-1) * behavior_slot_probs,
+            ),
             dim=-1,
         )
         behavior_probs = behavior_probs.masked_fill(~valid_mask, 0.0)
@@ -617,22 +709,6 @@ class ActionHead(nn.Module):
         else:
             selected = actions
         return selected, None, None
-
-    @staticmethod
-    def _early_turn_mask(
-        *,
-        battle_obs: dict[str, torch.Tensor] | None,
-        batch_size: int,
-        device: torch.device,
-        max_turn: int,
-    ) -> torch.Tensor:
-        if max_turn <= 0 or battle_obs is None or "field" not in battle_obs:
-            return torch.zeros(batch_size, dtype=torch.bool, device=device)
-        field = battle_obs["field"]
-        if field.shape[-1] <= FIELD_TURN_OFFSET:
-            return torch.zeros(batch_size, dtype=torch.bool, device=device)
-        max_turn_feature = max_turn / float(FIELD_TIMER_CAPS["turn"])
-        return field[:, FIELD_TURN_OFFSET] <= max_turn_feature + 1e-6
 
     def _score_actions(
         self,

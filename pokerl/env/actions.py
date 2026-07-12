@@ -62,6 +62,31 @@ class LegalActionState:
     can_tera: np.ndarray
 
 
+INTENT_NONE = 0
+INTENT_PASS = 1
+INTENT_MOVE = 2
+INTENT_SWITCH = 3
+NUM_INTENT_KINDS = 4
+
+
+@dataclass(frozen=True)
+class SemanticSlotIntent:
+    """Stable meaning of one submitted action after request-local resolution."""
+
+    kind: int
+    move_id: str | None = None
+    target: int = TARGET_NONE
+    switch_species: str | None = None
+    terastallize: bool = False
+
+
+@dataclass(frozen=True)
+class SemanticActionIntent:
+    """The two policy-controlled slot choices submitted for one request."""
+
+    slots: tuple[SemanticSlotIntent, SemanticSlotIntent]
+
+
 @dataclass(frozen=True)
 class _SlotActionState:
     action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder]
@@ -90,6 +115,53 @@ def decode_tera_choice(tera_choice: int) -> tuple[bool, bool]:
     if tera_choice == TERA_SLOT_2:
         return False, True
     raise ValueError(f"Unsupported tera choice {tera_choice}.")
+
+
+def semantic_action_intent(
+    action: np.ndarray,
+    action_state: LegalActionState,
+) -> SemanticActionIntent:
+    """Resolve request-local action ids to move/species semantics."""
+    action = np.asarray(action, dtype=np.int64)
+    if action.shape != (3,):
+        raise ValueError("A semantic doubles intent requires action shape (3,).")
+    tera_slots = decode_tera_choice(int(action[2]))
+    slots: list[SemanticSlotIntent] = []
+    for slot in range(2):
+        action_index = int(action[slot])
+        try:
+            order = action_state.slot_action_orders[slot][action_index]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Action {action_index} is not legal for slot {slot}."
+            ) from exc
+        kind, _, target = decode_action(action_index)
+        if kind == "move":
+            if not isinstance(order, SingleBattleOrder) or not isinstance(
+                order.order, Move
+            ):
+                raise RuntimeError("A move action did not resolve to a Move order.")
+            slots.append(
+                SemanticSlotIntent(
+                    kind=INTENT_MOVE,
+                    move_id=order.order.id,
+                    target=target,
+                    terastallize=tera_slots[slot],
+                )
+            )
+        elif kind == "switch":
+            species = getattr(getattr(order, "order", None), "species", None)
+            if species is None:
+                raise RuntimeError("A switch action did not resolve to a Pokemon.")
+            slots.append(
+                SemanticSlotIntent(
+                    kind=INTENT_SWITCH,
+                    switch_species=str(species),
+                )
+            )
+        else:
+            slots.append(SemanticSlotIntent(kind=INTENT_PASS))
+    return SemanticActionIntent(slots=(slots[0], slots[1]))
 
 
 def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:

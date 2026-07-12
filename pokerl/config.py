@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 
@@ -16,6 +17,7 @@ class ModelConfig:
     team_attention_heads: int = 4
     team_attention_layers: int = 2
     field_out: int = 64
+    recent_event_out: int = 64
 
     # Memory
     memory_type: str = "lstm"  # "lstm" or "identity"
@@ -56,12 +58,22 @@ class TrainingConfig:
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     entropy_coef: float = 0.01
+    # Entropy coefficients for the factorized base (deployment) Tera policy.
+    # Gate and conditional-slot entropy are separate so slot diversity cannot
+    # create pressure to use Tera now.
+    tera_gate_entropy_coef: float = 0.01
+    tera_slot_entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     team_preview_value_coef: float = 0.5
     team_preview_bring_coef: float = 0.1
     team_preview_lead_coef: float = 0.05
-    team_preview_max_samples: int = 1024  # uniform current-rollout subsample cap
+    # Use every current-policy preview sample by default. An explicit cap still
+    # provides deterministic uniform subsampling for constrained experiments.
+    team_preview_max_samples: int | None = None
+    # Preview samples are accumulated in chunks into one globally weighted
+    # optimizer step, bounding activation memory without changing the update.
+    preview_update_minibatch_size: int = 512
     # Auxiliary prediction losses. These do not modify the reward or the
     # action/value path; they add dense gradient to the shared encoder by
     # predicting opponent hidden info (end-of-episode labels) and the
@@ -83,24 +95,13 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
     seed: int = 0
 
-    # Tera exploration: with probability epsilon on each turn that has a real
-    # tera choice (>= 2 valid options), override the policy's tera sample with a
-    # uniform draw over valid options. Breaks the "tera always turn 1" attractor
-    # by forcing the policy to observe outcomes from saving tera. Rollout and
-    # PPO log-probabilities both use the exact resulting behavior distribution.
-    # Linear decay from start to end across tera_exploration_decay_updates PPO
-    # updates.
+    # Factorized Tera exploration mixes the use-now gate toward Bernoulli(0.5)
+    # and the conditional eligible-slot distribution toward uniform. PPO uses
+    # the exact reconstructed three-choice behavior likelihood. Exploration
+    # reaches its end value after this fraction of the planned update horizon.
     tera_exploration_start: float = 0.15
-    tera_exploration_end: float = 0.02
-    tera_exploration_decay_updates: int = 2000
-    # Targeted anti-collapse exploration: on early turns, if the policy samples
-    # tera now, override that third action to no-tera with this decayed
-    # probability. This directly creates delayed-tera rollouts without changing
-    # the action/value model or reward.
-    tera_force_delay_start: float = 0.40
-    tera_force_delay_end: float = 0.03
-    tera_force_delay_decay_updates: int = 3000
-    tera_force_delay_max_turn: int = 3
+    tera_exploration_end: float = 0.0
+    tera_exploration_decay_fraction: float = 0.25
 
     # League
     league_size: int = 12
@@ -123,34 +124,38 @@ class TrainingConfig:
                 "league_refresh_interval must be positive "
                 f"(got {self.league_refresh_interval})."
             )
-        if self.team_preview_max_samples <= 0:
+        if (
+            self.team_preview_max_samples is not None
+            and self.team_preview_max_samples <= 0
+        ):
             raise ValueError(
                 "team_preview_max_samples must be positive "
                 f"(got {self.team_preview_max_samples})."
             )
+        if self.preview_update_minibatch_size <= 0:
+            raise ValueError(
+                "preview_update_minibatch_size must be positive "
+                f"(got {self.preview_update_minibatch_size})."
+            )
+        for name, value in (
+            ("tera_gate_entropy_coef", self.tera_gate_entropy_coef),
+            ("tera_slot_entropy_coef", self.tera_slot_entropy_coef),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"{name} must be finite and non-negative (got {value})."
+                )
         for name, value in (
             ("tera_exploration_start", self.tera_exploration_start),
             ("tera_exploration_end", self.tera_exploration_end),
-            ("tera_force_delay_start", self.tera_force_delay_start),
-            ("tera_force_delay_end", self.tera_force_delay_end),
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be within [0, 1] (got {value}).")
-        if self.tera_exploration_decay_updates < 0:
+        if (
+            not math.isfinite(self.tera_exploration_decay_fraction)
+            or not 0.0 <= self.tera_exploration_decay_fraction <= 1.0
+        ):
             raise ValueError(
-                "tera_exploration_decay_updates must be >= 0 "
-                f"(got {self.tera_exploration_decay_updates}); "
-                "use 0 to skip decay and apply tera_exploration_end immediately."
-            )
-        if self.tera_force_delay_decay_updates < 0:
-            raise ValueError(
-                "tera_force_delay_decay_updates must be >= 0 "
-                f"(got {self.tera_force_delay_decay_updates}); "
-                "use 0 to skip decay and apply tera_force_delay_end immediately."
-            )
-        if self.tera_force_delay_max_turn < 0:
-            raise ValueError(
-                "tera_force_delay_max_turn must be >= 0 "
-                f"(got {self.tera_force_delay_max_turn}); "
-                "use 0 to disable early-turn force-delay exploration."
+                "tera_exploration_decay_fraction must be finite and within [0, 1] "
+                f"(got {self.tera_exploration_decay_fraction})."
             )

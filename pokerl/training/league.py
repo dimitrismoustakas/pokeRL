@@ -27,12 +27,14 @@ from ..env.observation import (
 )
 from ..env.actions import (
     PASS_ACTION,
+    SemanticActionIntent,
     TERA_NONE,
     action_to_order,
     build_legal_action_state,
     build_policy_action_masks,
     decode_tera_choice,
     is_default_only_action_state,
+    semantic_action_intent,
 )
 from ..env.showdown_env import (
     _NoopBattleOrder,
@@ -1208,6 +1210,8 @@ class LeaguePlayer(Player):
         # Most-recent (a1, a2, tera) chosen by this opponent. Read by the env
         # after each turn resolves so the aux opponent-action head has labels.
         self._last_actions: np.ndarray | None = None
+        self._committed_intent: SemanticActionIntent | None = None
+        self._pending_intent: SemanticActionIntent | None = None
 
     def stage_checkpoint(self, checkpoint_path: str) -> None:
         self._pending_checkpoint_path = checkpoint_path
@@ -1304,6 +1308,7 @@ class LeaguePlayer(Player):
                 result = self.choose_default_move()
                 self._pending_decision_key = decision_key
                 self._pending_hidden = self._hidden
+                self._pending_intent = None
                 self._pending_order = result
                 self._last_actions = np.asarray(
                     [PASS_ACTION, PASS_ACTION, TERA_NONE],
@@ -1326,7 +1331,11 @@ class LeaguePlayer(Player):
                     "opponent_mask_build_sec", time.perf_counter() - masks_started
                 )
                 obs_started = time.perf_counter()
-            obs = self.obs_builder.build(battle)
+            obs = self.obs_builder.build(
+                battle,
+                previous_intent=self._committed_intent,
+            )
+            self._committed_intent = None
             if timing_enabled:
                 self._add_timing(
                     "opponent_obs_build_sec", time.perf_counter() - obs_started
@@ -1372,6 +1381,7 @@ class LeaguePlayer(Player):
             )
         self._pending_decision_key = decision_key
         self._pending_hidden = next_hidden
+        self._pending_intent = semantic_action_intent(actions, action_state)
         self._last_actions = np.asarray(actions, dtype=np.int64).copy()
 
         if timing_enabled:
@@ -1476,6 +1486,8 @@ class LeaguePlayer(Player):
         self._pending_action_battle = None
         self._pending_action_started_at = None
         self._last_actions = None
+        self._committed_intent = None
+        self._pending_intent = None
 
     def describe_pending_inference(self) -> str:
         now = time.perf_counter()
@@ -1545,7 +1557,9 @@ class LeaguePlayer(Player):
         if decision_key == self._pending_decision_key:
             return
         self._hidden = self._pending_hidden
+        self._committed_intent = self._pending_intent
         self._pending_hidden = None
+        self._pending_intent = None
         self._pending_decision_key = None
         self._pending_order = None
 

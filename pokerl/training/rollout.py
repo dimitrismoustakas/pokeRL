@@ -41,8 +41,6 @@ class RolloutBatch:
     # rollout. PPO must evaluate actions under the same transformed tera
     # distribution that sampled them.
     tera_exploration_prob: float = 0.0
-    tera_force_delay_prob: float = 0.0
-    tera_force_delay_max_turn: int = 0
 
 
 class RolloutBuffer:
@@ -119,8 +117,6 @@ class RolloutBuffer:
         self._initial_hidden_h: torch.Tensor | None = None
         self._initial_hidden_c: torch.Tensor | None = None
         self._tera_exploration_prob = 0.0
-        self._tera_force_delay_prob = 0.0
-        self._tera_force_delay_max_turn = 0
 
         # Aux labels require a Pokemon-shaped observation. Tests that pass a
         # minimal obs dict without these keys simply get empty aux buffers and
@@ -340,35 +336,24 @@ class RolloutBuffer:
             initial_hidden_h=self._initial_hidden_h,
             initial_hidden_c=self._initial_hidden_c,
             tera_exploration_prob=self._tera_exploration_prob,
-            tera_force_delay_prob=self._tera_force_delay_prob,
-            tera_force_delay_max_turn=self._tera_force_delay_max_turn,
         )
 
     def set_tera_behavior_policy(
         self,
         *,
         exploration_prob: float,
-        force_delay_prob: float,
-        force_delay_max_turn: int,
     ) -> None:
         """Record the fixed tera behavior policy before collecting a rollout."""
         if self.step != 0:
             raise RuntimeError(
                 "Tera behavior policy cannot change after rollout collection starts."
             )
-        for name, value in (
-            ("exploration_prob", exploration_prob),
-            ("force_delay_prob", force_delay_prob),
-        ):
-            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
-                raise ValueError(
-                    f"{name} must be finite and within [0, 1], got {value}."
-                )
-        if force_delay_max_turn < 0:
-            raise ValueError("force_delay_max_turn must be non-negative.")
+        if not np.isfinite(exploration_prob) or not 0.0 <= exploration_prob <= 1.0:
+            raise ValueError(
+                "exploration_prob must be finite and within [0, 1], "
+                f"got {exploration_prob}."
+            )
         self._tera_exploration_prob = float(exploration_prob)
-        self._tera_force_delay_prob = float(force_delay_prob)
-        self._tera_force_delay_max_turn = int(force_delay_max_turn)
 
     def reset(
         self,
@@ -378,8 +363,6 @@ class RolloutBuffer:
         self._initial_hidden_h = None
         self._initial_hidden_c = None
         self._tera_exploration_prob = 0.0
-        self._tera_force_delay_prob = 0.0
-        self._tera_force_delay_max_turn = 0
         self._aux_label_valid.fill_(False)
         self._opp_actions.fill_(-1)
         self._opp_actions_valid.fill_(False)

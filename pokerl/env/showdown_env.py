@@ -47,12 +47,15 @@ from .observation import (
 )
 from .team_preview import parse_team_preview_order
 from .actions import (
+    SemanticActionIntent,
+    TERA_NONE,
     action_to_order,
     build_legal_action_state,
     build_policy_action_masks,
     decode_tera_choice,
     empty_action_masks,
     is_default_only_action_state,
+    semantic_action_intent,
 )
 from .rewards import sparse_reward
 
@@ -511,6 +514,7 @@ class ShowdownPlayer(Player):
         self._pending_action_request_id: int | None = None
         self._pending_action_future: asyncio.Future[np.ndarray | None] | None = None
         self._pending_finished_battle: DoubleBattle | None = None
+        self._previous_intent: SemanticActionIntent | None = None
 
     def choose_move(self, battle: DoubleBattle) -> Awaitable[BattleOrder]:
         return self._choose_move(battle)
@@ -669,6 +673,10 @@ class ShowdownPlayer(Player):
         except RuntimeError:
             return
 
+    def reset_transition_history(self) -> None:
+        """Clear semantic action history at an episode boundary."""
+        self._previous_intent = None
+
     def _make_order(self, action: np.ndarray, battle: DoubleBattle) -> BattleOrder:
         """Convert a (3,) action array to a DoubleBattleOrder."""
         timing_enabled = _timing_enabled(self.timing)
@@ -684,6 +692,7 @@ class ShowdownPlayer(Player):
         self._pending_action_requested_at = None
         if action_state is None:
             action_state = build_legal_action_state(battle)
+        resolved_intent = semantic_action_intent(action, action_state)
         orders = []
         tera_slot_1, tera_slot_2 = decode_tera_choice(int(action[2]))
         for slot in range(2):
@@ -695,6 +704,7 @@ class ShowdownPlayer(Player):
                 action_state=action_state,
             )
             orders.append(order)
+        self._previous_intent = resolved_intent
 
         if timing_enabled:
             self.timing.increment("player_make_order_calls")
@@ -718,7 +728,11 @@ class ShowdownPlayer(Player):
         timing_enabled = _timing_enabled(self.timing)
         if timing_enabled:
             emit_started = time.perf_counter()
-        obs = self.obs_builder.build(battle)
+        obs = self.obs_builder.build(
+            battle,
+            previous_intent=getattr(self, "_previous_intent", None),
+        )
+        self._previous_intent = None
         if timing_enabled:
             self.timing.add("player_emit_obs_sec", time.perf_counter() - emit_started)
 
@@ -826,6 +840,7 @@ class BattleEnv:
         self._episode_opponent_choice_calls = 0
         self._episode_opponent_turn_calls: dict[tuple[str, int], int] = defaultdict(int)
         self._episode_opponent_checkpoint_path: str | None = None
+        self._episode_first_tera_turn: int | None = None
         self._last_player_action: np.ndarray | None = None
         self._pending_player_request_id: int | None = None
 
@@ -886,11 +901,13 @@ class BattleEnv:
             reset_started = time.perf_counter()
         self._wait_for_battle_task_completion("before BattleEnv reset")
         self._pending_player_request_id = None
+        self.player.reset_transition_history()
         self._episode_team_preview = None
         self._episode_opponent_preview_picks = None
         self._episode_opponent_packed_team = None
         self._episode_opponent_choice_calls = 0
         self._episode_opponent_turn_calls.clear()
+        self._episode_first_tera_turn = None
         self._episode_opponent_checkpoint_path = getattr(
             self.opponent, "checkpoint_path", None
         )
@@ -977,6 +994,10 @@ class BattleEnv:
             step_started = time.perf_counter()
             enqueue_started = step_started
         self._last_player_action = np.array(action, copy=True)
+        if self._episode_first_tera_turn is None and int(action[2]) != TERA_NONE:
+            self._episode_first_tera_turn = int(
+                getattr(getattr(self.player, "last_battle", None), "turn", 0)
+            )
         if hasattr(self.opponent, "_last_actions"):
             self.opponent._last_actions = None
         action_requested_at = getattr(self.player, "_pending_action_requested_at", None)
@@ -1057,6 +1078,7 @@ class BattleEnv:
                 self._episode_opponent_turn_calls.values(),
                 default=0,
             )
+            info["episode_first_tera_turn"] = self._episode_first_tera_turn
             if self._episode_opponent_checkpoint_path is not None:
                 info["episode_opponent_checkpoint_path"] = (
                     self._episode_opponent_checkpoint_path

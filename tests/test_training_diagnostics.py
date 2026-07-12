@@ -1,37 +1,41 @@
 import pytest
+import torch
 
-from scripts.train import build_rollout_diagnostics
-
-
-def test_build_rollout_diagnostics_computes_wait_and_latency_shares() -> None:
-    diagnostics = build_rollout_diagnostics(
-        rollout_profile={
-            "rollout_sec": 100.0,
-            "policy_forward_sec": 5.0,
-            "obs_to_device_sec": 1.0,
-            "mask_to_device_sec": 2.0,
-            "feedback_to_device_sec": 3.0,
-        },
-        env_profile={
-            "env_step_total_sec": 80.0,
-            "env_step_calls": 40.0,
-            "env_queue_wait_sec": 60.0,
-            "parallel_step_wall_sec": 10.0,
-            "parallel_step_calls": 20.0,
-            "opponent_choice_sec": 3.0,
-            "opponent_choice_calls": 12.0,
-        },
-    )
-
-    assert diagnostics["env_queue_wait_share"] == pytest.approx(0.75)
-    assert diagnostics["avg_env_step_ms"] == pytest.approx(2000.0)
-    assert diagnostics["avg_parallel_step_wall_ms"] == pytest.approx(500.0)
-    assert diagnostics["avg_opponent_choice_ms"] == pytest.approx(250.0)
-    assert diagnostics["policy_forward_share"] == pytest.approx(0.05)
-    assert diagnostics["device_transfer_share"] == pytest.approx(0.06)
+from scripts.train import summarize_first_tera_turns, summarize_observation_history
 
 
-def test_build_rollout_diagnostics_handles_missing_counters() -> None:
-    diagnostics = build_rollout_diagnostics({}, {})
+def test_summarize_observation_history_reports_causal_input_coverage() -> None:
+    obs = {
+        "recent_event_meta": torch.tensor(
+            [[[1.0, 0.0, 0.0], [1.0, 1.0, 0.25]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]
+        ),
+        "recent_event_mask": torch.tensor(
+            [
+                [[False, False, True], [False, True, True]],
+                [[True, True, True], [False, False, False]],
+            ]
+        ),
+        "prev_own_valid": torch.tensor(
+            [[[True, True], [True, False]], [[False, False], [True, True]]]
+        ),
+    }
 
-    assert all(value == 0.0 for value in diagnostics.values())
+    metrics = summarize_observation_history(obs)
+
+    assert metrics["history_event_segment_coverage"] == pytest.approx(0.75)
+    assert metrics["history_partial_segment_fraction"] == pytest.approx(1 / 3)
+    assert metrics["history_overflow_segment_fraction"] == pytest.approx(1 / 3)
+    assert metrics["history_events_per_valid_segment"] == pytest.approx(2.0)
+    assert metrics["history_previous_intent_slot_coverage"] == pytest.approx(0.625)
+
+
+def test_summarize_first_tera_turns_keeps_nonuse_in_denominator() -> None:
+    summary = summarize_first_tera_turns([1, 3, 3], completed_battles=5)
+
+    assert summary["tera_used_fraction"] == pytest.approx(0.6)
+    assert summary["turn_one_fraction"] == pytest.approx(0.2)
+    assert summary["avg_first_tera_turn"] == pytest.approx(7 / 3)
+    assert summary["first_tera_turn_distribution"] == [
+        {"turn": 1, "count": 1},
+        {"turn": 3, "count": 2},
+    ]

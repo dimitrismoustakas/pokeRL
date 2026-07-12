@@ -27,7 +27,7 @@ from pokerl.training.ppo import PPOTrainer
 from pokerl.training.rollout import RolloutBuffer
 
 
-def test_tera_behavior_distribution_matches_exact_two_stage_marginal() -> None:
+def test_tera_behavior_distribution_matches_exact_factorized_marginal() -> None:
     logits = torch.tensor(
         [
             [2.0, 0.5, -1.0],
@@ -44,30 +44,23 @@ def test_tera_behavior_distribution_matches_exact_two_stage_marginal() -> None:
             [True, False, False],
         ]
     )
-    early = torch.tensor([True, False, True])
     epsilon = 0.30
-    delay = 0.40
 
     log_probs, probs = ActionHead._tera_behavior_distribution(
         logits,
         valid,
-        early_turn=early,
         exploration_prob=epsilon,
-        force_delay_prob=delay,
     )
 
     base = torch.softmax(logits[:2], dim=-1)
-    mixed = (1.0 - epsilon) * base + epsilon / 3.0
-    expected_early = torch.cat(
-        (
-            (mixed[0, TERA_NONE] + delay * (1.0 - mixed[0, TERA_NONE])).view(1),
-            mixed[0, 1:] * (1.0 - delay),
-        )
-    )
+    base_use = 1.0 - base[:, TERA_NONE]
+    mixed_use = (1.0 - epsilon) * base_use + epsilon * 0.5
+    base_slots = base[:, 1:] / base_use.unsqueeze(-1)
+    mixed_slots = (1.0 - epsilon) * base_slots + epsilon * 0.5
     expected = torch.stack(
         (
-            expected_early,
-            mixed[1],
+            torch.cat(((1.0 - mixed_use[0]).view(1), mixed_use[0] * mixed_slots[0])),
+            torch.cat(((1.0 - mixed_use[1]).view(1), mixed_use[1] * mixed_slots[1])),
             torch.tensor([1.0, 0.0, 0.0], dtype=torch.double),
         )
     )
@@ -93,9 +86,7 @@ def test_tera_behavior_sampler_matches_transformed_distribution() -> None:
     log_probs, expected_probs = ActionHead._tera_behavior_distribution(
         logits,
         valid,
-        early_turn=torch.tensor([True]),
         exploration_prob=0.35,
-        force_delay_prob=0.45,
     )
 
     torch.manual_seed(17)
@@ -106,8 +97,104 @@ def test_tera_behavior_sampler_matches_transformed_distribution() -> None:
     torch.testing.assert_close(empirical, expected_probs[0], atol=0.01, rtol=0.0)
 
 
-class _FixedTeraScore(nn.Module):
-    def __init__(self, logits: tuple[float, float, float]):
+def test_full_factorized_exploration_is_uniform_per_gate_and_eligible_slot() -> None:
+    logits = torch.tensor([[5.0, -2.0, 3.0], [-4.0, 8.0, -3.0]])
+    valid = torch.tensor([[True, True, True], [True, True, False]])
+
+    log_probs, probs = ActionHead._tera_behavior_distribution(
+        logits,
+        valid,
+        exploration_prob=1.0,
+    )
+
+    torch.testing.assert_close(
+        probs,
+        torch.tensor([[0.5, 0.25, 0.25], [0.5, 0.5, 0.0]]),
+    )
+    torch.testing.assert_close(log_probs.exp(), probs)
+
+
+def test_factorized_tera_distribution_matches_exact_three_choice_categorical() -> None:
+    categorical_logits = torch.tensor(
+        [
+            [-0.5, 1.5, 0.25],
+            [2.0, -1.0, 0.75],
+        ],
+        dtype=torch.double,
+    )
+    gate_logits = (
+        torch.logsumexp(categorical_logits[:, 1:], dim=-1)
+        - categorical_logits[:, TERA_NONE]
+    )
+    valid_slots = torch.ones((2, 2), dtype=torch.bool)
+
+    (
+        log_probs,
+        probs,
+        entropy,
+        gate_entropy,
+        slot_entropy,
+        use_prob,
+    ) = ActionHead._factorized_tera_distribution(
+        gate_logits,
+        categorical_logits[:, 1:],
+        valid_slots,
+    )
+
+    expected = torch.distributions.Categorical(logits=categorical_logits)
+    torch.testing.assert_close(probs, expected.probs)
+    torch.testing.assert_close(log_probs, expected.logits)
+    torch.testing.assert_close(entropy, expected.entropy())
+    torch.testing.assert_close(entropy, gate_entropy + use_prob * slot_entropy)
+
+
+def test_factorized_tera_distribution_respects_slot_masks_and_no_choice() -> None:
+    gate_logits = torch.tensor([0.5, 8.0], requires_grad=True)
+    slot_logits = torch.tensor([[1.0, 4.0], [-2.0, 3.0]], requires_grad=True)
+    valid_slots = torch.tensor([[True, False], [False, False]])
+
+    log_probs, probs, entropy, gate_entropy, slot_entropy, use_prob = (
+        ActionHead._factorized_tera_distribution(
+            gate_logits,
+            slot_logits,
+            valid_slots,
+        )
+    )
+
+    torch.testing.assert_close(probs.sum(dim=-1), torch.ones(2))
+    assert probs[0, 2].item() == 0.0
+    assert probs[1].tolist() == [1.0, 0.0, 0.0]
+    assert log_probs[1, TERA_NONE].item() == 0.0
+    assert torch.isneginf(log_probs[1, 1:]).all()
+    assert slot_entropy[0].item() == 0.0
+    assert entropy[1].item() == 0.0
+    assert gate_entropy[1].item() == 0.0
+    assert use_prob[1].item() == 0.0
+
+    entropy.sum().backward()
+    assert torch.isfinite(gate_logits.grad).all()
+    assert torch.isfinite(slot_logits.grad).all()
+
+
+def test_tera_gate_initialization_prefers_waiting() -> None:
+    head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
+
+    expected = torch.tensor(ActionHead._INITIAL_TERA_USE_PROB)
+    torch.testing.assert_close(head.tera_gate_score.bias.sigmoid().squeeze(0), expected)
+    assert torch.count_nonzero(head.tera_gate_score.weight).item() == 0
+
+
+class _FixedTeraGateScore(nn.Module):
+    def __init__(self, logit: float):
+        super().__init__()
+        self.register_buffer("logit", torch.tensor([logit], dtype=torch.float32))
+
+    def forward(self, query: torch.Tensor) -> torch.Tensor:
+        return self.logit.to(dtype=query.dtype).expand(query.shape[0], -1)
+
+
+class _FixedTeraSlotScore(nn.Module):
+    def __init__(self, logits: tuple[float, float]):
         super().__init__()
         self.register_buffer("logits", torch.tensor(logits, dtype=torch.float32))
 
@@ -115,9 +202,19 @@ class _FixedTeraScore(nn.Module):
         return self.logits.to(dtype=query.dtype).expand(query.shape[0], -1)
 
 
+def _install_fixed_tera_distribution(
+    head: ActionHead,
+    logits: tuple[float, float, float],
+) -> None:
+    logits_tensor = torch.tensor(logits, dtype=torch.float32)
+    gate_logit = torch.logsumexp(logits_tensor[1:], dim=0) - logits_tensor[TERA_NONE]
+    head.tera_gate_score = _FixedTeraGateScore(float(gate_logit))
+    head.tera_slot_score = _FixedTeraSlotScore((logits[1], logits[2]))
+
+
 def _minimal_head_inputs(batch_size: int = 1):
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
-    head.tera_score = _FixedTeraScore((-0.5, 1.5, 0.25))
+    _install_fixed_tera_distribution(head, (-0.5, 1.5, 0.25))
     context = torch.zeros((batch_size, 3))
     active_reps = torch.zeros((batch_size, 2, 2))
     own_team_reps = torch.zeros((batch_size, 6, 2))
@@ -160,21 +257,19 @@ def test_rollout_and_supplied_action_use_identical_tera_behavior_stats() -> None
         *inputs[1:8],
         battle_obs=inputs[8],
         tera_exploration_prob=0.25,
-        tera_force_delay_prob=0.60,
-        tera_force_delay_max_turn=3,
     )
     evaluated = head(
         *inputs[1:8],
         actions=rollout["actions"],
         battle_obs=inputs[8],
         tera_exploration_prob=0.25,
-        tera_force_delay_prob=0.60,
-        tera_force_delay_max_turn=3,
     )
 
     torch.testing.assert_close(evaluated["log_prob"], rollout["log_prob"])
     torch.testing.assert_close(evaluated["entropy"], rollout["entropy"])
-    expected_base = torch.distributions.Categorical(logits=head.tera_score.logits)
+    expected_base = torch.distributions.Categorical(
+        logits=torch.tensor((-0.5, 1.5, 0.25))
+    )
     torch.testing.assert_close(
         rollout["base_tera_entropy"],
         expected_base.entropy().expand_as(rollout["base_tera_entropy"]),
@@ -193,25 +288,9 @@ def test_greedy_action_ignores_training_exploration_transform() -> None:
         battle_obs=inputs[8],
         greedy=True,
         tera_exploration_prob=1.0,
-        tera_force_delay_prob=1.0,
-        tera_force_delay_max_turn=3,
     )
 
     assert out["actions"][0, 2].item() == TERA_SLOT_1
-
-
-def test_zero_force_delay_turn_limit_disables_delay_even_at_turn_zero() -> None:
-    inputs = _minimal_head_inputs()
-    inputs[8]["field"][:, FIELD_TURN_OFFSET] = 0.0
-
-    early = ActionHead._early_turn_mask(
-        battle_obs=inputs[8],
-        batch_size=1,
-        device=torch.device("cpu"),
-        max_turn=0,
-    )
-
-    assert not early.any()
 
 
 def test_rollout_buffer_carries_fixed_tera_behavior_policy() -> None:
@@ -221,8 +300,6 @@ def test_rollout_buffer_carries_fixed_tera_behavior_policy() -> None:
     buffer.reset()
     buffer.set_tera_behavior_policy(
         exploration_prob=0.2,
-        force_delay_prob=0.3,
-        force_delay_max_turn=4,
     )
     zeros = torch.zeros(2)
     buffer.add(
@@ -237,13 +314,9 @@ def test_rollout_buffer_carries_fixed_tera_behavior_policy() -> None:
     batch = buffer.compute_gae(zeros)
 
     assert batch.tera_exploration_prob == pytest.approx(0.2)
-    assert batch.tera_force_delay_prob == pytest.approx(0.3)
-    assert batch.tera_force_delay_max_turn == 4
     with pytest.raises(RuntimeError, match="cannot change"):
         buffer.set_tera_behavior_policy(
             exploration_prob=0.1,
-            force_delay_prob=0.1,
-            force_delay_max_turn=1,
         )
 
 
@@ -268,7 +341,10 @@ class _TinyAgent(nn.Module):
         self.spatial = _TinySpatial()
         self.memory = IdentityMemory(input_dim=3, hidden_dim=3)
         self.action_head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
-        self.action_head.tera_score = _FixedTeraScore((-0.5, 1.5, 0.25))
+        _install_fixed_tera_distribution(
+            self.action_head,
+            (-0.5, 1.5, 0.25),
+        )
         self.value_head = ValueHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
 
     def forward(
@@ -278,8 +354,6 @@ class _TinyAgent(nn.Module):
         *,
         action_masks,
         tera_exploration_prob=0.0,
-        tera_force_delay_prob=0.0,
-        tera_force_delay_max_turn=0,
     ):
         context, active, own, opp, opp_active = self.spatial(obs)
         context, hidden = self.memory(context, hidden)
@@ -295,8 +369,6 @@ class _TinyAgent(nn.Module):
             action_masks,
             battle_obs=obs,
             tera_exploration_prob=tera_exploration_prob,
-            tera_force_delay_prob=tera_force_delay_prob,
-            tera_force_delay_max_turn=tera_force_delay_max_turn,
         )
         return {
             **action_out,
@@ -367,8 +439,6 @@ def test_ppo_initial_ratio_is_one_under_rollout_behavior_policy() -> None:
     buffer.reset()
     buffer.set_tera_behavior_policy(
         exploration_prob=0.25,
-        force_delay_prob=0.60,
-        force_delay_max_turn=3,
     )
     obs = {key: torch.from_numpy(value) for key, value in obs_np.items()}
     masks = {key: torch.from_numpy(value) for key, value in masks_np.items()}
@@ -378,8 +448,6 @@ def test_ppo_initial_ratio_is_one_under_rollout_behavior_policy() -> None:
                 obs,
                 action_masks=masks,
                 tera_exploration_prob=0.25,
-                tera_force_delay_prob=0.60,
-                tera_force_delay_max_turn=3,
             )
         rewards = torch.tensor([1.0, -1.0]) if step else torch.zeros(num_envs)
         dones = (
@@ -415,8 +483,133 @@ def test_ppo_initial_ratio_is_one_under_rollout_behavior_policy() -> None:
     assert metrics["pre_ppo_approx_kl"] == pytest.approx(0.0, abs=1e-7)
     assert metrics["pre_ppo_clip_fraction"] == 0.0
     assert metrics["base_tera_real_choice_evaluations"] > 0
+    assert metrics["base_tera_slot_choice_evaluations"] > 0
     assert 0.0 <= metrics["base_tera_entropy"] <= np.log(3)
+    assert 0.0 <= metrics["base_tera_gate_entropy"] <= np.log(2)
+    assert 0.0 <= metrics["base_tera_slot_entropy"] <= np.log(2)
+    assert 0.0 <= metrics["base_tera_use_prob"] <= 1.0
     assert 0.0 <= metrics["base_tera_none_prob"] <= 1.0
+
+
+def test_ppo_uses_separate_tera_gate_entropy_coefficient() -> None:
+    torch.manual_seed(37)
+    device = torch.device("cpu")
+    num_steps = 2
+    num_envs = 2
+    obs_np = _ppo_obs(num_envs)
+    masks_np = _ppo_masks(num_envs)
+    agent = _TinyAgent()
+    gate = nn.Linear(8, 1)
+    nn.init.zeros_(gate.weight)
+    nn.init.constant_(
+        gate.bias,
+        float(torch.logit(torch.tensor(ActionHead._INITIAL_TERA_USE_PROB)).item()),
+    )
+    agent.action_head.tera_gate_score = gate
+    for parameter in agent.value_head.parameters():
+        nn.init.zeros_(parameter)
+
+    buffer = RolloutBuffer(num_steps, num_envs, obs_np, masks_np, device)
+    buffer.reset()
+    obs = {key: torch.from_numpy(value) for key, value in obs_np.items()}
+    masks = {key: torch.from_numpy(value) for key, value in masks_np.items()}
+    for step in range(num_steps):
+        with torch.no_grad():
+            out = agent(obs, action_masks=masks)
+        buffer.add(
+            obs,
+            out["actions"],
+            masks,
+            out["log_prob"],
+            out["value"],
+            torch.zeros(num_envs),
+            torch.full((num_envs,), step == num_steps - 1, dtype=torch.bool),
+        )
+    batch = buffer.compute_gae(torch.zeros(num_envs))
+
+    initial_gate_bias = agent.action_head.tera_gate_score.bias.detach().clone()
+    trainer = PPOTrainer(
+        agent,
+        TrainingConfig(
+            lr=1e-2,
+            num_epochs=1,
+            num_minibatches=1,
+            entropy_coef=0.0,
+            tera_gate_entropy_coef=1.0,
+            tera_slot_entropy_coef=0.0,
+            value_coef=0.0,
+            aux_hidden_info_coef=0.0,
+            aux_opp_action_coef=0.0,
+        ),
+        device,
+    )
+    metrics = trainer.update(batch)
+
+    assert metrics["action_entropy"] == 0.0
+    assert metrics["base_tera_gate_entropy"] > 0.0
+    assert metrics["base_tera_slot_entropy"] > 0.0
+    assert agent.action_head.tera_gate_score.bias.item() > initial_gate_bias.item()
+
+
+def test_tera_slot_entropy_does_not_pressure_use_gate() -> None:
+    torch.manual_seed(41)
+    device = torch.device("cpu")
+    num_steps = 2
+    num_envs = 2
+    obs_np = _ppo_obs(num_envs)
+    masks_np = _ppo_masks(num_envs)
+    agent = _TinyAgent()
+    gate = nn.Linear(8, 1)
+    nn.init.zeros_(gate.weight)
+    nn.init.constant_(gate.bias, -1.0)
+    slot = nn.Linear(8, 2)
+    nn.init.zeros_(slot.weight)
+    with torch.no_grad():
+        slot.bias.copy_(torch.tensor([2.0, -2.0]))
+    agent.action_head.tera_gate_score = gate
+    agent.action_head.tera_slot_score = slot
+    for parameter in agent.value_head.parameters():
+        nn.init.zeros_(parameter)
+
+    buffer = RolloutBuffer(num_steps, num_envs, obs_np, masks_np, device)
+    buffer.reset()
+    obs = {key: torch.from_numpy(value) for key, value in obs_np.items()}
+    masks = {key: torch.from_numpy(value) for key, value in masks_np.items()}
+    for step in range(num_steps):
+        with torch.no_grad():
+            out = agent(obs, action_masks=masks)
+        buffer.add(
+            obs,
+            out["actions"],
+            masks,
+            out["log_prob"],
+            out["value"],
+            torch.zeros(num_envs),
+            torch.full((num_envs,), step == num_steps - 1, dtype=torch.bool),
+        )
+    batch = buffer.compute_gae(torch.zeros(num_envs))
+    initial_gate_bias = gate.bias.detach().clone()
+    initial_slot_gap = (slot.bias[0] - slot.bias[1]).detach().abs()
+
+    trainer = PPOTrainer(
+        agent,
+        TrainingConfig(
+            lr=1e-2,
+            num_epochs=1,
+            num_minibatches=1,
+            entropy_coef=0.0,
+            tera_gate_entropy_coef=0.0,
+            tera_slot_entropy_coef=1.0,
+            value_coef=0.0,
+            aux_hidden_info_coef=0.0,
+            aux_opp_action_coef=0.0,
+        ),
+        device,
+    )
+    trainer.update(batch)
+
+    torch.testing.assert_close(gate.bias, initial_gate_bias)
+    assert (slot.bias[0] - slot.bias[1]).detach().abs() < initial_slot_gap
 
 
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
@@ -435,10 +628,24 @@ def test_action_head_rejects_invalid_exploration_probabilities(value: float) -> 
     [
         {"tera_exploration_start": -0.01},
         {"tera_exploration_end": 1.01},
-        {"tera_force_delay_start": float("nan")},
-        {"tera_force_delay_end": float("inf")},
     ],
 )
 def test_training_config_rejects_invalid_tera_probabilities(override) -> None:
     with pytest.raises(ValueError, match="within \\[0, 1\\]"):
         TrainingConfig(**override)
+
+
+@pytest.mark.parametrize("field", ["tera_gate_entropy_coef", "tera_slot_entropy_coef"])
+@pytest.mark.parametrize("value", [-0.01, float("nan"), float("inf")])
+def test_training_config_rejects_invalid_tera_entropy_coefficients(
+    field: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        TrainingConfig(**{field: value})
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
+def test_training_config_rejects_invalid_exploration_decay_fraction(value) -> None:
+    with pytest.raises(ValueError, match="tera_exploration_decay_fraction"):
+        TrainingConfig(tera_exploration_decay_fraction=value)

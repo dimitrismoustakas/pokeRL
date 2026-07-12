@@ -10,6 +10,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import math
 import random
 import time
 import uuid
@@ -383,13 +384,22 @@ def parse_args() -> argparse.Namespace:
         "--team-preview-max-samples",
         type=int,
         default=None,
-        help="Uniform current-rollout preview sample cap.",
+        help="Optional uniform current-rollout preview sample cap; defaults to all.",
+    )
+    parser.add_argument(
+        "--preview-update-minibatch-size",
+        type=int,
+        default=None,
+        help=(
+            "Preview samples per gradient-accumulation chunk. All chunks form "
+            "one optimizer step."
+        ),
     )
     parser.add_argument(
         "--tera-exploration-start",
         type=float,
         default=None,
-        help="Initial probability of uniform-over-valid tera sampling during rollout.",
+        help="Initial epsilon for factorized Tera gate/slot exploration.",
     )
     parser.add_argument(
         "--tera-exploration-end",
@@ -398,34 +408,22 @@ def parse_args() -> argparse.Namespace:
         help="Final tera-exploration epsilon after the decay window.",
     )
     parser.add_argument(
-        "--tera-exploration-decay-updates",
-        type=int,
-        default=None,
-        help="PPO updates over which to linearly decay tera-exploration epsilon.",
-    )
-    parser.add_argument(
-        "--tera-force-delay-start",
+        "--tera-exploration-decay-fraction",
         type=float,
         default=None,
-        help="Initial probability of forcing early sampled tera actions to no-tera during rollout.",
+        help="Fraction of planned updates used to anneal Tera exploration.",
     )
     parser.add_argument(
-        "--tera-force-delay-end",
+        "--tera-gate-entropy-coef",
         type=float,
         default=None,
-        help="Final early-turn tera-delay probability after the decay window.",
+        help="Entropy coefficient for the base Tera use-now gate.",
     )
     parser.add_argument(
-        "--tera-force-delay-decay-updates",
-        type=int,
+        "--tera-slot-entropy-coef",
+        type=float,
         default=None,
-        help="PPO updates over which to linearly decay early-turn tera-delay exploration.",
-    )
-    parser.add_argument(
-        "--tera-force-delay-max-turn",
-        type=int,
-        default=None,
-        help="Apply forced tera delay only through this battle turn. Use 0 to disable.",
+        help="Entropy coefficient for the conditional eligible Tera slot.",
     )
     parser.add_argument(
         "--aux-hidden-info-coef",
@@ -521,13 +519,12 @@ def build_configs(
         "league_refresh_interval": args.league_refresh_interval,
         "league_coalesce_ms": args.league_coalesce_ms,
         "team_preview_max_samples": args.team_preview_max_samples,
+        "preview_update_minibatch_size": args.preview_update_minibatch_size,
         "tera_exploration_start": args.tera_exploration_start,
         "tera_exploration_end": args.tera_exploration_end,
-        "tera_exploration_decay_updates": args.tera_exploration_decay_updates,
-        "tera_force_delay_start": args.tera_force_delay_start,
-        "tera_force_delay_end": args.tera_force_delay_end,
-        "tera_force_delay_decay_updates": args.tera_force_delay_decay_updates,
-        "tera_force_delay_max_turn": args.tera_force_delay_max_turn,
+        "tera_exploration_decay_fraction": args.tera_exploration_decay_fraction,
+        "tera_gate_entropy_coef": args.tera_gate_entropy_coef,
+        "tera_slot_entropy_coef": args.tera_slot_entropy_coef,
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
         "aux_opp_action_coef": args.aux_opp_action_coef,
         "diagnose_memory_gradients": args.diagnose_memory_gradients,
@@ -591,6 +588,38 @@ def resolve_update_bounds(
         updates_done + requested_updates if additional_updates else requested_updates
     )
     return updates_done, target_update
+
+
+def resolve_tera_exploration_decay_updates(
+    total_updates: int,
+    decay_fraction: float,
+) -> int:
+    """Convert a horizon fraction into an absolute exploration window."""
+    if total_updates <= 0:
+        raise ValueError("total_updates must be positive.")
+    if not 0.0 <= decay_fraction <= 1.0:
+        raise ValueError("decay_fraction must be within [0, 1].")
+    if decay_fraction == 0.0:
+        return 0
+    return max(1, math.ceil(total_updates * decay_fraction))
+
+
+def tera_exploration_probability(
+    *,
+    start: float,
+    end: float,
+    update: int,
+    decay_updates: int,
+) -> float:
+    """Linearly anneal epsilon, reaching ``end`` within the decay window."""
+    if update <= 0:
+        raise ValueError("update must be positive.")
+    if decay_updates < 0:
+        raise ValueError("decay_updates must be non-negative.")
+    if decay_updates <= 1:
+        return float(end)
+    progress = min(1.0, max(0.0, (update - 1) / (decay_updates - 1)))
+    return float(start + (end - start) * progress)
 
 
 def make_league_opponent_factory(
@@ -929,8 +958,6 @@ def collect_synchronous_rollout(
     device: torch.device,
     num_steps: int,
     tera_exploration_prob: float,
-    tera_force_delay_prob: float,
-    tera_force_delay_max_turn: int,
     collect_timing: bool,
 ) -> tuple[
     dict[str, np.ndarray],
@@ -947,8 +974,6 @@ def collect_synchronous_rollout(
     """
     buffer.set_tera_behavior_policy(
         exploration_prob=tera_exploration_prob,
-        force_delay_prob=tera_force_delay_prob,
-        force_delay_max_turn=tera_force_delay_max_turn,
     )
     profile = {
         "obs_to_device_sec": 0.0,
@@ -996,8 +1021,6 @@ def collect_synchronous_rollout(
                 hidden,
                 action_masks=masks_t,
                 tera_exploration_prob=tera_exploration_prob,
-                tera_force_delay_prob=tera_force_delay_prob,
-                tera_force_delay_max_turn=tera_force_delay_max_turn,
             )
             if collect_timing:
                 profile["policy_forward_sec"] += time.perf_counter() - started
@@ -1177,6 +1200,57 @@ def _json_ready_metrics(metrics: dict[str, float]) -> dict[str, float]:
 
 def _safe_div(numerator: float, denominator: float) -> float:
     return float(numerator / denominator) if denominator else 0.0
+
+
+def summarize_observation_history(
+    obs: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """Report whether the causal event and prior-intent inputs are populated."""
+    required = {"recent_event_meta", "recent_event_mask", "prev_own_valid"}
+    if not required.issubset(obs):
+        return {}
+    with torch.no_grad():
+        meta = obs["recent_event_meta"]
+        valid = meta[..., 0] > 0.5
+        partial = (meta[..., 1] > 0.5) & valid
+        overflow = (meta[..., 2] > 0.0) & valid
+        event_counts = (~obs["recent_event_mask"]).sum(dim=-1).to(torch.float32)
+        valid_count = valid.sum().item()
+        return {
+            "history_event_segment_coverage": valid.to(torch.float32).mean().item(),
+            "history_partial_segment_fraction": _safe_div(
+                partial.sum().item(), valid_count
+            ),
+            "history_overflow_segment_fraction": _safe_div(
+                overflow.sum().item(), valid_count
+            ),
+            "history_events_per_valid_segment": _safe_div(
+                event_counts[valid].sum().item(), valid_count
+            ),
+            "history_previous_intent_slot_coverage": obs["prev_own_valid"]
+            .to(torch.float32)
+            .mean()
+            .item(),
+        }
+
+
+def summarize_first_tera_turns(
+    first_turns: list[int],
+    completed_battles: int,
+) -> dict[str, object]:
+    counts: dict[int, int] = {}
+    for turn in first_turns:
+        counts[turn] = counts.get(turn, 0) + 1
+    return {
+        "completed_battles": completed_battles,
+        "tera_used_battles": len(first_turns),
+        "tera_used_fraction": _safe_div(len(first_turns), completed_battles),
+        "turn_one_fraction": _safe_div(counts.get(1, 0), completed_battles),
+        "avg_first_tera_turn": (float(np.mean(first_turns)) if first_turns else 0.0),
+        "first_tera_turn_distribution": [
+            {"turn": turn, "count": count} for turn, count in sorted(counts.items())
+        ],
+    }
 
 
 def build_rollout_diagnostics(
@@ -1513,13 +1587,16 @@ def train():
             "team_preview_bring_coef": train_config.team_preview_bring_coef,
             "team_preview_lead_coef": train_config.team_preview_lead_coef,
             "team_preview_max_samples": train_config.team_preview_max_samples,
+            "preview_update_minibatch_size": (
+                train_config.preview_update_minibatch_size
+            ),
             "tera_exploration_start": train_config.tera_exploration_start,
             "tera_exploration_end": train_config.tera_exploration_end,
-            "tera_exploration_decay_updates": train_config.tera_exploration_decay_updates,
-            "tera_force_delay_start": train_config.tera_force_delay_start,
-            "tera_force_delay_end": train_config.tera_force_delay_end,
-            "tera_force_delay_decay_updates": train_config.tera_force_delay_decay_updates,
-            "tera_force_delay_max_turn": train_config.tera_force_delay_max_turn,
+            "tera_exploration_decay_fraction": (
+                train_config.tera_exploration_decay_fraction
+            ),
+            "tera_gate_entropy_coef": train_config.tera_gate_entropy_coef,
+            "tera_slot_entropy_coef": train_config.tera_slot_entropy_coef,
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opp_action_coef": train_config.aux_opp_action_coef,
             "diagnose_memory_gradients": train_config.diagnose_memory_gradients,
@@ -1570,9 +1647,22 @@ def train():
             global_step=trainer.global_step,
             additional_updates=args.resume is not None and args.num_updates is not None,
         )
+        tera_exploration_decay_updates = resolve_tera_exploration_decay_updates(
+            num_updates,
+            train_config.tera_exploration_decay_fraction,
+        )
+        run_summary["config"]["tera_exploration_decay_updates"] = (
+            tera_exploration_decay_updates
+        )
 
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")
+        print(
+            "Tera exploration: "
+            f"{train_config.tera_exploration_start:g} -> "
+            f"{train_config.tera_exploration_end:g} over "
+            f"{tera_exploration_decay_updates} update(s)"
+        )
         print("Backend: local BattleStream")
         print(f"Opponent groups: {opponent_groups}")
         print(
@@ -1600,6 +1690,7 @@ def train():
         _maybe_write_run_summary(args.summary_path, run_summary)
 
         episode_rewards: list[float] = []
+        run_first_tera_turns: list[int] = []
         start_time = time.time()
         invocation_start_global_step = trainer.global_step
 
@@ -1614,38 +1705,16 @@ def train():
                 parallel_env.reset_timing()
             rollout_started = time.perf_counter()
 
-            # Linear decay of tera exploration. A zero-length decay window means
-            # "skip decay, apply end immediately". Negative values are rejected
-            # by TrainingConfig validation.
-            decay_updates = train_config.tera_exploration_decay_updates
-            if decay_updates == 0:
-                tera_eps = train_config.tera_exploration_end
-            else:
-                progress = min(1.0, max(0.0, (update - 1) / decay_updates))
-                tera_eps = (
-                    train_config.tera_exploration_start
-                    + (
-                        train_config.tera_exploration_end
-                        - train_config.tera_exploration_start
-                    )
-                    * progress
-                )
-            delay_decay_updates = train_config.tera_force_delay_decay_updates
-            if delay_decay_updates == 0:
-                tera_force_delay_prob = train_config.tera_force_delay_end
-            else:
-                delay_progress = min(1.0, max(0.0, (update - 1) / delay_decay_updates))
-                tera_force_delay_prob = (
-                    train_config.tera_force_delay_start
-                    + (
-                        train_config.tera_force_delay_end
-                        - train_config.tera_force_delay_start
-                    )
-                    * delay_progress
-                )
+            tera_eps = tera_exploration_probability(
+                start=train_config.tera_exploration_start,
+                end=train_config.tera_exploration_end,
+                update=update,
+                decay_updates=tera_exploration_decay_updates,
+            )
             update_episode_rewards: list[float] = []
             update_episode_secs: list[float] = []
             update_episode_turns: list[float] = []
+            update_first_tera_turns: list[int] = []
             update_episode_opponent_choice_calls: list[int] = []
             update_episode_opponent_repeated_turn_requests: list[int] = []
             update_episode_opponent_max_calls_same_turn: list[int] = []
@@ -1666,8 +1735,6 @@ def train():
                     device=device,
                     num_steps=train_config.rollout_steps,
                     tera_exploration_prob=tera_eps,
-                    tera_force_delay_prob=tera_force_delay_prob,
-                    tera_force_delay_max_turn=(train_config.tera_force_delay_max_turn),
                     collect_timing=collect_timing,
                 )
             )
@@ -1717,6 +1784,11 @@ def train():
                     update_episode_secs.append(info["episode_sec"])
                 if "battle_turn" in info and info.get("episode_reward") is not None:
                     update_episode_turns.append(info["battle_turn"])
+                    first_tera_turn = info.get("episode_first_tera_turn")
+                    if first_tera_turn is not None:
+                        first_tera_turn = int(first_tera_turn)
+                        update_first_tera_turns.append(first_tera_turn)
+                        run_first_tera_turns.append(first_tera_turn)
                 if "episode_opponent_choice_calls" in info:
                     update_episode_opponent_choice_calls.append(
                         int(info["episode_opponent_choice_calls"])
@@ -1778,6 +1850,7 @@ def train():
                     train_config.gamma,
                     train_config.gae_lambda,
                 )
+                observation_history_metrics = summarize_observation_history(batch.obs)
             advantage_sec = time.perf_counter() - advantage_started
 
             # --- PPO update ---
@@ -1793,7 +1866,7 @@ def train():
                     update=update,
                 )
                 metrics["tera_exploration_prob"] = tera_eps
-                metrics["tera_force_delay_prob"] = tera_force_delay_prob
+                metrics.update(observation_history_metrics)
                 metrics["team_preview_samples_stale_excluded"] = float(
                     stale_preview_samples
                 )
@@ -1941,6 +2014,10 @@ def train():
                 else []
             )
             exact_aux_label_episodes = int(rollout_profile["exact_aux_label_episodes"])
+            update_tera_summary = summarize_first_tera_turns(
+                update_first_tera_turns,
+                len(update_episode_rewards),
+            )
             update_summary = {
                 "update": update,
                 "global_step": trainer.global_step,
@@ -1967,6 +2044,7 @@ def train():
                 "update_steps_per_second": update_steps_per_second,
                 "avg_episode_sec": avg_episode_sec,
                 "avg_episode_turns": avg_episode_turns,
+                "tera": update_tera_summary,
                 "avg_episode_opponent_choice_calls": avg_episode_opponent_choice_calls,
                 "avg_episode_opponent_repeated_turn_requests": avg_episode_opponent_repeated_turn_requests,
                 "max_episode_opponent_choice_calls": max_episode_opponent_choice_calls,
@@ -2040,6 +2118,10 @@ def train():
                 "observed_checkpoint_paths": sorted(run_observed_opponents),
                 "outcomes": _summarize_opponent_outcomes(run_opponent_outcomes),
             }
+            run_summary["tera"] = summarize_first_tera_turns(
+                run_first_tera_turns,
+                len(episode_rewards),
+            )
             run_summary["updates"].append(update_summary)
             run_summary["status"] = "running"
             run_summary["update_count"] = update
@@ -2092,7 +2174,9 @@ def train():
                     f"Policy loss {metrics['policy_loss']:.4f} | "
                     f"Value loss {metrics['value_loss']:.4f} | "
                     f"Entropy {metrics['entropy']:.4f} | "
-                    f"Base tera H(choice) {metrics['base_tera_entropy']:.3f} | "
+                    f"Tera H(gate/slot) {metrics['base_tera_gate_entropy']:.3f}/"
+                    f"{metrics['base_tera_slot_entropy']:.3f} | "
+                    f"Tera t1 {update_tera_summary['turn_one_fraction']:.1%} | "
                     f"Pre-PPO KL {metrics['pre_ppo_approx_kl']:.5f}/"
                     f"clip {metrics['pre_ppo_clip_fraction']:.1%} | "
                     f"Preview loss {metrics.get('team_preview_loss', float('nan')):.4f} | "

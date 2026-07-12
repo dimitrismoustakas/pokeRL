@@ -17,7 +17,9 @@ from scripts.train import (
     configure_training_randomness,
     parse_args,
     resolve_opponent_groups,
+    resolve_tera_exploration_decay_updates,
     resolve_update_bounds,
+    tera_exploration_probability,
 )
 
 
@@ -177,6 +179,83 @@ def test_league_refresh_cli_is_independent_of_snapshot_interval(monkeypatch) -> 
 
     assert train_config.league_update_interval == 12
     assert train_config.league_refresh_interval == 3
+
+
+def test_factorized_tera_cli_overrides(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--tera-exploration-end",
+            "0.01",
+            "--tera-exploration-decay-fraction",
+            "0.4",
+            "--tera-gate-entropy-coef",
+            "0.02",
+            "--tera-slot-entropy-coef",
+            "0.03",
+        ],
+    )
+
+    _, _, config = build_configs(parse_args())
+
+    assert config.tera_exploration_end == pytest.approx(0.01)
+    assert config.tera_exploration_decay_fraction == pytest.approx(0.4)
+    assert config.tera_gate_entropy_coef == pytest.approx(0.02)
+    assert config.tera_slot_entropy_coef == pytest.approx(0.03)
+
+
+def test_factorized_tera_defaults_leave_unmodified_training_tail() -> None:
+    config = TrainingConfig()
+
+    assert config.tera_exploration_start == pytest.approx(0.15)
+    assert config.tera_exploration_end == 0.0
+    assert config.tera_exploration_decay_fraction == pytest.approx(0.25)
+
+
+def test_tera_exploration_decay_uses_planned_update_horizon() -> None:
+    decay_updates = resolve_tera_exploration_decay_updates(100, 0.25)
+
+    assert decay_updates == 25
+    assert tera_exploration_probability(
+        start=0.15,
+        end=0.0,
+        update=1,
+        decay_updates=decay_updates,
+    ) == pytest.approx(0.15)
+    assert tera_exploration_probability(
+        start=0.15,
+        end=0.0,
+        update=13,
+        decay_updates=decay_updates,
+    ) == pytest.approx(0.075)
+    assert tera_exploration_probability(
+        start=0.15,
+        end=0.0,
+        update=25,
+        decay_updates=decay_updates,
+    ) == pytest.approx(0.0)
+    assert tera_exploration_probability(
+        start=0.15,
+        end=0.0,
+        update=90,
+        decay_updates=decay_updates,
+    ) == pytest.approx(0.0)
+
+
+def test_zero_tera_decay_fraction_applies_end_immediately() -> None:
+    decay_updates = resolve_tera_exploration_decay_updates(100, 0.0)
+
+    assert decay_updates == 0
+    assert (
+        tera_exploration_probability(
+            start=0.15,
+            end=0.0,
+            update=1,
+            decay_updates=decay_updates,
+        )
+        == 0.0
+    )
 
 
 @pytest.mark.parametrize(

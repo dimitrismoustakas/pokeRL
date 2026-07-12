@@ -68,6 +68,7 @@ def _make_step_env(
     env._episode_opponent_choice_calls = 0
     env._episode_opponent_turn_calls = {}
     env._episode_opponent_checkpoint_path = None
+    env._episode_first_tera_turn = None
     return env
 
 
@@ -130,6 +131,20 @@ def test_step_waits_for_terminal_battle_task_before_returning_done() -> None:
     assert info["team_preview_obs"] is preview_obs
     np.testing.assert_array_equal(info["team_preview_picks"], preview_picks)
     assert info["team_preview_policy_version"] == 14
+
+
+def test_step_records_the_first_tera_decision_turn() -> None:
+    task = Future()
+    task.set_result(None)
+    battle = SimpleNamespace(battle_tag="battle-test", turn=5)
+    queue = _ObservationQueue(({}, {}, 1.0, True, battle))
+    env = _make_step_env(queue, task)
+    env.player.last_battle = SimpleNamespace(turn=3)
+
+    _obs, _mask, _reward, done, info = env.step(np.asarray([0, 0, 1], dtype=np.int64))
+
+    assert done
+    assert info["episode_first_tera_turn"] == 3
     assert env._battle_task is None
     assert len(env.player.action_queue.items) == 1
 

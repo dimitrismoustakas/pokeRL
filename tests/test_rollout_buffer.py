@@ -33,8 +33,6 @@ from pokerl.env.actions import (
 from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
 from pokerl.env.observation import (
     CONTINUOUS_DIM,
-    FIELD_TIMER_CAPS,
-    FIELD_TURN_OFFSET,
     ROLE_ACTIVE_1,
     ROLE_ACTIVE_2,
     ROLE_BENCH,
@@ -550,7 +548,16 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
     metrics = trainer.update(batch)
 
     assert trainer.global_step == num_steps * num_envs
-    assert {"policy_loss", "value_loss", "entropy", "approx_kl"} <= set(metrics)
+    assert {
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "approx_kl",
+        "max_approx_kl",
+        "clip_fraction",
+        "value_clip_fraction",
+        "value_explained_variance",
+    } <= set(metrics)
     assert metrics["pre_ppo_clip_fraction"] >= 0.0
     assert metrics["base_tera_real_choice_evaluations"] >= 0.0
 
@@ -993,71 +1000,6 @@ def test_action_head_categorical_choice_samples_without_torch_multinomial(
     assert torch.all((selected_no_stats >= 0) & (selected_no_stats < logits.shape[1]))
     assert log_prob_no_stats is None
     assert entropy_no_stats is None
-
-
-def test_action_head_force_delay_turns_early_sampled_tera_into_no_tera() -> None:
-    class FixedTeraScore(nn.Module):
-        def forward(self, query: torch.Tensor) -> torch.Tensor:
-            logits = torch.full(
-                (query.shape[0], 3), -1e8, dtype=query.dtype, device=query.device
-            )
-            logits[:, TERA_SLOT_1] = 1e8
-            return logits
-
-    torch.manual_seed(0)
-    head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
-    head.tera_score = FixedTeraScore()
-    context = torch.zeros((1, 3))
-    active_reps = torch.zeros((1, 2, 2))
-    own_team_reps = torch.zeros((1, 6, 2))
-    opp_team_reps = torch.zeros((1, 6, 2))
-    opp_reserve_mask = torch.tensor(
-        [[True, True, False, False, False, False]], dtype=torch.bool
-    )
-    opp_active_reps = torch.zeros((1, 2, 2))
-    masks = {
-        "joint": torch.zeros(
-            (1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool
-        ),
-        "can_tera": torch.tensor([[True, False]], dtype=torch.bool),
-    }
-    masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
-    masks["joint"][0, 1, 0] = True
-    battle_obs = {
-        "field": torch.zeros((1, FIELD_TURN_OFFSET + 1), dtype=torch.float32),
-    }
-    battle_obs["field"][0, FIELD_TURN_OFFSET] = 1.0 / float(FIELD_TIMER_CAPS["turn"])
-
-    out = head(
-        context,
-        active_reps,
-        own_team_reps,
-        opp_team_reps,
-        opp_reserve_mask,
-        opp_active_reps,
-        masks,
-        battle_obs=battle_obs,
-        tera_force_delay_prob=1.0,
-        tera_force_delay_max_turn=3,
-    )
-
-    assert out["actions"][0, 2].item() == TERA_NONE
-
-    battle_obs["field"][0, FIELD_TURN_OFFSET] = 4.0 / float(FIELD_TIMER_CAPS["turn"])
-    out_after_window = head(
-        context,
-        active_reps,
-        own_team_reps,
-        opp_team_reps,
-        opp_reserve_mask,
-        opp_active_reps,
-        masks,
-        battle_obs=battle_obs,
-        tera_force_delay_prob=1.0,
-        tera_force_delay_max_turn=3,
-    )
-
-    assert out_after_window["actions"][0, 2].item() == TERA_SLOT_1
 
 
 def test_masked_set_attention_returns_zero_when_every_item_is_masked() -> None:
@@ -1789,7 +1731,9 @@ def test_finished_battle_update_skips_legality_rebuild(
         last_battle=None,
         _last_finished_token=None,
         obs_builder=SimpleNamespace(
-            build=lambda battle: {"context": np.array([1], dtype=np.int64)}
+            build=lambda battle, **kwargs: {
+                "context": np.array([1], dtype=np.int64)
+            }
         ),
         timing=timing,
         obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
@@ -1849,7 +1793,9 @@ def test_emit_pending_finished_battle_enqueues_terminal_observation(
         _last_finished_token=None,
         _pending_finished_battle=None,
         obs_builder=SimpleNamespace(
-            build=lambda battle: {"context": np.array([1], dtype=np.int64)}
+            build=lambda battle, **kwargs: {
+                "context": np.array([1], dtype=np.int64)
+            }
         ),
         timing=timing,
         obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
@@ -1960,7 +1906,7 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(
     fake_service = _FakeInferenceService()
     build_calls = []
 
-    def _build_obs(battle):
+    def _build_obs(battle, **kwargs):
         build_calls.append(battle.state)
         return {"context": np.array([battle.state], dtype=np.int64)}
 
@@ -1980,6 +1926,8 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(
     player._pending_action_battle = None
     player._pending_action_started_at = None
     player._last_actions = None
+    player._committed_intent = None
+    player._pending_intent = None
     player.choose_default_move = lambda: PassBattleOrder()
     monkeypatch.setattr(
         league_module,
@@ -2004,6 +1952,11 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(
         lambda action_idx, battle, slot, terastallize=False, action_state=None: (
             PassBattleOrder()
         ),
+    )
+    monkeypatch.setattr(
+        league_module,
+        "semantic_action_intent",
+        lambda actions, action_state: None,
     )
 
     battle_kwargs = dict(
@@ -2050,7 +2003,7 @@ async def test_league_player_reuses_inflight_same_state_request(
     fake_service = _FakeInferenceService()
     build_calls = []
 
-    def _build_obs(battle):
+    def _build_obs(battle, **kwargs):
         build_calls.append(battle.state)
         return {"context": np.array([battle.state], dtype=np.int64)}
 
@@ -2070,6 +2023,8 @@ async def test_league_player_reuses_inflight_same_state_request(
     player._pending_action_battle = None
     player._pending_action_started_at = None
     player._last_actions = None
+    player._committed_intent = None
+    player._pending_intent = None
     player._timing = None
     player.choose_default_move = lambda: PassBattleOrder()
     monkeypatch.setattr(
@@ -2095,6 +2050,11 @@ async def test_league_player_reuses_inflight_same_state_request(
         lambda action_idx, battle, slot, terastallize=False, action_state=None: (
             PassBattleOrder()
         ),
+    )
+    monkeypatch.setattr(
+        league_module,
+        "semantic_action_intent",
+        lambda actions, action_state: None,
     )
 
     battle = SimpleNamespace(
@@ -2165,6 +2125,8 @@ async def test_league_player_default_only_request_skips_inference() -> None:
     player._pending_action_battle = None
     player._pending_action_started_at = None
     player._last_actions = None
+    player._committed_intent = None
+    player._pending_intent = None
     player._timing = None
     player.choose_default_move = lambda: PassBattleOrder()
 

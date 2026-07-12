@@ -7,9 +7,24 @@ import torch.nn as nn
 
 from ..config import ModelConfig
 from ..data import GameData
-from ..env.observation import CONTINUOUS_DIM, ROLE_BENCH
-from ..env.actions import ACTIONS_PER_SLOT, NUM_TERA_CHOICES
-from .encoders import PokemonEncoder, TeamEncoder, FieldEncoder, SpatialEncoder
+from ..env.observation import (
+    CONTINUOUS_DIM,
+    NUM_EVENT_KINDS,
+    NUM_EVENT_POSITIONS,
+    ROLE_BENCH,
+)
+from ..env.actions import (
+    ACTIONS_PER_SLOT,
+    NUM_INTENT_KINDS,
+    NUM_TERA_CHOICES,
+)
+from .encoders import (
+    FieldEncoder,
+    PokemonEncoder,
+    RecentEventEncoder,
+    SpatialEncoder,
+    TeamEncoder,
+)
 from .memory import build_memory
 from .heads import (
     ActionHead,
@@ -86,9 +101,22 @@ class PokeAgent(nn.Module):
             config.team_attention_layers,
         )
         field_encoder = FieldEncoder(config.field_out)
+        recent_event_encoder = RecentEventEncoder(
+            num_moves=game_data.num_moves,
+            num_species=game_data.num_species,
+            num_types=game_data.num_types,
+            num_event_kinds=NUM_EVENT_KINDS,
+            num_positions=NUM_EVENT_POSITIONS,
+            num_intent_kinds=NUM_INTENT_KINDS,
+            out_dim=config.recent_event_out,
+        )
 
         self.spatial = SpatialEncoder(
-            pokemon_encoder, team_own, team_opp, field_encoder
+            pokemon_encoder,
+            team_own,
+            team_opp,
+            field_encoder,
+            recent_event_encoder,
         )
 
         # --- Memory ---
@@ -148,8 +176,6 @@ class PokeAgent(nn.Module):
         actions: torch.Tensor | None = None,
         action_masks: dict[str, torch.Tensor] | None = None,
         tera_exploration_prob: float = 0.0,
-        tera_force_delay_prob: float = 0.0,
-        tera_force_delay_max_turn: int = 0,
         greedy: bool = False,
         validate_actions: bool = True,
         include_value: bool = True,
@@ -164,14 +190,9 @@ class PokeAgent(nn.Module):
             action_masks: dict with boolean legality tables:
                 ``joint`` has shape (batch, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
                 ``can_tera`` has shape (batch, 2)
-            tera_exploration_prob: epsilon for uniform-over-valid tera exploration
-                during rollout. PPO passes the same value when evaluating supplied
-                actions so behavior-policy likelihood ratios stay exact.
-            tera_force_delay_prob: probability of converting early sampled tera
-                actions to no-tera. PPO also applies the resulting marginal
-                distribution when evaluating supplied actions.
-            tera_force_delay_max_turn: latest battle turn eligible for forced
-                no-tera exploration. 0 disables it.
+            tera_exploration_prob: epsilon for factorized use-gate and eligible-slot
+                exploration during rollout. PPO passes the same value when evaluating
+                supplied actions so behavior-policy likelihood ratios stay exact.
             greedy: choose the highest-probability legal actions instead of
                 sampling when actions are not supplied.
             validate_actions: validate caller-supplied actions against the
@@ -203,8 +224,6 @@ class PokeAgent(nn.Module):
             greedy=greedy,
             battle_obs=obs,
             tera_exploration_prob=tera_exploration_prob,
-            tera_force_delay_prob=tera_force_delay_prob,
-            tera_force_delay_max_turn=tera_force_delay_max_turn,
             validate_actions=validate_actions,
             include_policy_stats=include_policy_stats,
         )

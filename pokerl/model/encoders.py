@@ -38,11 +38,11 @@ class PokemonEncoder(nn.Module):
 
         total_input = (
             species_dim
-            + 4 * move_dim    # 4 moves
-            + move_dim        # last revealed move
+            + 4 * move_dim  # 4 moves
+            + move_dim  # last revealed move
             + ability_dim
             + item_dim
-            + 3 * type_dim    # type_1, type_2, tera_type
+            + 3 * type_dim  # type_1, type_2, tera_type
             + continuous_dim
         )
 
@@ -55,23 +55,26 @@ class PokemonEncoder(nn.Module):
 
     def forward(
         self,
-        species: torch.Tensor,       # (batch, )
-        moves: torch.Tensor,         # (batch, 4)
-        last_move: torch.Tensor,     # (batch, )
-        ability: torch.Tensor,       # (batch, )
-        item: torch.Tensor,          # (batch, )
-        types: torch.Tensor,         # (batch, 3)  — type_1, type_2, tera_type
-        continuous: torch.Tensor,    # (batch, continuous_dim)
-    ) -> torch.Tensor:               # (batch, out_dim)
-        x = torch.cat([
-            self.species_emb(species),
-            self.move_emb(moves).flatten(-2),       # (batch, 4 * move_dim)
-            self.move_emb(last_move),
-            self.ability_emb(ability),
-            self.item_emb(item),
-            self.type_emb(types).flatten(-2),       # (batch, 2 * type_dim)
-            continuous,
-        ], dim=-1)
+        species: torch.Tensor,  # (batch, )
+        moves: torch.Tensor,  # (batch, 4)
+        last_move: torch.Tensor,  # (batch, )
+        ability: torch.Tensor,  # (batch, )
+        item: torch.Tensor,  # (batch, )
+        types: torch.Tensor,  # (batch, 3)  — type_1, type_2, tera_type
+        continuous: torch.Tensor,  # (batch, continuous_dim)
+    ) -> torch.Tensor:  # (batch, out_dim)
+        x = torch.cat(
+            [
+                self.species_emb(species),
+                self.move_emb(moves).flatten(-2),  # (batch, 4 * move_dim)
+                self.move_emb(last_move),
+                self.ability_emb(ability),
+                self.item_emb(item),
+                self.type_emb(types).flatten(-2),  # (batch, 2 * type_dim)
+                continuous,
+            ],
+            dim=-1,
+        )
         return self.mlp(x)
 
 
@@ -102,9 +105,9 @@ class TeamEncoder(nn.Module):
     def forward(
         self,
         pokemon_reps: torch.Tensor,  # (batch, team_size, pokemon_dim)
-        roles: torch.Tensor,         # (batch, team_size) values in {0, 1, 2}
+        roles: torch.Tensor,  # (batch, team_size) values in {0, 1, 2}
         mask: torch.Tensor | None = None,  # (batch, team_size) True = padding
-    ) -> torch.Tensor:               # (batch, team_size, pokemon_dim)
+    ) -> torch.Tensor:  # (batch, team_size, pokemon_dim)
         x = pokemon_reps + self.role_emb(roles)
         return self.attention(x, src_key_padding_mask=mask)
 
@@ -133,6 +136,93 @@ class FieldEncoder(nn.Module):
         return self.mlp(field_features)
 
 
+class RecentEventEncoder(nn.Module):
+    """Encode the last public resolution segment and our prior submitted intent."""
+
+    def __init__(
+        self,
+        *,
+        num_moves: int,
+        num_species: int,
+        num_types: int,
+        num_event_kinds: int,
+        num_positions: int,
+        num_intent_kinds: int,
+        out_dim: int = 64,
+    ):
+        super().__init__()
+        if out_dim <= 0:
+            raise ValueError(
+                f"Recent-event output width must be positive, got {out_dim}."
+            )
+        self.out_dim = out_dim
+        self.kind_emb = nn.Embedding(num_event_kinds, 8, padding_idx=0)
+        self.position_emb = nn.Embedding(num_positions, 8, padding_idx=0)
+        self.move_emb = nn.Embedding(num_moves, 16, padding_idx=0)
+        self.species_emb = nn.Embedding(num_species, 16, padding_idx=0)
+        self.type_emb = nn.Embedding(num_types, 8, padding_idx=0)
+        self.intent_kind_emb = nn.Embedding(num_intent_kinds, 8, padding_idx=0)
+        self.event_projection = nn.Sequential(
+            nn.Linear(8 + 8 + 8 + 16 + 16 + 8 + 3, 64),
+            nn.ReLU(),
+        )
+        self.event_memory = nn.GRU(64, 64, batch_first=True)
+        self.intent_projection = nn.Sequential(
+            nn.Linear(8 + 16 + 8 + 16 + 1, 32),
+            nn.ReLU(),
+        )
+        self.output = nn.Sequential(
+            nn.Linear(64 + 2 * 32 + 3, out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        reference = obs["field"]
+        batch_size = reference.shape[0]
+        if "recent_event_kind" not in obs:
+            return reference.new_zeros((batch_size, self.out_dim))
+
+        event_tokens = torch.cat(
+            [
+                self.kind_emb(obs["recent_event_kind"]),
+                self.position_emb(obs["recent_event_actor"]),
+                self.position_emb(obs["recent_event_target"]),
+                self.move_emb(obs["recent_event_move"]),
+                self.species_emb(obs["recent_event_species"]),
+                self.type_emb(obs["recent_event_tera_type"]),
+                obs["recent_event_flags"],
+            ],
+            dim=-1,
+        )
+        event_tokens = self.event_projection(event_tokens)
+        event_outputs, _ = self.event_memory(event_tokens)
+        lengths = (~obs["recent_event_mask"]).sum(dim=1)
+        last_indices = (lengths - 1).clamp_min(0)
+        event_summary = event_outputs[
+            torch.arange(batch_size, device=reference.device), last_indices
+        ]
+        event_summary = event_summary * (lengths > 0).unsqueeze(-1)
+
+        intent_tokens = torch.cat(
+            [
+                self.intent_kind_emb(obs["prev_own_kind"]),
+                self.move_emb(obs["prev_own_move"]),
+                self.position_emb(obs["prev_own_target"]),
+                self.species_emb(obs["prev_own_switch_species"]),
+                obs["prev_own_tera"].unsqueeze(-1).to(reference.dtype),
+            ],
+            dim=-1,
+        )
+        intent_tokens = self.intent_projection(intent_tokens)
+        intent_tokens = intent_tokens * obs["prev_own_valid"].unsqueeze(-1)
+        intent_summary = intent_tokens.flatten(1)
+        encoded = self.output(
+            torch.cat([event_summary, intent_summary, obs["recent_event_meta"]], dim=-1)
+        )
+        valid = (lengths > 0) | obs["prev_own_valid"].any(dim=1)
+        return encoded * valid.unsqueeze(-1)
+
+
 class SpatialEncoder(nn.Module):
     """Full spatial encoder: both teams + field -> battle representation.
 
@@ -150,16 +240,20 @@ class SpatialEncoder(nn.Module):
         team_encoder_own: TeamEncoder,
         team_encoder_opp: TeamEncoder,
         field_encoder: FieldEncoder,
+        recent_event_encoder: RecentEventEncoder,
     ):
         super().__init__()
         self.pokemon_encoder = pokemon_encoder
         self.team_own = team_encoder_own
         self.team_opp = team_encoder_opp
         self.field_encoder = field_encoder
+        self.recent_event_encoder = recent_event_encoder
 
         pokemon_dim = team_encoder_own.role_emb.embedding_dim
         # context = mean(own_team) + mean(opp_team) + field
-        self.context_dim = pokemon_dim * 2 + field_encoder.out_dim
+        self.context_dim = (
+            pokemon_dim * 2 + field_encoder.out_dim + recent_event_encoder.out_dim
+        )
 
     def forward(
         self, obs: dict[str, torch.Tensor]
@@ -189,12 +283,13 @@ class SpatialEncoder(nn.Module):
 
         # Field
         field = self.field_encoder(obs["field"])
+        recent_events = self.recent_event_encoder(obs)
 
         # Pool teams into summary vectors (mask-aware mean)
         own_summary = self._masked_mean(own_reps, obs.get("own_mask"))
         opp_summary = self._masked_mean(opp_reps, opp_mask)
 
-        context = torch.cat([own_summary, opp_summary, field], dim=-1)
+        context = torch.cat([own_summary, opp_summary, field, recent_events], dim=-1)
 
         # Extract our active pokemon representations by index
         active_indices = obs["own_active_indices"]  # (batch, 2)

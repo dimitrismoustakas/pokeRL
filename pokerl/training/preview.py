@@ -98,19 +98,19 @@ def filter_current_team_preview_training_samples(
 
 def select_team_preview_training_samples(
     samples: Sequence[TeamPreviewTrainingSample],
-    max_samples: int,
+    max_samples: int | None,
     *,
     seed: int,
     update: int,
 ) -> TeamPreviewTrainingSelection:
-    """Uniformly subsample one rollout's preview decisions without replacement.
+    """Select all preview decisions, or uniformly cap them without replacement.
 
     Deriving a fresh generator from the run seed and absolute update makes the
     selection reproducible after resume without persisting additional RNG state.
     Sorting the selected indices preserves rollout order without changing which
     subset is sampled.
     """
-    if max_samples <= 0:
+    if max_samples is not None and max_samples <= 0:
         raise ValueError(f"max_samples must be positive (got {max_samples}).")
     if not 0 <= seed < 2**32:
         raise ValueError(f"seed must be in [0, 2**32) (got {seed}).")
@@ -118,7 +118,7 @@ def select_team_preview_training_samples(
         raise ValueError(f"update must be non-negative (got {update}).")
 
     available_count = len(samples)
-    if available_count <= max_samples:
+    if max_samples is None or available_count <= max_samples:
         selected = tuple(samples)
     else:
         rng = np.random.default_rng(np.random.SeedSequence([seed, update]))
@@ -138,7 +138,7 @@ def update_preview_then_battle(
     trainer: _PreviewAndBattleTrainer,
     battle_batch: object,
     preview_samples: Sequence[TeamPreviewTrainingSample],
-    max_preview_samples: int,
+    max_preview_samples: int | None,
     *,
     seed: int,
     update: int,

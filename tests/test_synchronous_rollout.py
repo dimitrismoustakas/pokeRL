@@ -65,14 +65,10 @@ class _DeterministicAgent:
         *,
         action_masks,
         tera_exploration_prob,
-        tera_force_delay_prob,
-        tera_force_delay_max_turn,
     ):
         del (
             action_masks,
             tera_exploration_prob,
-            tera_force_delay_prob,
-            tera_force_delay_max_turn,
         )
         states = obs["state"].reshape(-1)
         state_key = tuple(int(value) for value in states.detach().cpu().tolist())
@@ -183,8 +179,6 @@ def test_collect_synchronous_rollout_prefers_private_exact_labels_and_preserves_
             device=torch.device("cpu"),
             num_steps=2,
             tera_exploration_prob=0.2,
-            tera_force_delay_prob=0.3,
-            tera_force_delay_max_turn=4,
             collect_timing=True,
         )
     )
@@ -208,8 +202,6 @@ def test_collect_synchronous_rollout_prefers_private_exact_labels_and_preserves_
     assert batch.aux_label_valid[:, 3].any(dim=-1).tolist() == [True, True]
     assert batch.aux_labels["opp_item"][:, 3, 0].tolist() == [933, 933]
     assert batch.tera_exploration_prob == pytest.approx(0.2)
-    assert batch.tera_force_delay_prob == pytest.approx(0.3)
-    assert batch.tera_force_delay_max_turn == 4
 
     assert agent.hidden_inputs[(0, 10, 20, 30)] == [10.0, 11.0, 12.0, 13.0]
     assert agent.hidden_inputs[(100, 11, 21, 31)] == [0.0, 12.0, 13.0, 14.0]
@@ -256,8 +248,6 @@ def test_collect_synchronous_rollout_requires_terminal_final_observation() -> No
             device=torch.device("cpu"),
             num_steps=1,
             tera_exploration_prob=0.0,
-            tera_force_delay_prob=0.0,
-            tera_force_delay_max_turn=0,
             collect_timing=False,
         )
 
@@ -289,8 +279,6 @@ def test_collect_synchronous_rollout_propagates_step_failure() -> None:
             device=torch.device("cpu"),
             num_steps=1,
             tera_exploration_prob=0.0,
-            tera_force_delay_prob=0.0,
-            tera_force_delay_max_turn=0,
             collect_timing=False,
         )
 
