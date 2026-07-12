@@ -638,6 +638,41 @@ def build_team_preview_observation(
     return ObservationBuilder(game_data, team_size).build(battle)
 
 
+def summarize_observation_mismatch(
+    actual: dict[str, np.ndarray],
+    prepared: dict[str, np.ndarray],
+) -> str:
+    """Describe a failed prepared-observation equality check compactly."""
+    if actual.keys() != prepared.keys():
+        missing = sorted(prepared.keys() - actual.keys())
+        extra = sorted(actual.keys() - prepared.keys())
+        return f"missing keys={missing}, extra keys={extra}"
+
+    summaries: list[str] = []
+    for key in actual:
+        left = np.asarray(actual[key])
+        right = np.asarray(prepared[key])
+        if np.array_equal(left, right):
+            continue
+        if left.shape != right.shape:
+            summaries.append(f"{key} shape live={left.shape} prepared={right.shape}")
+            continue
+        differing = np.flatnonzero(left.reshape(-1) != right.reshape(-1))
+        samples = [
+            (
+                int(index),
+                left.reshape(-1)[index].item(),
+                right.reshape(-1)[index].item(),
+            )
+            for index in differing[:4]
+        ]
+        summaries.append(
+            f"{key} differs at {len(differing)} value(s) "
+            f"(flat index, live, prepared)={samples}"
+        )
+    return "; ".join(summaries) or "unknown difference"
+
+
 @lru_cache(maxsize=512)
 def _cached_packed_team_aux_labels(
     game_data: GameData,

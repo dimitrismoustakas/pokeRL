@@ -20,7 +20,11 @@ from poke_env.player import DoubleBattleOrder, PassBattleOrder, Player
 from ..model.agent import PokeAgent, load_state_dict_compatible
 from ..data import GameData
 from ..config import TrainingConfig, EnvConfig
-from ..env.observation import ObservationBuilder, build_team_preview_observation
+from ..env.observation import (
+    ObservationBuilder,
+    build_team_preview_observation,
+    summarize_observation_mismatch,
+)
 from ..env.actions import (
     PASS_ACTION,
     TERA_NONE,
@@ -39,7 +43,12 @@ from ..env.showdown_env import (
 from .cuda_execution import cuda_model_execution
 
 
-_LEAGUE_STATE_FORMAT_VERSION = 1
+_LEAGUE_STATE_FORMAT_VERSION = 2
+_LEAGUE_STATE_CONFIG_FIELDS = (
+    "league_size",
+    "league_update_interval",
+    "league_refresh_interval",
+)
 
 
 def _tuples_to_lists(value):
@@ -1439,9 +1448,10 @@ class LeaguePlayer(Player):
 
         if timing_enabled:
             self._increment_timing("opponent_precompute_preview_misses")
-        self._record_preview_obs_mismatch(obs, prepared_obs)
+        mismatch = self._record_preview_obs_mismatch(obs, prepared_obs)
         raise RuntimeError(
-            "Prepared opponent team preview observation did not match the live battle state."
+            "Prepared opponent team preview observation did not match the live battle "
+            f"state: {mismatch}."
         )
 
     def reset_hidden(self):
@@ -1622,13 +1632,16 @@ class LeaguePlayer(Player):
         self,
         actual: dict[str, np.ndarray],
         prepared: dict[str, np.ndarray],
-    ) -> None:
+    ) -> str:
         if actual.keys() != prepared.keys():
             self._increment_timing("opponent_precompute_preview_keyset_mismatch")
-            return
-        for key in actual:
-            if not np.array_equal(actual[key], prepared[key]):
-                self._increment_timing(f"opponent_precompute_preview_mismatch_{key}")
+        else:
+            for key in actual:
+                if not np.array_equal(actual[key], prepared[key]):
+                    self._increment_timing(
+                        f"opponent_precompute_preview_mismatch_{key}"
+                    )
+        return summarize_observation_mismatch(actual, prepared)
 
     def _add_timing(self, key: str, value: float) -> None:
         timing = getattr(self, "_timing", None)
@@ -1756,8 +1769,12 @@ class League:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(target.suffix + ".tmp")
+        league_config = {
+            field: getattr(self.config, field) for field in _LEAGUE_STATE_CONFIG_FIELDS
+        }
         payload = {
             "format_version": _LEAGUE_STATE_FORMAT_VERSION,
+            "league_config": league_config,
             "checkpoints": list(self.checkpoints),
             "rng_state": _tuples_to_lists(self._rng.getstate()),
             "extra_state": _tuples_to_lists(extra_state or {}),
@@ -1769,10 +1786,7 @@ class League:
             temporary.unlink(missing_ok=True)
 
     def load_state(self, path: str) -> dict[str, object]:
-        """Restore checkpoint paths from a saved state file.
-
-        Skips any paths that no longer exist on disk and warns if any are missing.
-        """
+        """Strictly restore checkpoint paths and the league sampling state."""
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("League state must contain a versioned JSON object.")
@@ -1781,29 +1795,63 @@ class League:
                 "Unsupported league-state format version: "
                 f"{payload.get('format_version')!r}."
             )
+        saved_league_config = payload.get("league_config")
+        if not isinstance(saved_league_config, dict) or set(saved_league_config) != set(
+            _LEAGUE_STATE_CONFIG_FIELDS
+        ):
+            raise ValueError("League state has an invalid league_config.")
+        if any(
+            isinstance(saved_league_config[field], bool)
+            or not isinstance(saved_league_config[field], int)
+            or saved_league_config[field] <= 0
+            for field in _LEAGUE_STATE_CONFIG_FIELDS
+        ):
+            raise ValueError(
+                "League state league_config values must be positive integers."
+            )
+        expected_league_config = {
+            field: getattr(self.config, field) for field in _LEAGUE_STATE_CONFIG_FIELDS
+        }
+        if saved_league_config != expected_league_config:
+            raise ValueError(
+                "Configured league schedule does not match the resume state: "
+                f"configured={expected_league_config}, saved={saved_league_config}."
+            )
+        saved_league_size = saved_league_config["league_size"]
         paths = payload.get("checkpoints")
         if not isinstance(paths, list) or not all(
             isinstance(checkpoint_path, str) for checkpoint_path in paths
         ):
             raise ValueError("League state checkpoints must be a list of paths.")
+        if not paths:
+            raise ValueError("League state checkpoints must not be empty.")
+        if len(paths) > saved_league_size:
+            raise ValueError("League state contains more checkpoints than league_size.")
+        if len(set(paths)) != len(paths):
+            raise ValueError("League state contains duplicate checkpoint paths.")
+        missing_paths = [
+            checkpoint_path
+            for checkpoint_path in paths
+            if not Path(checkpoint_path).is_file()
+        ]
+        if missing_paths:
+            raise FileNotFoundError(
+                "Strict resume requires every saved league checkpoint; missing: "
+                + ", ".join(missing_paths)
+            )
         rng_state = _lists_to_tuples(payload.get("rng_state"))
         try:
-            self._rng.setstate(rng_state)
+            validated_rng = random.Random()
+            validated_rng.setstate(rng_state)
         except (TypeError, ValueError) as exc:
             raise ValueError("League state contains an invalid RNG state.") from exc
         extra_state = _lists_to_tuples(payload.get("extra_state", {}))
         if not isinstance(extra_state, dict):
             raise ValueError("League state extra_state must be an object.")
 
-        existing = [p for p in paths if Path(p).exists()]
-        missing = len(paths) - len(existing)
-        if missing:
-            print(
-                f"Warning: {missing} league checkpoint(s) no longer on disk, skipping."
-            )
-
+        self._rng.setstate(rng_state)
         self.checkpoints.clear()
-        for p in existing[-self.config.league_size :]:
+        for p in paths:
             self.checkpoints.append(p)
         keep_paths = set(self.checkpoints)
         for service in self._inference_services():

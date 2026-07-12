@@ -354,3 +354,69 @@ def test_league_state_roundtrips_membership_rng_and_extra_state(tmp_path) -> Non
     assert [target._sample_checkpoint() for _ in range(12)] == expected_samples
     assert isinstance(extra_state["team_pool_rng_state"], tuple)
     assert not state_path.with_suffix(".json.tmp").exists()
+
+
+def test_league_state_rejects_missing_checkpoint(tmp_path) -> None:
+    checkpoint_path = tmp_path / "step_1.pt"
+    checkpoint_path.touch()
+    source = object.__new__(League)
+    source.config = TrainingConfig(league_size=3)
+    source.checkpoints = deque([str(checkpoint_path)], maxlen=3)
+    source._rng = random.Random(37)
+    state_path = tmp_path / "step_1.league_state.json"
+    source.save_state(str(state_path))
+    checkpoint_path.unlink()
+
+    target = object.__new__(League)
+    target.config = TrainingConfig(league_size=3)
+    target.checkpoints = deque(maxlen=3)
+    target._rng = random.Random(999)
+
+    with pytest.raises(FileNotFoundError, match="every saved league checkpoint"):
+        target.load_state(str(state_path))
+
+
+def test_league_state_rejects_changed_league_size(tmp_path) -> None:
+    checkpoint_path = tmp_path / "step_1.pt"
+    checkpoint_path.touch()
+    source = object.__new__(League)
+    source.config = TrainingConfig(league_size=3)
+    source.checkpoints = deque([str(checkpoint_path)], maxlen=3)
+    source._rng = random.Random(37)
+    state_path = tmp_path / "step_1.league_state.json"
+    source.save_state(str(state_path))
+
+    target = object.__new__(League)
+    target.config = TrainingConfig(league_size=4)
+    target.checkpoints = deque(maxlen=4)
+    target._rng = random.Random(999)
+
+    with pytest.raises(ValueError, match="league schedule does not match"):
+        target.load_state(str(state_path))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("league_update_interval", 11),
+        ("league_refresh_interval", 2),
+    ],
+)
+def test_league_state_rejects_changed_schedule(tmp_path, field, value) -> None:
+    checkpoint_path = tmp_path / "step_1.pt"
+    checkpoint_path.touch()
+    source = object.__new__(League)
+    source.config = TrainingConfig(league_size=3)
+    source.checkpoints = deque([str(checkpoint_path)], maxlen=3)
+    source._rng = random.Random(37)
+    state_path = tmp_path / "step_1.league_state.json"
+    source.save_state(str(state_path))
+
+    config_kwargs = {"league_size": 3, field: value}
+    target = object.__new__(League)
+    target.config = TrainingConfig(**config_kwargs)
+    target.checkpoints = deque(maxlen=3)
+    target._rng = random.Random(999)
+
+    with pytest.raises(ValueError, match="league schedule does not match"):
+        target.load_state(str(state_path))

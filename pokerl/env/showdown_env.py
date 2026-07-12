@@ -43,6 +43,7 @@ from .observation import (
     ObservationBuilder,
     build_packed_team_aux_labels,
     build_team_preview_observation,
+    summarize_observation_mismatch,
 )
 from .team_preview import parse_team_preview_order
 from .actions import (
@@ -1599,9 +1600,10 @@ class BattleEnv:
 
         if _timing_enabled(self._timing):
             self._timing.increment("env_precompute_preview_misses")
-        self._record_preview_obs_mismatch(obs, prepared_obs)
+        mismatch = self._record_preview_obs_mismatch(obs, prepared_obs)
         raise RuntimeError(
-            "Prepared team preview observation did not match the live battle state."
+            "Prepared team preview observation did not match the live battle state: "
+            f"{mismatch}."
         )
 
     async def _choose_team_preview_picks_async(
@@ -1642,9 +1644,10 @@ class BattleEnv:
 
         if _timing_enabled(self._timing):
             self._timing.increment("env_precompute_preview_misses")
-        self._record_preview_obs_mismatch(obs, prepared_obs)
+        mismatch = self._record_preview_obs_mismatch(obs, prepared_obs)
         raise RuntimeError(
-            "Prepared team preview observation did not match the live battle state."
+            "Prepared team preview observation did not match the live battle state: "
+            f"{mismatch}."
         )
 
     @staticmethod
@@ -1668,13 +1671,14 @@ class BattleEnv:
         self,
         actual: dict[str, np.ndarray],
         prepared: dict[str, np.ndarray],
-    ) -> None:
+    ) -> str:
         if actual.keys() != prepared.keys():
             self._timing.increment("env_precompute_preview_keyset_mismatch")
-            return
-        for key in actual:
-            if not np.array_equal(actual[key], prepared[key]):
-                self._timing.increment(f"env_precompute_preview_mismatch_{key}")
+        else:
+            for key in actual:
+                if not np.array_equal(actual[key], prepared[key]):
+                    self._timing.increment(f"env_precompute_preview_mismatch_{key}")
+        return summarize_observation_mismatch(actual, prepared)
 
     def _attach_choice_timer(self, opponent: Player) -> None:
         original_choose_move = opponent.choose_move
