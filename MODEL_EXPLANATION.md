@@ -647,7 +647,7 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
    - `hidden_info_loss`: masked CE/BCE for the selected opponent's exact item, ability, tera type, and move set using trainer-private completed-episode labels aligned by stable public roster identity. The unselected two, ambiguous identities, and pokemon not publicly present at that timestep are excluded. Metrics report exact-label episode coverage, valid selected slots per labeled step, public-slot coverage, and labeled-step coverage.
    - `opp_action_loss`: masked CE for the league opponent's observed `(a1, a2, tera)` this turn.
 
-   **Total:** `loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss + aux_hidden_info_coef * hidden_info_loss + aux_opp_action_coef * opp_action_loss`, with `value_coef=0.5`, `entropy_coef=0.01`, and both auxiliary coefficients defaulting to `0.25`.
+   **Total:** `loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss + aux_hidden_info_coef * hidden_info_loss + aux_opp_action_coef * opp_action_loss`, with `value_coef=0.5`, `entropy_coef=0.01`, and both auxiliary coefficients defaulting to `0.25`. Each auxiliary loss averages its active prediction tasks, so adding item/ability/Tera/move or joint-action heads does not implicitly multiply the configured task weight.
 
 5. **Gradient update:**
    ```python

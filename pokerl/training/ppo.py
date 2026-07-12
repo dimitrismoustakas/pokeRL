@@ -910,22 +910,21 @@ class PPOTrainer:
         item_labels = labels["opp_item"].reshape(-1)
         ability_labels = labels["opp_ability"].reshape(-1)
 
-        zero = torch.zeros((), device=item_logits.device)
-        item_loss = (
-            F.cross_entropy(item_logits[item_mask], item_labels[item_mask])
-            if item_mask.any()
-            else zero
-        )
-        ability_loss = (
-            F.cross_entropy(ability_logits[ability_mask], ability_labels[ability_mask])
-            if ability_mask.any()
-            else zero
-        )
-        tera_loss = (
-            F.cross_entropy(tera_logits[tera_mask], tera_types[tera_mask])
-            if tera_mask.any()
-            else zero
-        )
+        component_losses: list[torch.Tensor] = []
+        if item_mask.any():
+            component_losses.append(
+                F.cross_entropy(item_logits[item_mask], item_labels[item_mask])
+            )
+        if ability_mask.any():
+            component_losses.append(
+                F.cross_entropy(
+                    ability_logits[ability_mask], ability_labels[ability_mask]
+                )
+            )
+        if tera_mask.any():
+            component_losses.append(
+                F.cross_entropy(tera_logits[tera_mask], tera_types[tera_mask])
+            )
 
         # Multi-hot move labels from slot indices. Slot value 0 is "no move" and
         # is not a valid move id, so we ignore it. A pokemon's label is valid if
@@ -940,15 +939,22 @@ class PPOTrainer:
         multihot[..., 0] = 0.0
 
         move_slot_mask = base_mask & valid_slot.any(dim=-1)  # (T, E_mb, 6)
-        move_loss_raw = F.binary_cross_entropy_with_logits(
-            move_logits, multihot, reduction="none"
-        )
-        # Mean across the move vocab for each pokemon, then mask-average.
-        per_pokemon_bce = move_loss_raw.mean(dim=-1)
-        denom = move_slot_mask.float().sum().clamp(min=1.0)
-        move_loss = (per_pokemon_bce * move_slot_mask.float()).sum() / denom
+        if move_slot_mask.any():
+            move_loss_raw = F.binary_cross_entropy_with_logits(
+                move_logits, multihot, reduction="none"
+            )
+            # Mean across the move vocab for each pokemon, then mask-average.
+            per_pokemon_bce = move_loss_raw.mean(dim=-1)
+            denom = move_slot_mask.float().sum()
+            component_losses.append(
+                (per_pokemon_bce * move_slot_mask.float()).sum() / denom
+            )
 
-        return item_loss + ability_loss + tera_loss + move_loss
+        if not component_losses:
+            return item_logits.sum() * 0.0
+        # The configured coefficient weights the auxiliary task as a whole;
+        # adding another prediction head must not silently increase that weight.
+        return torch.stack(component_losses).mean()
 
     @staticmethod
     def _opp_action_loss(
@@ -967,25 +973,24 @@ class PPOTrainer:
         a2_mask = valid_flat & (a2_labels >= 0)
         tera_mask = valid_flat & (tera_labels >= 0)
 
-        zero = torch.zeros((), device=logits["opp_a1_logits"].device)
-        a1_loss = (
-            F.cross_entropy(logits["opp_a1_logits"][a1_mask], a1_labels[a1_mask])
-            if a1_mask.any()
-            else zero
-        )
-        a2_loss = (
-            F.cross_entropy(logits["opp_a2_logits"][a2_mask], a2_labels[a2_mask])
-            if a2_mask.any()
-            else zero
-        )
-        tera_loss = (
-            F.cross_entropy(
-                logits["opp_tera_logits"][tera_mask], tera_labels[tera_mask]
+        component_losses: list[torch.Tensor] = []
+        if a1_mask.any():
+            component_losses.append(
+                F.cross_entropy(logits["opp_a1_logits"][a1_mask], a1_labels[a1_mask])
             )
-            if tera_mask.any()
-            else zero
-        )
-        return a1_loss + a2_loss + tera_loss
+        if a2_mask.any():
+            component_losses.append(
+                F.cross_entropy(logits["opp_a2_logits"][a2_mask], a2_labels[a2_mask])
+            )
+        if tera_mask.any():
+            component_losses.append(
+                F.cross_entropy(
+                    logits["opp_tera_logits"][tera_mask], tera_labels[tera_mask]
+                )
+            )
+        if not component_losses:
+            return logits["opp_a1_logits"].sum() * 0.0
+        return torch.stack(component_losses).mean()
 
     def update_team_preview(
         self,

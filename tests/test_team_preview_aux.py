@@ -101,6 +101,25 @@ def test_hidden_info_loss_matches_dense_reference() -> None:
     assert torch.allclose(sparse_loss, dense_loss)
 
 
+def test_opponent_action_loss_averages_available_prediction_tasks() -> None:
+    logits = {
+        "opp_a1_logits": torch.zeros((2, 2)),
+        "opp_a2_logits": torch.zeros((2, 4)),
+        "opp_tera_logits": torch.zeros((2, 3)),
+    }
+    labels = torch.tensor([[[0, 0, 0], [1, -1, 2]]])
+    valid = torch.tensor([[True, True]])
+
+    loss = PPOTrainer._opp_action_loss(logits, labels, valid)
+
+    expected_a1 = torch.log(torch.tensor(2.0))
+    expected_a2 = torch.log(torch.tensor(4.0))
+    expected_tera = torch.log(torch.tensor(3.0))
+    assert loss == pytest.approx(
+        ((expected_a1 + expected_a2 + expected_tera) / 3).item()
+    )
+
+
 def test_hidden_info_context_adapter_is_initially_exactly_compatible() -> None:
     torch.manual_seed(11)
     head = HiddenInfoHead(
@@ -230,23 +249,19 @@ def _dense_hidden_info_loss(
     )
     item_labels = labels["opp_item"].reshape(-1)
     ability_labels = labels["opp_ability"].reshape(-1)
-    zero = torch.zeros(())
-
-    item_loss = (
-        F.cross_entropy(item_logits[item_mask], item_labels[item_mask])
-        if item_mask.any()
-        else zero
-    )
-    ability_loss = (
-        F.cross_entropy(ability_logits[ability_mask], ability_labels[ability_mask])
-        if ability_mask.any()
-        else zero
-    )
-    tera_loss = (
-        F.cross_entropy(tera_logits[tera_mask], tera_types[tera_mask])
-        if tera_mask.any()
-        else zero
-    )
+    component_losses = []
+    if item_mask.any():
+        component_losses.append(
+            F.cross_entropy(item_logits[item_mask], item_labels[item_mask])
+        )
+    if ability_mask.any():
+        component_losses.append(
+            F.cross_entropy(ability_logits[ability_mask], ability_labels[ability_mask])
+        )
+    if tera_mask.any():
+        component_losses.append(
+            F.cross_entropy(tera_logits[tera_mask], tera_types[tera_mask])
+        )
 
     move_logits = logits["move_logits"]
     move_slots = labels["opp_moves"]
@@ -256,9 +271,12 @@ def _dense_hidden_info_loss(
     multihot = torch.zeros_like(move_logits)
     multihot.scatter_(-1, safe_slots, valid_slot.float())
     multihot[..., 0] = 0.0
-    move_loss_raw = F.binary_cross_entropy_with_logits(
-        move_logits, multihot, reduction="none"
-    )
-    denom = move_slot_mask.float().sum().clamp(min=1.0)
-    move_loss = (move_loss_raw.mean(dim=-1) * move_slot_mask.float()).sum() / denom
-    return item_loss + ability_loss + tera_loss + move_loss
+    if move_slot_mask.any():
+        move_loss_raw = F.binary_cross_entropy_with_logits(
+            move_logits, multihot, reduction="none"
+        )
+        denom = move_slot_mask.float().sum()
+        component_losses.append(
+            (move_loss_raw.mean(dim=-1) * move_slot_mask.float()).sum() / denom
+        )
+    return torch.stack(component_losses).mean()
