@@ -94,6 +94,7 @@ class PPOTrainer:
         returns_seq = batch.returns  # (T, E)
         values_old_seq = batch.values  # (T, E)
         dones_seq = batch.dones  # (T, E)
+        dones_seq_cpu = dones_seq.detach().to(device="cpu")
 
         # Per-env initial hidden states at the start of the rollout.
         if batch.initial_hidden_h is not None:
@@ -133,11 +134,15 @@ class PPOTrainer:
             metric_sums["aux_opp_action_loss"] = torch.zeros((), device=self.device)
 
         for epoch in range(self.config.num_epochs):
-            env_order = torch.randperm(E, device=self.device)
+            env_order_cpu = torch.randperm(E, device="cpu")
 
-            for mb_envs in torch.tensor_split(env_order, self.config.num_minibatches):
-                if mb_envs.numel() == 0:
+            for mb_envs_cpu in torch.tensor_split(
+                env_order_cpu,
+                self.config.num_minibatches,
+            ):
+                if mb_envs_cpu.numel() == 0:
                     continue
+                mb_envs = mb_envs_cpu.to(device=self.device)
                 E_mb = mb_envs.numel()
 
                 mb_obs_seq = {k: v[:, mb_envs] for k, v in obs_seq.items()}
@@ -145,7 +150,7 @@ class PPOTrainer:
                 mb_masks_seq = {
                     key: value[:, mb_envs] for key, value in masks_seq.items()
                 }
-                mb_dones_seq = dones_seq[:, mb_envs]  # (T, E_mb)
+                mb_dones_seq_cpu = dones_seq_cpu[:, mb_envs_cpu]
                 mb_old_lp = old_lp_seq[:, mb_envs].reshape(-1)
                 mb_adv = adv_seq[:, mb_envs].reshape(-1)
                 mb_returns = returns_seq[:, mb_envs].reshape(-1)
@@ -188,29 +193,15 @@ class PPOTrainer:
                     mb_obs_seq["opp_roles"] != ROLE_BENCH
                 ) | mb_obs_seq["opp_mask"]
 
-                # LSTM: step through the sequence so episode-boundary resets
-                # preserve recurrent semantics, then batch the stateless heads.
-                all_ctx: list[torch.Tensor] = []
-
-                for t in range(T):
-                    ctx_t, hidden = self.agent.memory(context_seq_mb[t], hidden)
-                    all_ctx.append(ctx_t)
-
-                    # Zero hidden state at episode boundaries without host-side syncs.
-                    if hidden is not None:
-                        not_done = (~mb_dones_seq[t]).to(ctx_t.dtype).view(1, E_mb, 1)
-                        h, c = hidden
-                        hidden = (h * not_done, c * not_done)
-                        if (
-                            self.config.bptt_chunk_steps is not None
-                            and self.config.bptt_chunk_steps > 0
-                            and (t + 1) % self.config.bptt_chunk_steps == 0
-                            and t + 1 < T
-                        ):
-                            hidden = tuple(state.detach() for state in hidden)
-
-                # Evaluate heads in flattened time-major chunks for loss computation.
-                ctx_seq_mb = torch.stack(all_ctx, dim=0)  # (T, E_mb, mem_dim)
+                # Pack independent episode fragments so recurrent training takes
+                # one LSTM launch per explicit TBPTT window rather than one per
+                # timestep. Terminal resets and detach boundaries are unchanged.
+                ctx_seq_mb, _ = self.agent.memory.unroll(
+                    context_seq_mb,
+                    mb_dones_seq_cpu,
+                    hidden,
+                    bptt_chunk_steps=self.config.bptt_chunk_steps,
+                )
 
                 # The action and value heads are independent across timesteps.
                 # Chunking avoids many tiny GPU launches without evaluating the
