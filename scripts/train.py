@@ -108,7 +108,10 @@ def parse_args() -> argparse.Namespace:
         "--num-updates",
         type=int,
         default=None,
-        help="Override how many rollout/PPO updates to run.",
+        help=(
+            "Number of rollout/PPO updates to execute. When resuming, these are "
+            "additional updates rather than an absolute update ceiling."
+        ),
     )
     parser.add_argument(
         "--total-timesteps",
@@ -422,6 +425,24 @@ def apply_torch_runtime_config(args: argparse.Namespace) -> dict[str, object]:
         )
         runtime_config["cudnn_allow_tf32"] = bool(torch.backends.cudnn.allow_tf32)
     return runtime_config
+
+
+def resolve_update_bounds(
+    *,
+    total_timesteps: int,
+    steps_per_update: int,
+    global_step: int,
+    additional_updates: bool,
+) -> tuple[int, int]:
+    """Return completed and target update counts for this invocation."""
+    if steps_per_update <= 0:
+        raise ValueError("steps_per_update must be positive.")
+    requested_updates = total_timesteps // steps_per_update
+    updates_done = global_step // steps_per_update
+    target_update = (
+        updates_done + requested_updates if additional_updates else requested_updates
+    )
+    return updates_done, target_update
 
 
 def make_league_opponent_factory(
@@ -1249,8 +1270,12 @@ def train():
                 device,
             )
             hidden = agent.initial_hidden(env_config.num_envs)
-        num_updates = train_config.total_timesteps // steps_per_update
-        updates_done = trainer.global_step // steps_per_update
+        updates_done, num_updates = resolve_update_bounds(
+            total_timesteps=train_config.total_timesteps,
+            steps_per_update=steps_per_update,
+            global_step=trainer.global_step,
+            additional_updates=args.resume is not None and args.num_updates is not None,
+        )
 
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")

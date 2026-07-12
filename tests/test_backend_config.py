@@ -16,6 +16,7 @@ from scripts.train import (
     build_configs,
     parse_args,
     resolve_opponent_groups,
+    resolve_update_bounds,
 )
 
 
@@ -140,6 +141,28 @@ def test_float32_matmul_precision_defaults_to_highest(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["train"])
 
     assert parse_args().float32_matmul_precision == "highest"
+
+
+def test_num_updates_are_additional_when_resuming() -> None:
+    steps_per_update = 9_216
+
+    assert resolve_update_bounds(
+        total_timesteps=steps_per_update,
+        steps_per_update=steps_per_update,
+        global_step=158 * steps_per_update,
+        additional_updates=True,
+    ) == (158, 159)
+
+
+def test_total_timestep_target_remains_absolute_when_resuming() -> None:
+    steps_per_update = 9_216
+
+    assert resolve_update_bounds(
+        total_timesteps=200 * steps_per_update,
+        steps_per_update=steps_per_update,
+        global_step=158 * steps_per_update,
+        additional_updates=False,
+    ) == (158, 200)
 
 
 def test_resolve_opponent_groups_defaults_to_two_when_possible() -> None:
