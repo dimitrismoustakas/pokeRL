@@ -52,11 +52,36 @@ To train on a fixed Regulation F pool with team preview (bring 4 of 6):
 & .\.venv\Scripts\python.exe .\scripts\train.py --battle-format gen9vgc2026regf --team-pool-format gen9vgc2026regf --num-envs 8 --opponent-groups 2
 ```
 
-To evaluate whether a checkpoint is improving against a frozen past self:
+To evaluate whether a checkpoint is improving against a frozen past self,
+sample both trained policies on a pre-planned schedule and mirror every team
+pair across the two player roles:
 
 ```powershell
-& .\.venv\Scripts\python.exe .\scripts\evaluate_anchor.py --checkpoint checkpoints\current.pt --anchor checkpoints\anchor.pt --games 32 --summary-path logs\anchor_eval.json
+& .\.venv\Scripts\python.exe .\scripts\evaluate_anchor.py --checkpoint checkpoints\current.pt --anchor checkpoints\anchor.pt --games 64 --action-mode sample --summary-path logs\anchor_eval.json
 ```
+
+`--games` is the number per role, so this command runs 128 battles. Use
+`--action-mode argmax` only as a separate deterministic diagnostic; the same
+mode is applied to both checkpoints. Results separate wins/losses/draws, include
+95% intervals, and retain per-game teams and preview choices.
+
+For an absolute fixed-bot diagnostic with action, Tera, and team-preview
+telemetry:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\evaluate_fixed_bot.py --checkpoint checkpoints\current.pt --opponent simple-heuristics --games 76 --action-mode sample --summary-path logs\fixed_bot_eval.json
+```
+
+To measure whether preview probabilities actually change with the opposing
+roster, exactly enumerate all 180 legal bring/lead choices:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\evaluate_preview_policy.py --checkpoint checkpoints\current.pt --summary-path logs\preview_eval.json
+```
+
+The default Regulation F manifest currently contains only teams used for
+training. Treat those results as in-distribution until a separate evaluation
+population is supplied with `--team-pool-manifest`.
 
 To tune how many frozen opponents are shared across the env batch:
 

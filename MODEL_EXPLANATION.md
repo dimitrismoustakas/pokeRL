@@ -930,23 +930,24 @@ Bring-choice and lead ordering are now separated, but the two non-lead brought p
 
 ### 10.7 Simulator latency remains a throughput bottleneck
 
-Even with batching and multiple environments, Showdown battle latency dominates wall-clock training speed. Per-battle latency is on the order of minutes, so with sparse rewards the number of reward signals per wall-clock hour is limited.
+Even with batching and multiple environments, Showdown battle latency dominates wall-clock training speed. In the 150-update July 2026 run, rollout collection used 92.4% of post-warmup update wall time while PPO used 7.4%. The run completed 214,421 battles in about 5.5 hours at 70.4 mean wall SPS, so the old claim that an individual local battle takes minutes is no longer accurate.
 
 **Mitigations already in place:**
 
 - Batched inference across env threads (`TeamPreviewBatcher`, `_LeagueInferenceService`).
-- Multiple Showdown server instances (supported via `--server-urls`).
-- Parallel `BattleEnv` instances sharing inference.
+- A shared local BattleStream worker pool with bounded battle and runtime-loop concurrency.
+- Parallel `BattleEnv` instances sharing model inference and persistent players.
+- Optional hot-path timing, disabled during ordinary training.
 
-**Still open:**
-
-- A faster Python-native battle simulator would be a multi-month engineering project but is the only way to get orders-of-magnitude throughput.
+**Still open:** profile the JavaScript request/protocol path on warmed long runs, and benchmark worker/runtime-loop/coalescing changes without startup-heavy measurements. Model micro-optimizations have a hard single-digit-percent ceiling unless the rollout share changes materially.
 
 ### 10.8 League diversity is bounded by a small rolling window
 
-With `league_size=12` and `league_update_interval=10`, the pool spans at most ~120 updates back. If the policy converges slowly, the pool can contain policies that are all very similar — no diversity benefit. There is also no diagnostic in place to detect strategic cycling (the current agent silently forgetting how to beat older policies).
+With `league_size=12` and `league_update_interval=10`, the pool spans at most ~120 updates back. If the policy converges slowly, the pool can contain policies that are all very similar.
 
-**Fix direction:** larger `league_size`, or a priority-replay scheme that maintains diverse checkpoints (e.g. keep a sample across different ELO tiers, or different seeds). See [LEAGUE_IMPROVEMENTS.md](LEAGUE_IMPROVEMENTS.md) for a fuller design-space overview — evaluation harness, PFSP sampling, archiving, KL anchors, exploiter agents.
+Mirrored checkpoint evaluation now provides the missing cycling diagnostic. The first 0/50/100/125/150 matrix showed strong improvement through update 100 and then a plateau, but no statistically supported non-transitive cycle. That argues for keeping permanent evaluation anchors now and introducing PFSP only when a larger matrix shows forgetting or recurrent hard opponents.
+
+See [LEAGUE_IMPROVEMENTS.md](LEAGUE_IMPROVEMENTS.md) for the league design space and [EVALUATION.md](EVALUATION.md) for the measured 150-update results and current priorities.
 
 ### 10.9 No explicit hazard / weather strategy
 

@@ -22,9 +22,9 @@ Heuristic opponents (random, max-power, scripted) are deliberately excluded here
 
 - Rolling pool of `league_size = 12` checkpoints, snapshot every `league_update_interval = 10` PPO updates. Pool spans at most ~120 updates of history; oldest evicted on overflow. The default two opponent groups are resampled every update independently of snapshot creation.
 - Sampling: 70% from the recent half, 30% from the older half. Uniform within each half. Outcomes are tracked per opponent for diagnosis, but they do not yet change sampling weights.
-- Training summaries now record wins, losses, and draws by opponent checkpoint, but anchor evaluation is still a manual offline step rather than a periodic checkpoint panel that can reliably detect cycling.
+- Training summaries record wins, losses, and draws by opponent checkpoint. The evaluation harness now runs sampled or greedy checkpoint cross-play on pre-planned team pairs, mirrors player/team roles, and retains the raw payoff matrix.
 
-So the primary gap is **diagnostic**: we don't currently have the data to tell whether the naive setup is working.
+The first 0/50/100/125/150 matrix found strong improvement through update 100 and then a plateau, with no statistically supported cycle. The immediate gap is therefore **absolute and roster-specific skill**, not demonstrated league cycling: the same final checkpoint ranged from 14.5% to 94.7% against SimpleHeuristics depending on its own roster. See [EVALUATION.md](EVALUATION.md).
 
 ---
 
@@ -53,12 +53,12 @@ Organized by effort vs. expected payoff.
 
 #### A. Evaluation harness first
 
-Before changing the training, diagnose the actual problem. Keep a small **anchor set** of frozen checkpoints (e.g. snapshots at 100k, 500k, 1M, 2M steps) permanently on disk, *outside* the rolling pool. Periodically run N games of current agent vs each anchor, log win rates over training time.
+**Implemented offline.** Keep a small **anchor set** of frozen checkpoints permanently on disk, outside the rolling pool. Periodically run current agent versus each anchor on the mirrored schedule and retain the complete payoff matrix.
 
 - If win rate vs an old anchor flatlines or *decreases*, cycling is real.
 - If it keeps rising, the current setup is working and further changes may be premature.
 
-Roughly a day of work. Tells us whether anything else in this document is worth implementing.
+The remaining work is orchestration: invoke the panel periodically during long runs and add held-out team populations.
 
 #### B. Prioritized Fictitious Self-Play (PFSP)
 
@@ -103,20 +103,20 @@ Every N updates, identify the one historical checkpoint the current agent has th
 
 ---
 
-## 5. Explicitly not pursued
+## 5. Guardrails
 
-- **Heuristic bots as training partners.** Adding random/max-power/scripted opponents to *training* would bias the policy toward beating specific weak strategies rather than generalizing. These are fine as additional rows in the eval harness (A) — as sanity checks on absolute skill — but not in the opponent distribution.
+- **Do not make weak bots the main opponent distribution.** That would optimize for their exploitable quirks. The 150-update run did expose shared self-play blind spots, however, so a small measured tactical-curriculum or absolute-anchor fraction is now worth an A/B test. It should be retained only if it improves held-out teams and checkpoint cross-play, not merely bot win rate.
 
 ---
 
 ## 6. Suggested order
 
-Given the constraints (single developer, single GPU, sparse rewards making every training hour expensive):
+Given the current evidence and the single-GPU constraint:
 
-1. **A — Evaluation harness.** Diagnostic prerequisite. Without it we're guessing whether any of the below is solving a real problem.
-2. **B — PFSP sampling.** Where the literature most clearly points. Directly targets cycling.
-3. **C — Archive beyond the rolling window.** Makes (B) materially better.
-4. **D — KL anchor.** Revisit once (A) gives us a measured picture of drift.
-5. Tier 3 is an "if I still see cycling after 1–4" question.
+1. **Automate A and add held-out teams.** Keep the matrix, fixed bots, preview conditioning, and roster-stratified metrics as quality gates.
+2. **Fix the measured Tera, preview, and archetype failures.** These dominate current quality more clearly than league sampling does.
+3. **C — retain permanent evaluation anchors.** Archival is cheap even before it affects training.
+4. **B — add PFSP only after a larger matrix demonstrates forgetting, cycling, or stable hard opponents.** It should solve an observed failure rather than add inference fragmentation speculatively.
+5. Revisit **D** and Tier 3 only if simpler measured corrections leave a league-specific failure.
 
-The honest starting move is (A): it's not the most exciting, but it's the one that tells the truth.
+The evaluation harness now tells the truth: the current policy is improving, then plateauing, with serious shared strategic blind spots.
