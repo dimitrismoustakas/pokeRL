@@ -34,6 +34,7 @@ from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
 from pokerl.training.preview import TeamPreviewBatcher
+from pokerl.training.recurrent_history import RecurrentObservationHistory
 from pokerl.training.cuda_execution import cuda_model_execution
 
 
@@ -1280,6 +1281,7 @@ def train():
                 device,
             )
             hidden = agent.initial_hidden(env_config.num_envs)
+            recurrent_history = RecurrentObservationHistory.empty(env_config.num_envs)
         updates_done, num_updates = resolve_update_bounds(
             total_timesteps=train_config.total_timesteps,
             steps_per_update=steps_per_update,
@@ -1500,6 +1502,21 @@ def train():
                 # mode.  Otherwise a preview can observe train-mode layers or
                 # race the next update's agent.eval() transition.
                 agent.eval()
+            hidden_refresh_started = time.perf_counter()
+            with cuda_model_execution(device):
+                if hidden is not None:
+                    recurrent_history = recurrent_history.extend(
+                        batch.obs,
+                        batch.dones,
+                    )
+                    hidden = recurrent_history.recompute_hidden(agent)
+                    metrics["recurrent_history_mean_steps"] = (
+                        recurrent_history.mean_length
+                    )
+                    metrics["recurrent_history_max_steps"] = float(
+                        recurrent_history.max_length
+                    )
+            hidden_refresh_sec = time.perf_counter() - hidden_refresh_started
             ppo_sec = time.perf_counter() - ppo_started
             preview_refresh_sec = 0.0
             if update < num_updates:
@@ -1560,6 +1577,15 @@ def train():
                 "rollout_sec": rollout_sec,
                 "advantage_sec": advantage_sec,
                 "ppo_sec": ppo_sec,
+                "hidden_refresh_sec": hidden_refresh_sec,
+                "recurrent_history_mean_steps": metrics_json.get(
+                    "recurrent_history_mean_steps",
+                    0.0,
+                ),
+                "recurrent_history_max_steps": metrics_json.get(
+                    "recurrent_history_max_steps",
+                    0.0,
+                ),
                 "preview_refresh_sec": preview_refresh_sec,
                 "update_accounted_sec": update_accounted_sec,
                 "update_steps_per_second": update_steps_per_second,
