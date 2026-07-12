@@ -181,8 +181,23 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
     assert obs["own_active_present"].tolist() == [True, True]
     assert obs["opp_active_indices"].tolist() == [0, 0]
     assert obs["opp_active_present"].tolist() == [True, False]
-    assert obs["own_roles"].tolist() == [ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH]
-    assert obs["opp_roles"].tolist() == [ROLE_ACTIVE_1, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH]
+    assert obs["opp_source_index"].tolist() == [0, 1, -1, -1, -1, -1]
+    assert obs["own_roles"].tolist() == [
+        ROLE_ACTIVE_1,
+        ROLE_ACTIVE_2,
+        ROLE_BENCH,
+        ROLE_BENCH,
+        ROLE_BENCH,
+        ROLE_BENCH,
+    ]
+    assert obs["opp_roles"].tolist() == [
+        ROLE_ACTIVE_1,
+        ROLE_BENCH,
+        ROLE_BENCH,
+        ROLE_BENCH,
+        ROLE_BENCH,
+        ROLE_BENCH,
+    ]
     assert obs["own_mask"].tolist() == [False, False, False, True, True, True]
     assert obs["opp_mask"].tolist() == [False, False, True, True, True, True]
 
@@ -193,7 +208,7 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
     assert obs["own_last_move"][0] == gd.move_to_idx["partingshot"]
     assert obs["opp_last_move"][0] == gd.move_to_idx["electroshot"]
     assert obs["opp_moves"][0, 0] == gd.move_to_idx["electroshot"]
-    assert np.all(obs["opp_continuous"][0, MOVE_PP_OFFSET:MOVE_PP_OFFSET + 4] == 0.0)
+    assert np.all(obs["opp_continuous"][0, MOVE_PP_OFFSET : MOVE_PP_OFFSET + 4] == 0.0)
 
     assert obs["own_ability"][0] == gd.abilities_to_idx["intimidate"]
     assert obs["own_item"][0] == gd.item_index("sitrusberry")
@@ -229,6 +244,63 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
     assert field[FIELD_USED_TERA_OFFSET] == 1.0
     assert field[FIELD_OPPONENT_USED_TERA_OFFSET] == 0.0
     assert field[FIELD_TURN_OFFSET] == pytest.approx(4 / 20)
+
+
+def test_opponent_source_indices_remain_stable_when_actives_switch() -> None:
+    gd = GameData(gen=9)
+    builder = ObservationBuilder(gd, team_size=6)
+    opponents = [
+        _pokemon(
+            species=species,
+            moves=OrderedDict(),
+            ability=None,
+            item=None,
+            type_1="normal",
+            type_2=None,
+            tera_type=None,
+            current_hp=100,
+            max_hp=100,
+        )
+        for species in ("incineroar", "pelipper", "archaludon")
+    ]
+    battle = SimpleNamespace(
+        team=OrderedDict(),
+        opponent_team=OrderedDict(
+            (f"p2:{index}", pokemon) for index, pokemon in enumerate(opponents)
+        ),
+        active_pokemon=[None, None],
+        opponent_active_pokemon=[opponents[0], opponents[1]],
+        weather={},
+        fields={},
+        side_conditions={},
+        opponent_side_conditions={},
+        turn=1,
+        used_tera=False,
+        opponent_used_tera=False,
+    )
+
+    before_switch = builder.build(battle)
+    battle.opponent_active_pokemon = [opponents[2], opponents[1]]
+    after_switch = builder.build(battle)
+
+    assert before_switch["opp_source_index"].tolist() == [0, 1, 2, -1, -1, -1]
+    assert after_switch["opp_source_index"].tolist() == [1, 2, 0, -1, -1, -1]
+    expected_identity_by_species = {
+        gd.species_to_idx[pokemon.species]: index
+        for index, pokemon in enumerate(opponents)
+    }
+    for obs in (before_switch, after_switch):
+        identity_by_species = {
+            int(species): int(source_index)
+            for species, source_index, padded in zip(
+                obs["opp_species"],
+                obs["opp_source_index"],
+                obs["opp_mask"],
+                strict=True,
+            )
+            if not padded
+        }
+        assert identity_by_species == expected_identity_by_species
 
 
 def test_observation_builder_raises_when_active_pokemon_is_missing_from_team() -> None:
@@ -322,6 +394,7 @@ def test_observation_builder_keeps_unmatched_visible_opponent_active() -> None:
     assert obs["opp_roles"].tolist()[:2] == [ROLE_ACTIVE_1, ROLE_BENCH]
     assert obs["opp_species"][0] == gd.species_to_idx["gengar"]
     assert obs["opp_species"][1] == gd.species_to_idx["zoroark"]
+    assert obs["opp_source_index"].tolist() == [-1, 0, -1, -1, -1, -1]
     assert obs["opp_moves"][0, 0] == gd.move_to_idx["shadowball"]
 
 

@@ -28,7 +28,9 @@ class PPOTrainer:
         self.config = config
         self.device = device
         self.optimizer = self._make_optimizer()
-        self._trainable_params = [param for param in agent.parameters() if param.requires_grad]
+        self._trainable_params = [
+            param for param in agent.parameters() if param.requires_grad
+        ]
         self.global_step = 0
 
     def _make_optimizer(self) -> torch.optim.Adam:
@@ -42,7 +44,9 @@ class PPOTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
 
-        total_norm = nn.utils.clip_grad_norm_(self._trainable_params, self.config.max_grad_norm)
+        total_norm = nn.utils.clip_grad_norm_(
+            self._trainable_params, self.config.max_grad_norm
+        )
         if not torch.isfinite(total_norm).item():
             self.optimizer.zero_grad(set_to_none=True)
             return False
@@ -83,13 +87,13 @@ class PPOTrainer:
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         obs_seq = batch.obs
-        actions_seq = batch.actions              # (T, E, 3)
+        actions_seq = batch.actions  # (T, E, 3)
         masks_seq = batch.action_masks
-        old_lp_seq = batch.log_probs             # (T, E)
-        adv_seq = adv                            # (T, E)
-        returns_seq = batch.returns              # (T, E)
-        values_old_seq = batch.values            # (T, E)
-        dones_seq = batch.dones                  # (T, E)
+        old_lp_seq = batch.log_probs  # (T, E)
+        adv_seq = adv  # (T, E)
+        returns_seq = batch.returns  # (T, E)
+        values_old_seq = batch.values  # (T, E)
+        dones_seq = batch.dones  # (T, E)
 
         # Per-env initial hidden states at the start of the rollout.
         if batch.initial_hidden_h is not None:
@@ -137,9 +141,11 @@ class PPOTrainer:
                 E_mb = mb_envs.numel()
 
                 mb_obs_seq = {k: v[:, mb_envs] for k, v in obs_seq.items()}
-                mb_actions_seq = actions_seq[:, mb_envs]      # (T, E_mb, 3)
-                mb_masks_seq = {key: value[:, mb_envs] for key, value in masks_seq.items()}
-                mb_dones_seq = dones_seq[:, mb_envs]          # (T, E_mb)
+                mb_actions_seq = actions_seq[:, mb_envs]  # (T, E_mb, 3)
+                mb_masks_seq = {
+                    key: value[:, mb_envs] for key, value in masks_seq.items()
+                }
+                mb_dones_seq = dones_seq[:, mb_envs]  # (T, E_mb)
                 mb_old_lp = old_lp_seq[:, mb_envs].reshape(-1)
                 mb_adv = adv_seq[:, mb_envs].reshape(-1)
                 mb_returns = returns_seq[:, mb_envs].reshape(-1)
@@ -157,17 +163,30 @@ class PPOTrainer:
                 # Spatial encoder: process all T*E_mb pokemon in one batched pass
                 # (heavy attention layers run once; only the lightweight LSTM loops).
                 flat_obs = {
-                    k: v.reshape(T * E_mb, *v.shape[2:])
-                    for k, v in mb_obs_seq.items()
+                    k: v.reshape(T * E_mb, *v.shape[2:]) for k, v in mb_obs_seq.items()
                 }
-                context_flat, active_reps_flat, own_reps_flat, opp_reps_flat, opp_active_reps_flat = self.agent.spatial(flat_obs)
+                (
+                    context_flat,
+                    active_reps_flat,
+                    own_reps_flat,
+                    opp_reps_flat,
+                    opp_active_reps_flat,
+                ) = self.agent.spatial(flat_obs)
                 context_seq_mb = context_flat.reshape(T, E_mb, -1)
                 active_reps_seq_mb = active_reps_flat.reshape(T, E_mb, 2, -1)
-                own_reps_seq_mb = own_reps_flat.reshape(T, E_mb, own_reps_flat.shape[1], -1)
-                opp_reps_seq_mb = opp_reps_flat.reshape(T, E_mb, opp_reps_flat.shape[1], -1)
+                own_reps_seq_mb = own_reps_flat.reshape(
+                    T, E_mb, own_reps_flat.shape[1], -1
+                )
+                opp_reps_seq_mb = opp_reps_flat.reshape(
+                    T, E_mb, opp_reps_flat.shape[1], -1
+                )
                 opp_active_reps_seq_mb = opp_active_reps_flat.reshape(T, E_mb, 2, -1)
-                own_bench_mask_seq_mb = (mb_obs_seq["own_roles"] != ROLE_BENCH) | mb_obs_seq["own_mask"]
-                opp_bench_mask_seq_mb = (mb_obs_seq["opp_roles"] != ROLE_BENCH) | mb_obs_seq["opp_mask"]
+                own_bench_mask_seq_mb = (
+                    mb_obs_seq["own_roles"] != ROLE_BENCH
+                ) | mb_obs_seq["own_mask"]
+                opp_bench_mask_seq_mb = (
+                    mb_obs_seq["opp_roles"] != ROLE_BENCH
+                ) | mb_obs_seq["opp_mask"]
 
                 # LSTM: step through the sequence so episode-boundary resets
                 # preserve recurrent semantics, then batch the stateless heads.
@@ -269,9 +288,18 @@ class PPOTrainer:
                 # Rare extreme policy shifts can overflow exp(log_ratio) in float32 and
                 # poison Adam with non-finite gradients. Clamping here only affects
                 # already-pathological ratios far outside PPO's trust region.
-                ratio = torch.exp(log_ratio.clamp(min=-self._LOG_RATIO_CLAMP, max=self._LOG_RATIO_CLAMP))
+                ratio = torch.exp(
+                    log_ratio.clamp(
+                        min=-self._LOG_RATIO_CLAMP, max=self._LOG_RATIO_CLAMP
+                    )
+                )
                 surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - self.config.clip_eps, 1.0 + self.config.clip_eps) * mb_adv
+                surr2 = (
+                    torch.clamp(
+                        ratio, 1.0 - self.config.clip_eps, 1.0 + self.config.clip_eps
+                    )
+                    * mb_adv
+                )
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Value loss with clipping (prevents large value updates).
@@ -280,10 +308,13 @@ class PPOTrainer:
                     -self.config.clip_eps,
                     self.config.clip_eps,
                 )
-                value_loss = 0.5 * torch.max(
-                    (values_flat - mb_returns).pow(2),
-                    (values_clipped - mb_returns).pow(2),
-                ).mean()
+                value_loss = (
+                    0.5
+                    * torch.max(
+                        (values_flat - mb_returns).pow(2),
+                        (values_clipped - mb_returns).pow(2),
+                    ).mean()
+                )
 
                 entropy_loss = -entropies_flat.mean()
 
@@ -301,7 +332,9 @@ class PPOTrainer:
                 hidden_info_loss = None
                 opp_action_loss = None
                 if hidden_info_enabled:
-                    aux_labels_mb = {key: value[:, mb_envs] for key, value in aux_labels_all.items()}
+                    aux_labels_mb = {
+                        key: value[:, mb_envs] for key, value in aux_labels_all.items()
+                    }
                     aux_label_valid_mb = aux_label_valid_all[:, mb_envs]
                     hidden_info_out = self.agent.hidden_info_head(opp_reps_seq_mb)
                     hidden_info_loss = self._hidden_info_loss(
@@ -331,18 +364,25 @@ class PPOTrainer:
                     continue
 
                 with torch.no_grad():
-                    approx_kl = ((ratio - 1) - log_ratio.clamp(
-                        min=-self._LOG_RATIO_CLAMP,
-                        max=self._LOG_RATIO_CLAMP,
-                    )).mean()
+                    approx_kl = (
+                        (ratio - 1)
+                        - log_ratio.clamp(
+                            min=-self._LOG_RATIO_CLAMP,
+                            max=self._LOG_RATIO_CLAMP,
+                        )
+                    ).mean()
                     metric_sums["policy_loss"].add_(policy_loss.detach())
                     metric_sums["value_loss"].add_(value_loss.detach())
                     metric_sums["entropy"].add_((-entropy_loss).detach())
                     metric_sums["approx_kl"].add_(approx_kl)
                     if hidden_info_enabled:
-                        metric_sums["aux_hidden_info_loss"].add_(hidden_info_loss.detach())
+                        metric_sums["aux_hidden_info_loss"].add_(
+                            hidden_info_loss.detach()
+                        )
                     if opp_action_enabled:
-                        metric_sums["aux_opp_action_loss"].add_(opp_action_loss.detach())
+                        metric_sums["aux_opp_action_loss"].add_(
+                            opp_action_loss.detach()
+                        )
                 num_updates += 1
 
         if num_updates == 0:
@@ -351,7 +391,9 @@ class PPOTrainer:
             )
 
         self.global_step += T * E
-        averaged = {key: (value / num_updates).item() for key, value in metric_sums.items()}
+        averaged = {
+            key: (value / num_updates).item() for key, value in metric_sums.items()
+        }
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
@@ -369,8 +411,11 @@ class PPOTrainer:
         ability_known = opp_cont[..., ABILITY_KNOWN_OFFSET] > 0.5
         tera_known = opp_cont[..., TERA_KNOWN_OFFSET] > 0.5
 
-        valid_step = label_valid.unsqueeze(-1).expand_as(opp_pad)  # (T, E_mb, 6)
-        base_mask = valid_step & ~opp_pad
+        if label_valid.shape != opp_pad.shape:
+            raise ValueError(
+                "Hidden-info validity must have shape (steps, envs, team_size)."
+            )
+        base_mask = label_valid & ~opp_pad
 
         item_mask = (base_mask & item_known).reshape(-1)
         ability_mask = (base_mask & ability_known).reshape(-1)
@@ -379,8 +424,12 @@ class PPOTrainer:
         tera_mask = (base_mask & tera_known).reshape(-1) & (tera_types > 0)
 
         item_logits = logits["item_logits"].reshape(-1, logits["item_logits"].shape[-1])
-        ability_logits = logits["ability_logits"].reshape(-1, logits["ability_logits"].shape[-1])
-        tera_logits = logits["tera_type_logits"].reshape(-1, logits["tera_type_logits"].shape[-1])
+        ability_logits = logits["ability_logits"].reshape(
+            -1, logits["ability_logits"].shape[-1]
+        )
+        tera_logits = logits["tera_type_logits"].reshape(
+            -1, logits["tera_type_logits"].shape[-1]
+        )
         move_logits = logits["move_logits"]  # (T, E_mb, 6, num_moves)
 
         item_labels = labels["opp_item"].reshape(-1)
@@ -416,7 +465,9 @@ class PPOTrainer:
         multihot[..., 0] = 0.0
 
         move_slot_mask = base_mask & valid_slot.any(dim=-1)  # (T, E_mb, 6)
-        move_loss_raw = F.binary_cross_entropy_with_logits(move_logits, multihot, reduction="none")
+        move_loss_raw = F.binary_cross_entropy_with_logits(
+            move_logits, multihot, reduction="none"
+        )
         # Mean across the move vocab for each pokemon, then mask-average.
         per_pokemon_bce = move_loss_raw.mean(dim=-1)
         denom = move_slot_mask.float().sum().clamp(min=1.0)
@@ -453,7 +504,9 @@ class PPOTrainer:
             else zero
         )
         tera_loss = (
-            F.cross_entropy(logits["opp_tera_logits"][tera_mask], tera_labels[tera_mask])
+            F.cross_entropy(
+                logits["opp_tera_logits"][tera_mask], tera_labels[tera_mask]
+            )
             if tera_mask.any()
             else zero
         )
@@ -477,9 +530,15 @@ class PPOTrainer:
             k: torch.from_numpy(np.stack([d[0][k] for d in data])).to(self.device)
             for k in data[0][0]
         }
-        picks_batch = torch.from_numpy(np.stack([d[1] for d in data])).long().to(self.device)
-        rewards_batch = torch.tensor([d[2] for d in data], dtype=torch.float32, device=self.device)
-        opponent_picks_batch = torch.from_numpy(np.stack([d[3] for d in data])).long().to(self.device)
+        picks_batch = (
+            torch.from_numpy(np.stack([d[1] for d in data])).long().to(self.device)
+        )
+        rewards_batch = torch.tensor(
+            [d[2] for d in data], dtype=torch.float32, device=self.device
+        )
+        opponent_picks_batch = (
+            torch.from_numpy(np.stack([d[3] for d in data])).long().to(self.device)
+        )
 
         out = self.agent.team_preview(obs_batch, picks=picks_batch)
         log_prob = out["log_prob"]
@@ -498,10 +557,16 @@ class PPOTrainer:
         bring_targets = torch.zeros_like(bring_logits)
         bring_targets.scatter_(1, opponent_picks_batch, 1.0)
         valid_slots = (~obs_batch["opp_mask"]).to(bring_logits.dtype)
-        bring_loss_raw = F.binary_cross_entropy_with_logits(bring_logits, bring_targets, reduction="none")
-        bring_loss = (bring_loss_raw * valid_slots).sum() / valid_slots.sum().clamp(min=1.0)
+        bring_loss_raw = F.binary_cross_entropy_with_logits(
+            bring_logits, bring_targets, reduction="none"
+        )
+        bring_loss = (bring_loss_raw * valid_slots).sum() / valid_slots.sum().clamp(
+            min=1.0
+        )
 
-        lead_targets = opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
+        lead_targets = (
+            opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
+        )
         lead_loss = F.cross_entropy(lead_pair_logits, lead_targets)
 
         loss = (
@@ -526,17 +591,22 @@ class PPOTrainer:
 
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "checkpoint_type": "trainer",
-            "agent": self.agent.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "global_step": self.global_step,
-        }, path)
+        torch.save(
+            {
+                "checkpoint_type": "trainer",
+                "agent": self.agent.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "global_step": self.global_step,
+            },
+            path,
+        )
 
     def load(self, path: str):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         if not isinstance(checkpoint, dict):
-            raise ValueError(f"Trainer checkpoint must be a mapping, got {type(checkpoint).__name__}.")
+            raise ValueError(
+                f"Trainer checkpoint must be a mapping, got {type(checkpoint).__name__}."
+            )
         checkpoint_type = checkpoint.get("checkpoint_type")
         if checkpoint_type is not None and checkpoint_type != "trainer":
             raise ValueError(

@@ -22,7 +22,14 @@ def _batched_obs(states: list[int], *, aux: bool) -> dict[str, np.ndarray]:
             dtype = np.bool_
         else:
             dtype = np.int64
-        obs[key] = np.asarray(states, dtype=dtype).reshape(-1, 1)
+        if key == "opp_mask":
+            obs[key] = np.zeros((len(states), 1), dtype=dtype)
+        else:
+            obs[key] = np.asarray(states, dtype=dtype).reshape(-1, 1)
+    obs[RolloutBuffer.AUX_IDENTITY_KEY] = np.ones(
+        (len(states), 1),
+        dtype=np.int64,
+    )
     return obs
 
 
@@ -35,10 +42,11 @@ def _single_obs(state: int, *, aux_value: int | None = None) -> dict[str, np.nda
         if key == "opp_continuous":
             value = np.asarray([aux_value], dtype=np.float32)
         elif key == "opp_mask":
-            value = np.asarray([bool(aux_value)], dtype=np.bool_)
+            value = np.zeros(1, dtype=np.bool_)
         else:
             value = np.asarray([aux_value], dtype=np.int64)
         obs[key] = value
+    obs[RolloutBuffer.AUX_IDENTITY_KEY] = np.ones(1, dtype=np.int64)
     return obs
 
 
@@ -190,9 +198,9 @@ def test_collect_synchronous_rollout_preserves_sequences_hidden_and_terminal_lab
         [True, False, False, False],
         [False, False, False, True],
     ]
-    assert batch.aux_label_valid[:, 0].tolist() == [True, False]
+    assert batch.aux_label_valid[:, 0].any(dim=-1).tolist() == [True, False]
     assert batch.aux_labels["opp_item"][0, 0, 0].item() == 900
-    assert batch.aux_label_valid[:, 3].tolist() == [True, True]
+    assert batch.aux_label_valid[:, 3].any(dim=-1).tolist() == [True, True]
     assert batch.aux_labels["opp_item"][:, 3, 0].tolist() == [933, 933]
 
     assert agent.hidden_inputs[(0, 10, 20, 30)] == [10.0, 11.0, 12.0, 13.0]

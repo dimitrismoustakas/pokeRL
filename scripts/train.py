@@ -859,13 +859,13 @@ def collect_synchronous_rollout(
                     )
                 terminal_observations[int(env_index)] = final_observation
 
-            if all(key in next_obs for key in RolloutBuffer.AUX_LABEL_KEYS):
+            if all(key in next_obs for key in RolloutBuffer.AUX_OBS_KEYS):
                 aux_label_obs_np = {
                     key: np.empty_like(next_obs[key])
-                    for key in RolloutBuffer.AUX_LABEL_KEYS
+                    for key in RolloutBuffer.AUX_OBS_KEYS
                 }
                 for env_index, final_observation in terminal_observations.items():
-                    for key in RolloutBuffer.AUX_LABEL_KEYS:
+                    for key in RolloutBuffer.AUX_OBS_KEYS:
                         aux_label_obs_np[key][env_index] = final_observation[key]
                 aux_label_obs_t = obs_to_device(
                     aux_label_obs_np,

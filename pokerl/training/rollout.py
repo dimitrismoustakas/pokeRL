@@ -16,22 +16,22 @@ class RolloutBatch:
     """
 
     obs: dict[str, torch.Tensor]
-    actions: torch.Tensor          # (num_steps, num_envs, 3)
+    actions: torch.Tensor  # (num_steps, num_envs, 3)
     action_masks: dict[str, torch.Tensor]
-    log_probs: torch.Tensor        # (num_steps, num_envs)
-    values: torch.Tensor           # (num_steps, num_envs)
-    rewards: torch.Tensor          # (num_steps, num_envs)
-    dones: torch.Tensor            # (num_steps, num_envs)
-    advantages: torch.Tensor       # (num_steps, num_envs)
-    returns: torch.Tensor          # (num_steps, num_envs)
-    # Aux labels for hidden-info prediction. Each tensor holds the end-of-episode
-    # opponent observation copied onto every timestep of that episode. Unfinished
-    # episodes at rollout boundary leave aux_label_valid=False for that slice.
+    log_probs: torch.Tensor  # (num_steps, num_envs)
+    values: torch.Tensor  # (num_steps, num_envs)
+    rewards: torch.Tensor  # (num_steps, num_envs)
+    dones: torch.Tensor  # (num_steps, num_envs)
+    advantages: torch.Tensor  # (num_steps, num_envs)
+    returns: torch.Tensor  # (num_steps, num_envs)
+    # Aux labels for hidden-info prediction. Terminal opponent attributes are
+    # aligned to the same Pokemon at each earlier timestep. Unfinished episodes
+    # and ambiguous identities leave aux_label_valid=False for that Pokemon.
     aux_labels: dict[str, torch.Tensor]
-    aux_label_valid: torch.Tensor  # (num_steps, num_envs) bool
+    aux_label_valid: torch.Tensor  # (num_steps, num_envs, team_size) bool
     # Observed opponent actions for the aux opponent-action head. Entries where
     # the env did not expose them carry opp_actions_valid=False.
-    opp_actions: torch.Tensor      # (num_steps, num_envs, 3) long; -1 when invalid
+    opp_actions: torch.Tensor  # (num_steps, num_envs, 3) long; -1 when invalid
     opp_actions_valid: torch.Tensor  # (num_steps, num_envs) bool
     num_steps: int
     num_envs: int
@@ -56,6 +56,8 @@ class RolloutBuffer:
         "opp_continuous",
         "opp_mask",
     )
+    AUX_IDENTITY_KEY = "opp_source_index"
+    AUX_OBS_KEYS: tuple[str, ...] = (*AUX_LABEL_KEYS, AUX_IDENTITY_KEY)
 
     def __init__(
         self,
@@ -79,7 +81,9 @@ class RolloutBuffer:
             )
             for key, value in obs_example.items()
         }
-        self._actions = torch.empty((num_steps, num_envs, 3), dtype=torch.long, device=device)
+        self._actions = torch.empty(
+            (num_steps, num_envs, 3), dtype=torch.long, device=device
+        )
         self._action_masks = {
             key: torch.empty(
                 (num_steps, num_envs, *value.shape[1:]),
@@ -88,38 +92,58 @@ class RolloutBuffer:
             )
             for key, value in action_mask_example.items()
         }
-        self._log_probs = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
-        self._values = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
-        self._rewards = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
-        self._dones = torch.empty((num_steps, num_envs), dtype=torch.bool, device=device)
-        self._advantages = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
-        self._returns = torch.empty((num_steps, num_envs), dtype=torch.float32, device=device)
+        self._log_probs = torch.empty(
+            (num_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self._values = torch.empty(
+            (num_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self._rewards = torch.empty(
+            (num_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self._dones = torch.empty(
+            (num_steps, num_envs), dtype=torch.bool, device=device
+        )
+        self._advantages = torch.empty(
+            (num_steps, num_envs), dtype=torch.float32, device=device
+        )
+        self._returns = torch.empty(
+            (num_steps, num_envs), dtype=torch.float32, device=device
+        )
         self._initial_hidden_h: torch.Tensor | None = None
         self._initial_hidden_c: torch.Tensor | None = None
 
         # Aux labels require a Pokemon-shaped observation. Tests that pass a
         # minimal obs dict without these keys simply get empty aux buffers and
         # aux_label_valid=False everywhere; no label-tracking work is done.
-        self._aux_enabled = all(key in obs_example for key in self.AUX_LABEL_KEYS)
+        self._aux_enabled = all(key in obs_example for key in self.AUX_OBS_KEYS)
         if self._aux_enabled:
             self._aux_labels = {
-                key: torch.empty(
+                key: torch.zeros(
                     (num_steps, num_envs, *obs_example[key].shape[1:]),
                     dtype=torch.from_numpy(obs_example[key]).dtype,
                     device=device,
                 )
                 for key in self.AUX_LABEL_KEYS
             }
+            team_size = obs_example[self.AUX_IDENTITY_KEY].shape[-1]
         else:
             self._aux_labels = {}
-        self._aux_label_valid = torch.zeros((num_steps, num_envs), dtype=torch.bool, device=device)
+            team_size = 0
+        self._aux_label_valid = torch.zeros(
+            (num_steps, num_envs, team_size),
+            dtype=torch.bool,
+            device=device,
+        )
         self._opp_actions = torch.full(
             (num_steps, num_envs, 3),
             fill_value=-1,
             dtype=torch.long,
             device=device,
         )
-        self._opp_actions_valid = torch.zeros((num_steps, num_envs), dtype=torch.bool, device=device)
+        self._opp_actions_valid = torch.zeros(
+            (num_steps, num_envs), dtype=torch.bool, device=device
+        )
         # Tracks the timestep within the current rollout at which each env's
         # active episode began. Used to retroactively fill aux labels on done.
         self._episode_start = [0] * num_envs
@@ -163,9 +187,10 @@ class RolloutBuffer:
         else:
             self._opp_actions_valid[slot].fill_(False)
 
-        # Retroactively fill aux labels: every env whose episode ended at this
-        # step gets the terminal opponent state copied into every timestep from
-        # episode start through the done step.
+        # Retroactively fill aux labels for completed episodes. Terminal slots
+        # are matched by their episode-local source index rather than output
+        # position because observation slots move when the active Pokemon
+        # switch. A unique match is required; untracked identities are skipped.
         if self._aux_enabled:
             if done_env_indices is None:
                 done_envs = dones.detach().nonzero(as_tuple=False).squeeze(-1).tolist()
@@ -176,15 +201,48 @@ class RolloutBuffer:
                 for env_idx_raw in done_envs:
                     env_idx = int(env_idx_raw)
                     start = self._episode_start[env_idx]
-                    for key in self.AUX_LABEL_KEYS:
-                        label_value = label_obs[key][env_idx].detach()
-                        self._aux_labels[key][start : slot + 1, env_idx].copy_(
-                            label_value.unsqueeze(0).expand(slot + 1 - start, *label_value.shape)
-                        )
-                    self._aux_label_valid[start : slot + 1, env_idx] = True
+                    self._fill_aligned_aux_labels(
+                        start=start,
+                        end=slot + 1,
+                        env_idx=env_idx,
+                        label_obs=label_obs,
+                    )
                     self._episode_start[env_idx] = slot + 1
 
         self.step += 1
+
+    def _fill_aligned_aux_labels(
+        self,
+        *,
+        start: int,
+        end: int,
+        env_idx: int,
+        label_obs: dict[str, torch.Tensor],
+    ) -> None:
+        current_identity = self._obs[self.AUX_IDENTITY_KEY][start:end, env_idx]
+        terminal_identity = label_obs[self.AUX_IDENTITY_KEY][env_idx].detach()
+        current_present = ~self._obs["opp_mask"][start:end, env_idx]
+        terminal_present = ~label_obs["opp_mask"][env_idx].detach()
+
+        matches = current_identity.unsqueeze(-1).eq(terminal_identity.view(1, 1, -1))
+        matches &= current_present.unsqueeze(-1)
+        matches &= terminal_present.view(1, 1, -1)
+        matches &= current_identity.unsqueeze(-1).ge(0)
+        unique_match = matches.sum(dim=-1).eq(1)
+        terminal_indices = matches.to(torch.int64).argmax(dim=-1)
+
+        for key in self.AUX_LABEL_KEYS:
+            terminal_value = label_obs[key][env_idx].detach()
+            aligned_value = terminal_value[terminal_indices]
+            trailing_dims = aligned_value.ndim - unique_match.ndim
+            valid_value = unique_match.reshape(
+                *unique_match.shape,
+                *((1,) * trailing_dims),
+            ).expand_as(aligned_value)
+            self._aux_labels[key][start:end, env_idx].copy_(
+                aligned_value.masked_fill(~valid_value, 0)
+            )
+        self._aux_label_valid[start:end, env_idx].copy_(unique_match)
 
     def compute_gae(
         self,
@@ -206,7 +264,11 @@ class RolloutBuffer:
                 next_value = self._values[t + 1]
             next_non_terminal = (~self._dones[t]).float()
 
-            delta = self._rewards[t] + gamma * next_value * next_non_terminal - self._values[t]
+            delta = (
+                self._rewards[t]
+                + gamma * next_value * next_non_terminal
+                - self._values[t]
+            )
             last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
             self._advantages[t].copy_(last_gae)
 

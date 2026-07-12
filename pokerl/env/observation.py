@@ -165,6 +165,19 @@ class ObservationBuilder:
             self._ordered_team_with_roles(battle, own=False)
         )
         self._encode_team(opp_pokemon, opp_roles, obs, prefix="opp", full_info=False)
+        opponent_source_lookup = {
+            id(pokemon): index
+            for index, pokemon in enumerate(battle.opponent_team.values())
+        }
+        obs["opp_source_index"] = np.asarray(
+            [
+                opponent_source_lookup.get(id(pokemon), -1)
+                if pokemon is not None
+                else -1
+                for pokemon in opp_pokemon
+            ],
+            dtype=np.int64,
+        )
 
         obs["field"] = self._encode_field(battle)
         obs["own_active_indices"] = own_active_indices

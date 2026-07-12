@@ -39,7 +39,12 @@ from pokerl.env.observation import (
     ROLE_ACTIVE_2,
     ROLE_BENCH,
 )
-from pokerl.model.heads import ActionHead, MaskedSetAttention, TeamPreviewHead, ValueHead
+from pokerl.model.heads import (
+    ActionHead,
+    MaskedSetAttention,
+    TeamPreviewHead,
+    ValueHead,
+)
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
 from pokerl.training.ppo import PPOTrainer
@@ -112,12 +117,21 @@ async def test_async_queue_threadsafe_put_records_loop_delay() -> None:
     assert snapshot["test_queue_item_age_sec"] >= 0.0
 
 
-def _obs_to_tensor(obs: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
+def _obs_to_tensor(
+    obs: dict[str, np.ndarray], device: torch.device
+) -> dict[str, torch.Tensor]:
     return {key: torch.from_numpy(value).to(device) for key, value in obs.items()}
 
 
 def _aux_obs(num_envs: int, item_idx: int) -> dict[str, np.ndarray]:
     return {
+        # Deliberately duplicate species: auxiliary alignment must use the
+        # episode-local source identity, not species.
+        "opp_species": np.full((num_envs, 6), 42, dtype=np.int64),
+        "opp_source_index": np.broadcast_to(
+            np.arange(6, dtype=np.int64),
+            (num_envs, 6),
+        ).copy(),
         "opp_item": np.full((num_envs, 6), item_idx, dtype=np.int64),
         "opp_ability": np.full((num_envs, 6), 2, dtype=np.int64),
         "opp_types": np.full((num_envs, 6, 3), 3, dtype=np.int64),
@@ -127,13 +141,19 @@ def _aux_obs(num_envs: int, item_idx: int) -> dict[str, np.ndarray]:
     }
 
 
-def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidden() -> None:
+def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidden() -> (
+    None
+):
     device = torch.device("cpu")
     num_steps = 2
     num_envs = 2
-    buffer = RolloutBuffer(num_steps, num_envs, _obs(0, num_envs), _mask(num_envs), device)
+    buffer = RolloutBuffer(
+        num_steps, num_envs, _obs(0, num_envs), _mask(num_envs), device
+    )
 
-    hidden_h = torch.arange(8, dtype=torch.float32, device=device).reshape(1, num_envs, 4)
+    hidden_h = torch.arange(8, dtype=torch.float32, device=device).reshape(
+        1, num_envs, 4
+    )
     hidden_c = hidden_h + 100
     expected_h = hidden_h.squeeze(0).clone()
     expected_c = hidden_c.squeeze(0).clone()
@@ -153,18 +173,31 @@ def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidd
             key: torch.from_numpy(value).to(device)
             for key, value in _mask(num_envs).items()
         }
-        log_probs_t = torch.full((num_envs,), float(step), dtype=torch.float32, device=device)
-        values_t = torch.full((num_envs,), float(step) + 0.5, dtype=torch.float32, device=device)
+        log_probs_t = torch.full(
+            (num_envs,), float(step), dtype=torch.float32, device=device
+        )
+        values_t = torch.full(
+            (num_envs,), float(step) + 0.5, dtype=torch.float32, device=device
+        )
         rewards_t = torch.tensor([1.0, -1.0], dtype=torch.float32, device=device)
-        dones_t = torch.tensor([False, step == num_steps - 1], dtype=torch.bool, device=device)
+        dones_t = torch.tensor(
+            [False, step == num_steps - 1], dtype=torch.bool, device=device
+        )
         buffer.add(obs_t, actions_t, masks_t, log_probs_t, values_t, rewards_t, dones_t)
 
-    batch = buffer.compute_gae(torch.zeros(num_envs, dtype=torch.float32, device=device))
+    batch = buffer.compute_gae(
+        torch.zeros(num_envs, dtype=torch.float32, device=device)
+    )
 
     assert batch.obs["float_obs"].shape == (num_steps, num_envs, 3)
     assert batch.obs["index_obs"].shape == (num_steps, num_envs, 2)
     assert batch.actions.shape == (num_steps, num_envs, 3)
-    assert batch.action_masks["joint"].shape == (num_steps, num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT)
+    assert batch.action_masks["joint"].shape == (
+        num_steps,
+        num_envs,
+        ACTIONS_PER_SLOT + 1,
+        ACTIONS_PER_SLOT,
+    )
     assert batch.action_masks["can_tera"].shape == (num_steps, num_envs, 2)
     assert batch.advantages.shape == (num_steps, num_envs)
     assert batch.obs["float_obs"].device == device
@@ -179,7 +212,9 @@ def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> 
     device = torch.device("cpu")
     num_steps = 2
     num_envs = 1
-    buffer = RolloutBuffer(num_steps, num_envs, _aux_obs(num_envs, 1), _mask(num_envs), device)
+    buffer = RolloutBuffer(
+        num_steps, num_envs, _aux_obs(num_envs, 1), _mask(num_envs), device
+    )
     buffer.reset()
 
     actions_t = torch.zeros((num_envs, 3), dtype=torch.long, device=device)
@@ -211,17 +246,83 @@ def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> 
         torch.tensor([False], dtype=torch.bool, device=device),
     )
 
-    batch = buffer.compute_gae(torch.zeros(num_envs, dtype=torch.float32, device=device))
+    batch = buffer.compute_gae(
+        torch.zeros(num_envs, dtype=torch.float32, device=device)
+    )
 
-    assert batch.aux_label_valid[:, 0].tolist() == [True, False]
+    assert batch.aux_label_valid[:, 0].any(dim=-1).tolist() == [True, False]
     assert batch.aux_labels["opp_item"][0, 0, 0].item() == 9
+
+
+def test_rollout_buffer_aligns_terminal_aux_labels_by_source_identity() -> None:
+    device = torch.device("cpu")
+    buffer = RolloutBuffer(2, 1, _aux_obs(1, 1), _mask(1), device)
+    buffer.reset()
+
+    actions = torch.zeros((1, 3), dtype=torch.long)
+    masks = _obs_to_tensor(_mask(1), device)
+    zeros = torch.zeros(1)
+
+    first = _aux_obs(1, 1)
+    first["opp_source_index"][0] = [0, 1, -1, -1, -1, -1]
+    first["opp_mask"][0] = [False, False, True, True, True, True]
+    buffer.add(
+        _obs_to_tensor(first, device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        zeros,
+        torch.tensor([False]),
+    )
+
+    switched = _aux_obs(1, 1)
+    switched["opp_source_index"][0] = [1, 0, 2, -1, -1, -1]
+    switched["opp_mask"][0] = [False, False, False, True, True, True]
+    terminal = _aux_obs(1, 1)
+    terminal["opp_source_index"][0] = [1, 0, 2, -1, -1, -1]
+    terminal["opp_item"][0] = [200, 100, 300, 0, 0, 0]
+    terminal["opp_mask"][0] = [False, False, False, True, True, True]
+    buffer.add(
+        _obs_to_tensor(switched, device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        zeros,
+        torch.tensor([True]),
+        aux_label_obs=_obs_to_tensor(terminal, device),
+    )
+
+    batch = buffer.compute_gae(torch.zeros(1))
+
+    assert batch.aux_labels["opp_item"][0, 0].tolist() == [100, 200, 0, 0, 0, 0]
+    assert batch.aux_labels["opp_item"][1, 0].tolist() == [200, 100, 300, 0, 0, 0]
+    assert batch.aux_label_valid[0, 0].tolist() == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert batch.aux_label_valid[1, 0].tolist() == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
 
 
 def test_rollout_buffer_requires_a_complete_rollout_before_gae() -> None:
     device = torch.device("cpu")
     num_steps = 2
     num_envs = 2
-    buffer = RolloutBuffer(num_steps, num_envs, _obs(0, num_envs), _mask(num_envs), device)
+    buffer = RolloutBuffer(
+        num_steps, num_envs, _obs(0, num_envs), _mask(num_envs), device
+    )
     buffer.reset()
 
     buffer.add(
@@ -292,7 +393,9 @@ class _DummyAgent(nn.Module):
         )
         return {
             **action_out,
-            "value": self.value_head(context, own_reps, opp_reps, own_bench_mask, opp_bench_mask),
+            "value": self.value_head(
+                context, own_reps, opp_reps, own_bench_mask, opp_bench_mask
+            ),
             "hidden": hidden,
         }
 
@@ -302,11 +405,31 @@ class _DummyAgent(nn.Module):
 
 def _ppo_obs(step: int, num_envs: int) -> dict[str, np.ndarray]:
     own_roles = np.tile(
-        np.array([ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH], dtype=np.int64),
+        np.array(
+            [
+                ROLE_ACTIVE_1,
+                ROLE_ACTIVE_2,
+                ROLE_BENCH,
+                ROLE_BENCH,
+                ROLE_BENCH,
+                ROLE_BENCH,
+            ],
+            dtype=np.int64,
+        ),
         (num_envs, 1),
     )
     opp_roles = np.tile(
-        np.array([ROLE_ACTIVE_1, ROLE_ACTIVE_2, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH, ROLE_BENCH], dtype=np.int64),
+        np.array(
+            [
+                ROLE_ACTIVE_1,
+                ROLE_ACTIVE_2,
+                ROLE_BENCH,
+                ROLE_BENCH,
+                ROLE_BENCH,
+                ROLE_BENCH,
+            ],
+            dtype=np.int64,
+        ),
         (num_envs, 1),
     )
     mask = np.zeros((num_envs, 6), dtype=bool)
@@ -328,13 +451,17 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
     num_steps = 2
     num_envs = 2
     action_mask = {
-        "joint": np.ones((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool),
+        "joint": np.ones(
+            (num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool
+        ),
         "can_tera": np.ones((num_envs, 2), dtype=bool),
     }
     agent = _DummyAgent().to(device)
     config = TrainingConfig(num_epochs=1, num_minibatches=2)
     trainer = PPOTrainer(agent, config, device)
-    buffer = RolloutBuffer(num_steps, num_envs, _ppo_obs(0, num_envs), action_mask, device)
+    buffer = RolloutBuffer(
+        num_steps, num_envs, _ppo_obs(0, num_envs), action_mask, device
+    )
     buffer.reset(initial_hidden=agent.initial_hidden(num_envs))
 
     for step in range(num_steps):
@@ -347,10 +474,22 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
             out = agent(obs_t, action_masks=masks_t)
 
         rewards_t = torch.tensor([1.0, -0.5], dtype=torch.float32, device=device)
-        dones_t = torch.tensor([False, step == num_steps - 1], dtype=torch.bool, device=device)
-        buffer.add(obs_t, out["actions"], masks_t, out["log_prob"], out["value"], rewards_t, dones_t)
+        dones_t = torch.tensor(
+            [False, step == num_steps - 1], dtype=torch.bool, device=device
+        )
+        buffer.add(
+            obs_t,
+            out["actions"],
+            masks_t,
+            out["log_prob"],
+            out["value"],
+            rewards_t,
+            dones_t,
+        )
 
-    batch = buffer.compute_gae(torch.zeros(num_envs, dtype=torch.float32, device=device))
+    batch = buffer.compute_gae(
+        torch.zeros(num_envs, dtype=torch.float32, device=device)
+    )
     metrics = trainer.update(batch)
 
     assert trainer.global_step == num_steps * num_envs
@@ -362,13 +501,17 @@ def test_ppo_trainer_clamps_extreme_log_ratios_and_keeps_parameters_finite() -> 
     num_steps = 2
     num_envs = 2
     action_mask = {
-        "joint": np.ones((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool),
+        "joint": np.ones(
+            (num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool
+        ),
         "can_tera": np.ones((num_envs, 2), dtype=bool),
     }
     agent = _DummyAgent().to(device)
     config = TrainingConfig(num_epochs=1, num_minibatches=2)
     trainer = PPOTrainer(agent, config, device)
-    buffer = RolloutBuffer(num_steps, num_envs, _ppo_obs(0, num_envs), action_mask, device)
+    buffer = RolloutBuffer(
+        num_steps, num_envs, _ppo_obs(0, num_envs), action_mask, device
+    )
     buffer.reset(initial_hidden=agent.initial_hidden(num_envs))
 
     for step in range(num_steps):
@@ -381,10 +524,22 @@ def test_ppo_trainer_clamps_extreme_log_ratios_and_keeps_parameters_finite() -> 
             out = agent(obs_t, action_masks=masks_t)
 
         rewards_t = torch.tensor([1.0, -0.5], dtype=torch.float32, device=device)
-        dones_t = torch.tensor([False, step == num_steps - 1], dtype=torch.bool, device=device)
-        buffer.add(obs_t, out["actions"], masks_t, out["log_prob"], out["value"], rewards_t, dones_t)
+        dones_t = torch.tensor(
+            [False, step == num_steps - 1], dtype=torch.bool, device=device
+        )
+        buffer.add(
+            obs_t,
+            out["actions"],
+            masks_t,
+            out["log_prob"],
+            out["value"],
+            rewards_t,
+            dones_t,
+        )
 
-    batch = buffer.compute_gae(torch.zeros(num_envs, dtype=torch.float32, device=device))
+    batch = buffer.compute_gae(
+        torch.zeros(num_envs, dtype=torch.float32, device=device)
+    )
     batch.log_probs.fill_(-1.0e9)
     batch.advantages.copy_(
         torch.tensor(
@@ -405,7 +560,9 @@ def test_ppo_head_chunking_matches_stepwise_head_evaluation() -> None:
     num_steps = 3
     num_envs = 2
     action_mask = {
-        "joint": np.ones((num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool),
+        "joint": np.ones(
+            (num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool
+        ),
         "can_tera": np.ones((num_envs, 2), dtype=bool),
     }
 
@@ -413,7 +570,9 @@ def test_ppo_head_chunking_matches_stepwise_head_evaluation() -> None:
     base_agent = _DummyAgent().to(device)
     initial_state = copy.deepcopy(base_agent.state_dict())
 
-    buffer = RolloutBuffer(num_steps, num_envs, _ppo_obs(0, num_envs), action_mask, device)
+    buffer = RolloutBuffer(
+        num_steps, num_envs, _ppo_obs(0, num_envs), action_mask, device
+    )
     buffer.reset(initial_hidden=base_agent.initial_hidden(num_envs))
     for step in range(num_steps):
         obs_t = _obs_to_tensor(_ppo_obs(step, num_envs), device)
@@ -425,10 +584,22 @@ def test_ppo_head_chunking_matches_stepwise_head_evaluation() -> None:
             out = base_agent(obs_t, action_masks=masks_t)
 
         rewards_t = torch.tensor([1.0, -0.5], dtype=torch.float32, device=device)
-        dones_t = torch.tensor([False, step == num_steps - 1], dtype=torch.bool, device=device)
-        buffer.add(obs_t, out["actions"], masks_t, out["log_prob"], out["value"], rewards_t, dones_t)
+        dones_t = torch.tensor(
+            [False, step == num_steps - 1], dtype=torch.bool, device=device
+        )
+        buffer.add(
+            obs_t,
+            out["actions"],
+            masks_t,
+            out["log_prob"],
+            out["value"],
+            rewards_t,
+            dones_t,
+        )
 
-    batch = buffer.compute_gae(torch.zeros(num_envs, dtype=torch.float32, device=device))
+    batch = buffer.compute_gae(
+        torch.zeros(num_envs, dtype=torch.float32, device=device)
+    )
     config = TrainingConfig(num_epochs=1, num_minibatches=1, lr=1e-4)
 
     step_agent = _DummyAgent().to(device)
@@ -494,10 +665,14 @@ def test_action_head_uses_joint_and_tera_masks_to_coordinate_actions() -> None:
     active_reps = torch.zeros((1, 2, 2))
     own_team_reps = torch.zeros((1, 6, 2))
     opp_team_reps = torch.zeros((1, 6, 2))
-    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
+    opp_reserve_mask = torch.tensor(
+        [[True, True, False, False, False, False]], dtype=torch.bool
+    )
     opp_active_reps = torch.zeros((1, 2, 2))
     masks = {
-        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "joint": torch.zeros(
+            (1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool
+        ),
         "can_tera": torch.zeros((1, 2), dtype=torch.bool),
     }
     masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
@@ -528,10 +703,14 @@ def test_action_head_can_skip_policy_stats_for_frozen_opponent_inference() -> No
     active_reps = torch.zeros((1, 2, 2))
     own_team_reps = torch.zeros((1, 6, 2))
     opp_team_reps = torch.zeros((1, 6, 2))
-    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
+    opp_reserve_mask = torch.tensor(
+        [[True, True, False, False, False, False]], dtype=torch.bool
+    )
     opp_active_reps = torch.zeros((1, 2, 2))
     masks = {
-        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "joint": torch.zeros(
+            (1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool
+        ),
         "can_tera": torch.zeros((1, 2), dtype=torch.bool),
     }
     masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
@@ -607,31 +786,47 @@ def test_action_head_allows_trusted_supplied_actions_to_skip_validation() -> Non
     assert torch.equal(out["actions"], trusted_actions)
 
 
-def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_target() -> None:
+def test_action_head_uses_conditional_joint_mask_to_block_duplicate_switch_target() -> (
+    None
+):
     torch.manual_seed(0)
     head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
     context = torch.zeros((1, 3))
     active_reps = torch.zeros((1, 2, 2))
     own_team_reps = torch.zeros((1, 6, 2))
     opp_team_reps = torch.zeros((1, 6, 2))
-    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
+    opp_reserve_mask = torch.tensor(
+        [[True, True, False, False, False, False]], dtype=torch.bool
+    )
     opp_active_reps = torch.zeros((1, 2, 2))
     masks = {
-        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "joint": torch.zeros(
+            (1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool
+        ),
         "can_tera": torch.zeros((1, 2), dtype=torch.bool),
     }
     shared_switch = SWITCH_OFFSET + 5
     masks["joint"][0, FIRST_SLOT_MASK_ROW, shared_switch] = True
     masks["joint"][0, shared_switch + 1, 0] = True
 
-    out = head(context, active_reps, own_team_reps, opp_team_reps, opp_reserve_mask, opp_active_reps, masks)
+    out = head(
+        context,
+        active_reps,
+        own_team_reps,
+        opp_team_reps,
+        opp_reserve_mask,
+        opp_active_reps,
+        masks,
+    )
 
     assert out["actions"][0, 0].item() == shared_switch
     assert out["actions"][0, 1].item() == 0
     assert out["actions"][0, 2].item() == TERA_NONE
 
 
-def test_action_head_matchup_features_distinguish_super_effective_and_resisted_targets() -> None:
+def test_action_head_matchup_features_distinguish_super_effective_and_resisted_targets() -> (
+    None
+):
     head = ActionHead(
         context_dim=3,
         pokemon_dim=2,
@@ -676,7 +871,9 @@ def test_action_head_matchup_features_distinguish_super_effective_and_resisted_t
     assert features[0, 0, target_eff_feature] > features[0, 1, target_eff_feature]
 
 
-def test_action_head_categorical_choice_matches_torch_distribution_for_evaluation() -> None:
+def test_action_head_categorical_choice_matches_torch_distribution_for_evaluation() -> (
+    None
+):
     logits = torch.tensor(
         [
             [1.5, -2.0, 0.25],
@@ -698,7 +895,9 @@ def test_action_head_categorical_choice_matches_torch_distribution_for_evaluatio
     assert torch.allclose(entropy, dist.entropy())
 
 
-def test_action_head_categorical_choice_samples_without_torch_multinomial(monkeypatch) -> None:
+def test_action_head_categorical_choice_samples_without_torch_multinomial(
+    monkeypatch,
+) -> None:
     def fail_multinomial(*args, **kwargs):
         raise AssertionError("torch.multinomial should not be used for policy sampling")
 
@@ -717,11 +916,13 @@ def test_action_head_categorical_choice_samples_without_torch_multinomial(monkey
         actions=None,
         greedy=False,
     )
-    selected_no_stats, log_prob_no_stats, entropy_no_stats = ActionHead._categorical_choice(
-        logits,
-        actions=None,
-        greedy=False,
-        include_stats=False,
+    selected_no_stats, log_prob_no_stats, entropy_no_stats = (
+        ActionHead._categorical_choice(
+            logits,
+            actions=None,
+            greedy=False,
+            include_stats=False,
+        )
     )
 
     assert selected.shape == (2,)
@@ -738,7 +939,9 @@ def test_action_head_categorical_choice_samples_without_torch_multinomial(monkey
 def test_action_head_force_delay_turns_early_sampled_tera_into_no_tera() -> None:
     class FixedTeraScore(nn.Module):
         def forward(self, query: torch.Tensor) -> torch.Tensor:
-            logits = torch.full((query.shape[0], 3), -1e8, dtype=query.dtype, device=query.device)
+            logits = torch.full(
+                (query.shape[0], 3), -1e8, dtype=query.dtype, device=query.device
+            )
             logits[:, TERA_SLOT_1] = 1e8
             return logits
 
@@ -749,10 +952,14 @@ def test_action_head_force_delay_turns_early_sampled_tera_into_no_tera() -> None
     active_reps = torch.zeros((1, 2, 2))
     own_team_reps = torch.zeros((1, 6, 2))
     opp_team_reps = torch.zeros((1, 6, 2))
-    opp_reserve_mask = torch.tensor([[True, True, False, False, False, False]], dtype=torch.bool)
+    opp_reserve_mask = torch.tensor(
+        [[True, True, False, False, False, False]], dtype=torch.bool
+    )
     opp_active_reps = torch.zeros((1, 2, 2))
     masks = {
-        "joint": torch.zeros((1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool),
+        "joint": torch.zeros(
+            (1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool
+        ),
         "can_tera": torch.tensor([[True, False]], dtype=torch.bool),
     }
     masks["joint"][0, FIRST_SLOT_MASK_ROW, 0] = True
@@ -826,7 +1033,14 @@ def test_team_preview_head_accepts_opponent_structure_and_greedy_mode() -> None:
         dtype=torch.bool,
     )
 
-    out = head(own_reps, opp_reps, context, team_mask=own_mask, opponent_mask=opponent_mask, greedy=True)
+    out = head(
+        own_reps,
+        opp_reps,
+        context,
+        team_mask=own_mask,
+        opponent_mask=opponent_mask,
+        greedy=True,
+    )
 
     assert out["picks"].shape == (2, 3)
     assert out["log_prob"].shape == (2,)
@@ -838,7 +1052,9 @@ def test_team_preview_head_accepts_opponent_structure_and_greedy_mode() -> None:
 
 def test_team_preview_head_samples_without_torch_multinomial(monkeypatch) -> None:
     def fail_multinomial(*args, **kwargs):
-        raise AssertionError("torch.multinomial should not be used for team-preview sampling")
+        raise AssertionError(
+            "torch.multinomial should not be used for team-preview sampling"
+        )
 
     monkeypatch.setattr(torch, "multinomial", fail_multinomial)
     torch.manual_seed(0)
@@ -902,7 +1118,9 @@ def test_team_preview_head_can_return_picks_without_policy_stats() -> None:
     assert "entropy" not in out
 
 
-def test_team_preview_head_preserves_lead_order_while_canonicalizing_bench_tail() -> None:
+def test_team_preview_head_preserves_lead_order_while_canonicalizing_bench_tail() -> (
+    None
+):
     torch.manual_seed(0)
     head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=4)
     own_reps = torch.randn(1, 6, 4)
@@ -913,7 +1131,9 @@ def test_team_preview_head_preserves_lead_order_while_canonicalizing_bench_tail(
     out = head(own_reps, opp_reps, context, picks=provided_picks)
 
     assert torch.equal(out["lead_pair"], torch.tensor([[4, 1]], dtype=torch.long))
-    assert torch.equal(out["bring_picks"], torch.tensor([[0, 1, 4, 5]], dtype=torch.long))
+    assert torch.equal(
+        out["bring_picks"], torch.tensor([[0, 1, 4, 5]], dtype=torch.long)
+    )
     assert torch.equal(out["picks"], torch.tensor([[4, 1, 0, 5]], dtype=torch.long))
 
 
@@ -995,15 +1215,22 @@ def test_legal_action_state_reuses_slot_orders(monkeypatch: pytest.MonkeyPatch) 
         calls += 1
         return original(current_battle, slot)
 
-    monkeypatch.setattr(actions_module, "_build_slot_action_state", counted_slot_action_state)
+    monkeypatch.setattr(
+        actions_module, "_build_slot_action_state", counted_slot_action_state
+    )
 
     action_state = build_legal_action_state(battle)
     expected_team_slot = 3
     switch_action = SWITCH_OFFSET + expected_team_slot
 
     assert build_action_mask(battle, slot=0, action_state=action_state)[switch_action]
-    assert build_joint_action_mask(battle, action_state=action_state)[FIRST_SLOT_MASK_ROW, switch_action]
-    assert action_to_order(switch_action, battle, slot=0, action_state=action_state).order is battle.available_switches[0][0]
+    assert build_joint_action_mask(battle, action_state=action_state)[
+        FIRST_SLOT_MASK_ROW, switch_action
+    ]
+    assert (
+        action_to_order(switch_action, battle, slot=0, action_state=action_state).order
+        is battle.available_switches[0][0]
+    )
     assert calls == 2
 
 
@@ -1041,7 +1268,10 @@ class _FakeTargetBattle:
         self.force_switch = [False, False]
         self.can_tera = [False, False]
         self.active_pokemon = [_FakePokemon("attacker"), _FakePokemon("ally")]
-        self.opponent_active_pokemon = [_FakePokemon("foe-one"), _FakePokemon("foe-two")]
+        self.opponent_active_pokemon = [
+            _FakePokemon("foe-one"),
+            _FakePokemon("foe-two"),
+        ]
         self.available_moves = [[move], []]
         self.available_switches = [[], []]
         self.team = {
@@ -1064,12 +1294,18 @@ class _FakeTargetBattle:
         }
         self.trapped = [False, False]
 
-    def get_possible_showdown_targets(self, move: Move, pokemon, dynamax: bool = False) -> list[int]:
+    def get_possible_showdown_targets(
+        self, move: Move, pokemon, dynamax: bool = False
+    ) -> list[int]:
         del dynamax
-        if pokemon == self.active_pokemon[0] and move.id in [m.id for m in self.available_moves[0]]:
+        if pokemon == self.active_pokemon[0] and move.id in [
+            m.id for m in self.available_moves[0]
+        ]:
             self_position = self.POKEMON_1_POSITION
             ally_position = self.POKEMON_2_POSITION
-        elif pokemon == self.active_pokemon[1] and move.id in [m.id for m in self.available_moves[1]]:
+        elif pokemon == self.active_pokemon[1] and move.id in [
+            m.id for m in self.available_moves[1]
+        ]:
             self_position = self.POKEMON_2_POSITION
             ally_position = self.POKEMON_1_POSITION
         else:
@@ -1081,16 +1317,27 @@ class _FakeTargetBattle:
             targets = {
                 Target.ADJACENT_ALLY: [ally_position],
                 Target.ADJACENT_ALLY_OR_SELF: [ally_position, self_position],
-                Target.ADJACENT_FOE: [self.OPPONENT_1_POSITION, self.OPPONENT_2_POSITION],
+                Target.ADJACENT_FOE: [
+                    self.OPPONENT_1_POSITION,
+                    self.OPPONENT_2_POSITION,
+                ],
                 Target.ALL: [self.EMPTY_TARGET_POSITION],
                 Target.ALL_ADJACENT: [self.EMPTY_TARGET_POSITION],
                 Target.ALL_ADJACENT_FOES: [self.EMPTY_TARGET_POSITION],
                 Target.ALLIES: [self.EMPTY_TARGET_POSITION],
                 Target.ALLY_SIDE: [self.EMPTY_TARGET_POSITION],
                 Target.ALLY_TEAM: [self.EMPTY_TARGET_POSITION],
-                Target.ANY: [ally_position, self.OPPONENT_1_POSITION, self.OPPONENT_2_POSITION],
+                Target.ANY: [
+                    ally_position,
+                    self.OPPONENT_1_POSITION,
+                    self.OPPONENT_2_POSITION,
+                ],
                 Target.FOE_SIDE: [self.EMPTY_TARGET_POSITION],
-                Target.NORMAL: [ally_position, self.OPPONENT_1_POSITION, self.OPPONENT_2_POSITION],
+                Target.NORMAL: [
+                    ally_position,
+                    self.OPPONENT_1_POSITION,
+                    self.OPPONENT_2_POSITION,
+                ],
                 Target.RANDOM_NORMAL: [self.EMPTY_TARGET_POSITION],
                 Target.SCRIPTED: [self.EMPTY_TARGET_POSITION],
                 Target.SELF: [self.EMPTY_TARGET_POSITION],
@@ -1221,9 +1468,7 @@ def test_random_normal_move_without_explicit_request_target_uses_request_slot(
     battle = _FakeTargetBattle(move)
     battle.last_request = {
         "active": [
-            {
-                "moves": [move_request]
-            },
+            {"moves": [move_request]},
             {"moves": []},
         ]
     }
@@ -1297,13 +1542,17 @@ def test_parallel_battle_env_collate_reuses_batch_buffers() -> None:
             "can_tera": np.array([True, True], dtype=bool),
         },
     ]
-    batch_obs_2, batch_mask_2 = ParallelBattleEnv._collate(env, second_obs, second_masks)
+    batch_obs_2, batch_mask_2 = ParallelBattleEnv._collate(
+        env, second_obs, second_masks
+    )
 
     assert batch_obs_1["a"] is batch_obs_2["a"]
     assert batch_obs_1["b"] is batch_obs_2["b"]
     assert batch_mask_1["joint"] is batch_mask_2["joint"]
     assert batch_mask_1["can_tera"] is batch_mask_2["can_tera"]
-    np.testing.assert_array_equal(batch_obs_2["a"], np.array([[5, 6], [7, 8]], dtype=np.int64))
+    np.testing.assert_array_equal(
+        batch_obs_2["a"], np.array([[5, 6], [7, 8]], dtype=np.int64)
+    )
     np.testing.assert_array_equal(
         batch_obs_2["b"],
         np.array([[[5.0], [6.0]], [[7.0], [8.0]]], dtype=np.float32),
@@ -1349,12 +1598,20 @@ def test_joint_action_mask_comes_from_joined_valid_orders() -> None:
             "active": [
                 {
                     "moves": [
-                        {"id": "icespinner", "target": "adjacentFoe", "disabled": False},
+                        {
+                            "id": "icespinner",
+                            "target": "adjacentFoe",
+                            "disabled": False,
+                        },
                     ]
                 },
                 {
                     "moves": [
-                        {"id": "suckerpunch", "target": "adjacentFoe", "disabled": False},
+                        {
+                            "id": "suckerpunch",
+                            "target": "adjacentFoe",
+                            "disabled": False,
+                        },
                     ]
                 },
             ]
@@ -1381,12 +1638,16 @@ def test_battle_env_team_preview_propagates_precompute_failure() -> None:
     obs = {"context": np.array([1, 2, 3], dtype=np.int64)}
     future: Future = Future()
     future.set_exception(RuntimeError("preview batch failed"))
-    timing = SimpleNamespace(increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None)
+    timing = SimpleNamespace(
+        increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None
+    )
     fake_env = SimpleNamespace(
         _active_preview_obs=obs,
         _active_preview_future=future,
         _timing=timing,
-        _ext_team_preview_fn=lambda current_obs: (_ for _ in ()).throw(AssertionError("fallback should not run")),
+        _ext_team_preview_fn=lambda current_obs: (_ for _ in ()).throw(
+            AssertionError("fallback should not run")
+        ),
         _obs_equal=lambda left, right: BattleEnv._obs_equal(left, right),
         _record_preview_obs_mismatch=lambda actual, prepared: (_ for _ in ()).throw(
             AssertionError("mismatch handler should not run")
@@ -1401,20 +1662,26 @@ def test_battle_env_team_preview_propagates_precompute_failure() -> None:
 async def test_battle_env_async_team_preview_awaits_precomputed_future() -> None:
     obs = {"context": np.array([1, 2, 3], dtype=np.int64)}
     future: Future = Future()
-    timing = SimpleNamespace(increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None)
+    timing = SimpleNamespace(
+        increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None
+    )
     fake_env = SimpleNamespace(
         _active_preview_obs=obs,
         _active_preview_future=future,
         _team_preview_batcher=None,
         _timing=timing,
-        _ext_team_preview_fn=lambda current_obs: (_ for _ in ()).throw(AssertionError("fallback should not run")),
+        _ext_team_preview_fn=lambda current_obs: (_ for _ in ()).throw(
+            AssertionError("fallback should not run")
+        ),
         _obs_equal=lambda left, right: BattleEnv._obs_equal(left, right),
         _record_preview_obs_mismatch=lambda actual, prepared: (_ for _ in ()).throw(
             AssertionError("mismatch handler should not run")
         ),
     )
 
-    task = asyncio.create_task(BattleEnv._choose_team_preview_picks_async(fake_env, obs))
+    task = asyncio.create_task(
+        BattleEnv._choose_team_preview_picks_async(fake_env, obs)
+    )
     await asyncio.sleep(0)
     assert not task.done()
 
@@ -1424,24 +1691,34 @@ async def test_battle_env_async_team_preview_awaits_precomputed_future() -> None
     np.testing.assert_array_equal(await asyncio.wait_for(task, timeout=0.2), expected)
 
 
-def test_finished_battle_update_skips_legality_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_finished_battle_update_skips_legality_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     queued = []
-    timing = SimpleNamespace(increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None)
+    timing = SimpleNamespace(
+        increment=lambda *args, **kwargs: None, add=lambda *args, **kwargs: None
+    )
     fake_player = SimpleNamespace(
         last_battle=None,
         _last_finished_token=None,
-        obs_builder=SimpleNamespace(build=lambda battle: {"context": np.array([1], dtype=np.int64)}),
+        obs_builder=SimpleNamespace(
+            build=lambda battle: {"context": np.array([1], dtype=np.int64)}
+        ),
         timing=timing,
         obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
         _pending_action_state="stale",
         _pending_action_battle=object(),
     )
-    battle = SimpleNamespace(battle_tag="battle-1", turn=7, finished=True, won=True, lost=False)
+    battle = SimpleNamespace(
+        battle_tag="battle-1", turn=7, finished=True, won=True, lost=False
+    )
 
     monkeypatch.setattr(
         showdown_env_module,
         "build_legal_action_state",
-        lambda battle: (_ for _ in ()).throw(AssertionError("finished battles should not rebuild legality")),
+        lambda battle: (_ for _ in ()).throw(
+            AssertionError("finished battles should not rebuild legality")
+        ),
     )
 
     ShowdownPlayer._emit_battle_update(fake_player, battle)
@@ -1453,7 +1730,9 @@ def test_finished_battle_update_skips_legality_rebuild(monkeypatch: pytest.Monke
     assert queued_battle is battle
     assert mask["joint"][FIRST_SLOT_MASK_ROW, PASS_ACTION]
     assert mask["joint"][PASS_ACTION + 1, PASS_ACTION]
-    np.testing.assert_array_equal(mask["can_tera"], np.array([False, False], dtype=bool))
+    np.testing.assert_array_equal(
+        mask["can_tera"], np.array([False, False], dtype=bool)
+    )
 
 
 def test_finished_battle_callback_defers_terminal_observation() -> None:
@@ -1482,24 +1761,32 @@ def test_emit_pending_finished_battle_enqueues_terminal_observation(
         last_battle=None,
         _last_finished_token=None,
         _pending_finished_battle=None,
-        obs_builder=SimpleNamespace(build=lambda battle: {"context": np.array([1], dtype=np.int64)}),
+        obs_builder=SimpleNamespace(
+            build=lambda battle: {"context": np.array([1], dtype=np.int64)}
+        ),
         timing=timing,
         obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
         _pending_action_state=None,
         _pending_action_battle=None,
     )
-    fake_player._emit_battle_update = lambda battle, request_id=None: ShowdownPlayer._emit_battle_update(
-        fake_player,
-        battle,
-        request_id=request_id,
+    fake_player._emit_battle_update = lambda battle, request_id=None: (
+        ShowdownPlayer._emit_battle_update(
+            fake_player,
+            battle,
+            request_id=request_id,
+        )
     )
-    battle = SimpleNamespace(battle_tag="battle-1", turn=7, finished=True, won=True, lost=False)
+    battle = SimpleNamespace(
+        battle_tag="battle-1", turn=7, finished=True, won=True, lost=False
+    )
     fake_player._pending_finished_battle = battle
 
     monkeypatch.setattr(
         showdown_env_module,
         "build_legal_action_state",
-        lambda battle: (_ for _ in ()).throw(AssertionError("finished battles should not rebuild legality")),
+        lambda battle: (_ for _ in ()).throw(
+            AssertionError("finished battles should not rebuild legality")
+        ),
     )
 
     emitted = ShowdownPlayer.emit_pending_finished_battle(fake_player)
@@ -1541,9 +1828,9 @@ async def test_league_player_team_preview_propagates_precompute_failure() -> Non
             AssertionError("mismatch handler should not run")
         ),
         inference_service=SimpleNamespace(
-            infer_team_preview=lambda checkpoint_path, current_obs: (_ for _ in ()).throw(
-                AssertionError("fallback should not run")
-            )
+            infer_team_preview=lambda checkpoint_path, current_obs: (
+                _ for _ in ()
+            ).throw(AssertionError("fallback should not run"))
         ),
         checkpoint_path="checkpoint.pt",
     )
@@ -1553,14 +1840,18 @@ async def test_league_player_team_preview_propagates_precompute_failure() -> Non
 
 
 @pytest.mark.asyncio
-async def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_league_player_keeps_recurrent_state_on_same_state_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _FakeInferenceService:
         def __init__(self) -> None:
             self.hidden_inputs: list[torch.Tensor | None] = []
             self.step = 0
 
         def infer_action(self, checkpoint_path, obs, masks, hidden, timing=None):
-            return self.submit_action(checkpoint_path, obs, masks, hidden, timing=timing).result()
+            return self.submit_action(
+                checkpoint_path, obs, masks, hidden, timing=timing
+            ).result()
 
         def submit_action(self, checkpoint_path, obs, masks, hidden, timing=None):
             self.step += 1
@@ -1571,7 +1862,12 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypat
                 torch.full((1, 1, 1), next_value + 100),
             )
             future: Future = Future()
-            future.set_result((np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden))
+            future.set_result(
+                (
+                    np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64),
+                    next_hidden,
+                )
+            )
             return future
 
     fake_service = _FakeInferenceService()
@@ -1609,20 +1905,28 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypat
             ),
             can_tera=np.array([False, False], dtype=bool),
             slot_action_orders=({}, {}),
-            slot_masks=(np.zeros(ACTIONS_PER_SLOT, dtype=bool), np.zeros(ACTIONS_PER_SLOT, dtype=bool)),
+            slot_masks=(
+                np.zeros(ACTIONS_PER_SLOT, dtype=bool),
+                np.zeros(ACTIONS_PER_SLOT, dtype=bool),
+            ),
         ),
     )
     monkeypatch.setattr(
         league_module,
         "action_to_order",
-        lambda action_idx, battle, slot, terastallize=False, action_state=None: PassBattleOrder(),
+        lambda action_idx, battle, slot, terastallize=False, action_state=None: (
+            PassBattleOrder()
+        ),
     )
 
     battle_kwargs = dict(
         finished=False,
         battle_tag="battle-hidden",
         active_pokemon=[SimpleNamespace(species="a"), SimpleNamespace(species="b")],
-        opponent_active_pokemon=[SimpleNamespace(species="c"), SimpleNamespace(species="d")],
+        opponent_active_pokemon=[
+            SimpleNamespace(species="c"),
+            SimpleNamespace(species="d"),
+        ],
         force_switch=[False, False],
         can_tera=[False, False],
         trapped=[False, False],
@@ -1642,7 +1946,9 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_league_player_reuses_inflight_same_state_request(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_league_player_reuses_inflight_same_state_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _FakeInferenceService:
         def __init__(self) -> None:
             self.future: Future = Future()
@@ -1690,13 +1996,18 @@ async def test_league_player_reuses_inflight_same_state_request(monkeypatch: pyt
             ),
             can_tera=np.array([False, False], dtype=bool),
             slot_action_orders=({}, {}),
-            slot_masks=(np.zeros(ACTIONS_PER_SLOT, dtype=bool), np.zeros(ACTIONS_PER_SLOT, dtype=bool)),
+            slot_masks=(
+                np.zeros(ACTIONS_PER_SLOT, dtype=bool),
+                np.zeros(ACTIONS_PER_SLOT, dtype=bool),
+            ),
         ),
     )
     monkeypatch.setattr(
         league_module,
         "action_to_order",
-        lambda action_idx, battle, slot, terastallize=False, action_state=None: PassBattleOrder(),
+        lambda action_idx, battle, slot, terastallize=False, action_state=None: (
+            PassBattleOrder()
+        ),
     )
 
     battle = SimpleNamespace(
@@ -1705,7 +2016,10 @@ async def test_league_player_reuses_inflight_same_state_request(monkeypatch: pyt
         battle_tag="battle-inflight",
         turn=1,
         active_pokemon=[SimpleNamespace(species="a"), SimpleNamespace(species="b")],
-        opponent_active_pokemon=[SimpleNamespace(species="c"), SimpleNamespace(species="d")],
+        opponent_active_pokemon=[
+            SimpleNamespace(species="c"),
+            SimpleNamespace(species="d"),
+        ],
         force_switch=[False, False],
         can_tera=[False, False],
         trapped=[False, False],
@@ -1724,7 +2038,9 @@ async def test_league_player_reuses_inflight_same_state_request(monkeypatch: pyt
         torch.full((1, 1, 1), 11.0),
         torch.full((1, 1, 1), 111.0),
     )
-    fake_service.future.set_result((np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden))
+    fake_service.future.set_result(
+        (np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64), next_hidden)
+    )
     order1, order2 = await asyncio.gather(first, second)
 
     assert isinstance(order1, PassBattleOrder)
@@ -1738,7 +2054,9 @@ async def test_league_player_reuses_inflight_same_state_request(monkeypatch: pyt
 async def test_league_player_default_only_request_skips_inference() -> None:
     class _FakeInferenceService:
         def submit_action(self, *args, **kwargs):
-            raise AssertionError("default-only request should not submit league inference")
+            raise AssertionError(
+                "default-only request should not submit league inference"
+            )
 
     player = LeaguePlayer.__new__(LeaguePlayer)
     player.checkpoint_path = "checkpoint.pt"
@@ -1798,11 +2116,16 @@ def test_league_player_decision_signature_tracks_action_request_fields() -> None
 
     unrelated_side_update = copy.deepcopy(request)
     unrelated_side_update["side"]["pokemon"][0]["condition"] = "1/100"
-    assert LeaguePlayer._request_decision_signature(unrelated_side_update) == base_signature
+    assert (
+        LeaguePlayer._request_decision_signature(unrelated_side_update)
+        == base_signature
+    )
 
     fainted_side_update = copy.deepcopy(request)
     fainted_side_update["side"]["pokemon"][0]["condition"] = "0 fnt"
-    assert LeaguePlayer._request_decision_signature(fainted_side_update) != base_signature
+    assert (
+        LeaguePlayer._request_decision_signature(fainted_side_update) != base_signature
+    )
 
     changed_target = copy.deepcopy(request)
     changed_target["active"][0]["moves"][1]["target"] = "adjacentFoe"
@@ -1814,4 +2137,6 @@ def test_league_player_decision_signature_tracks_action_request_fields() -> None
 
     changed_force_switch = copy.deepcopy(request)
     changed_force_switch["forceSwitch"] = [True, False]
-    assert LeaguePlayer._request_decision_signature(changed_force_switch) != base_signature
+    assert (
+        LeaguePlayer._request_decision_signature(changed_force_switch) != base_signature
+    )
