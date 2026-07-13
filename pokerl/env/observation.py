@@ -254,10 +254,14 @@ class ObservationBuilder:
                     event_move[index] = self.gd.move_to_idx.get(
                         to_id_str(event.move), UNKNOWN_IDX
                     )
-                if event.kind in {
-                    PublicBattleEventKind.SWITCH,
-                    PublicBattleEventKind.DRAG,
-                } and event.details:
+                if (
+                    event.kind
+                    in {
+                        PublicBattleEventKind.SWITCH,
+                        PublicBattleEventKind.DRAG,
+                    }
+                    and event.details
+                ):
                     switched = Pokemon(gen=self.gd.gen, details=event.details)
                     event_species[index] = self._species_idx(switched)
                 if event.kind is PublicBattleEventKind.TERA and event.details:
@@ -286,9 +290,7 @@ class ObservationBuilder:
                     own_move[slot] = self.gd.move_to_idx.get(
                         to_id_str(intent.move_id), UNKNOWN_IDX
                     )
-                    own_target[slot] = self._intent_target_position(
-                        intent.target, slot
-                    )
+                    own_target[slot] = self._intent_target_position(intent.target, slot)
                 elif intent.kind == INTENT_SWITCH and intent.switch_species:
                     own_switch_species[slot] = self.gd.species_to_idx.get(
                         to_id_str(intent.switch_species), UNKNOWN_IDX
@@ -763,29 +765,120 @@ class _SyntheticTeamPreviewBattle:
         self.opponent_used_tera = False
 
 
+_TEAM_PREVIEW_SIDE_CACHE_SIZE = 512
+
+
+def _freeze_observation_arrays(
+    observation: dict[str, np.ndarray],
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Return cache-safe, read-only observation entries."""
+    for value in observation.values():
+        value.setflags(write=False)
+    return tuple(observation.items())
+
+
+def _copy_observation_arrays(
+    entries: tuple[tuple[str, np.ndarray], ...],
+) -> dict[str, np.ndarray]:
+    """Materialize independent writable arrays from cached observation entries."""
+    return {key: value.copy() for key, value in entries}
+
+
+@lru_cache(maxsize=_TEAM_PREVIEW_SIDE_CACHE_SIZE)
+def _cached_team_preview_side(
+    game_data: GameData,
+    team_size: int,
+    packed_team: str,
+    own_team: bool,
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Encode one packed roster once for repeated preview matchups.
+
+    Team-preview state before turn zero is a pure function of one packed team,
+    its public-information role, the categorical vocabulary, and team size.
+    Caching each side separately gives reuse across every opposing roster while
+    keeping the bounded cache independent of the number of possible pairings.
+    """
+    entries = Teambuilder.parse_packed_team(packed_team)[:team_size]
+    if own_team:
+        pokemon = [
+            _init_team_preview_pokemon(
+                Pokemon(gen=game_data.gen, teambuilder=entry),
+                own_team=True,
+            )
+            for entry in entries
+        ]
+        prefix = "own"
+    else:
+        pokemon = [
+            _init_team_preview_pokemon(
+                Pokemon(
+                    gen=game_data.gen,
+                    species=_preview_visible_species(game_data.gen, entry),
+                ),
+                own_team=False,
+            )
+            for entry in entries
+        ]
+        prefix = "opp"
+
+    padded_team: list[Pokemon | None] = [*pokemon]
+    padded_team.extend([None] * (team_size - len(padded_team)))
+    observation: dict[str, np.ndarray] = {}
+    ObservationBuilder(game_data, team_size)._encode_team(
+        padded_team,
+        np.full(team_size, ROLE_BENCH, dtype=np.int64),
+        observation,
+        prefix=prefix,
+        full_info=own_team,
+    )
+    if not own_team:
+        source_indices = np.full(team_size, -1, dtype=np.int64)
+        source_indices[: len(pokemon)] = np.arange(len(pokemon), dtype=np.int64)
+        observation["opp_source_index"] = source_indices
+    return _freeze_observation_arrays(observation)
+
+
+@lru_cache(maxsize=32)
+def _cached_empty_team_preview_observation(
+    game_data: GameData,
+    team_size: int,
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Cache the team-independent, neutral turn-zero observation fields."""
+    empty_battle = _SyntheticTeamPreviewBattle([], [])
+    observation = ObservationBuilder(game_data, team_size).build(empty_battle)
+    return _freeze_observation_arrays(observation)
+
+
 def build_team_preview_observation(
     game_data: GameData,
     team_size: int,
     own_packed_team: str,
     opponent_packed_team: str,
 ) -> dict[str, np.ndarray]:
-    own_team = [
-        _init_team_preview_pokemon(
-            Pokemon(gen=game_data.gen, teambuilder=tb), own_team=True
+    observation = _copy_observation_arrays(
+        _cached_empty_team_preview_observation(game_data, team_size)
+    )
+    observation.update(
+        _copy_observation_arrays(
+            _cached_team_preview_side(
+                game_data,
+                team_size,
+                own_packed_team,
+                True,
+            )
         )
-        for tb in Teambuilder.parse_packed_team(own_packed_team)[:team_size]
-    ]
-    opponent_team = [
-        _init_team_preview_pokemon(
-            Pokemon(
-                gen=game_data.gen, species=_preview_visible_species(game_data.gen, tb)
-            ),
-            own_team=False,
+    )
+    observation.update(
+        _copy_observation_arrays(
+            _cached_team_preview_side(
+                game_data,
+                team_size,
+                opponent_packed_team,
+                False,
+            )
         )
-        for tb in Teambuilder.parse_packed_team(opponent_packed_team)[:team_size]
-    ]
-    battle = _SyntheticTeamPreviewBattle(own_team, opponent_team)
-    return ObservationBuilder(game_data, team_size).build(battle)
+    )
+    return observation
 
 
 def summarize_observation_mismatch(
