@@ -348,6 +348,16 @@ same 9,216 policy decisions, but the later policy incurs roughly twice as many
 terminal resets and team previews and supplies roughly twice as many terminal
 learning signals. Decision SPS therefore fell while battles per second rose.
 
+That does not explain the full throughput regression. The previous architecture
+averaged 70.98 wall SPS overall and 73.46 over its final 50 updates, with 1,585
+battles/update at 4.56 turns. The event-aware run averaged 55.65 SPS overall and
+55.56 over its final 50, with an almost identical 1,581 battles/update at 4.63
+turns. Isolated construction of the new history costs only about 31 microseconds
+per observation, and live-policy profiling attributes roughly 2.7 seconds per
+update to the broader event/belief architecture. Frozen-opponent inference and
+queue amplification account for more of the remaining gap than Python event
+construction itself.
+
 The clean efficiency target is the now-dominant reset/preview path. Team preview
 has no prior public events or submitted intent, so its recent-event vector is
 provably zero and the padded 12-step event GRU can be bypassed exactly on preview
