@@ -8,7 +8,7 @@ from pokerl.env.observation import (
 )
 from pokerl.training.aux_metrics import (
     hidden_info_belief_additive_metrics,
-    opponent_action_additive_metrics,
+    opponent_intent_additive_metrics,
 )
 from pokerl.training.ppo import PPOTrainer
 
@@ -150,38 +150,61 @@ def test_hidden_info_move_recall_excludes_all_revealed_targets() -> None:
     assert metrics["aux_move_unknown_recall_at_4_count"] == 0.0
 
 
-def test_opponent_action_metrics_report_each_raw_component() -> None:
+def test_opponent_intent_metrics_report_only_unforced_semantic_components() -> None:
     logits = {
-        "opp_a1_logits": torch.tensor([[0.0, 3.0, 1.0], [4.0, 0.0, 0.0]]),
-        "opp_a2_logits": torch.tensor([[3.0, 0.0, 0.0], [0.0, 1.0, 4.0]]),
-        "opp_tera_logits": torch.tensor([[0.0, 0.0, 2.0], [3.0, 0.0, 0.0]]),
+        "opp_intent_kind_logits": torch.tensor([[[0.0, 3.0, 1.0], [4.0, 0.0, 0.0]]]),
+        "opp_intent_move_logits": torch.tensor([[[3.0, 0.0, 0.0], [0.0, 1.0, 4.0]]]),
+        "opp_intent_target_logits": torch.zeros((1, 2, 5)),
+        "opp_intent_switch_species_logits": torch.zeros((1, 2, 6)),
+        "opp_intent_tera_use_logits": torch.tensor([[0.0, 2.0]]),
+        "opp_intent_tera_slot_logits": torch.tensor([[3.0, 0.0]]),
     }
-    labels = torch.tensor([[1, 0, 2], [-1, 1, 0]])
-    valid = torch.tensor([True, True])
+    slot_labels = torch.tensor([[[1, 0, -1, -1], [0, 2, -1, -1]]])
+    slot_masks = torch.tensor(
+        [[[True, False, False, False], [False, True, False, False]]]
+    )
+    tera_labels = torch.tensor([[1, 0]])
+    tera_masks = torch.tensor([[True, False]])
 
-    metrics = opponent_action_additive_metrics(logits, labels, valid)
+    metrics = opponent_intent_additive_metrics(
+        logits,
+        slot_labels,
+        slot_masks,
+        tera_labels,
+        tera_masks,
+    )
 
-    assert metrics == {
-        "opp_action_a1_top1_correct": 1.0,
-        "opp_action_a1_count": 1.0,
-        "opp_action_a2_top1_correct": 1.0,
-        "opp_action_a2_count": 2.0,
-        "opp_action_tera_top1_correct": 2.0,
-        "opp_action_tera_count": 2.0,
-    }
+    assert metrics["opp_intent_kind_top1_correct"] == 1.0
+    assert metrics["opp_intent_kind_count"] == 1.0
+    assert metrics["opp_intent_move_top1_correct"] == 1.0
+    assert metrics["opp_intent_move_count"] == 1.0
+    assert metrics["opp_intent_target_count"] == 0.0
+    assert metrics["opp_intent_switch_species_count"] == 0.0
+    assert metrics["opp_intent_tera_use_top1_correct"] == 1.0
+    assert metrics["opp_intent_tera_use_count"] == 1.0
+    assert metrics["opp_intent_tera_slot_count"] == 0.0
 
 
 def test_aux_metrics_reject_out_of_range_targets() -> None:
     logits = {
-        "opp_a1_logits": torch.zeros((1, 2)),
-        "opp_a2_logits": torch.zeros((1, 2)),
-        "opp_tera_logits": torch.zeros((1, 3)),
+        "opp_intent_kind_logits": torch.zeros((1, 2, 4)),
+        "opp_intent_move_logits": torch.zeros((1, 2, 2)),
+        "opp_intent_target_logits": torch.zeros((1, 2, 5)),
+        "opp_intent_switch_species_logits": torch.zeros((1, 2, 3)),
+        "opp_intent_tera_use_logits": torch.zeros((1, 2)),
+        "opp_intent_tera_slot_logits": torch.zeros((1, 2)),
     }
+    slot_labels = torch.tensor([[[1, 2, -1, -1], [1, -1, -1, -1]]])
+    slot_masks = torch.tensor(
+        [[[False, True, False, False], [False, False, False, False]]]
+    )
     with pytest.raises(ValueError, match="out-of-range"):
-        opponent_action_additive_metrics(
+        opponent_intent_additive_metrics(
             logits,
-            torch.tensor([[2, 0, 0]]),
-            torch.tensor([True]),
+            slot_labels,
+            slot_masks,
+            torch.tensor([[0, -1]]),
+            torch.tensor([[False, False]]),
         )
 
 
@@ -194,8 +217,10 @@ def test_ppo_finalizes_additive_belief_metrics_as_rates() -> None:
             "aux_item_unknown_brier_sum": 1.0,
             "aux_move_unknown_recall_at_4_correct": 5.0,
             "aux_move_unknown_recall_at_4_count": 8.0,
-            "opp_action_a1_top1_correct": 7.0,
-            "opp_action_a1_count": 10.0,
+            "opp_intent_move_top1_correct": 7.0,
+            "opp_intent_move_count": 10.0,
+            "opp_intent_move_nll_sum": 5.0,
+            "opp_intent_move_brier_sum": 2.5,
         }
     )
 
@@ -203,5 +228,7 @@ def test_ppo_finalizes_additive_belief_metrics_as_rates() -> None:
     assert metrics["aux_item_unknown_nll"] == pytest.approx(0.5)
     assert metrics["aux_item_unknown_brier"] == pytest.approx(0.25)
     assert metrics["aux_move_unknown_recall_at_4"] == pytest.approx(0.625)
-    assert metrics["opp_action_a1_top1_accuracy"] == pytest.approx(0.7)
+    assert metrics["opp_intent_move_top1_accuracy"] == pytest.approx(0.7)
+    assert metrics["opp_intent_move_nll"] == pytest.approx(0.5)
+    assert metrics["opp_intent_move_brier"] == pytest.approx(0.25)
     assert metrics["aux_ability_unknown_count"] == 0.0

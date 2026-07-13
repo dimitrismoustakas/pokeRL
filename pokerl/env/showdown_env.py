@@ -28,6 +28,7 @@ import numpy as np
 from poke_env import AccountConfiguration, LocalBattleStreamConfiguration
 from poke_env.battle import DoubleBattle
 from poke_env.concurrency import create_in_poke_loop
+from poke_env.data.normalize import to_id_str
 from poke_env.player import (
     BattleOrder,
     DoubleBattleOrder,
@@ -47,7 +48,18 @@ from .observation import (
 )
 from .team_preview import parse_team_preview_order
 from .actions import (
+    INTENT_MOVE,
+    INTENT_SWITCH,
+    NUM_SLOT_INTENT_COMPONENTS,
+    NUM_TERA_INTENT_COMPONENTS,
+    SLOT_INTENT_KIND,
+    SLOT_INTENT_MOVE,
+    SLOT_INTENT_SWITCH_SPECIES,
+    SLOT_INTENT_TARGET,
     SemanticActionIntent,
+    SemanticActionSupervision,
+    TERA_INTENT_SLOT,
+    TERA_INTENT_USE,
     TERA_NONE,
     action_to_order,
     build_legal_action_state,
@@ -55,6 +67,7 @@ from .actions import (
     decode_tera_choice,
     empty_action_masks,
     is_default_only_action_state,
+    semantic_action_request_key,
     semantic_action_intent,
 )
 from .rewards import sparse_reward
@@ -71,6 +84,69 @@ _DEFAULT_SHARED_BATTLES_PER_WORKER = 3
 _LOCAL_DISCONNECT_TIMEOUT_SECONDS = 30.0
 OpponentFactory = Callable[[asyncio.AbstractEventLoop], Player]
 TeamPairProvider = Callable[[], tuple[str | None, str | None]]
+
+
+def _encode_opponent_intent_supervision(
+    game_data: GameData,
+    supervision: SemanticActionSupervision,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Encode trainer-only semantic intent labels into global vocab indices."""
+    slot_labels = np.full(
+        (2, NUM_SLOT_INTENT_COMPONENTS),
+        fill_value=-1,
+        dtype=np.int64,
+    )
+    slot_masks = np.zeros((2, NUM_SLOT_INTENT_COMPONENTS), dtype=bool)
+
+    for slot, (intent, decision) in enumerate(
+        zip(
+            supervision.intent.slots,
+            supervision.decision_mask.slots,
+            strict=True,
+        )
+    ):
+        slot_labels[slot, SLOT_INTENT_KIND] = intent.kind
+        slot_masks[slot, SLOT_INTENT_KIND] = decision.kind
+        if intent.kind == INTENT_MOVE:
+            move_id = to_id_str(intent.move_id or "")
+            move_index = game_data.move_to_idx.get(move_id)
+            if move_index is None:
+                raise RuntimeError(
+                    f"Opponent intent move {move_id!r} is absent from GameData."
+                )
+            slot_labels[slot, SLOT_INTENT_MOVE] = move_index
+            slot_labels[slot, SLOT_INTENT_TARGET] = intent.target
+            slot_masks[slot, SLOT_INTENT_MOVE] = decision.move
+            slot_masks[slot, SLOT_INTENT_TARGET] = decision.target
+        elif intent.kind == INTENT_SWITCH:
+            species = to_id_str(intent.switch_species or "")
+            species_index = game_data.species_to_idx.get(species)
+            if species_index is None:
+                raise RuntimeError(
+                    f"Opponent switch species {species!r} is absent from GameData."
+                )
+            slot_labels[slot, SLOT_INTENT_SWITCH_SPECIES] = species_index
+            slot_masks[slot, SLOT_INTENT_SWITCH_SPECIES] = decision.switch_species
+
+    tera_used_slots = [
+        slot
+        for slot, intent in enumerate(supervision.intent.slots)
+        if intent.terastallize
+    ]
+    if len(tera_used_slots) > 1:
+        raise RuntimeError("A semantic opponent intent terastallized both slots.")
+    tera_labels = np.full(NUM_TERA_INTENT_COMPONENTS, -1, dtype=np.int64)
+    tera_labels[TERA_INTENT_USE] = int(bool(tera_used_slots))
+    if tera_used_slots:
+        tera_labels[TERA_INTENT_SLOT] = tera_used_slots[0]
+    tera_masks = np.array(
+        [
+            supervision.decision_mask.tera_use,
+            supervision.decision_mask.tera_slot,
+        ],
+        dtype=bool,
+    )
+    return slot_labels, slot_masks, tera_labels, tera_masks
 
 
 def showdown_log_level() -> int | None:
@@ -998,8 +1074,19 @@ class BattleEnv:
             self._episode_first_tera_turn = int(
                 getattr(getattr(self.player, "last_battle", None), "turn", 0)
             )
-        if hasattr(self.opponent, "_last_actions"):
-            self.opponent._last_actions = None
+        consume_opponent_intent = getattr(
+            self.opponent,
+            "consume_intent_supervision",
+            None,
+        )
+        opponent_intent_request_key = None
+        if callable(consume_opponent_intent):
+            pending_battle = getattr(self.player, "_pending_action_battle", None)
+            if pending_battle is None:
+                raise RuntimeError(
+                    "BattleEnv has no pending battle for opponent intent alignment."
+                )
+            opponent_intent_request_key = semantic_action_request_key(pending_battle)
         action_requested_at = getattr(self.player, "_pending_action_requested_at", None)
         if timing_enabled and action_requested_at is not None:
             self._timing.increment("env_agent_action_latency_calls")
@@ -1038,12 +1125,36 @@ class BattleEnv:
             "battle_turn": getattr(battle, "turn", 0),
         }
 
-        # Capture the opponent's most recent (a1, a2, tera) for the aux
-        # opponent-action head. Only LeaguePlayer exposes this; other opponents
-        # leave it None and the PPO update masks the sample.
-        opp_actions = getattr(self.opponent, "_last_actions", None)
-        if opp_actions is not None:
-            info["opp_actions"] = np.asarray(opp_actions, dtype=np.int64).copy()
+        # Semantic opponent intent is trainer-only supervision. It is attached
+        # to transition info after resolution and never enters observations or
+        # league inference. Non-league opponents leave it unavailable.
+        opponent_intent = None
+        if callable(consume_opponent_intent):
+            if opponent_intent_request_key is None:
+                raise RuntimeError(
+                    "BattleEnv omitted the opponent intent request identity."
+                )
+            request_resolved = done
+            if not request_resolved:
+                if battle is None:
+                    raise RuntimeError(
+                        "BattleEnv received a non-terminal observation without a battle."
+                    )
+                request_resolved = (
+                    semantic_action_request_key(battle) != opponent_intent_request_key
+                )
+            if request_resolved:
+                opponent_intent = consume_opponent_intent(opponent_intent_request_key)
+        if opponent_intent is not None:
+            (
+                info["opponent_intent_slot_labels"],
+                info["opponent_intent_slot_masks"],
+                info["opponent_intent_tera_labels"],
+                info["opponent_intent_tera_masks"],
+            ) = _encode_opponent_intent_supervision(
+                self.game_data,
+                opponent_intent,
+            )
         if done:
             if self._battle_started_at is not None:
                 info["episode_sec"] = time.perf_counter() - self._battle_started_at
@@ -1209,10 +1320,6 @@ class BattleEnv:
             if self._last_player_action is not None
             else None
         )
-        opponent_last_actions = getattr(self.opponent, "_last_actions", None)
-        if opponent_last_actions is not None:
-            opponent_last_actions = opponent_last_actions.tolist()
-
         return (
             f"battle_tag={getattr(battle, 'battle_tag', None)} "
             f"turn={getattr(battle, 'turn', None)} "
@@ -1221,7 +1328,6 @@ class BattleEnv:
             f"active={species_list(getattr(battle, 'active_pokemon', []))} "
             f"opponent_active={species_list(getattr(battle, 'opponent_active_pokemon', []))} "
             f"last_player_action={last_player_action} "
-            f"opponent_last_actions={opponent_last_actions} "
             f"request_moves={move_request_summary()} "
             f"valid_orders={valid_order_summary()}"
         )

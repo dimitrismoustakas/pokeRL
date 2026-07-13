@@ -22,6 +22,10 @@ import torch
 
 from pokerl.config import ModelConfig, EnvConfig, TrainingConfig
 from pokerl.data import GameData
+from pokerl.env.actions import (
+    NUM_SLOT_INTENT_COMPONENTS,
+    NUM_TERA_INTENT_COMPONENTS,
+)
 from pokerl.model.agent import PokeAgent
 from pokerl.env.showdown_env import (
     BattleEnv,
@@ -432,10 +436,13 @@ def parse_args() -> argparse.Namespace:
         help="Coefficient on the opponent hidden-info prediction loss (item/ability/tera/moves).",
     )
     parser.add_argument(
-        "--aux-opp-action-coef",
+        "--aux-opponent-intent-coef",
         type=float,
         default=None,
-        help="Coefficient on the opponent-action prediction loss (a1/a2/tera).",
+        help=(
+            "Coefficient on masked semantic opponent-intent prediction "
+            "(kind/move/target/switch/Tera)."
+        ),
     )
     parser.add_argument(
         "--diagnose-memory-gradients",
@@ -526,7 +533,7 @@ def build_configs(
         "tera_gate_entropy_coef": args.tera_gate_entropy_coef,
         "tera_slot_entropy_coef": args.tera_slot_entropy_coef,
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
-        "aux_opp_action_coef": args.aux_opp_action_coef,
+        "aux_opponent_intent_coef": args.aux_opponent_intent_coef,
         "diagnose_memory_gradients": args.diagnose_memory_gradients,
     }
     for field_name, value in overrides.items():
@@ -991,10 +998,26 @@ def collect_synchronous_rollout(
     mask_device_buffers: dict[str, torch.Tensor] | None = None
     rewards_device_buffer: torch.Tensor | None = None
     dones_device_buffer: torch.Tensor | None = None
-    opp_actions_np_buffer = np.empty((parallel_env.num_envs, 3), dtype=np.int64)
-    opp_actions_valid_np_buffer = np.empty(parallel_env.num_envs, dtype=bool)
-    opp_actions_device_buffer: torch.Tensor | None = None
-    opp_actions_valid_device_buffer: torch.Tensor | None = None
+    opponent_intent_slot_labels_np = np.empty(
+        (parallel_env.num_envs, 2, NUM_SLOT_INTENT_COMPONENTS),
+        dtype=np.int64,
+    )
+    opponent_intent_slot_masks_np = np.empty_like(
+        opponent_intent_slot_labels_np,
+        dtype=bool,
+    )
+    opponent_intent_tera_labels_np = np.empty(
+        (parallel_env.num_envs, NUM_TERA_INTENT_COMPONENTS),
+        dtype=np.int64,
+    )
+    opponent_intent_tera_masks_np = np.empty_like(
+        opponent_intent_tera_labels_np,
+        dtype=bool,
+    )
+    opponent_intent_slot_labels_device: torch.Tensor | None = None
+    opponent_intent_slot_masks_device: torch.Tensor | None = None
+    opponent_intent_tera_labels_device: torch.Tensor | None = None
+    opponent_intent_tera_masks_device: torch.Tensor | None = None
     aux_label_obs_device_buffers: dict[str, torch.Tensor] | None = None
 
     for _ in range(num_steps):
@@ -1066,28 +1089,64 @@ def collect_synchronous_rollout(
         rewards_device_buffer = rewards_t
         dones_device_buffer = dones_t
 
-        opp_actions_np_buffer.fill(-1)
-        opp_actions_valid_np_buffer.fill(False)
+        opponent_intent_slot_labels_np.fill(-1)
+        opponent_intent_slot_masks_np.fill(False)
+        opponent_intent_tera_labels_np.fill(-1)
+        opponent_intent_tera_masks_np.fill(False)
         for env_index, info in enumerate(infos):
-            opponent_actions = info.get("opp_actions")
-            if opponent_actions is not None:
-                opp_actions_np_buffer[env_index] = opponent_actions
-                opp_actions_valid_np_buffer[env_index] = True
+            slot_labels = info.get("opponent_intent_slot_labels")
+            if slot_labels is None:
+                continue
+            required_keys = {
+                "opponent_intent_slot_masks",
+                "opponent_intent_tera_labels",
+                "opponent_intent_tera_masks",
+            }
+            missing_keys = required_keys.difference(info)
+            if missing_keys:
+                raise RuntimeError(
+                    "Semantic opponent intent omitted keys: "
+                    + ", ".join(sorted(missing_keys))
+                )
+            opponent_intent_slot_labels_np[env_index] = slot_labels
+            opponent_intent_slot_masks_np[env_index] = info[
+                "opponent_intent_slot_masks"
+            ]
+            opponent_intent_tera_labels_np[env_index] = info[
+                "opponent_intent_tera_labels"
+            ]
+            opponent_intent_tera_masks_np[env_index] = info[
+                "opponent_intent_tera_masks"
+            ]
 
-        opp_actions_t = array_to_device(
-            opp_actions_np_buffer,
+        opponent_intent_slot_labels_t = array_to_device(
+            opponent_intent_slot_labels_np,
             device,
             dtype=torch.long,
-            buffer=opp_actions_device_buffer,
+            buffer=opponent_intent_slot_labels_device,
         )
-        opp_actions_valid_t = array_to_device(
-            opp_actions_valid_np_buffer,
+        opponent_intent_slot_masks_t = array_to_device(
+            opponent_intent_slot_masks_np,
             device,
             dtype=torch.bool,
-            buffer=opp_actions_valid_device_buffer,
+            buffer=opponent_intent_slot_masks_device,
         )
-        opp_actions_device_buffer = opp_actions_t
-        opp_actions_valid_device_buffer = opp_actions_valid_t
+        opponent_intent_tera_labels_t = array_to_device(
+            opponent_intent_tera_labels_np,
+            device,
+            dtype=torch.long,
+            buffer=opponent_intent_tera_labels_device,
+        )
+        opponent_intent_tera_masks_t = array_to_device(
+            opponent_intent_tera_masks_np,
+            device,
+            dtype=torch.bool,
+            buffer=opponent_intent_tera_masks_device,
+        )
+        opponent_intent_slot_labels_device = opponent_intent_slot_labels_t
+        opponent_intent_slot_masks_device = opponent_intent_slot_masks_t
+        opponent_intent_tera_labels_device = opponent_intent_tera_labels_t
+        opponent_intent_tera_masks_device = opponent_intent_tera_masks_t
 
         done_env_indices = np.flatnonzero(dones)
         aux_label_obs_t = None
@@ -1145,8 +1204,10 @@ def collect_synchronous_rollout(
             values_t,
             rewards_t,
             dones_t,
-            opp_actions=opp_actions_t,
-            opp_actions_valid=opp_actions_valid_t,
+            opponent_intent_slot_labels=opponent_intent_slot_labels_t,
+            opponent_intent_slot_masks=opponent_intent_slot_masks_t,
+            opponent_intent_tera_labels=opponent_intent_tera_labels_t,
+            opponent_intent_tera_masks=opponent_intent_tera_masks_t,
             aux_label_obs=aux_label_obs_t,
             done_env_indices=done_env_indices,
         )
@@ -1598,7 +1659,7 @@ def train():
             "tera_gate_entropy_coef": train_config.tera_gate_entropy_coef,
             "tera_slot_entropy_coef": train_config.tera_slot_entropy_coef,
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
-            "aux_opp_action_coef": train_config.aux_opp_action_coef,
+            "aux_opponent_intent_coef": train_config.aux_opponent_intent_coef,
             "diagnose_memory_gradients": train_config.diagnose_memory_gradients,
             "league_size": train_config.league_size,
             "league_update_interval": train_config.league_update_interval,

@@ -5,6 +5,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from ..env.actions import (
+    NUM_SLOT_INTENT_COMPONENTS,
+    NUM_TERA_INTENT_COMPONENTS,
+)
+
 
 @dataclass
 class RolloutBatch:
@@ -29,10 +34,12 @@ class RolloutBatch:
     # unselected Pokemon, and ambiguous identities leave aux_label_valid=False.
     aux_labels: dict[str, torch.Tensor]
     aux_label_valid: torch.Tensor  # (num_steps, num_envs, team_size) bool
-    # Observed opponent actions for the aux opponent-action head. Entries where
-    # the env did not expose them carry opp_actions_valid=False.
-    opp_actions: torch.Tensor  # (num_steps, num_envs, 3) long; -1 when invalid
-    opp_actions_valid: torch.Tensor  # (num_steps, num_envs) bool
+    # Trainer-only semantic opponent-intent targets. Component-specific masks
+    # exclude forced/default choices and unavailable conditional decisions.
+    opponent_intent_slot_labels: torch.Tensor  # (steps, envs, 2, 4) long
+    opponent_intent_slot_masks: torch.Tensor  # (steps, envs, 2, 4) bool
+    opponent_intent_tera_labels: torch.Tensor  # (steps, envs, 2) long
+    opponent_intent_tera_masks: torch.Tensor  # (steps, envs, 2) bool
     num_steps: int
     num_envs: int
     initial_hidden_h: torch.Tensor | None = None  # (num_envs, hidden_dim)
@@ -140,14 +147,27 @@ class RolloutBuffer:
             dtype=torch.bool,
             device=device,
         )
-        self._opp_actions = torch.full(
-            (num_steps, num_envs, 3),
+        self._opponent_intent_slot_labels = torch.full(
+            (num_steps, num_envs, 2, NUM_SLOT_INTENT_COMPONENTS),
             fill_value=-1,
             dtype=torch.long,
             device=device,
         )
-        self._opp_actions_valid = torch.zeros(
-            (num_steps, num_envs), dtype=torch.bool, device=device
+        self._opponent_intent_slot_masks = torch.zeros(
+            (num_steps, num_envs, 2, NUM_SLOT_INTENT_COMPONENTS),
+            dtype=torch.bool,
+            device=device,
+        )
+        self._opponent_intent_tera_labels = torch.full(
+            (num_steps, num_envs, NUM_TERA_INTENT_COMPONENTS),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+        self._opponent_intent_tera_masks = torch.zeros(
+            (num_steps, num_envs, NUM_TERA_INTENT_COMPONENTS),
+            dtype=torch.bool,
+            device=device,
         )
         # Tracks the timestep within the current rollout at which each env's
         # active episode began. Used to retroactively fill aux labels on done.
@@ -162,8 +182,10 @@ class RolloutBuffer:
         values: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
-        opp_actions: torch.Tensor | None = None,
-        opp_actions_valid: torch.Tensor | None = None,
+        opponent_intent_slot_labels: torch.Tensor | None = None,
+        opponent_intent_slot_masks: torch.Tensor | None = None,
+        opponent_intent_tera_labels: torch.Tensor | None = None,
+        opponent_intent_tera_masks: torch.Tensor | None = None,
         aux_label_obs: dict[str, torch.Tensor] | None = None,
         done_env_indices: np.ndarray | list[int] | tuple[int, ...] | None = None,
     ) -> None:
@@ -183,14 +205,30 @@ class RolloutBuffer:
         self._rewards[slot].copy_(rewards.detach())
         self._dones[slot].copy_(dones.detach())
 
-        if opp_actions is not None:
-            self._opp_actions[slot].copy_(opp_actions.detach())
+        if opponent_intent_slot_labels is not None:
+            self._opponent_intent_slot_labels[slot].copy_(
+                opponent_intent_slot_labels.detach()
+            )
         else:
-            self._opp_actions[slot].fill_(-1)
-        if opp_actions_valid is not None:
-            self._opp_actions_valid[slot].copy_(opp_actions_valid.detach())
+            self._opponent_intent_slot_labels[slot].fill_(-1)
+        if opponent_intent_slot_masks is not None:
+            self._opponent_intent_slot_masks[slot].copy_(
+                opponent_intent_slot_masks.detach()
+            )
         else:
-            self._opp_actions_valid[slot].fill_(False)
+            self._opponent_intent_slot_masks[slot].fill_(False)
+        if opponent_intent_tera_labels is not None:
+            self._opponent_intent_tera_labels[slot].copy_(
+                opponent_intent_tera_labels.detach()
+            )
+        else:
+            self._opponent_intent_tera_labels[slot].fill_(-1)
+        if opponent_intent_tera_masks is not None:
+            self._opponent_intent_tera_masks[slot].copy_(
+                opponent_intent_tera_masks.detach()
+            )
+        else:
+            self._opponent_intent_tera_masks[slot].fill_(False)
 
         # Retroactively fill aux labels for completed episodes. Terminal slots
         # are matched by their episode-local source index rather than output
@@ -329,8 +367,10 @@ class RolloutBuffer:
             returns=self._returns,
             aux_labels=self._aux_labels,
             aux_label_valid=self._aux_label_valid,
-            opp_actions=self._opp_actions,
-            opp_actions_valid=self._opp_actions_valid,
+            opponent_intent_slot_labels=self._opponent_intent_slot_labels,
+            opponent_intent_slot_masks=self._opponent_intent_slot_masks,
+            opponent_intent_tera_labels=self._opponent_intent_tera_labels,
+            opponent_intent_tera_masks=self._opponent_intent_tera_masks,
             num_steps=self.num_steps,
             num_envs=self.num_envs,
             initial_hidden_h=self._initial_hidden_h,
@@ -364,8 +404,10 @@ class RolloutBuffer:
         self._initial_hidden_c = None
         self._tera_exploration_prob = 0.0
         self._aux_label_valid.fill_(False)
-        self._opp_actions.fill_(-1)
-        self._opp_actions_valid.fill_(False)
+        self._opponent_intent_slot_labels.fill_(-1)
+        self._opponent_intent_slot_masks.fill_(False)
+        self._opponent_intent_tera_labels.fill_(-1)
+        self._opponent_intent_tera_masks.fill_(False)
         # New rollout starts a fresh episode-start tracker for every env.
         self._episode_start = [0] * self.num_envs
 

@@ -19,6 +19,7 @@ from pokerl.env.observation import (
 )
 from pokerl.model.heads import (
     ActionHead,
+    HiddenInfoHead,
     ValueHead,
     _sample_categorical_logits,
 )
@@ -340,12 +341,28 @@ class _TinyAgent(nn.Module):
         super().__init__()
         self.spatial = _TinySpatial()
         self.memory = IdentityMemory(input_dim=3, hidden_dim=3)
+        self.hidden_info_head = HiddenInfoHead(
+            pokemon_dim=2,
+            context_dim=3,
+            num_items=3,
+            num_abilities=3,
+            num_types=3,
+            num_moves=3,
+            hidden_dim=4,
+        )
         self.action_head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
         _install_fixed_tera_distribution(
             self.action_head,
             (-0.5, 1.5, 0.25),
         )
         self.value_head = ValueHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
+
+    def condition_opponent_reps(self, opp, opp_active, context):
+        residual = self.hidden_info_head.context_residual(context)
+        return (
+            self.hidden_info_head.encode_with_residual(opp, residual),
+            self.hidden_info_head.encode_with_residual(opp_active, residual),
+        )
 
     def forward(
         self,
@@ -357,6 +374,7 @@ class _TinyAgent(nn.Module):
     ):
         context, active, own, opp, opp_active = self.spatial(obs)
         context, hidden = self.memory(context, hidden)
+        opp, opp_active = self.condition_opponent_reps(opp, opp_active, context)
         own_bench_mask = (obs["own_roles"] != ROLE_BENCH) | obs["own_mask"]
         opp_bench_mask = (obs["opp_roles"] != ROLE_BENCH) | obs["opp_mask"]
         action_out = self.action_head(
@@ -473,7 +491,7 @@ def test_ppo_initial_ratio_is_one_under_rollout_behavior_policy() -> None:
             num_epochs=1,
             num_minibatches=1,
             aux_hidden_info_coef=0.0,
-            aux_opp_action_coef=0.0,
+            aux_opponent_intent_coef=0.0,
         ),
         device,
     )
@@ -539,7 +557,7 @@ def test_ppo_uses_separate_tera_gate_entropy_coefficient() -> None:
             tera_slot_entropy_coef=0.0,
             value_coef=0.0,
             aux_hidden_info_coef=0.0,
-            aux_opp_action_coef=0.0,
+            aux_opponent_intent_coef=0.0,
         ),
         device,
     )
@@ -602,7 +620,7 @@ def test_tera_slot_entropy_does_not_pressure_use_gate() -> None:
             tera_slot_entropy_coef=1.0,
             value_coef=0.0,
             aux_hidden_info_coef=0.0,
-            aux_opp_action_coef=0.0,
+            aux_opponent_intent_coef=0.0,
         ),
         device,
     )

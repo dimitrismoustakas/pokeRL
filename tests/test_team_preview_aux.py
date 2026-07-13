@@ -101,26 +101,40 @@ def test_hidden_info_loss_matches_dense_reference() -> None:
     assert torch.allclose(sparse_loss, dense_loss)
 
 
-def test_opponent_action_loss_averages_available_prediction_tasks() -> None:
+def test_opponent_intent_loss_averages_available_prediction_tasks() -> None:
     logits = {
-        "opp_a1_logits": torch.zeros((2, 2)),
-        "opp_a2_logits": torch.zeros((2, 4)),
-        "opp_tera_logits": torch.zeros((2, 3)),
+        "opp_intent_kind_logits": torch.zeros((2, 2, 4)),
+        "opp_intent_move_logits": torch.zeros((2, 2, 5)),
+        "opp_intent_target_logits": torch.zeros((2, 2, 3)),
+        "opp_intent_switch_species_logits": torch.zeros((2, 2, 7)),
+        "opp_intent_tera_use_logits": torch.zeros((2, 2)),
+        "opp_intent_tera_slot_logits": torch.zeros((2, 2)),
     }
-    labels = torch.tensor([[[0, 0, 0], [1, -1, 2]]])
-    valid = torch.tensor([[True, True]])
+    slot_labels = torch.tensor(
+        [[[[1, 2, 0, -1], [2, -1, -1, 3]], [[1, -1, -1, -1], [1, -1, -1, -1]]]]
+    )
+    slot_masks = torch.zeros_like(slot_labels, dtype=torch.bool)
+    slot_masks[0, 0, 0, :3] = True
+    slot_masks[0, 0, 1, 3] = True
+    tera_labels = torch.tensor([[[1, 0], [0, -1]]])
+    tera_masks = torch.tensor([[[True, True], [False, False]]])
 
-    loss = PPOTrainer._opp_action_loss(logits, labels, valid)
-
-    expected_a1 = torch.log(torch.tensor(2.0))
-    expected_a2 = torch.log(torch.tensor(4.0))
-    expected_tera = torch.log(torch.tensor(3.0))
-    assert loss == pytest.approx(
-        ((expected_a1 + expected_a2 + expected_tera) / 3).item()
+    loss = PPOTrainer._opponent_intent_loss(
+        logits,
+        slot_labels,
+        slot_masks,
+        tera_labels,
+        tera_masks,
     )
 
+    expected = (
+        sum(torch.log(torch.tensor(float(classes))) for classes in (4, 5, 3, 7, 2, 2))
+        / 6
+    )
+    assert loss == pytest.approx(expected.item())
 
-def test_hidden_info_context_adapter_is_initially_exactly_compatible() -> None:
+
+def test_policy_belief_adapter_is_initially_exactly_compatible() -> None:
     torch.manual_seed(11)
     head = HiddenInfoHead(
         pokemon_dim=4,
@@ -134,22 +148,28 @@ def test_hidden_info_context_adapter_is_initially_exactly_compatible() -> None:
     context = torch.randn(2, 6, requires_grad=True)
 
     spatial_only = head(opp_reps)
+    encoded = head.encode(opp_reps, context)
+    decoded = head.decode(encoded)
     conditioned = head(opp_reps, context)
 
-    assert torch.count_nonzero(head.context_adapter.weight) == 0
-    assert torch.count_nonzero(head.context_adapter.bias) == 0
+    assert torch.count_nonzero(head.policy_belief_adapter.weight) == 0
+    assert torch.count_nonzero(head.policy_belief_adapter.bias) == 0
+    assert torch.equal(encoded, opp_reps)
     for key in spatial_only:
+        assert torch.equal(decoded[key], conditioned[key])
         assert torch.equal(spatial_only[key], conditioned[key])
 
     initial_loss = sum(value.square().mean() for value in conditioned.values())
     initial_loss.backward()
-    assert head.context_adapter.weight.grad is not None
-    assert torch.count_nonzero(head.context_adapter.weight.grad) > 0
+    assert head.policy_belief_adapter.weight.grad is not None
+    assert torch.count_nonzero(head.policy_belief_adapter.weight.grad) > 0
     assert context.grad is not None
     assert torch.count_nonzero(context.grad) == 0
 
     with torch.no_grad():
-        head.context_adapter.weight.add_(-0.1 * head.context_adapter.weight.grad)
+        head.policy_belief_adapter.weight.add_(
+            -0.1 * head.policy_belief_adapter.weight.grad
+        )
     head.zero_grad(set_to_none=True)
     learned_context = context.detach().clone().requires_grad_(True)
     learned_loss = sum(
@@ -159,6 +179,24 @@ def test_hidden_info_context_adapter_is_initially_exactly_compatible() -> None:
 
     assert learned_context.grad is not None
     assert torch.count_nonzero(learned_context.grad) > 0
+
+
+def test_legacy_auxiliary_adapter_state_fails_strict_loading() -> None:
+    head = HiddenInfoHead(
+        pokemon_dim=4,
+        context_dim=6,
+        num_items=7,
+        num_abilities=5,
+        num_types=6,
+        num_moves=9,
+    )
+    legacy_state = {
+        key.replace("policy_belief_adapter", "context_adapter"): value
+        for key, value in head.state_dict().items()
+    }
+
+    with pytest.raises(RuntimeError, match="Missing key.*policy_belief_adapter"):
+        head.load_state_dict(legacy_state, strict=True)
 
 
 def test_hidden_info_coverage_reports_selected_slots_and_public_fraction() -> None:
@@ -194,7 +232,7 @@ def test_gradient_diagnostics_measure_norms_conflicts_and_preserve_graph() -> No
     objectives = {
         "actor": (parameter * torch.tensor([1.0, 0.0])).sum(),
         "value": (parameter * torch.tensor([0.0, 2.0])).sum(),
-        "opp_action": (parameter * torch.tensor([-1.0, 0.0])).sum(),
+        "opponent_intent": (parameter * torch.tensor([-1.0, 0.0])).sum(),
         "hidden_info": unrelated.square().sum(),
         "zero_connected": (parameter * 0.0).sum(),
     }
@@ -208,7 +246,7 @@ def test_gradient_diagnostics_measure_norms_conflicts_and_preserve_graph() -> No
 
     assert diagnostics["memory_grad_norm_actor"] == pytest.approx(1.0)
     assert diagnostics["memory_grad_norm_value"] == pytest.approx(2.0)
-    assert diagnostics["memory_grad_norm_opp_action"] == pytest.approx(1.0)
+    assert diagnostics["memory_grad_norm_opponent_intent"] == pytest.approx(1.0)
     assert diagnostics["memory_grad_norm_hidden_info"] == pytest.approx(0.0)
     assert diagnostics["memory_grad_connected_hidden_info"] == pytest.approx(0.0)
     assert diagnostics["memory_grad_nonzero_hidden_info"] == pytest.approx(0.0)
@@ -218,8 +256,8 @@ def test_gradient_diagnostics_measure_norms_conflicts_and_preserve_graph() -> No
     assert diagnostics["memory_grad_cancellation_fraction"] == pytest.approx(0.5)
     assert diagnostics["memory_grad_cos_actor_value"] == pytest.approx(0.0)
     assert diagnostics["memory_grad_cos_actor_value_valid"] == pytest.approx(1.0)
-    assert diagnostics["memory_grad_cos_actor_opp_action"] == pytest.approx(-1.0)
-    assert diagnostics["memory_grad_cos_value_opp_action"] == pytest.approx(0.0)
+    assert diagnostics["memory_grad_cos_actor_opponent_intent"] == pytest.approx(-1.0)
+    assert diagnostics["memory_grad_cos_value_opponent_intent"] == pytest.approx(0.0)
     assert diagnostics["memory_grad_cos_actor_hidden_info_valid"] == pytest.approx(0.0)
     assert torch.equal(parameter.grad, torch.tensor([0.0, 2.0]))
 

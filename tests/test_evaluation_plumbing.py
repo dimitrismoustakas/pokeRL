@@ -27,6 +27,14 @@ class _MemoryStub(nn.Module):
         return context, hidden
 
 
+class _BeliefStub(nn.Module):
+    def context_residual(self, context):
+        return torch.zeros((*context.shape[:-1], 2), device=context.device)
+
+    def encode_with_residual(self, opponent_reps, residual):
+        return opponent_reps + residual.unsqueeze(-2)
+
+
 class _RecordingActionHead(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -49,6 +57,7 @@ def test_poke_agent_forward_passes_greedy_to_action_head() -> None:
     nn.Module.__init__(agent)
     agent.spatial = _SpatialStub()
     agent.memory = _MemoryStub()
+    agent.hidden_info_head = _BeliefStub()
     action_head = _RecordingActionHead()
     agent.action_head = action_head
 

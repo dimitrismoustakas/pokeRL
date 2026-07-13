@@ -39,9 +39,9 @@ TARGET_OPPONENT_2 = 1
 TARGET_ALLY = 2
 TARGET_SELF = 3
 TARGET_NONE = 4
-SWITCH_OFFSET = NUM_MOVES * NUM_TARGETS        # 20
-PASS_ACTION = SWITCH_OFFSET + MAX_TEAM_SLOTS   # 26
-ACTIONS_PER_SLOT = PASS_ACTION + 1             # 27
+SWITCH_OFFSET = NUM_MOVES * NUM_TARGETS  # 20
+PASS_ACTION = SWITCH_OFFSET + MAX_TEAM_SLOTS  # 26
+ACTIONS_PER_SLOT = PASS_ACTION + 1  # 27
 NUM_TERA_CHOICES = 3
 TERA_NONE = 0
 TERA_SLOT_1 = 1
@@ -68,6 +68,15 @@ INTENT_MOVE = 2
 INTENT_SWITCH = 3
 NUM_INTENT_KINDS = 4
 
+SLOT_INTENT_KIND = 0
+SLOT_INTENT_MOVE = 1
+SLOT_INTENT_TARGET = 2
+SLOT_INTENT_SWITCH_SPECIES = 3
+NUM_SLOT_INTENT_COMPONENTS = 4
+TERA_INTENT_USE = 0
+TERA_INTENT_SLOT = 1
+NUM_TERA_INTENT_COMPONENTS = 2
+
 
 @dataclass(frozen=True)
 class SemanticSlotIntent:
@@ -85,6 +94,43 @@ class SemanticActionIntent:
     """The two policy-controlled slot choices submitted for one request."""
 
     slots: tuple[SemanticSlotIntent, SemanticSlotIntent]
+
+
+@dataclass(frozen=True)
+class SemanticSlotDecisionMask:
+    """Which semantic components represented a real choice for one slot."""
+
+    kind: bool
+    move: bool
+    target: bool
+    switch_species: bool
+
+
+@dataclass(frozen=True)
+class SemanticActionDecisionMask:
+    """Component-specific masks for trainer-only opponent supervision."""
+
+    slots: tuple[SemanticSlotDecisionMask, SemanticSlotDecisionMask]
+    tera_use: bool
+    tera_slot: bool
+
+
+@dataclass(frozen=True)
+class SemanticActionSupervision:
+    """Chosen semantic intent plus masks for non-forced decision components."""
+
+    intent: SemanticActionIntent
+    decision_mask: SemanticActionDecisionMask
+
+
+def semantic_action_request_key(battle: DoubleBattle) -> tuple[str, int]:
+    """Return poke-env's backend-independent decision-request identity."""
+    generation = getattr(battle, "request_generation", None)
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise RuntimeError(
+            "Semantic action supervision requires poke-env request_generation."
+        )
+    return str(getattr(battle, "battle_tag", "")), generation
 
 
 @dataclass(frozen=True)
@@ -126,42 +172,144 @@ def semantic_action_intent(
     if action.shape != (3,):
         raise ValueError("A semantic doubles intent requires action shape (3,).")
     tera_slots = decode_tera_choice(int(action[2]))
-    slots: list[SemanticSlotIntent] = []
-    for slot in range(2):
-        action_index = int(action[slot])
-        try:
-            order = action_state.slot_action_orders[slot][action_index]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"Action {action_index} is not legal for slot {slot}."
-            ) from exc
-        kind, _, target = decode_action(action_index)
-        if kind == "move":
-            if not isinstance(order, SingleBattleOrder) or not isinstance(
-                order.order, Move
-            ):
-                raise RuntimeError("A move action did not resolve to a Move order.")
-            slots.append(
-                SemanticSlotIntent(
-                    kind=INTENT_MOVE,
-                    move_id=order.order.id,
-                    target=target,
-                    terastallize=tera_slots[slot],
-                )
-            )
-        elif kind == "switch":
-            species = getattr(getattr(order, "order", None), "species", None)
-            if species is None:
-                raise RuntimeError("A switch action did not resolve to a Pokemon.")
-            slots.append(
-                SemanticSlotIntent(
-                    kind=INTENT_SWITCH,
-                    switch_species=str(species),
-                )
-            )
-        else:
-            slots.append(SemanticSlotIntent(kind=INTENT_PASS))
+    slots = [
+        _semantic_slot_intent(
+            action_state,
+            slot,
+            int(action[slot]),
+            terastallize=tera_slots[slot],
+        )
+        for slot in range(2)
+    ]
     return SemanticActionIntent(slots=(slots[0], slots[1]))
+
+
+def semantic_action_supervision(
+    action: np.ndarray,
+    action_state: LegalActionState,
+) -> SemanticActionSupervision:
+    """Resolve an action and mask semantic components that were forced.
+
+    The first slot is evaluated against every legal first action. The second
+    slot is evaluated against actions legal after the selected first action,
+    matching the policy's autoregressive decision order. Tera is split into a
+    use-now gate and a conditional slot choice.
+    """
+    action = np.asarray(action, dtype=np.int64)
+    if action.shape != (3,):
+        raise ValueError("Semantic action supervision requires action shape (3,).")
+
+    intent = semantic_action_intent(action, action_state)
+    first_action = int(action[0])
+    second_action = int(action[1])
+    if not action_state.joint_mask[FIRST_SLOT_MASK_ROW, first_action]:
+        raise RuntimeError("Selected first-slot action is absent from the joint mask.")
+    if not action_state.joint_mask[first_action + 1, second_action]:
+        raise RuntimeError(
+            "Selected second-slot action is absent from its conditional joint mask."
+        )
+
+    candidate_indices = (
+        np.flatnonzero(action_state.joint_mask[FIRST_SLOT_MASK_ROW]),
+        np.flatnonzero(action_state.joint_mask[first_action + 1]),
+    )
+    slot_masks: list[SemanticSlotDecisionMask] = []
+    for slot, indices in enumerate(candidate_indices):
+        candidates = [
+            _semantic_slot_intent(
+                action_state,
+                slot,
+                int(action_index),
+                terastallize=False,
+            )
+            for action_index in indices
+        ]
+        chosen = intent.slots[slot]
+        kinds = {candidate.kind for candidate in candidates}
+        move_ids = {
+            candidate.move_id
+            for candidate in candidates
+            if candidate.kind == INTENT_MOVE
+        }
+        chosen_move_targets = {
+            candidate.target
+            for candidate in candidates
+            if candidate.kind == INTENT_MOVE and candidate.move_id == chosen.move_id
+        }
+        switch_species = {
+            candidate.switch_species
+            for candidate in candidates
+            if candidate.kind == INTENT_SWITCH
+        }
+        slot_masks.append(
+            SemanticSlotDecisionMask(
+                kind=len(kinds) > 1,
+                move=chosen.kind == INTENT_MOVE and len(move_ids) > 1,
+                target=(chosen.kind == INTENT_MOVE and len(chosen_move_targets) > 1),
+                switch_species=(
+                    chosen.kind == INTENT_SWITCH and len(switch_species) > 1
+                ),
+            )
+        )
+
+    tera_mask = _build_tera_action_mask(
+        action_state.joint_mask,
+        action_state.can_tera,
+    )[first_action, second_action]
+    tera_choice = int(action[2])
+    if not tera_mask[tera_choice]:
+        raise RuntimeError("Selected Tera choice is absent from the legal Tera mask.")
+    legal_tera_choices = np.flatnonzero(tera_mask)
+    tera_use_options = {int(choice) != TERA_NONE for choice in legal_tera_choices}
+    tera_slot_options = {
+        int(choice) - 1 for choice in legal_tera_choices if choice != TERA_NONE
+    }
+    tera_used = tera_choice != TERA_NONE
+
+    return SemanticActionSupervision(
+        intent=intent,
+        decision_mask=SemanticActionDecisionMask(
+            slots=(slot_masks[0], slot_masks[1]),
+            tera_use=len(tera_use_options) > 1,
+            tera_slot=tera_used and len(tera_slot_options) > 1,
+        ),
+    )
+
+
+def _semantic_slot_intent(
+    action_state: LegalActionState,
+    slot: int,
+    action_index: int,
+    *,
+    terastallize: bool,
+) -> SemanticSlotIntent:
+    try:
+        order = action_state.slot_action_orders[slot][action_index]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Action {action_index} is not legal for slot {slot}."
+        ) from exc
+    kind, _, target = decode_action(action_index)
+    if kind == "move":
+        if not isinstance(order, SingleBattleOrder) or not isinstance(
+            order.order, Move
+        ):
+            raise RuntimeError("A move action did not resolve to a Move order.")
+        return SemanticSlotIntent(
+            kind=INTENT_MOVE,
+            move_id=order.order.id,
+            target=target,
+            terastallize=terastallize,
+        )
+    if kind == "switch":
+        species = getattr(getattr(order, "order", None), "species", None)
+        if species is None:
+            raise RuntimeError("A switch action did not resolve to a Pokemon.")
+        return SemanticSlotIntent(
+            kind=INTENT_SWITCH,
+            switch_species=str(species),
+        )
+    return SemanticSlotIntent(kind=INTENT_PASS)
 
 
 def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
@@ -278,14 +426,15 @@ def _build_joint_mask(
     legal_pairs[switch_actions, switch_actions] = False
     first_pass = slot_states[0].action_orders.get(PASS_ACTION)
     second_pass = slot_states[1].action_orders.get(PASS_ACTION)
-    if isinstance(first_pass, PassBattleOrder) and isinstance(second_pass, PassBattleOrder):
+    if isinstance(first_pass, PassBattleOrder) and isinstance(
+        second_pass, PassBattleOrder
+    ):
         legal_pairs[PASS_ACTION, PASS_ACTION] = False
 
     if not np.any(legal_pairs):
-        if (
-            set(slot_states[0].action_orders) == {PASS_ACTION}
-            and set(slot_states[1].action_orders) == {PASS_ACTION}
-        ):
+        if set(slot_states[0].action_orders) == {PASS_ACTION} and set(
+            slot_states[1].action_orders
+        ) == {PASS_ACTION}:
             legal_pairs[PASS_ACTION, PASS_ACTION] = True
         else:
             raise RuntimeError(
@@ -303,7 +452,9 @@ def _build_tera_action_mask(
     joint_mask: np.ndarray,
     can_tera: np.ndarray,
 ) -> np.ndarray:
-    tera_mask = np.zeros((ACTIONS_PER_SLOT, ACTIONS_PER_SLOT, NUM_TERA_CHOICES), dtype=bool)
+    tera_mask = np.zeros(
+        (ACTIONS_PER_SLOT, ACTIONS_PER_SLOT, NUM_TERA_CHOICES), dtype=bool
+    )
 
     for a1 in np.flatnonzero(joint_mask[FIRST_SLOT_MASK_ROW]):
         kind1, _, _ = decode_action(int(a1))
@@ -360,7 +511,9 @@ def action_to_order(
 def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionState:
     trapped = getattr(battle, "trapped", [False, False])
     force_switch = battle.force_switch
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder] = {}
+    action_orders: dict[
+        int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder
+    ] = {}
     mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
 
     if any(force_switch) and not force_switch[slot]:
@@ -396,7 +549,9 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
     active_pokemon = battle.active_pokemon[slot]
     if active_pokemon is not None and not force_switch[slot]:
         for move_idx, move in enumerate(battle.available_moves[slot]):
-            hydrated_move, target_locs = _request_aware_move_targets(move, active_pokemon, battle, slot)
+            hydrated_move, target_locs = _request_aware_move_targets(
+                move, active_pokemon, battle, slot
+            )
             for target_loc in target_locs:
                 target_idx = _showdown_target_to_index(target_loc, slot, battle)
                 action_idx = move_idx * NUM_TARGETS + target_idx
@@ -517,8 +672,12 @@ def _showdown_target_to_index(
     slot: int,
     battle: DoubleBattle,
 ) -> int:
-    ally_position = battle.POKEMON_2_POSITION if slot == 0 else battle.POKEMON_1_POSITION
-    self_position = battle.POKEMON_1_POSITION if slot == 0 else battle.POKEMON_2_POSITION
+    ally_position = (
+        battle.POKEMON_2_POSITION if slot == 0 else battle.POKEMON_1_POSITION
+    )
+    self_position = (
+        battle.POKEMON_1_POSITION if slot == 0 else battle.POKEMON_2_POSITION
+    )
 
     mapping = {
         battle.OPPONENT_1_POSITION: TARGET_OPPONENT_1,

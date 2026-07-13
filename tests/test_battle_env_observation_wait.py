@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import pokerl.env.showdown_env as showdown_env_module
 from pokerl.env.showdown_env import (
     BattleEnv,
     ShowdownPlayer,
@@ -181,6 +182,125 @@ def test_step_submits_action_to_matching_player_request() -> None:
     assert submitted[0][0] == 42
     np.testing.assert_array_equal(submitted[0][1], action)
     assert submitted[0][2] == 30.0
+
+
+def test_step_consumes_intent_for_submitted_generation_not_next_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = Future()
+    next_battle = SimpleNamespace(
+        battle_tag="battle-request",
+        turn=2,
+        request_generation=8,
+    )
+    queue = _ObservationQueue(({}, {}, 0.0, False, next_battle))
+    env = _make_step_env(queue, task)
+    env.game_data = object()
+    env._pending_player_request_id = 42
+    pending_battle = SimpleNamespace(
+        battle_tag="battle-request",
+        request_generation=7,
+    )
+    env.player._pending_action_battle = pending_battle
+    consumed = []
+    supervision = object()
+
+    def consume_intent(request_key):
+        consumed.append(request_key)
+        return supervision
+
+    env.opponent = SimpleNamespace(
+        consume_intent_supervision=consume_intent,
+    )
+
+    def submit_action(request_id, action, *, timeout=None):
+        assert request_id == 42
+        pending_battle.request_generation = 8
+
+    env.player.submit_action = submit_action
+    encoded = (
+        np.full((2, 4), 1, dtype=np.int64),
+        np.full((2, 4), True, dtype=bool),
+        np.full(2, 2, dtype=np.int64),
+        np.full(2, True, dtype=bool),
+    )
+    monkeypatch.setattr(
+        showdown_env_module,
+        "_encode_opponent_intent_supervision",
+        lambda game_data, value: encoded,
+    )
+
+    _obs, _mask, _reward, done, info = env.step(np.asarray([0, 0, 0], dtype=np.int64))
+
+    assert not done
+    assert consumed == [("battle-request", 7)]
+    assert info["opponent_intent_slot_labels"] is encoded[0]
+    assert info["opponent_intent_slot_masks"] is encoded[1]
+    assert info["opponent_intent_tera_labels"] is encoded[2]
+    assert info["opponent_intent_tera_masks"] is encoded[3]
+
+
+def test_step_keeps_intent_pending_across_same_generation_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = Future()
+    retry_battle = SimpleNamespace(
+        battle_tag="battle-retry",
+        turn=4,
+        request_generation=7,
+    )
+    resolved_battle = SimpleNamespace(
+        battle_tag="battle-retry",
+        turn=4,
+        request_generation=8,
+    )
+    queue = _ObservationQueue(
+        ({}, {}, 0.0, False, retry_battle),
+        ({}, {}, 0.0, False, resolved_battle),
+    )
+    env = _make_step_env(queue, task)
+    env.game_data = object()
+    env._pending_player_request_id = 42
+    env.player._pending_action_battle = retry_battle
+    consumed = []
+    supervision = object()
+
+    def consume_intent(request_key):
+        consumed.append(request_key)
+        return supervision
+
+    env.opponent = SimpleNamespace(
+        consume_intent_supervision=consume_intent,
+    )
+    env.player.submit_action = lambda request_id, action, timeout=None: None
+    encoded = (
+        np.full((2, 4), 1, dtype=np.int64),
+        np.full((2, 4), True, dtype=bool),
+        np.full(2, 2, dtype=np.int64),
+        np.full(2, True, dtype=bool),
+    )
+    monkeypatch.setattr(
+        showdown_env_module,
+        "_encode_opponent_intent_supervision",
+        lambda game_data, value: encoded,
+    )
+
+    _obs, _mask, _reward, done, retry_info = env.step(
+        np.asarray([0, 0, 0], dtype=np.int64)
+    )
+
+    assert not done
+    assert consumed == []
+    assert "opponent_intent_slot_labels" not in retry_info
+
+    env.player._pending_action_battle = retry_battle
+    _obs, _mask, _reward, done, resolved_info = env.step(
+        np.asarray([0, 0, 0], dtype=np.int64)
+    )
+
+    assert not done
+    assert consumed == [("battle-retry", 7)]
+    assert resolved_info["opponent_intent_slot_labels"] is encoded[0]
 
 
 def test_step_action_submit_timeout_includes_diagnostics() -> None:

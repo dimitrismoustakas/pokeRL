@@ -12,6 +12,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import TrainingConfig
+from ..env.actions import (
+    NUM_SLOT_INTENT_COMPONENTS,
+    NUM_TERA_INTENT_COMPONENTS,
+    SLOT_INTENT_KIND,
+    SLOT_INTENT_MOVE,
+    SLOT_INTENT_SWITCH_SPECIES,
+    SLOT_INTENT_TARGET,
+    TERA_INTENT_SLOT,
+    TERA_INTENT_USE,
+)
 from ..env.observation import (
     ABILITY_KNOWN_OFFSET,
     ITEM_KNOWN_OFFSET,
@@ -21,13 +31,13 @@ from ..env.observation import (
 from ..model.agent import PokeAgent
 from .aux_metrics import (
     hidden_info_belief_additive_metrics,
-    opponent_action_additive_metrics,
+    opponent_intent_additive_metrics,
 )
 from .rollout import RolloutBatch
 
 
 # Increment when trainer-checkpoint semantics or same-shaped model inputs change.
-TRAINER_CHECKPOINT_FORMAT_VERSION = 1
+TRAINER_CHECKPOINT_FORMAT_VERSION = 3
 
 
 def _qualified_type_name(value: object) -> str:
@@ -349,23 +359,31 @@ class PPOTrainer:
             aux_label_valid_all,
             obs_seq.get("opp_mask"),
         )
-        opp_actions_all = batch.opp_actions
-        opp_actions_valid_all = batch.opp_actions_valid
+        opponent_intent_slot_labels_all = batch.opponent_intent_slot_labels
+        opponent_intent_slot_masks_all = batch.opponent_intent_slot_masks
+        opponent_intent_tera_labels_all = batch.opponent_intent_tera_labels
+        opponent_intent_tera_masks_all = batch.opponent_intent_tera_masks
         hidden_info_enabled = (
             self.config.aux_hidden_info_coef != 0.0
             and bool(aux_labels_all)
             and hasattr(self.agent, "hidden_info_head")
             and hidden_info_coverage_metrics["aux_hidden_info_valid_selected_slots"] > 0
         )
-        opp_action_enabled = (
-            self.config.aux_opp_action_coef != 0.0
-            and hasattr(self.agent, "opponent_action_head")
-            and bool(opp_actions_valid_all.any().item())
+        opponent_intent_enabled = (
+            self.config.aux_opponent_intent_coef != 0.0
+            and hasattr(self.agent, "opponent_intent_head")
+            and bool(
+                opponent_intent_slot_masks_all.any().item()
+                or opponent_intent_tera_masks_all.any().item()
+            )
         )
         if hidden_info_enabled:
             metric_sums["aux_hidden_info_loss"] = torch.zeros((), device=self.device)
-        if opp_action_enabled:
-            metric_sums["aux_opp_action_loss"] = torch.zeros((), device=self.device)
+        if opponent_intent_enabled:
+            metric_sums["aux_opponent_intent_loss"] = torch.zeros(
+                (),
+                device=self.device,
+            )
 
         for epoch in range(self.config.num_epochs):
             env_order_cpu = torch.randperm(E, device="cpu")
@@ -436,6 +454,14 @@ class PPOTrainer:
                     hidden,
                     bptt_chunk_steps=self.config.bptt_chunk_steps,
                 )
+                (
+                    belief_opp_reps_seq_mb,
+                    belief_opp_active_reps_seq_mb,
+                ) = self.agent.condition_opponent_reps(
+                    opp_reps_seq_mb,
+                    opp_active_reps_seq_mb,
+                    ctx_seq_mb,
+                )
 
                 # The action and value heads are independent across timesteps.
                 # Chunking avoids many tiny GPU launches without evaluating the
@@ -461,10 +487,10 @@ class PPOTrainer:
                         own_reps_seq_mb.shape[2],
                         own_reps_seq_mb.shape[-1],
                     )
-                    opp_reps_flat = opp_reps_seq_mb[start:end].reshape(
+                    opp_reps_flat = belief_opp_reps_seq_mb[start:end].reshape(
                         flat_count,
-                        opp_reps_seq_mb.shape[2],
-                        opp_reps_seq_mb.shape[-1],
+                        belief_opp_reps_seq_mb.shape[2],
+                        belief_opp_reps_seq_mb.shape[-1],
                     )
                     opp_bench_mask_flat = opp_bench_mask_seq_mb[start:end].reshape(
                         flat_count,
@@ -481,10 +507,10 @@ class PPOTrainer:
                         own_reps_flat,
                         opp_reps_flat,
                         opp_bench_mask_flat,
-                        opp_active_reps_seq_mb[start:end].reshape(
+                        belief_opp_active_reps_seq_mb[start:end].reshape(
                             flat_count,
                             2,
-                            opp_active_reps_seq_mb.shape[-1],
+                            belief_opp_active_reps_seq_mb.shape[-1],
                         ),
                         {
                             key: value[start:end].reshape(flat_count, *value.shape[2:])
@@ -637,21 +663,20 @@ class PPOTrainer:
                 # --- Aux losses ---
                 # Hidden info: predict exact selected-team item/ability/
                 # tera-type/move-set from spatial reps plus recurrent belief
-                # state. Opp action: predict the opp's chosen (a1, a2, tera)
-                # using memory output plus both-side actives. Trainer-private
-                # labels come from the buffer's retroactive fill on done.
+                # state. Opponent intent: predict only non-forced semantic
+                # choices (kind/move/target/switch/Tera) from memory plus the
+                # public teams. Both target families remain trainer-private.
                 hidden_info_loss = None
-                opp_action_loss = None
+                opponent_intent_loss = None
                 hidden_info_out = None
-                opp_action_out = None
+                opponent_intent_out = None
                 if hidden_info_enabled:
                     aux_labels_mb = {
                         key: value[:, mb_envs] for key, value in aux_labels_all.items()
                     }
                     aux_label_valid_mb = aux_label_valid_all[:, mb_envs]
-                    hidden_info_out = self.agent.hidden_info_head(
-                        opp_reps_seq_mb,
-                        ctx_seq_mb,
+                    hidden_info_out = self.agent.hidden_info_head.decode(
+                        belief_opp_reps_seq_mb,
                     )
                     hidden_info_loss = self._hidden_info_loss(
                         logits=hidden_info_out,
@@ -660,20 +685,44 @@ class PPOTrainer:
                     )
                     loss = loss + self.config.aux_hidden_info_coef * hidden_info_loss
 
-                if opp_action_enabled:
-                    opp_action_out = self.agent.opponent_action_head(
+                if opponent_intent_enabled:
+                    opponent_intent_out = self.agent.opponent_intent_head(
                         ctx_seq_mb.reshape(T * E_mb, -1),
-                        opp_active_reps_seq_mb.reshape(T * E_mb, 2, -1),
+                        belief_opp_reps_seq_mb.reshape(
+                            T * E_mb,
+                            belief_opp_reps_seq_mb.shape[2],
+                            belief_opp_reps_seq_mb.shape[-1],
+                        ),
+                        belief_opp_active_reps_seq_mb.reshape(T * E_mb, 2, -1),
                         active_reps_seq_mb.reshape(T * E_mb, 2, -1),
+                        mb_obs_seq["opp_mask"].reshape(
+                            T * E_mb,
+                            mb_obs_seq["opp_mask"].shape[-1],
+                        ),
                     )
-                    opp_actions_mb = opp_actions_all[:, mb_envs]
-                    opp_actions_valid_mb = opp_actions_valid_all[:, mb_envs]
-                    opp_action_loss = self._opp_action_loss(
-                        logits=opp_action_out,
-                        labels=opp_actions_mb,
-                        valid=opp_actions_valid_mb,
+                    opponent_intent_slot_labels_mb = opponent_intent_slot_labels_all[
+                        :, mb_envs
+                    ]
+                    opponent_intent_slot_masks_mb = opponent_intent_slot_masks_all[
+                        :, mb_envs
+                    ]
+                    opponent_intent_tera_labels_mb = opponent_intent_tera_labels_all[
+                        :, mb_envs
+                    ]
+                    opponent_intent_tera_masks_mb = opponent_intent_tera_masks_all[
+                        :, mb_envs
+                    ]
+                    opponent_intent_loss = self._opponent_intent_loss(
+                        logits=opponent_intent_out,
+                        slot_labels=opponent_intent_slot_labels_mb,
+                        slot_masks=opponent_intent_slot_masks_mb,
+                        tera_labels=opponent_intent_tera_labels_mb,
+                        tera_masks=opponent_intent_tera_masks_mb,
                     )
-                    loss = loss + self.config.aux_opp_action_coef * opp_action_loss
+                    loss = (
+                        loss
+                        + self.config.aux_opponent_intent_coef * opponent_intent_loss
+                    )
 
                 pending_aux_diagnostics: dict[str, float] = {}
                 if epoch == self.config.num_epochs - 1:
@@ -686,15 +735,17 @@ class PPOTrainer:
                                 mb_obs_seq,
                             )
                         )
-                    if opp_action_out is not None:
+                    if opponent_intent_out is not None:
                         pending_aux_diagnostics.update(
-                            opponent_action_additive_metrics(
+                            opponent_intent_additive_metrics(
                                 {
-                                    key: value.reshape(T, E_mb, value.shape[-1])
-                                    for key, value in opp_action_out.items()
+                                    key: value.reshape(T, E_mb, *value.shape[1:])
+                                    for key, value in opponent_intent_out.items()
                                 },
-                                opp_actions_mb,
-                                opp_actions_valid_mb,
+                                opponent_intent_slot_labels_mb,
+                                opponent_intent_slot_masks_mb,
+                                opponent_intent_tera_labels_mb,
+                                opponent_intent_tera_masks_mb,
                             )
                         )
 
@@ -709,9 +760,14 @@ class PPOTrainer:
                     if hidden_info_loss is not None:
                         support_names.append("memory_grad_hidden_info_valid_slots")
                         support_tensors.append(aux_label_valid_mb.sum())
-                    if opp_action_loss is not None:
-                        support_names.append("memory_grad_opp_action_valid_steps")
-                        support_tensors.append(opp_actions_valid_mb.sum())
+                    if opponent_intent_loss is not None:
+                        support_names.append(
+                            "memory_grad_opponent_intent_valid_components"
+                        )
+                        support_tensors.append(
+                            opponent_intent_slot_masks_mb.sum()
+                            + opponent_intent_tera_masks_mb.sum()
+                        )
                     support_values = (
                         torch.stack(support_tensors).detach().to(device="cpu").tolist()
                         if support_tensors
@@ -733,9 +789,9 @@ class PPOTrainer:
                         objectives["hidden_info"] = (
                             self.config.aux_hidden_info_coef * hidden_info_loss
                         )
-                    if opp_action_loss is not None:
-                        objectives["opp_action"] = (
-                            self.config.aux_opp_action_coef * opp_action_loss
+                    if opponent_intent_loss is not None:
+                        objectives["opponent_intent"] = (
+                            self.config.aux_opponent_intent_coef * opponent_intent_loss
                         )
                     if all(value > 0 for value in support.values()):
                         pending_memory_diagnostics = self._gradient_diagnostics(
@@ -823,9 +879,9 @@ class PPOTrainer:
                         metric_sums["aux_hidden_info_loss"].add_(
                             hidden_info_loss.detach()
                         )
-                    if opp_action_enabled:
-                        metric_sums["aux_opp_action_loss"].add_(
-                            opp_action_loss.detach()
+                    if opponent_intent_enabled:
+                        metric_sums["aux_opponent_intent_loss"].add_(
+                            opponent_intent_loss.detach()
                         )
                 num_updates += 1
 
@@ -885,6 +941,11 @@ class PPOTrainer:
             averaged.update(hidden_info_coverage_metrics)
         averaged.update(self._finalize_aux_diagnostics(aux_diagnostic_sums))
         averaged.update(memory_gradient_diagnostics)
+        averaged["policy_belief_adapter_weight_norm"] = (
+            self.agent.hidden_info_head.policy_belief_adapter.weight.detach()
+            .norm()
+            .item()
+        )
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
@@ -913,13 +974,24 @@ class PPOTrainer:
             else 0.0
         )
 
-        for component in ("a1", "a2", "tera"):
-            prefix = f"opp_action_{component}"
+        for component in (
+            "kind",
+            "move",
+            "target",
+            "switch_species",
+            "tera_use",
+            "tera_slot",
+        ):
+            prefix = f"opp_intent_{component}"
             count = sums.get(f"{prefix}_count", 0.0)
             result[f"{prefix}_count"] = count
-            result[f"{prefix}_top1_accuracy"] = (
-                sums.get(f"{prefix}_top1_correct", 0.0) / count if count > 0.0 else 0.0
-            )
+            for source, target in (
+                ("top1_correct", "top1_accuracy"),
+                ("nll_sum", "nll"),
+                ("brier_sum", "brier"),
+            ):
+                numerator = sums.get(f"{prefix}_{source}", 0.0)
+                result[f"{prefix}_{target}"] = numerator / count if count > 0.0 else 0.0
         return result
 
     @staticmethod
@@ -1145,39 +1217,76 @@ class PPOTrainer:
         return torch.stack(component_losses).mean()
 
     @staticmethod
-    def _opp_action_loss(
+    def _opponent_intent_loss(
         logits: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        valid: torch.Tensor,
+        slot_labels: torch.Tensor,
+        slot_masks: torch.Tensor,
+        tera_labels: torch.Tensor,
+        tera_masks: torch.Tensor,
     ) -> torch.Tensor:
-        """Masked CE on opp a1 / a2 / tera using observed opponent actions."""
-        labels_flat = labels.reshape(-1, 3)
-        valid_flat = valid.reshape(-1)
-        a1_labels = labels_flat[:, 0]
-        a2_labels = labels_flat[:, 1]
-        tera_labels = labels_flat[:, 2]
-
-        a1_mask = valid_flat & (a1_labels >= 0)
-        a2_mask = valid_flat & (a2_labels >= 0)
-        tera_mask = valid_flat & (tera_labels >= 0)
+        """Average CE across available non-forced semantic intent tasks."""
+        if slot_labels.shape != slot_masks.shape or slot_labels.shape[-2:] != (
+            2,
+            NUM_SLOT_INTENT_COMPONENTS,
+        ):
+            raise ValueError(
+                "Opponent slot intent labels/masks must share shape (..., 2, 4)."
+            )
+        base_shape = slot_labels.shape[:-2]
+        expected_tera_shape = (*base_shape, NUM_TERA_INTENT_COMPONENTS)
+        if (
+            tera_labels.shape != expected_tera_shape
+            or tera_masks.shape != expected_tera_shape
+        ):
+            raise ValueError(
+                "Opponent Tera intent labels/masks must share shape (..., 2)."
+            )
 
         component_losses: list[torch.Tensor] = []
-        if a1_mask.any():
-            component_losses.append(
-                F.cross_entropy(logits["opp_a1_logits"][a1_mask], a1_labels[a1_mask])
+        for logits_key, component in (
+            ("opp_intent_kind_logits", SLOT_INTENT_KIND),
+            ("opp_intent_move_logits", SLOT_INTENT_MOVE),
+            ("opp_intent_target_logits", SLOT_INTENT_TARGET),
+            (
+                "opp_intent_switch_species_logits",
+                SLOT_INTENT_SWITCH_SPECIES,
+            ),
+        ):
+            component_logits = logits[logits_key]
+            component_mask = slot_masks[..., component].reshape(-1)
+            component_targets = slot_labels[..., component].reshape(-1)
+            component_logits = component_logits.reshape(
+                -1,
+                component_logits.shape[-1],
             )
-        if a2_mask.any():
-            component_losses.append(
-                F.cross_entropy(logits["opp_a2_logits"][a2_mask], a2_labels[a2_mask])
-            )
-        if tera_mask.any():
-            component_losses.append(
-                F.cross_entropy(
-                    logits["opp_tera_logits"][tera_mask], tera_labels[tera_mask]
+            if component_mask.any():
+                component_losses.append(
+                    F.cross_entropy(
+                        component_logits[component_mask],
+                        component_targets[component_mask],
+                    )
                 )
+
+        for logits_key, component in (
+            ("opp_intent_tera_use_logits", TERA_INTENT_USE),
+            ("opp_intent_tera_slot_logits", TERA_INTENT_SLOT),
+        ):
+            component_logits = logits[logits_key].reshape(
+                -1,
+                logits[logits_key].shape[-1],
             )
+            component_mask = tera_masks[..., component].reshape(-1)
+            component_targets = tera_labels[..., component].reshape(-1)
+            if component_mask.any():
+                component_losses.append(
+                    F.cross_entropy(
+                        component_logits[component_mask],
+                        component_targets[component_mask],
+                    )
+                )
+
         if not component_losses:
-            return logits["opp_a1_logits"].sum() * 0.0
+            return logits["opp_intent_kind_logits"].sum() * 0.0
         return torch.stack(component_losses).mean()
 
     def update_team_preview(

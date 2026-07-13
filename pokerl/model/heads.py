@@ -10,6 +10,7 @@ from ..env.actions import (
     ACTIONS_PER_SLOT,
     FIRST_SLOT_MASK_ROW,
     MAX_TEAM_SLOTS,
+    NUM_INTENT_KINDS,
     NUM_MOVES,
     NUM_TARGETS,
     NUM_TERA_CHOICES,
@@ -595,8 +596,7 @@ class ActionHead(nn.Module):
         )
 
         gate_entropy = -(
-            gate_wait_prob * gate_wait_log_prob
-            + gate_use_prob * gate_use_log_prob
+            gate_wait_prob * gate_wait_log_prob + gate_use_prob * gate_use_log_prob
         )
         gate_entropy = gate_entropy * has_real_choice.to(gate_entropy.dtype)
         slot_entropy = -torch.where(
@@ -1633,13 +1633,13 @@ class _ZeroInitializedLinear(nn.Linear):
 
 
 class HiddenInfoHead(nn.Module):
-    """Predict trainer-only opponent attributes from spatial and recurrent state.
+    """Encode compact beliefs and decode trainer-only opponent attributes.
 
-    These heads run only during PPO updates and never expose their predictions
-    or exact packed-team labels to policy inference. A zero-initialized
-    residual adapter adds recurrent context to every opponent representation;
-    its initial outputs therefore exactly match the spatial-only head while
-    later updates can train temporal belief features through memory.
+    The compact residual encoder consumes only public spatial and recurrent
+    state and is therefore safe for policy inference. Full attribute decoders
+    run only during PPO updates; neither their predictions nor exact packed-team
+    labels enter the policy. The zero-initialized adapter initially preserves
+    the spatial opponent representations exactly.
     """
 
     def __init__(
@@ -1653,7 +1653,7 @@ class HiddenInfoHead(nn.Module):
         hidden_dim: int = 128,
     ):
         super().__init__()
-        self.context_adapter = _ZeroInitializedLinear(context_dim, pokemon_dim)
+        self.policy_belief_adapter = _ZeroInitializedLinear(context_dim, pokemon_dim)
         self.item_mlp = nn.Sequential(
             nn.Linear(pokemon_dim, hidden_dim),
             nn.ReLU(),
@@ -1675,74 +1675,145 @@ class HiddenInfoHead(nn.Module):
             nn.Linear(hidden_dim, num_moves),
         )
 
+    def encode(
+        self,
+        opp_reps: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the public recurrent belief residual to each opponent slot."""
+        return self.encode_with_residual(
+            opp_reps,
+            self.context_residual(context),
+        )
+
+    def context_residual(self, context: torch.Tensor) -> torch.Tensor:
+        """Project public recurrent context once for one or more slot groups."""
+        return self.policy_belief_adapter(context)
+
+    @staticmethod
+    def encode_with_residual(
+        opp_reps: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Broadcast one precomputed belief residual across opponent slots."""
+        if residual.shape[:-1] != opp_reps.shape[:-2]:
+            raise ValueError(
+                "Hidden-info residual must match every opponent-representation "
+                "batch/sequence dimension."
+            )
+        if residual.shape[-1] != opp_reps.shape[-1]:
+            raise ValueError(
+                "Hidden-info residual width must match opponent representations."
+            )
+        return opp_reps + residual.unsqueeze(-2)
+
+    def decode(self, belief_reps: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Decode trainer-supervised attributes from compact belief features."""
+        return {
+            "item_logits": self.item_mlp(belief_reps),
+            "ability_logits": self.ability_mlp(belief_reps),
+            "tera_type_logits": self.tera_type_mlp(belief_reps),
+            "move_logits": self.move_mlp(belief_reps),
+        }
+
     def forward(
         self,
         opp_reps: torch.Tensor,
         context: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        if context is not None:
-            if context.shape[:-1] != opp_reps.shape[:-2]:
-                raise ValueError(
-                    "Hidden-info context must match every opponent-representation "
-                    "batch/sequence dimension."
-                )
-            opp_reps = opp_reps + self.context_adapter(context).unsqueeze(-2)
-        return {
-            "item_logits": self.item_mlp(opp_reps),
-            "ability_logits": self.ability_mlp(opp_reps),
-            "tera_type_logits": self.tera_type_mlp(opp_reps),
-            "move_logits": self.move_mlp(opp_reps),
-        }
+        belief_reps = opp_reps if context is None else self.encode(opp_reps, context)
+        return self.decode(belief_reps)
 
 
-class OpponentActionHead(nn.Module):
-    """Predicts the opponent's joint (a1, a2, tera) action for the current turn.
+class OpponentIntentHead(nn.Module):
+    """Predict trainer-only semantic opponent decisions.
 
-    Factorized as three independent categorical distributions for simplicity;
-    the autoregressive form can be introduced in commit 5 if Option B's
-    expectation over opp actions requires it. Labels come from the opponent's
-    actually-chosen actions captured in the env.
+    Request-local action indices are deliberately absent. Each opponent slot
+    predicts action kind, global move identity, semantic target, and switch
+    species. Tera is factorized into use-now and conditional slot decisions.
+    The head runs only during PPO updates; its labels and logits never enter
+    observations or rollout inference.
     """
 
     def __init__(
         self,
         context_dim: int,
         pokemon_dim: int,
-        num_actions: int,
-        num_tera_choices: int,
+        num_moves: int,
+        num_species: int,
         hidden_dim: int = 256,
     ):
         super().__init__()
-        self.query = nn.Sequential(
+        self.slot_query = nn.Sequential(
             nn.Linear(context_dim + pokemon_dim * 4, hidden_dim),
             nn.ReLU(),
         )
-        self.a1_head = nn.Linear(hidden_dim, num_actions)
-        self.a2_head = nn.Linear(hidden_dim, num_actions)
-        self.tera_head = nn.Linear(hidden_dim, num_tera_choices)
+        self.opponent_team_attention = MaskedSetAttention(
+            hidden_dim,
+            pokemon_dim,
+            hidden_dim,
+        )
+        self.slot_fuse = nn.Sequential(
+            nn.Linear(hidden_dim + pokemon_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.kind_head = nn.Linear(hidden_dim, NUM_INTENT_KINDS)
+        self.move_head = nn.Linear(hidden_dim, num_moves)
+        self.target_head = nn.Linear(hidden_dim, NUM_TARGETS)
+        self.switch_species_head = nn.Linear(hidden_dim, num_species)
+        self.tera_query = nn.Sequential(
+            nn.Linear(context_dim + hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+        )
+        self.tera_use_head = nn.Linear(hidden_dim, 2)
+        self.tera_slot_score = nn.Linear(hidden_dim, 1)
 
     def forward(
         self,
         context: torch.Tensor,
+        opp_team_reps: torch.Tensor,
         opp_active_reps: torch.Tensor,
         own_active_reps: torch.Tensor,
+        opp_team_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        query = self.query(
+        if opp_active_reps.shape[-2] != 2 or own_active_reps.shape[-2] != 2:
+            raise ValueError("Opponent intent requires two active slots per side.")
+        context_slots = context.unsqueeze(-2).expand(-1, 2, -1)
+        opponent_partner_reps = opp_active_reps.flip(dims=(-2,))
+        own_first = own_active_reps[:, :1].expand(-1, 2, -1)
+        own_second = own_active_reps[:, 1:].expand(-1, 2, -1)
+        base_slot_query = self.slot_query(
             torch.cat(
                 [
-                    context,
-                    opp_active_reps[:, 0],
-                    opp_active_reps[:, 1],
-                    own_active_reps[:, 0],
-                    own_active_reps[:, 1],
+                    context_slots,
+                    opp_active_reps,
+                    opponent_partner_reps,
+                    own_first,
+                    own_second,
                 ],
                 dim=-1,
             )
         )
+        opponent_team_summary = self.opponent_team_attention(
+            base_slot_query,
+            opp_team_reps,
+            opp_team_mask,
+        )
+        slot_latent = self.slot_fuse(
+            torch.cat([base_slot_query, opponent_team_summary], dim=-1)
+        )
+        tera_latent = self.tera_query(
+            torch.cat([context, slot_latent.flatten(start_dim=1)], dim=-1)
+        )
         return {
-            "opp_a1_logits": self.a1_head(query),
-            "opp_a2_logits": self.a2_head(query),
-            "opp_tera_logits": self.tera_head(query),
+            "opp_intent_kind_logits": self.kind_head(slot_latent),
+            "opp_intent_move_logits": self.move_head(slot_latent),
+            "opp_intent_target_logits": self.target_head(slot_latent),
+            "opp_intent_switch_species_logits": self.switch_species_head(slot_latent),
+            "opp_intent_tera_use_logits": self.tera_use_head(tera_latent),
+            "opp_intent_tera_slot_logits": self.tera_slot_score(slot_latent).squeeze(
+                -1
+            ),
         }
 
 

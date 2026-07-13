@@ -1,7 +1,5 @@
 """Full agent: spatial encoder -> memory -> action/value heads."""
 
-from collections.abc import Mapping
-
 import torch
 import torch.nn as nn
 
@@ -13,11 +11,7 @@ from ..env.observation import (
     NUM_EVENT_POSITIONS,
     ROLE_BENCH,
 )
-from ..env.actions import (
-    ACTIONS_PER_SLOT,
-    NUM_INTENT_KINDS,
-    NUM_TERA_CHOICES,
-)
+from ..env.actions import NUM_INTENT_KINDS
 from .encoders import (
     FieldEncoder,
     PokemonEncoder,
@@ -29,35 +23,11 @@ from .memory import build_memory
 from .heads import (
     ActionHead,
     HiddenInfoHead,
-    OpponentActionHead,
+    OpponentIntentHead,
     OpponentPreviewHead,
     TeamPreviewHead,
     ValueHead,
 )
-
-
-def load_state_dict_compatible(
-    module: nn.Module,
-    state_dict: Mapping[str, torch.Tensor],
-) -> dict[str, tuple[str, ...]]:
-    """Load the compatible subset of a checkpoint state dict into a module."""
-    current_state = module.state_dict()
-    compatible_state: dict[str, torch.Tensor] = {}
-    skipped_keys: list[str] = []
-
-    for key, value in state_dict.items():
-        current_value = current_state.get(key)
-        if current_value is None or current_value.shape != value.shape:
-            skipped_keys.append(key)
-            continue
-        compatible_state[key] = value
-
-    result = module.load_state_dict(compatible_state, strict=False)
-    return {
-        "missing_keys": tuple(sorted(result.missing_keys)),
-        "skipped_keys": tuple(sorted(skipped_keys)),
-        "unexpected_keys": tuple(sorted(result.unexpected_keys)),
-    }
 
 
 class PokeAgent(nn.Module):
@@ -157,11 +127,11 @@ class PokeAgent(nn.Module):
             num_types=game_data.num_types,
             num_moves=game_data.num_moves,
         )
-        self.opponent_action_head = OpponentActionHead(
+        self.opponent_intent_head = OpponentIntentHead(
             context_dim=memory_out,
             pokemon_dim=config.pokemon_out,
-            num_actions=ACTIONS_PER_SLOT,
-            num_tera_choices=NUM_TERA_CHOICES,
+            num_moves=game_data.num_moves,
+            num_species=game_data.num_species,
         )
 
         # Optional: stat-based embedding init
@@ -210,15 +180,20 @@ class PokeAgent(nn.Module):
         """
         context, active_reps, own_reps, opp_reps, opp_active_reps = self.spatial(obs)
         context, new_hidden = self.memory(context, hidden)
+        belief_opp_reps, belief_opp_active_reps = self.condition_opponent_reps(
+            opp_reps,
+            opp_active_reps,
+            context,
+        )
         opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
 
         action_out = self.action_head(
             context,
             active_reps,
             own_reps,
-            opp_reps,
+            belief_opp_reps,
             opp_bench_mask,
-            opp_active_reps,
+            belief_opp_active_reps,
             action_masks,
             actions,
             greedy=greedy,
@@ -237,7 +212,7 @@ class PokeAgent(nn.Module):
             result["value"] = self.value_head(
                 context,
                 own_reps,
-                opp_reps,
+                belief_opp_reps,
                 own_bench_mask,
                 opp_bench_mask,
             )
@@ -300,10 +275,15 @@ class PokeAgent(nn.Module):
         """Just the value estimate, for GAE computation."""
         context, _, own_reps, opp_reps, _ = self.spatial(obs)
         context, _ = self.memory(context, hidden)
+        belief_opp_reps = self.hidden_info_head.encode(opp_reps, context)
         own_bench_mask = self._bench_mask(obs.get("own_mask"), obs["own_roles"])
         opp_bench_mask = self._bench_mask(obs.get("opp_mask"), obs["opp_roles"])
         return self.value_head(
-            context, own_reps, opp_reps, own_bench_mask, opp_bench_mask
+            context,
+            own_reps,
+            belief_opp_reps,
+            own_bench_mask,
+            opp_bench_mask,
         )
 
     def get_preview_value(
@@ -325,6 +305,19 @@ class PokeAgent(nn.Module):
 
     def initial_hidden(self, batch_size: int):
         return self.memory.initial_hidden(batch_size)
+
+    def condition_opponent_reps(
+        self,
+        opp_reps: torch.Tensor,
+        opp_active_reps: torch.Tensor,
+        context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse public recurrent belief state into opponent representations."""
+        residual = self.hidden_info_head.context_residual(context)
+        return (
+            self.hidden_info_head.encode_with_residual(opp_reps, residual),
+            self.hidden_info_head.encode_with_residual(opp_active_reps, residual),
+        )
 
     @staticmethod
     def _bench_mask(mask: torch.Tensor | None, roles: torch.Tensor) -> torch.Tensor:

@@ -10,7 +10,7 @@ from contextlib import nullcontext
 from concurrent.futures import CancelledError, Future, InvalidStateError
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Condition, Thread
+from threading import Condition, Lock, Thread
 
 import numpy as np
 import torch
@@ -26,15 +26,15 @@ from ..env.observation import (
     summarize_observation_mismatch,
 )
 from ..env.actions import (
-    PASS_ACTION,
     SemanticActionIntent,
-    TERA_NONE,
+    SemanticActionSupervision,
     action_to_order,
     build_legal_action_state,
     build_policy_action_masks,
     decode_tera_choice,
     is_default_only_action_state,
-    semantic_action_intent,
+    semantic_action_request_key,
+    semantic_action_supervision,
 )
 from ..env.showdown_env import (
     _NoopBattleOrder,
@@ -1207,9 +1207,15 @@ class LeaguePlayer(Player):
         self._prepared_preview_future: Future | None = None
         self._prepared_preview_started_at: float | None = None
         self._timing = None
-        # Most-recent (a1, a2, tera) chosen by this opponent. Read by the env
-        # after each turn resolves so the aux opponent-action head has labels.
-        self._last_actions: np.ndarray | None = None
+        # Trainer-only semantic decisions are keyed by poke-env's normalized
+        # battle-local request generation so the synchronous env cannot race a
+        # concurrently prepared next request. This works for both direct
+        # BattleStream and websocket battles without server-only rqids.
+        self._intent_supervision_lock = Lock()
+        self._intent_supervision_by_request: dict[
+            tuple[str, int], SemanticActionSupervision | None
+        ] = {}
+        self._consumed_intent_requests: set[tuple[str, int]] = set()
         self._committed_intent: SemanticActionIntent | None = None
         self._pending_intent: SemanticActionIntent | None = None
 
@@ -1271,6 +1277,7 @@ class LeaguePlayer(Player):
             choice_started = time.perf_counter()
             key_started = time.perf_counter()
         decision_key = self._decision_key(battle)
+        intent_request_key = semantic_action_request_key(battle)
         if timing_enabled:
             self._add_timing(
                 "opponent_decision_key_sec", time.perf_counter() - key_started
@@ -1310,10 +1317,7 @@ class LeaguePlayer(Player):
                 self._pending_hidden = self._hidden
                 self._pending_intent = None
                 self._pending_order = result
-                self._last_actions = np.asarray(
-                    [PASS_ACTION, PASS_ACTION, TERA_NONE],
-                    dtype=np.int64,
-                )
+                self._record_intent_supervision(intent_request_key, None)
                 if timing_enabled:
                     self._increment_timing("opponent_default_only_requests")
                     self._add_timing(
@@ -1381,8 +1385,9 @@ class LeaguePlayer(Player):
             )
         self._pending_decision_key = decision_key
         self._pending_hidden = next_hidden
-        self._pending_intent = semantic_action_intent(actions, action_state)
-        self._last_actions = np.asarray(actions, dtype=np.int64).copy()
+        supervision = semantic_action_supervision(actions, action_state)
+        self._pending_intent = supervision.intent
+        self._record_intent_supervision(intent_request_key, supervision)
 
         if timing_enabled:
             order_started = time.perf_counter()
@@ -1485,9 +1490,47 @@ class LeaguePlayer(Player):
         self._pending_action_future = None
         self._pending_action_battle = None
         self._pending_action_started_at = None
-        self._last_actions = None
+        with self._intent_supervision_lock:
+            self._intent_supervision_by_request.clear()
+            self._consumed_intent_requests.clear()
         self._committed_intent = None
         self._pending_intent = None
+
+    def consume_intent_supervision(
+        self,
+        request_key: tuple[str, int],
+    ) -> SemanticActionSupervision | None:
+        """Consume exactly one trainer-only label for a Showdown request.
+
+        A missing entry is an explicit no-decision result: poke-env bypasses
+        ``choose_move`` for ``wait`` requests. Consumed state identities are
+        retained until the episode reset so accidental double consumption or
+        a late producer is surfaced instead of falling back to newer state.
+        """
+        with self._intent_supervision_lock:
+            if request_key in self._consumed_intent_requests:
+                raise RuntimeError(
+                    "Opponent intent supervision was consumed twice for "
+                    f"request {request_key!r}."
+                )
+            self._consumed_intent_requests.add(request_key)
+            return self._intent_supervision_by_request.pop(request_key, None)
+
+    def _record_intent_supervision(
+        self,
+        request_key: tuple[str, int],
+        supervision: SemanticActionSupervision | None,
+    ) -> None:
+        with self._intent_supervision_lock:
+            if request_key in self._consumed_intent_requests:
+                raise RuntimeError(
+                    "Opponent intent supervision arrived after request "
+                    f"{request_key!r} was consumed."
+                )
+            # Hidden-trap and invalid-choice retries can request a replacement
+            # decision without changing public state. Keep the final attempted
+            # decision until that state is resolved and consumed.
+            self._intent_supervision_by_request[request_key] = supervision
 
     def describe_pending_inference(self) -> str:
         now = time.perf_counter()
@@ -1567,6 +1610,7 @@ class LeaguePlayer(Player):
     def _decision_key(cls, battle: DoubleBattle) -> tuple[object, ...]:
         return (
             getattr(battle, "battle_tag", ""),
+            int(getattr(battle, "request_generation", 0)),
             int(getattr(battle, "turn", 0)),
             cls._request_decision_signature(getattr(battle, "last_request", None)),
             cls._simple_decision_tuple(getattr(battle, "force_switch", None)),

@@ -1,7 +1,7 @@
 import asyncio
 import copy
 from concurrent.futures import Future
-from threading import Thread
+from threading import Lock, Thread
 from types import SimpleNamespace
 
 import numpy as np
@@ -39,10 +39,12 @@ from pokerl.env.observation import (
 )
 from pokerl.model.heads import (
     ActionHead,
+    HiddenInfoHead,
     MaskedSetAttention,
     TeamPreviewHead,
     ValueHead,
 )
+from pokerl.model.agent import PokeAgent
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
 from pokerl.training.ppo import PPOTrainer
@@ -52,6 +54,12 @@ from poke_env.battle import Move, Pokemon
 from poke_env.battle.move import SPECIAL_MOVES
 from poke_env.battle.target import Target
 from poke_env.player import PassBattleOrder
+
+
+def _initialize_intent_mailbox(player: LeaguePlayer) -> None:
+    player._intent_supervision_lock = Lock()
+    player._intent_supervision_by_request = {}
+    player._consumed_intent_requests = set()
 
 
 def _obs(step: int, num_envs: int) -> dict[str, np.ndarray]:
@@ -204,7 +212,10 @@ def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidd
     assert torch.equal(batch.initial_hidden_c, expected_c)
     assert batch.aux_labels == {}
     assert not batch.aux_label_valid.any()
-    assert not batch.opp_actions_valid.any()
+    assert not batch.opponent_intent_slot_masks.any()
+    assert not batch.opponent_intent_tera_masks.any()
+    assert torch.all(batch.opponent_intent_slot_labels == -1)
+    assert torch.all(batch.opponent_intent_tera_labels == -1)
 
 
 def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> None:
@@ -417,45 +428,32 @@ class _DummySpatial(nn.Module):
         return context, active, team, opp_team, opp_active
 
 
-class _DummyAgent(nn.Module):
+class _DummyAgent(PokeAgent):
     def __init__(self) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         self.spatial = _DummySpatial()
         self.memory = IdentityMemory(input_dim=3, hidden_dim=3)
+        self.hidden_info_head = HiddenInfoHead(
+            pokemon_dim=2,
+            context_dim=3,
+            num_items=3,
+            num_abilities=3,
+            num_types=3,
+            num_moves=3,
+            hidden_dim=4,
+        )
         self.action_head = ActionHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
         self.value_head = ValueHead(context_dim=3, pokemon_dim=2, hidden_dim=8)
+        self.belief_condition_calls = 0
 
-    def forward(
+    def condition_opponent_reps(
         self,
-        obs: dict[str, torch.Tensor],
-        hidden=None,
-        actions: torch.Tensor | None = None,
-        action_masks: dict[str, torch.Tensor] | None = None,
-    ) -> dict[str, torch.Tensor]:
-        context, active_reps, own_reps, opp_reps, opp_active_reps = self.spatial(obs)
-        context, hidden = self.memory(context, hidden)
-        own_bench_mask = (obs["own_roles"] != ROLE_BENCH) | obs["own_mask"]
-        opp_bench_mask = (obs["opp_roles"] != ROLE_BENCH) | obs["opp_mask"]
-        action_out = self.action_head(
-            context,
-            active_reps,
-            own_reps,
-            opp_reps,
-            opp_bench_mask,
-            opp_active_reps,
-            action_masks,
-            actions,
-        )
-        return {
-            **action_out,
-            "value": self.value_head(
-                context, own_reps, opp_reps, own_bench_mask, opp_bench_mask
-            ),
-            "hidden": hidden,
-        }
-
-    def initial_hidden(self, batch_size: int):
-        return self.memory.initial_hidden(batch_size)
+        opp_reps: torch.Tensor,
+        opp_active_reps: torch.Tensor,
+        context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.belief_condition_calls += 1
+        return super().condition_opponent_reps(opp_reps, opp_active_reps, context)
 
 
 def _ppo_obs(step: int, num_envs: int) -> dict[str, np.ndarray]:
@@ -512,6 +510,9 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
         "can_tera": np.ones((num_envs, 2), dtype=bool),
     }
     agent = _DummyAgent().to(device)
+    with torch.no_grad():
+        agent.hidden_info_head.policy_belief_adapter.weight.fill_(0.05)
+        agent.hidden_info_head.policy_belief_adapter.bias.fill_(-0.02)
     config = TrainingConfig(num_epochs=1, num_minibatches=2)
     trainer = PPOTrainer(agent, config, device)
     buffer = RolloutBuffer(
@@ -545,6 +546,7 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
     batch = buffer.compute_gae(
         torch.zeros(num_envs, dtype=torch.float32, device=device)
     )
+    agent.belief_condition_calls = 0
     metrics = trainer.update(batch)
 
     assert trainer.global_step == num_steps * num_envs
@@ -559,7 +561,45 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
         "value_explained_variance",
     } <= set(metrics)
     assert metrics["pre_ppo_clip_fraction"] >= 0.0
+    assert metrics["pre_ppo_max_abs_log_ratio"] == pytest.approx(0.0, abs=1e-6)
     assert metrics["base_tera_real_choice_evaluations"] >= 0.0
+    assert metrics["policy_belief_adapter_weight_norm"] == pytest.approx(
+        agent.hidden_info_head.policy_belief_adapter.weight.detach().norm().item()
+    )
+    assert agent.belief_condition_calls == 2
+
+
+def test_actor_and_value_objectives_reach_belief_adapter() -> None:
+    device = torch.device("cpu")
+    num_envs = 2
+    agent = _DummyAgent().to(device)
+    obs = _obs_to_tensor(_ppo_obs(0, num_envs), device)
+    masks = {
+        "joint": torch.ones(
+            (num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT),
+            dtype=torch.bool,
+        ),
+        "can_tera": torch.ones((num_envs, 2), dtype=torch.bool),
+    }
+
+    actor_out = agent(obs, action_masks=masks)
+    actor_out["log_prob"].sum().backward()
+    actor_grad = agent.hidden_info_head.policy_belief_adapter.weight.grad
+    assert actor_grad is not None
+    assert torch.count_nonzero(actor_grad) > 0
+
+    agent.zero_grad(set_to_none=True)
+    value_out = agent(obs, action_masks=masks)
+    value_out["value"].sum().backward()
+    value_grad = agent.hidden_info_head.policy_belief_adapter.weight.grad
+    assert value_grad is not None
+    assert torch.count_nonzero(value_grad) > 0
+
+    agent.zero_grad(set_to_none=True)
+    agent.get_value(obs).sum().backward()
+    bootstrap_value_grad = agent.hidden_info_head.policy_belief_adapter.weight.grad
+    assert bootstrap_value_grad is not None
+    assert torch.count_nonzero(bootstrap_value_grad) > 0
 
 
 def test_ppo_trainer_clamps_extreme_log_ratios_and_keeps_parameters_finite() -> None:
@@ -1167,7 +1207,10 @@ class _FakeBattle:
         }
         self.available_moves = [[], []]
         self.available_switches = [[bench_one], []]
-        self.last_request = {"active": [{"moves": []}, {"moves": []}]}
+        self.last_request = {
+            "rqid": 3,
+            "active": [{"moves": []}, {"moves": []}],
+        }
 
 
 class _DefaultOnlyBattle:
@@ -1189,7 +1232,11 @@ class _DefaultOnlyBattle:
         self.available_moves = [[], []]
         self.available_switches = [[], []]
         self.team = {}
-        self.last_request = {"active": [{"moves": []}, {"moves": []}]}
+        self.request_generation = 3
+        self.last_request = {
+            "rqid": 3,
+            "active": [{"moves": []}, {"moves": []}],
+        }
 
 
 def test_switch_actions_use_stable_team_slots() -> None:
@@ -1731,9 +1778,7 @@ def test_finished_battle_update_skips_legality_rebuild(
         last_battle=None,
         _last_finished_token=None,
         obs_builder=SimpleNamespace(
-            build=lambda battle, **kwargs: {
-                "context": np.array([1], dtype=np.int64)
-            }
+            build=lambda battle, **kwargs: {"context": np.array([1], dtype=np.int64)}
         ),
         timing=timing,
         obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
@@ -1793,9 +1838,7 @@ def test_emit_pending_finished_battle_enqueues_terminal_observation(
         _last_finished_token=None,
         _pending_finished_battle=None,
         obs_builder=SimpleNamespace(
-            build=lambda battle, **kwargs: {
-                "context": np.array([1], dtype=np.int64)
-            }
+            build=lambda battle, **kwargs: {"context": np.array([1], dtype=np.int64)}
         ),
         timing=timing,
         obs_queue=SimpleNamespace(put=lambda item: queued.append(item)),
@@ -1925,7 +1968,7 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(
     player._pending_action_future = None
     player._pending_action_battle = None
     player._pending_action_started_at = None
-    player._last_actions = None
+    _initialize_intent_mailbox(player)
     player._committed_intent = None
     player._pending_intent = None
     player.choose_default_move = lambda: PassBattleOrder()
@@ -1955,8 +1998,8 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(
     )
     monkeypatch.setattr(
         league_module,
-        "semantic_action_intent",
-        lambda actions, action_state: None,
+        "semantic_action_supervision",
+        lambda actions, action_state: SimpleNamespace(intent=None),
     )
 
     battle_kwargs = dict(
@@ -1970,10 +2013,21 @@ async def test_league_player_keeps_recurrent_state_on_same_state_retry(
         force_switch=[False, False],
         can_tera=[False, False],
         trapped=[False, False],
-        last_request={"active": [{"moves": []}, {"moves": []}]},
     )
-    retry_battle = SimpleNamespace(state=1, turn=1, **battle_kwargs)
-    next_battle = SimpleNamespace(state=2, turn=2, **battle_kwargs)
+    retry_battle = SimpleNamespace(
+        state=1,
+        turn=1,
+        request_generation=1,
+        last_request={"rqid": 1, "active": [{"moves": []}, {"moves": []}]},
+        **battle_kwargs,
+    )
+    next_battle = SimpleNamespace(
+        state=2,
+        turn=1,
+        request_generation=2,
+        last_request={"rqid": 2, "active": [{"moves": []}, {"moves": []}]},
+        **battle_kwargs,
+    )
 
     await LeaguePlayer.choose_move(player, retry_battle)
     await LeaguePlayer.choose_move(player, retry_battle)
@@ -2022,7 +2076,7 @@ async def test_league_player_reuses_inflight_same_state_request(
     player._pending_action_future = None
     player._pending_action_battle = None
     player._pending_action_started_at = None
-    player._last_actions = None
+    _initialize_intent_mailbox(player)
     player._committed_intent = None
     player._pending_intent = None
     player._timing = None
@@ -2053,8 +2107,8 @@ async def test_league_player_reuses_inflight_same_state_request(
     )
     monkeypatch.setattr(
         league_module,
-        "semantic_action_intent",
-        lambda actions, action_state: None,
+        "semantic_action_supervision",
+        lambda actions, action_state: SimpleNamespace(intent=None),
     )
 
     battle = SimpleNamespace(
@@ -2062,6 +2116,7 @@ async def test_league_player_reuses_inflight_same_state_request(
         finished=False,
         battle_tag="battle-inflight",
         turn=1,
+        request_generation=1,
         active_pokemon=[SimpleNamespace(species="a"), SimpleNamespace(species="b")],
         opponent_active_pokemon=[
             SimpleNamespace(species="c"),
@@ -2070,7 +2125,10 @@ async def test_league_player_reuses_inflight_same_state_request(
         force_switch=[False, False],
         can_tera=[False, False],
         trapped=[False, False],
-        last_request={"active": [{"moves": []}, {"moves": []}]},
+        last_request={
+            "rqid": 1,
+            "active": [{"moves": []}, {"moves": []}],
+        },
     )
 
     first = asyncio.create_task(LeaguePlayer.choose_move(player, battle))
@@ -2124,7 +2182,7 @@ async def test_league_player_default_only_request_skips_inference() -> None:
     player._pending_action_future = None
     player._pending_action_battle = None
     player._pending_action_started_at = None
-    player._last_actions = None
+    _initialize_intent_mailbox(player)
     player._committed_intent = None
     player._pending_intent = None
     player._timing = None
@@ -2134,11 +2192,40 @@ async def test_league_player_default_only_request_skips_inference() -> None:
 
     assert isinstance(order, PassBattleOrder)
     assert player._pending_order is order
-    np.testing.assert_array_equal(
-        player._last_actions,
-        np.array([PASS_ACTION, PASS_ACTION, TERA_NONE], dtype=np.int64),
-    )
+    request_key = ("battle-default-only", 3)
+    assert request_key in player._intent_supervision_by_request
+    assert LeaguePlayer.consume_intent_supervision(player, request_key) is None
     assert torch.equal(player._pending_hidden[0], player._hidden[0])
+
+
+def test_league_player_intent_handoff_consumes_only_exact_request_once() -> None:
+    player = LeaguePlayer.__new__(LeaguePlayer)
+    _initialize_intent_mailbox(player)
+    first_key = ("battle-intent", 4)
+    second_key = ("battle-intent", 5)
+    no_decision_key = ("battle-intent", 6)
+    missing_key = ("battle-intent", 7)
+    first = SimpleNamespace(intent="first")
+    replacement = SimpleNamespace(intent="replacement")
+    second = SimpleNamespace(intent="second")
+
+    LeaguePlayer._record_intent_supervision(player, first_key, first)
+    LeaguePlayer._record_intent_supervision(player, first_key, replacement)
+    LeaguePlayer._record_intent_supervision(player, second_key, second)
+    LeaguePlayer._record_intent_supervision(player, no_decision_key, None)
+
+    assert LeaguePlayer.consume_intent_supervision(player, first_key) is replacement
+    assert player._intent_supervision_by_request[second_key] is second
+    assert LeaguePlayer.consume_intent_supervision(player, missing_key) is None
+    assert player._intent_supervision_by_request[second_key] is second
+    assert LeaguePlayer.consume_intent_supervision(player, no_decision_key) is None
+
+    with pytest.raises(RuntimeError, match="consumed twice"):
+        LeaguePlayer.consume_intent_supervision(player, first_key)
+    with pytest.raises(RuntimeError, match="consumed twice"):
+        LeaguePlayer.consume_intent_supervision(player, missing_key)
+    with pytest.raises(RuntimeError, match="arrived after"):
+        LeaguePlayer._record_intent_supervision(player, first_key, first)
 
 
 def test_league_player_decision_signature_tracks_action_request_fields() -> None:

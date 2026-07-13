@@ -6,6 +6,16 @@ from collections.abc import Mapping
 
 import torch
 
+from ..env.actions import (
+    NUM_SLOT_INTENT_COMPONENTS,
+    NUM_TERA_INTENT_COMPONENTS,
+    SLOT_INTENT_KIND,
+    SLOT_INTENT_MOVE,
+    SLOT_INTENT_SWITCH_SPECIES,
+    SLOT_INTENT_TARGET,
+    TERA_INTENT_SLOT,
+    TERA_INTENT_USE,
+)
 from ..env.observation import (
     ABILITY_KNOWN_OFFSET,
     ITEM_KNOWN_OFFSET,
@@ -220,36 +230,78 @@ def hidden_info_belief_additive_metrics(
 
 
 @torch.no_grad()
-def opponent_action_additive_metrics(
+def opponent_intent_additive_metrics(
     logits: Mapping[str, torch.Tensor],
-    labels: torch.Tensor,
-    valid: torch.Tensor,
+    slot_labels: torch.Tensor,
+    slot_masks: torch.Tensor,
+    tera_labels: torch.Tensor,
+    tera_masks: torch.Tensor,
 ) -> dict[str, float]:
-    """Return additive raw opponent-action top-1 correct/count diagnostics."""
-    required = {"opp_a1_logits", "opp_a2_logits", "opp_tera_logits"}
+    """Return additive diagnostics for non-forced semantic intent choices."""
+    required = {
+        "opp_intent_kind_logits",
+        "opp_intent_move_logits",
+        "opp_intent_target_logits",
+        "opp_intent_switch_species_logits",
+        "opp_intent_tera_use_logits",
+        "opp_intent_tera_slot_logits",
+    }
     missing = sorted(required.difference(logits))
     if missing:
         raise ValueError(f"logits is missing key(s): {', '.join(missing)}.")
-    if labels.shape != (*valid.shape, 3):
-        raise ValueError("opponent action labels must have shape (*valid.shape, 3).")
+    if slot_labels.shape != slot_masks.shape or slot_labels.shape[-2:] != (
+        2,
+        NUM_SLOT_INTENT_COMPONENTS,
+    ):
+        raise ValueError(
+            "opponent slot intent labels/masks must share shape (..., 2, 4)."
+        )
+    base_shape = tuple(slot_labels.shape[:-2])
+    expected_tera_shape = (*base_shape, NUM_TERA_INTENT_COMPONENTS)
+    if (
+        tera_labels.shape != expected_tera_shape
+        or tera_masks.shape != expected_tera_shape
+    ):
+        raise ValueError("opponent Tera intent labels/masks must have shape (..., 2).")
 
     result: dict[str, float] = {}
-    for index, (name, logits_key) in enumerate(
-        (("a1", "opp_a1_logits"), ("a2", "opp_a2_logits"), ("tera", "opp_tera_logits"))
+    for name, logits_key, component in (
+        ("kind", "opp_intent_kind_logits", SLOT_INTENT_KIND),
+        ("move", "opp_intent_move_logits", SLOT_INTENT_MOVE),
+        ("target", "opp_intent_target_logits", SLOT_INTENT_TARGET),
+        (
+            "switch_species",
+            "opp_intent_switch_species_logits",
+            SLOT_INTENT_SWITCH_SPECIES,
+        ),
     ):
         component_logits = logits[logits_key]
-        if component_logits.shape[:-1] != tuple(valid.shape):
-            raise ValueError(f"{logits_key} leading dimensions must match valid.")
-        targets = labels[..., index]
-        selected = valid.to(torch.bool) & (targets >= 0)
-        selected_targets = targets[selected]
-        class_count = component_logits.shape[-1]
-        if ((selected_targets < 0) | (selected_targets >= class_count)).any():
-            raise ValueError(
-                f"opponent {name} labels contain an out-of-range class index."
+        if component_logits.shape[:-1] != (*base_shape, 2):
+            raise ValueError(f"{logits_key} leading dimensions must match slot labels.")
+        targets = slot_labels[..., component]
+        selected = slot_masks[..., component].to(torch.bool)
+        result.update(
+            _classification_additive_sums(
+                logits=component_logits,
+                targets=targets,
+                selected=selected,
+                prefix=f"opp_intent_{name}",
             )
-        predictions = component_logits.argmax(dim=-1)
-        correct = ((predictions == targets) & selected).sum()
-        result[f"opp_action_{name}_top1_correct"] = float(correct.item())
-        result[f"opp_action_{name}_count"] = float(selected.sum().item())
+        )
+
+    for name, logits_key, component in (
+        ("tera_use", "opp_intent_tera_use_logits", TERA_INTENT_USE),
+        ("tera_slot", "opp_intent_tera_slot_logits", TERA_INTENT_SLOT),
+    ):
+        component_logits = logits[logits_key]
+        if component_logits.shape[:-1] != base_shape:
+            raise ValueError(f"{logits_key} leading dimensions must match Tera labels.")
+        result.update(
+            _classification_additive_sums(
+                logits=component_logits,
+                targets=tera_labels[..., component],
+                selected=tera_masks[..., component].to(torch.bool),
+                prefix=f"opp_intent_{name}",
+            )
+        )
     return result

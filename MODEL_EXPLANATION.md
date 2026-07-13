@@ -39,7 +39,7 @@ If this document and the code ever disagree, the code is authoritative.
 
 ## 1. High-Level Overview
 
-The agent plays **VGC doubles battles** (and other doubles formats) via **Proximal Policy Optimization (PPO)** against opponents sampled from a **league of past checkpoints**. The environment is a real [Pokemon Showdown](https://pokemonshowdown.com/) server running locally, bridged into Gymnasium through [poke-env](https://github.com/hsahovic/poke-env).
+The agent plays **VGC doubles battles** (and other doubles formats) via **Proximal Policy Optimization (PPO)** against opponents sampled from a **league of past checkpoints**. The environment runs the real [Pokemon Showdown](https://pokemonshowdown.com/) simulator directly through poke-env's local BattleStream backend, without a websocket server, and bridges it into a Gymnasium-style interface.
 
 The core loop:
 
@@ -84,7 +84,7 @@ synthetic preview observation
 
 The spatial encoder, memory module, and their weights are shared between battle turns and team preview — only the heads differ.
 
-During PPO updates, two additional auxiliary heads provide dense supervised signal without changing rewards or inference-time action selection. `HiddenInfoHead` predicts the selected opponent's exact item / ability / tera type / move set from `opp_reps` plus recurrent `memory_out`; `OpponentActionHead` predicts the opponent's observed `(a1, a2, tera)` from `memory_out` plus both sides' active reps. Exact packed-team attributes are trainer-only terminal targets and are never added to policy observations or inference outputs.
+Two opponent-modeling components provide dense supervised signal without changing rewards. `HiddenInfoHead.encode` uses `policy_belief_adapter` to add a compact recurrent-context residual to public `opp_reps`; those belief-conditioned representations are consumed directly by the battle action and value heads. During PPO only, `HiddenInfoHead.decode` predicts the selected opponent's exact item / ability / tera type / move set, while `OpponentIntentHead` predicts each opponent slot's semantic action kind, global move identity, target, switch species, and factorized Tera decision. Exact packed-team attributes, opponent decisions, and all full decoder logits are trainer-only: none are added to policy observations or inference outputs.
 
 ---
 
@@ -168,8 +168,8 @@ Entry point: [pokerl/model/agent.py](pokerl/model/agent.py). `PokeAgent` compose
 - `action_head` — `ActionHead` (autoregressive slot-1, slot-2, tera)
 - `team_preview_head` — `TeamPreviewHead`
 - `opponent_preview_head` — `OpponentPreviewHead` (auxiliary only)
-- `hidden_info_head` — `HiddenInfoHead` (auxiliary hidden-info prediction only)
-- `opponent_action_head` — `OpponentActionHead` (auxiliary opponent-action prediction only)
+- `hidden_info_head` — `HiddenInfoHead` (policy-consumed compact belief encoder plus training-only attribute decoders)
+- `opponent_intent_head` — `OpponentIntentHead` (auxiliary semantic opponent-decision prediction only)
 - `value_head` — `ValueHead` for battle turns
 - `preview_value_head` — separate `ValueHead` used as the REINFORCE baseline at preview
 
@@ -492,10 +492,10 @@ entropy:         (batch,)     bring + lead
 
 The gradients from the auxiliary losses flow back through the shared encoder stack, shaping `opp_reps` to encode information relevant to opponent behavior. That helps the downstream action head as well.
 
-Two battle-turn auxiliary heads also live in [pokerl/model/heads.py](pokerl/model/heads.py), but they do not get separate architecture sections because they are training-only heads rather than action-path components:
+Two battle-turn opponent-modeling modules also live in [pokerl/model/heads.py](pokerl/model/heads.py):
 
-- `HiddenInfoHead` adds a projected recurrent context to each `opp_rep`, then predicts item, ability, tera type, and move set for each opponent pokemon. The projection is initialized to exactly zero, so introducing the recurrent path does not change existing head outputs; after it learns, belief-state gradients can reach memory. Exact labels for only the opponent's selected four come from the simulator's already-assigned packed team at episode completion and are copied backward across that episode's timesteps by stable public roster identity. The unselected two are masked.
-- `OpponentActionHead` maps `[memory_out, opp_active_0, opp_active_1, own_active_0, own_active_1]` to three categorical predictions for the opponent's observed `a1`, `a2`, and tera choice. Non-league opponents have no labels and are masked out.
+- `HiddenInfoHead.encode` uses the registered `policy_belief_adapter` to add a projected recurrent context to each full-team and active `opp_rep`. The battle action and value heads consume this compact representation at inference. The adapter is initialized to exactly zero, so the initial policy is identical to the raw-public-representation policy; after it learns, actor, critic, and auxiliary gradients can shape it. `HiddenInfoHead.decode` is training-only and predicts item, ability, tera type, and move set. Exact labels for only the opponent's selected four come from the simulator's already-assigned packed team at episode completion and are copied backward across that episode's timesteps by stable public roster identity. The unselected two are masked, and neither labels nor decoder logits enter inference.
+- `OpponentIntentHead` combines recurrent context, both sides' active representations, and attention over the public opponent team. For each opponent slot it predicts action kind, global move identity, semantic target, and switch species; Tera is factorized into use-now and conditional slot predictions. Each component is supervised only when it represented a real decision, excluding forced/default/unavailable choices. Non-league opponents have no labels and are masked out.
 
 ### 3.11 Stat-based embedding initialization
 
@@ -519,11 +519,15 @@ obs dict
       { context (384), active_reps (2×128),
         own_reps (6×128), opp_reps (6×128), opp_active_reps (2×128) }
   → LSTMMemory:     context (384) → memory_out (256), (h, c)
-  → ActionHead:     (memory_out, active_reps, own_reps, opp_reps, opp_bench_mask,
-                     opp_active_reps, masks, battle_obs,
+  → HiddenInfoHead.encode:
+                     (opp_reps, opp_active_reps, memory_out)
+                     → belief_opp_reps, belief_opp_active_reps
+  → ActionHead:     (memory_out, active_reps, own_reps, belief_opp_reps,
+                     opp_bench_mask, belief_opp_active_reps, masks, battle_obs,
                      tera_exploration_prob)
                     → { actions (3), log_prob, entropy }
-  → ValueHead:      (memory_out, own_reps, opp_reps, own_bench_mask, opp_bench_mask)
+  → ValueHead:      (memory_out, own_reps, belief_opp_reps,
+                     own_bench_mask, opp_bench_mask)
                     → value
 ```
 
@@ -531,7 +535,7 @@ Team preview ([agent.py:151-189](pokerl/model/agent.py#L151-L189)):
 
 ```
 obs dict
-  → SpatialEncoder
+  → SpatialEncoder (raw public opponent representations; no belief adapter)
   → LSTMMemory:     context → memory_out, (h, c=None at preview time)
   → TeamPreviewHead      → bring_picks, lead_pair, picks, log_prob, entropy
   → OpponentPreviewHead  → bring_logits, lead_pair_logits   (aux only)
@@ -647,9 +651,9 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
 
    **Battle-turn auxiliary losses:**
    - `hidden_info_loss`: masked CE/BCE for the selected opponent's exact item, ability, tera type, and move set using trainer-private completed-episode labels aligned by stable public roster identity. The unselected two, ambiguous identities, and pokemon not publicly present at that timestep are excluded. Metrics report exact-label episode coverage, valid selected slots per labeled step, public-slot coverage, and labeled-step coverage.
-   - `opp_action_loss`: masked CE for the league opponent's observed `(a1, a2, tera)` this turn.
+   - `aux_opponent_intent_loss`: masked CE for the league opponent's semantic per-slot kind / move / target / switch decision and factorized Tera use / slot decision. Request-local action indices are not targets, and forced or unavailable components are excluded.
 
-   **Total:** `loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss + aux_hidden_info_coef * hidden_info_loss + aux_opp_action_coef * opp_action_loss`, with `value_coef=0.5`, `entropy_coef=0.01`, and both auxiliary coefficients defaulting to `0.25`. Each auxiliary loss averages its active prediction tasks, so adding item/ability/Tera/move or joint-action heads does not implicitly multiply the configured task weight.
+   **Total:** `loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss + aux_hidden_info_coef * hidden_info_loss + aux_opponent_intent_coef * aux_opponent_intent_loss`, with `value_coef=0.5`, `entropy_coef=0.01`, and both auxiliary coefficients defaulting to `0.25`. Each auxiliary loss averages its active prediction tasks, so adding item/ability/Tera/move or semantic-intent heads does not implicitly multiply the configured task weight.
 
 5. **Gradient update:**
    ```python
@@ -866,7 +870,7 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `team_preview_max_samples` | `None` | optional uniform preview cap (`None` uses all current samples) |
 | `preview_update_minibatch_size` | 512 | activation-bounded preview gradient chunk size |
 | `aux_hidden_info_coef` | 0.25 | hidden-info prediction aux weight |
-| `aux_opp_action_coef` | 0.25 | opponent-action prediction aux weight |
+| `aux_opponent_intent_coef` | 0.25 | semantic opponent-decision prediction aux weight |
 | `diagnose_memory_gradients` | `False` | opt-in one-minibatch norms/cosines for weighted battle-PPO gradients on shared memory |
 | `rollout_steps` | 128 | steps per env before update |
 | `num_epochs` | 4 | PPO epochs per rollout |
@@ -919,11 +923,11 @@ The 4 PP dimensions in the continuous feature vector are zero for all opponent p
 
 Default is full BPTT across the rollout (`bptt_chunk_steps=None`), so gradients flow across an entire 128-step chunk. Battles that span multiple rollouts still see a detach at the rollout boundary. `bptt_chunk_steps` remains available as an OOM fallback if the rollout length or model size grows.
 
-### 10.5 Opponent belief modeling is supervised only, not yet consumed
+### 10.5 Opponent belief modeling uses a compact residual
 
-The network sees revealed moves / items / abilities as they appear. `HiddenInfoHead` now conditions its selected-team predictions on recurrent context, and `OpponentActionHead` trains the same memory to predict the opponent's current action, but the policy does not yet consume either head's output distribution directly.
+The network sees revealed moves / items / abilities as they appear. `HiddenInfoHead.encode` turns recurrent public context into a compact additive residual that the battle actor and critic consume, while its full item / ability / tera / move decoders and the `OpponentIntentHead` remain training-only. This gives the policy a learned belief representation without exposing trainer-private labels or treating decoder guesses as facts.
 
-**Fix direction:** feed the opponent-action and hidden-info distributions back into the action head so the policy best-responds to the distribution, not just to the raw recurrent state.
+**Possible extension:** if the full auxiliary distributions become well calibrated, compare richer uncertainty-aware belief embeddings against the compact residual. Any such representation must still be derived entirely from public state at inference and preserve exact rollout/PPO policy evaluation.
 
 ### 10.6 Bench order still canonical
 

@@ -74,12 +74,11 @@ class TrainingConfig:
     # Preview samples are accumulated in chunks into one globally weighted
     # optimizer step, bounding activation memory without changing the update.
     preview_update_minibatch_size: int = 512
-    # Auxiliary prediction losses. These do not modify the reward or the
-    # action/value path; they add dense gradient to the shared encoder by
-    # predicting opponent hidden info (end-of-episode labels) and the
-    # opponent's observed action this turn.
+    # Auxiliary prediction losses do not modify rewards. Their full decoders and
+    # trainer-only labels stay outside inference; the hidden-info head's compact
+    # public-state belief residual is consumed by the battle policy and value.
     aux_hidden_info_coef: float = 0.25
-    aux_opp_action_coef: float = 0.25
+    aux_opponent_intent_coef: float = 0.25
     diagnose_memory_gradients: bool = False
 
     # Batching
