@@ -425,6 +425,46 @@ def _max_legal_damaging_base_power(battle: DoubleBattle, slot: int) -> int:
     )
 
 
+_MOVE_OPPORTUNITY_GROUPS = {
+    "protect_like": frozenset(
+        {
+            "banefulbunker",
+            "burningbulwark",
+            "detect",
+            "kingsshield",
+            "obstruct",
+            "protect",
+            "silktrap",
+            "spikyshield",
+        }
+    ),
+    "trick_room": frozenset({"trickroom"}),
+    "redirection": frozenset({"followme", "ragepowder"}),
+    "fake_out": frozenset({"fakeout"}),
+    "tailwind": frozenset({"tailwind"}),
+}
+
+
+def _record_action_opportunities(
+    battle: DoubleBattle,
+    slot: int,
+) -> Counter[str]:
+    """Count strategic actions that were legal for this slot decision."""
+    stats: Counter[str] = Counter()
+    moves = battle.available_moves[slot] if slot < len(battle.available_moves) else []
+    move_ids = {str(getattr(move, "id", "")) for move in moves}
+    for label, diagnostic_moves in _MOVE_OPPORTUNITY_GROUPS.items():
+        if move_ids & diagnostic_moves:
+            stats[f"{label}_opportunities"] += 1
+
+    switches = (
+        battle.available_switches[slot] if slot < len(battle.available_switches) else []
+    )
+    if switches:
+        stats["switch_opportunities"] += 1
+    return stats
+
+
 def _classify_slot_action(
     battle: DoubleBattle,
     slot: int,
@@ -434,7 +474,7 @@ def _classify_slot_action(
     kind, move_idx, target_idx = decode_action(int(action_idx))
     tera_slot_1, tera_slot_2 = decode_tera_choice(int(tera_choice))
     tera = tera_slot_1 if slot == 0 else tera_slot_2
-    stats: Counter[str] = Counter()
+    stats = _record_action_opportunities(battle, slot)
     stats["slot_decisions"] += 1
 
     if kind == "pass":
@@ -517,6 +557,10 @@ def _classify_slot_action(
 
     if getattr(move, "id", "") == "protect":
         stats["protect_actions"] += 1
+    move_id = str(getattr(move, "id", ""))
+    for label, diagnostic_moves in _MOVE_OPPORTUNITY_GROUPS.items():
+        if move_id in diagnostic_moves:
+            stats[f"{label}_actions"] += 1
 
     if base_power > 0 and best_base_power > 0:
         if base_power == best_base_power:
@@ -616,6 +660,17 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
             power_comparable,
         ),
         "protect_rate": _safe_rate(counts.get("protect_actions", 0), slot_decisions),
+        **{
+            f"{label}_choice_rate_when_available": _safe_rate(
+                counts.get(f"{label}_actions", 0),
+                counts.get(f"{label}_opportunities", 0),
+            )
+            for label in _MOVE_OPPORTUNITY_GROUPS
+        },
+        "switch_choice_rate_when_available": _safe_rate(
+            counts.get("switch_actions", 0),
+            counts.get("switch_opportunities", 0),
+        ),
         "immune_target_rate": _safe_rate(
             counts.get("immune_target_damage_actions", 0),
             typed_opponent_damage,
