@@ -11,6 +11,7 @@ from poke_env.battle import (
 )
 from poke_env.player import SingleBattleOrder
 
+from pokerl.config import ModelConfig
 from pokerl.data import GameData
 from pokerl.env.actions import (
     INTENT_MOVE,
@@ -30,6 +31,7 @@ from pokerl.env.observation import (
     ObservationBuilder,
     build_team_preview_observation,
 )
+from pokerl.model.agent import PokeAgent
 from pokerl.model.encoders import RecentEventEncoder
 
 
@@ -165,6 +167,10 @@ def test_recent_event_encoder_is_zero_without_history_and_receives_gradient() ->
         "prev_own_valid": torch.zeros(2, 2, dtype=torch.bool),
     }
     assert torch.equal(encoder(obs), torch.zeros(2, encoder.out_dim))
+    assert torch.equal(
+        encoder({"field": obs["field"]}),
+        encoder(obs),
+    )
 
     obs["recent_event_kind"][0, 0] = 1
     obs["recent_event_actor"][0, 0] = POSITION_OPP_2
@@ -176,3 +182,32 @@ def test_recent_event_encoder_is_zero_without_history_and_receives_gradient() ->
 
     assert output[0].abs().sum() > 0
     assert encoder.event_projection[0].weight.grad is not None
+
+
+def test_team_preview_bypasses_zero_recent_event_history() -> None:
+    game_data = GameData(gen=9)
+    preview_obs = build_team_preview_observation(
+        game_data,
+        team_size=6,
+        own_packed_team=PACKED_TEAM,
+        opponent_packed_team=PACKED_TEAM,
+    )
+    obs_batch = {
+        key: torch.from_numpy(np.stack([value, value]))
+        for key, value in preview_obs.items()
+    }
+    agent = PokeAgent(ModelConfig(), game_data).eval()
+
+    def fail_if_called(_obs):
+        raise AssertionError("team preview evaluated zero recent-event history")
+
+    agent.spatial.recent_event_encoder.forward = fail_if_called
+    with torch.inference_mode():
+        result = agent.team_preview(
+            obs_batch,
+            include_value=False,
+            include_policy_stats=False,
+            include_opponent_preview=False,
+        )
+
+    assert result["picks"].shape == (2, 4)

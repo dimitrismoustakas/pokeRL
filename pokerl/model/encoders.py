@@ -256,12 +256,18 @@ class SpatialEncoder(nn.Module):
         )
 
     def forward(
-        self, obs: dict[str, torch.Tensor]
+        self,
+        obs: dict[str, torch.Tensor],
+        *,
+        include_recent_events: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             obs: dictionary with keys for own team, opponent team, field.
                  See observation.py for the exact structure.
+            include_recent_events: whether to encode transition history. Team
+                preview happens before any public event or submitted intent, so
+                that path can supply the same all-zero representation directly.
 
         Returns:
             context:     (batch, context_dim) flat battle representation
@@ -283,7 +289,12 @@ class SpatialEncoder(nn.Module):
 
         # Field
         field = self.field_encoder(obs["field"])
-        recent_events = self.recent_event_encoder(obs)
+        if include_recent_events:
+            recent_events = self.recent_event_encoder(obs)
+        else:
+            recent_events = field.new_zeros(
+                (field.shape[0], self.recent_event_encoder.out_dim)
+            )
 
         # Pool teams into summary vectors (mask-aware mean)
         own_summary = self._masked_mean(own_reps, obs.get("own_mask"))

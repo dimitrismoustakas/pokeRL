@@ -259,7 +259,13 @@ class PokeAgent(nn.Module):
         preview head can score all six pokemon. The spatial encoder is called
         once; no second pass is needed.
         """
-        context, _, own_reps, opp_reps, _ = self.spatial(obs)
+        # Team preview precedes every public event and submitted intent. Its
+        # recent-event representation is therefore exactly zero; bypass the
+        # recurrent event encoder instead of evaluating a padded 12-step GRU.
+        context, _, own_reps, opp_reps, _ = self.spatial(
+            obs,
+            include_recent_events=False,
+        )
         context, new_hidden = self.memory(context, hidden)
 
         preview_out = self.team_preview_head(
@@ -304,7 +310,10 @@ class PokeAgent(nn.Module):
         self, obs: dict[str, torch.Tensor], hidden=None
     ) -> torch.Tensor:
         """Preview-only value estimate used as the team-preview baseline."""
-        context, _, own_reps, opp_reps, _ = self.spatial(obs)
+        context, _, own_reps, opp_reps, _ = self.spatial(
+            obs,
+            include_recent_events=False,
+        )
         context, _ = self.memory(context, hidden)
         return self.preview_value_head(
             context,
