@@ -234,3 +234,122 @@ Before a larger run, use short multi-seed A/B runs to require: no throughput
 regression, no friendly-fire/immunity regression, delayed and context-dependent
 Tera, non-trivial preview mutual information, improved Hatterene-roster bot
 results, and at least the existing checkpoint/fixed-bot strength trajectory.
+
+## Interrupted event-aware run at update 140
+
+The event-aware run was planned for 400 updates but completed 141 updates
+(1,299,456 decisions and 197,752 battles) in 6.51 hours before an environment
+reset timed out. The strongest immutable checkpoint before the failure is the
+league snapshot at update 140 (`league/step_1290240.pt`), which is the model
+evaluated below.
+
+The timeout was not a PPO, CUDA, or simulator crash. Concurrent resets could
+select the same apparently available local runtime shard before either caller
+reserved it. One shard could therefore be overbooked while another still had a
+free slot; the extra reset then waited on the full shard and the synchronous
+collector waited behind that reset. poke-env now makes shard selection and
+reservation one atomic operation and uses a global capacity wait/reselection
+path. Cancellation and acquisition failures also return reservations. Focused
+cross-thread tests reproduce the former race deterministically.
+
+Training itself remained healthy through update 141: all 72 player and opponent
+objects retained exactly one live battle, CUDA allocation stayed bounded,
+pre-PPO ratios remained close to one, and the final ten updates averaged
+0.00046 pre-PPO KL, 0.0138 post-update KL, 0.149 clip fraction, and 0.703 value
+explained variance. There is no evidence here for changing PPO.
+
+### Frozen self-play anchors
+
+Every comparison used 64 planned team pairs in each player direction, sampled
+actions, and identical team-pair roles after mirroring (128 games total).
+
+| Update 140 opponent | Wins | Losses | Win rate | 95% interval |
+|---|---:|---:|---:|---:|
+| Initialization | 99 | 29 | 77.3% | 69.4-83.7% |
+| Update 50 | 79 | 49 | 61.7% | 53.1-69.7% |
+| Update 100 | 60 | 68 | 46.9% | 38.4-55.5% |
+| Update 125 | 69 | 59 | 53.9% | 45.3-62.3% |
+| Itself | 71 | 57 | 55.5% | 46.8-63.8% |
+
+The model clearly learned beyond initialization and update 50, then plateaued.
+The self-match result and interval show that the apparent 55.5% is sampling
+noise rather than a meaningful first-player advantage. Update 140 is not
+statistically distinguishable from updates 100 or 125.
+
+### Common fixed-bot yardstick
+
+The table compares the previous 150-update checkpoint with update 140 of the
+harder event-aware model. Each cell contains 76 sampled-policy games against 76
+varying opponent rosters. Fixed bots remain evaluation probes only; they are not
+training opponents.
+
+| Model roster / opponent | Previous update 150 | Event-aware update 140 |
+|---|---:|---:|
+| Portland / Random | 63.2% | 68.4% |
+| Portland / MaxBasePower | 53.9% | 51.3% |
+| Portland / SimpleHeuristics | 40.8% | 40.8% |
+| Hatterene / MaxBasePower | 23.7% | 18.4% |
+| Hatterene / SimpleHeuristics | 14.5% | 10.5% |
+| Utrecht / MaxBasePower | 90.8% | 89.5% |
+| Utrecht / SimpleHeuristics | 94.7% | 89.5% |
+
+An independent Hatterene/SimpleHeuristics repeat scored 13.2%. At this sample
+size none of the differences supports a general regression claim, especially
+with ten fewer updates and a harder representation-learning problem. The
+important conclusion is instead that the same roster dependence remains:
+balanced/offensive rosters work, while the Trick Room/sun roster does not.
+
+Opportunity-normalized diagnostics rule out the explanation that the required
+actions simply never became legal. Against SimpleHeuristics, the Hatterene
+policy selected Trick Room on only 1.9% of decisions where it was available,
+redirection on 4.5%, Fake Out on 11.2%, and a Protect-family move on 11.5%.
+Portland selected Protect-family moves on 2.9% of available opportunities and
+redirection on 0.7%. At the same time, damaging friendly fire remained zero,
+immune targeting stayed below 0.4% on Portland/Hatterene, and 42-49% of typed
+opponent targets were super-effective. Basic mechanics are learned; coordinated
+strategic modes are not.
+
+### Preview and auxiliary information
+
+Exact enumeration covers all 180 legal bring/lead choices against every other
+roster in the 77-team pool.
+
+| Fixed own roster | Entropy | Mean top probability | Distinct joint MAPs | Opponent/choice MI | Mean TV from mean policy |
+|---|---:|---:|---:|---:|---:|
+| Portland | 2.181 nats | 33.6% | 1 | 0.00038 bits | 0.82% |
+| Hatterene | 3.800 nats | 8.6% | 1 | 0.00054 bits | 1.00% |
+
+The preview policy sharpened roster-specific defaults but still barely reacts
+to the opposing six. This is a structural learning bottleneck, not just a lack
+of preview samples: all current-policy preview samples were trained in this run.
+Meanwhile, the Hatterene fixed evaluation predicted the opponent's unordered
+bring set exactly in 28.9% of games and its ordered leads in 3.9%. Useful roster
+information exists in the representation but the own-choice head does not make
+effective candidate-specific use of it.
+
+The unknown-only hidden-information metrics became extremely high in-pool
+(roughly 99% item/ability/Tera top-1 and 71% move recall@4). Those results are
+not evidence of a general poker-like posterior: with only 77 recurring teams,
+species and roster identity can memorize most labels. Full vocabulary logits
+therefore should not be injected into the deployment policy. A compact shared
+belief residual can be policy-consumed while its expensive semantic decoders
+remain trainer-only, but it needs held-out-team and context-ablation evaluation.
+The old opponent-action auxiliary also uses request-local action indices and
+counts forced/default choices; it should be replaced by semantic, component-
+masked intent targets before any of its predictions influence the actor.
+
+### Throughput interpretation
+
+The apparent SPS decline is partly a real success of the learned policy rather
+than only a slower computer or larger encoder. Update 1 contained 784 completed
+battles averaging 9.43 turns and took 150.8 seconds. Update 141 contained 1,618
+battles averaging 4.46 turns and took 166.4 seconds. Both updates contain the
+same 9,216 policy decisions, but the later policy incurs roughly twice as many
+terminal resets and team previews and supplies roughly twice as many terminal
+learning signals. Decision SPS therefore fell while battles per second rose.
+
+The clean efficiency target is the now-dominant reset/preview path. Team preview
+has no prior public events or submitted intent, so its recent-event vector is
+provably zero and the padded 12-step event GRU can be bypassed exactly on preview
+and preview-value calls. Timing instrumentation remains optional and should be
+disabled for production runs.
