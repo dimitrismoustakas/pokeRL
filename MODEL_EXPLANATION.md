@@ -450,8 +450,8 @@ Picks 4 of the 6 own pokemon in **canonical increasing team-slot order**:
 
 1. accumulate the sum of already-picked reps: `picked_sum`
 2. project `[memory_out ⊕ picked_sum] → context_dim`
-3. attend over opponent reps with `MaskedSetAttention`
-4. score each still-available own pokemon from `[pokemon_rep ⊕ projected_context ⊕ opponent_summary]`
+3. form one query per own candidate from `[projected_context ⊕ pokemon_rep]`, then cross-attend each query over the public opponent reps with `MaskedSetAttention`
+4. score each still-available own pokemon from `[pokemon_rep ⊕ projected_context ⊕ candidate_opponent_summary]`
 5. mask: only positions past the last pick are legal, and only if enough later positions remain to finish the bring set
 6. sample / argmax → next pick
 
@@ -461,8 +461,8 @@ Repeat for 4 picks. Because the mask enforces increasing indices, the head learn
 
 1. summarize the chosen bring set: `bring_summary = picked_sum / pick_size`
 2. project `[memory_out ⊕ bring_summary] → context_dim`
-3. attend over opponent reps
-4. score all `team_size × team_size` ordered pairs from `[left_rep ⊕ right_rep ⊕ bring_summary ⊕ opponent_summary ⊕ projected_context]`
+3. form an order-sensitive query for every proposed lead pair from `[projected_context ⊕ left_rep ⊕ right_rep]`, then cross-attend each query over the public opponent reps
+4. score all `team_size × team_size` ordered pairs from `[left_rep ⊕ right_rep ⊕ bring_summary ⊕ pair_opponent_summary ⊕ projected_context]`
 5. mask out self-pairs, unbrought pokemon, and padding
 6. sample / argmax over the flattened `team_size²` logits
 

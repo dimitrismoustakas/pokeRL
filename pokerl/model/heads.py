@@ -33,7 +33,12 @@ def _sample_categorical_logits(logits: torch.Tensor) -> torch.Tensor:
 
 
 class MaskedSetAttention(nn.Module):
-    """Query-conditioned pooling over a masked set of pokemon representations."""
+    """Query-conditioned pooling over a masked set of pokemon representations.
+
+    ``query`` may contain one query per batch item (``[B, D]``) or any number
+    of structured queries (``[B, ..., D]``). The opponent keys and values are
+    projected once, then shared by every query belonging to that batch item.
+    """
 
     def __init__(self, query_dim: int, item_dim: int, hidden_dim: int):
         super().__init__()
@@ -76,22 +81,27 @@ class MaskedSetAttention(nn.Module):
         values: torch.Tensor,
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Pool already-projected items for one query."""
-        query_proj = self.query_proj(query).unsqueeze(1)
-        scores = (query_proj * key_proj).sum(dim=-1) / self.scale
+        """Pool already-projected items for one or more structured queries."""
+        batch_size, _, _ = key_proj.shape
+        query_shape = query.shape
+        flat_query_proj = self.query_proj(query).reshape(
+            batch_size, -1, key_proj.shape[-1]
+        )
+        scores = torch.bmm(flat_query_proj, key_proj.transpose(1, 2)) / self.scale
 
         if mask is not None:
-            scores = scores.masked_fill(mask, -1e8)
+            scores = scores.masked_fill(mask.unsqueeze(1), -1e8)
 
-        weights = torch.softmax(scores, dim=1)
+        weights = torch.softmax(scores, dim=-1)
         if mask is not None:
-            weights = weights.masked_fill(mask, 0.0)
-        weights_sum = weights.sum(dim=1, keepdim=True)
+            weights = weights.masked_fill(mask.unsqueeze(1), 0.0)
+        weights_sum = weights.sum(dim=-1, keepdim=True)
         weights = torch.where(
             weights_sum > 0, weights / weights_sum.clamp(min=1e-8), weights
         )
 
-        return torch.bmm(weights.unsqueeze(1), values).squeeze(1)
+        summaries = torch.bmm(weights, values)
+        return summaries.reshape(*query_shape[:-1], values.shape[-1])
 
 
 class ActionHead(nn.Module):
@@ -1303,7 +1313,13 @@ class ActionHead(nn.Module):
 
 
 class TeamPreviewHead(nn.Module):
-    """Canonical bring-set selection plus ordered lead-pair choice."""
+    """Canonical bring-set selection plus ordered lead-pair choice.
+
+    Every bring candidate and ordered lead pair cross-attends to the public
+    opponent representations with its own query. This lets preview decisions
+    express candidate-specific matchups instead of scoring every candidate
+    against one shared opponent summary.
+    """
 
     def __init__(self, pokemon_dim: int, context_dim: int, pick_size: int = 4):
         super().__init__()
@@ -1312,7 +1328,12 @@ class TeamPreviewHead(nn.Module):
                 "TeamPreviewHead requires pick_size >= 2 so it can choose a lead pair."
             )
         self.pick_size = pick_size
-        self.opponent_attention = MaskedSetAttention(context_dim, pokemon_dim, 128)
+        self.bring_opponent_attention = MaskedSetAttention(
+            context_dim + pokemon_dim, pokemon_dim, 128
+        )
+        self.lead_opponent_attention = MaskedSetAttention(
+            context_dim + pokemon_dim * 2, pokemon_dim, 128
+        )
         self.bring_score = nn.Sequential(
             nn.Linear(pokemon_dim * 2 + context_dim, 128),
             nn.ReLU(),
@@ -1338,6 +1359,20 @@ class TeamPreviewHead(nn.Module):
         include_policy_stats: bool = True,
     ) -> dict[str, torch.Tensor]:
         batch, team_size, pdim = pokemon_reps.shape
+        opponent_batch, opponent_size, _ = opponent_reps.shape
+        if opponent_batch != batch:
+            raise ValueError(
+                "TeamPreviewHead expected batch-aligned own and opponent "
+                f"representations, got {batch} and {opponent_batch}."
+            )
+        if opponent_mask is not None and opponent_mask.shape != (
+            batch,
+            opponent_size,
+        ):
+            raise ValueError(
+                "TeamPreviewHead expected opponent_mask shape "
+                f"{(batch, opponent_size)}, got {tuple(opponent_mask.shape)}."
+            )
         if team_mask is None:
             available = torch.ones(
                 batch, team_size, dtype=torch.bool, device=context.device
@@ -1360,17 +1395,24 @@ class TeamPreviewHead(nn.Module):
         picked_sum = torch.zeros(batch, pdim, device=context.device)
         next_min_index = torch.zeros(batch, 1, dtype=torch.long, device=context.device)
         remaining = available.clone()
+        bring_opponent_keys, bring_opponent_values = (
+            self.bring_opponent_attention._project_items(opponent_reps)
+        )
 
         for step in range(self.pick_size):
             ctx = self.context_proj(torch.cat([context, picked_sum], dim=-1))
-            opponent_summary = self.opponent_attention(
-                ctx, opponent_reps, opponent_mask
-            )
-
             ctx_expanded = ctx.unsqueeze(1).expand(-1, team_size, -1)
-            opponent_expanded = opponent_summary.unsqueeze(1).expand(-1, team_size, -1)
+            candidate_queries = torch.cat([ctx_expanded, pokemon_reps], dim=-1)
+            candidate_opponent_summaries = (
+                self.bring_opponent_attention._pool_projected(
+                    candidate_queries,
+                    bring_opponent_keys,
+                    bring_opponent_values,
+                    opponent_mask,
+                )
+            )
             bring_inputs = torch.cat(
-                [pokemon_reps, ctx_expanded, opponent_expanded], dim=-1
+                [pokemon_reps, ctx_expanded, candidate_opponent_summaries], dim=-1
             )
             bring_scores = self.bring_score(bring_inputs).squeeze(-1)
             picks_left = self.pick_size - step
@@ -1433,26 +1475,27 @@ class TeamPreviewHead(nn.Module):
         lead_context = self.lead_context_proj(
             torch.cat([context, bring_summary], dim=-1)
         )
-        lead_opponent_summary = self.opponent_attention(
-            lead_context, opponent_reps, opponent_mask
-        )
-
         left = pokemon_reps.unsqueeze(2).expand(-1, team_size, team_size, -1)
         right = pokemon_reps.unsqueeze(1).expand(-1, team_size, team_size, -1)
         bring_expanded = (
             bring_summary.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
         )
-        opponent_expanded = (
-            lead_opponent_summary.unsqueeze(1)
-            .unsqueeze(2)
-            .expand(-1, team_size, team_size, -1)
-        )
         lead_context_expanded = (
             lead_context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
         )
+        lead_pair_queries = torch.cat([lead_context_expanded, left, right], dim=-1)
+        lead_pair_opponent_summaries = self.lead_opponent_attention(
+            lead_pair_queries, opponent_reps, opponent_mask
+        )
         lead_pair_logits = self.lead_pair_score(
             torch.cat(
-                [left, right, bring_expanded, opponent_expanded, lead_context_expanded],
+                [
+                    left,
+                    right,
+                    bring_expanded,
+                    lead_pair_opponent_summaries,
+                    lead_context_expanded,
+                ],
                 dim=-1,
             )
         ).squeeze(-1)
