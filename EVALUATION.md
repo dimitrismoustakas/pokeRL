@@ -1,8 +1,9 @@
 # Evaluation and quality plan
 
 This document records the evaluation methodology and the main findings from the
-150-update run completed on 2026-07-12. The machine-readable summaries live
-under `logs/evaluation_150_20260712/` and are intentionally ignored by Git.
+150-update run, the interrupted event-aware run, and the completed 400-update
+matchup-belief run. The machine-readable summaries live under `logs/` and are
+intentionally ignored by Git.
 
 ## Methodology
 
@@ -178,32 +179,37 @@ regularizers.
 
 ### Remaining priorities
 
-1. **Create a real validation population.** Expand the legal team population,
-   reserve an archetype-stratified set that training never samples, and report
-   preview, belief, checkpoint cross-play, and fixed-probe metrics on both train
-   and held-out teams. The current hidden-info result can otherwise be fixed-set
-   memorization.
+1. **Make the self-play population permanent and payoff-aware.** Replace the
+   rolling FIFO window with an on-disk permanent archive and discounted PFSP.
+   The two inference groups should receive distinct historical opponents when
+   possible, while a uniform component preserves broad coverage. Dedicated
+   exploiter policies are deferred until the payoff matrix demonstrates a
+   cycle or persistent blind spot that PFSP alone does not repair.
 
-2. **Improve coverage inside self-play.** Balance league rollout sampling by
-   roster archetype and measured per-roster weakness while retaining frozen
-   checkpoints as the scalable opponent source. Trick Room, redirection, Fake
-   Out, Protect, speed control, immunity avoidance, and Tera timing should have
-   deterministic evaluation probes, not scripted training opponents.
+2. **Fix preview optimization before changing its objective.** Reuse each
+   current-policy preview sample with clipped on-policy PPO, including value
+   clipping and direct KL/clip diagnostics. Only if this still collapses to an
+   opponent-insensitive default should a candidate-value/Q preview objective
+   be trialled. Continue to report exact opponent/preview mutual information
+   and learned/max-BST/random preview ablations; do not reward variation for
+   its own sake.
 
-3. **Keep preview evidence-based.** Continue to report exact opponent/preview
-   mutual information and preview ablations. Add stratification, clipping, or
-   an entropy floor only when short A/B runs show better held-out outcomes; do
-   not reward a preview for merely being different across opponents.
+3. **Measure strategic moves with semantic denominators.** Trick Room must be
+   reported per selectable slot-decision and per battle. Fake Out must separate
+   live first-active-turn choices from dead later choices. Protect must separate
+   fresh use, same-Pokemon consecutive use, and simultaneous ally use. These
+   remain evaluation probes, not scripted rewards or training opponents.
 
 4. **Keep the LSTM through this iteration.** Explicit public events and own
    intent repair a real information omission while recurrence preserves longer
    history. Measure full-history versus reset-hidden inference before replacing
    memory.
 
-5. **Do not deploy PFSP merely because it is fashionable.** The current matrix
-   shows a plateau but no cycle. Keep permanent evaluation anchors and the raw
-   payoff matrix. Add PFSP or worst-opponent sampling only if a larger held-out
-   matrix exposes forgetting or a recurrent worst matchup.
+5. **Keep held-out teams in the backlog.** A legal archetype-stratified team
+   population remains necessary to distinguish general beliefs from memorized
+   roster identity, but it should not be approximated with randomly assembled
+   invalid or strategically incoherent teams. Until a sound source exists,
+   report the 77-team panel explicitly as in-distribution.
 
 ## Efficiency implications
 
@@ -363,3 +369,166 @@ has no prior public events or submitted intent, so its recent-event vector is
 provably zero and the padded 12-step event GRU can be bypassed exactly on preview
 and preview-value calls. Timing instrumentation remains optional and should be
 disabled for production runs.
+
+## Completed matchup-belief run at update 400
+
+The replacement run completed all 400 updates: 3,686,400 policy decisions and
+628,523 battles in 68,420.8 seconds (19 hours 0 minutes). Mean/median wall-update
+throughput was 54.90/56.45 SPS, with a 22.92-70.44 range. Excluding the first
+five updates gives 54.87/56.44 SPS and the same range. Updates 301-350 averaged
+56.92 SPS; the final 50 fell to 46.72 while the host was also doing other work,
+so the overall mean is not a clean isolated-machine ceiling.
+
+All 72 persistent learner players and all 72 persistent opponent players
+retained exactly one live battle at every update. CUDA allocation stayed within
+230-560 MB and reservation within 3.04-3.41 GB. The previous battle-retention
+leak and reset-reservation race did not recur.
+
+### Learning trajectory and fixed probes
+
+Each frozen-anchor comparison contains 128 mirrored sampled-policy games.
+
+| Final checkpoint opponent | Wins-losses | Win rate | 95% interval |
+|---|---:|---:|---:|
+| Initialization | 102-26 | 79.7% | 71.9-85.7% |
+| Update 100 | 65-63 | 50.8% | 42.2-59.3% |
+| Update 200 | 64-64 | 50.0% | 41.5-58.5% |
+| Update 300 | 68-60 | 53.1% | 44.5-61.6% |
+| Itself | 56-72 | 43.8% | 35.5-52.4% |
+
+The final policy is decisively stronger than initialization but is not
+distinguishable from updates 100, 200, or 300. The self-match interval includes
+50%, so its asymmetric point estimate is sampling and simulator noise, not
+evidence that the final policy loses to itself. The central result remains a
+large early gain followed by a long learning plateau.
+
+Each fixed-bot cell below contains 76 games against all other in-pool rosters.
+Bots remain deterministic evaluation probes only.
+
+| Fixed model roster | Random | MaxBasePower | SimpleHeuristics |
+|---|---:|---:|---:|
+| Portland balance | 69.7% | 48.7% | 32.9% |
+| Hatterene Trick Room/sun | - | 23.7% | 14.5% |
+| Utrecht balance | - | 93.4% | 90.8% |
+
+This is not a generally strong policy. Utrecht is already easy for its learned
+offensive mode, Portland is mixed, and the Hatterene roster still fails to
+execute its defining strategy.
+
+### Mechanics diagnostics
+
+The semantic evaluator was rerun on four 76-game sampled-policy panels. Tera
+was used in 71/76 Hatterene games against each bot, 72/76 Utrecht games, and
+75/76 Portland games. Conditional turn-one use was 60.6%, 56.9%, and 78.7%
+respectively, and both active slots were selected often. Every non-Tera game
+ended on turn 2-4; Utrecht won all four of its non-Tera games. Near-universal
+use remains the expectation, but evaluation should not encode an unconditional
+rule: declining a type change in an already decisive short win can be rational.
+
+Trick Room is a clear failure under either denominator. Hatterene selected it
+in 3/119 eligible setup slot-decisions spanning 3/71 opportunity-games against
+SimpleHeuristics, and 2/112 decisions spanning 2/72 games against MaxBasePower.
+The greedy action mode selected it in 0/72 opportunity-games against
+SimpleHeuristics when rerun with the checkpoint's original observation
+semantics. The setter was present and able to act; this is not primarily a
+preview-denominator artifact.
+
+Fake Out timing was not learned. Against SimpleHeuristics, Utrecht selected it
+6/140 times while the user was on its live first active turn, but 16/169 times
+after that condition had expired and the move was guaranteed to fail. The
+Hatterene panel was similarly inverted (3/77 live versus 4/47 late). Greedy
+inference also chose late Fake Out more often than live Fake Out, so the sampled
+tail is not the explanation.
+
+Protect behavior is roster-dependent but includes obvious over-chaining. The
+sampled Hatterene policy repeated a Protect-family move after a successful
+Protect on 19/44 available decisions against SimpleHeuristics and 27/65 against
+MaxBasePower, succeeding only 6 and 8 times. It attempted a fourth consecutive
+Protect once. Greedy Hatterene repeated on 37/59 opportunities; greedy Utrecht
+repeated on 9/11. By contrast, sampled Utrecht repeated on 0/8 and Portland on
+6/37, so the policy has some contextual variation but no reliable general rule.
+Simultaneous ally Protect remained rare (4/438 and 6/453 Hatterene joint
+decisions) and is a separate behavior.
+
+These mechanics are structurally learnable: the observation exposes
+`first_turn`, `protect_counter`, `last_move`, and timed field state to the action
+head. One information defect was nevertheless repaired for the next run. Timed
+conditions previously encoded both absence and their activation turn as zero;
+absence is now zero while active Trick Room, screens, and Tailwind are positive
+from the turn they begin. The remaining failure is chiefly sparse action-credit
+learning and exploration, not an LSTM capacity bottleneck.
+
+Basic target selection remains much healthier: damaging friendly fire was zero
+on all Portland panels and 0.1-0.2% on Hatterene, while immune targeting was at
+or below 0.8% there. That competence does not compensate for the missing
+multi-turn strategies.
+
+### Preview, beliefs, and event history
+
+Exact enumeration still finds a collapsed preview policy despite a measurable
+opponent signal.
+
+| Roster / checkpoint | Entropy | Joint MAPs | Opponent/choice MI |
+|---|---:|---:|---:|
+| Portland / initialization | 4.661 nats | 1 | ~0 bits |
+| Portland / update 200 | 2.290 nats | 2 | 0.0181 bits |
+| Portland / final | 0.317 nats | 1 | 0.0135 bits |
+| Hatterene / initialization | 4.653 nats | 1 | ~0 bits |
+| Hatterene / update 200 | 3.504 nats | 1 | 0.0107 bits |
+| Hatterene / final | 1.195 nats | 2 | 0.0104 bits |
+
+For Hatterene, the two final joint MAPs differ only in lead order; the greedy
+bring set is still unique across all 76 opponents. Against SimpleHeuristics,
+learned/max-BST/random preview scored 32.9/34.2/22.4% on Portland and
+14.5/10.5/10.5% on Hatterene. Those small, noisy panels show that roster synergy
+matters, but they do not demonstrate reliable opponent-conditioned selection.
+
+Unknown-only in-pool item, ability, and Tera accuracy finished near 100%, with
+move recall@4 at 91.1%. This is still compatible with memorizing 77 recurring
+teams. In direct 128-game mirrored ablations, the full policy scored 43.0%
+(34.7-51.6%) against a policy with the belief adapter zeroed and 47.7%
+(39.2-56.3%) against one with the recent-event encoder zeroed. Both overlap the
+final self-match result, so neither module has demonstrated a deployment-strength
+benefit yet. That is a reason to improve learning and diagnostics, not to remove
+causal information from the model after one in-distribution run.
+
+### PPO assessment and accepted next iteration
+
+Battle PPO remained numerically healthy. Over the final 50 updates, mean
+pre-update KL was 0.00060, post-update KL 0.01836, clip fraction 0.166, and
+value explained variance 0.734. CUDA memory was bounded and no non-finite update
+was reported. Action entropy nevertheless fell from a mean 2.78 over updates
+1-50 to 0.92 over updates 351-400 while strength had already plateaued. The
+problem is learning coverage and sample use, not an unstable PPO implementation.
+
+The accepted next iteration has now been implemented as follows:
+
+1. Every frozen checkpoint is kept in a permanent archive. The league maintains
+   discounted current-policy payoff evidence per opponent and PFSP-samples
+   opponents that remain difficult, with a uniform coverage component. It
+   assigns distinct draws to the two inference groups whenever the archive
+   permits it. Do not add
+   dedicated exploiters yet; first determine whether this simpler population
+   fixes the plateau and exposes stable payoff cycles.
+2. Preview's one-use terminal update is now clipped on-policy PPO, so
+   each current-policy sample receives bounded multi-epoch reuse and logs its
+   own KL/clip behavior. Run this diagnostic before introducing a candidate-Q
+   objective, whose unchosen-action estimates would add extrapolation risk.
+3. The fixed panels were rerun with live/dead Fake Out, fresh/chained Protect,
+   simultaneous ally Protect, and per-slot and per-battle Trick Room metrics.
+   They exposed concrete failures rather than a denominator problem. The next
+   model therefore learns selected-action public consequences (execution,
+   failure/miss/CANT, target CANT, and next field) and feeds detached learned
+   public-transition predictions into the policy. This remains sparse
+   terminal-reward learning;
+   it does not add heuristics, shaped rewards, or simulator-private outcomes.
+4. Keep periodic frozen-anchor and small fixed-probe evaluation cheap and
+   separate from training. Keep dedicated exploiters and a legal held-out team
+   population in the backlog rather than substituting bots or randomly
+   assembled teams.
+5. Frozen-opponent CUDA graphs are enabled for production rollout inference.
+   A two-update same-seed A/B preserved action/RNG parity, used one capture and
+   1,299 replays with zero fallbacks, reduced aggregate rollout time by 6.27%,
+   and improved wall throughput by 6.13% without changing PPO work or reserved
+   CUDA memory. This is an efficiency change only; terminal win/loss and the
+   learned policy are unchanged.

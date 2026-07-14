@@ -5,7 +5,19 @@ import pytest
 import torch
 
 import scripts.train as train_module
+from pokerl.env.actions import INTENT_MOVE
+from pokerl.env.observation import (
+    EVENT_KIND_TO_INDEX,
+    FIELD_TURN_OFFSET,
+    POSITION_IMPLICIT,
+    POSITION_OWN_1,
+)
+from pokerl.public_consequence import (
+    PUBLIC_CONSEQUENCE_CANT,
+    PUBLIC_CONSEQUENCE_EXECUTED,
+)
 from pokerl.training.rollout import RolloutBuffer
+from poke_env.battle import PublicBattleEventKind
 
 
 def _batched_obs(states: list[int], *, aux: bool) -> dict[str, np.ndarray]:
@@ -252,6 +264,110 @@ def test_collect_synchronous_rollout_requires_terminal_final_observation() -> No
         )
 
     assert buffer.step == 0
+
+
+def _consequence_obs(
+    state: int,
+    *,
+    field_value: float,
+    cant: bool,
+) -> dict[str, np.ndarray]:
+    event_kind = EVENT_KIND_TO_INDEX[
+        PublicBattleEventKind.CANT if cant else PublicBattleEventKind.MOVE
+    ]
+    return {
+        "state": np.asarray([state], dtype=np.float32),
+        "field": np.full(FIELD_TURN_OFFSET + 1, field_value, dtype=np.float32),
+        "recent_event_meta": np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        "recent_event_kind": np.asarray([event_kind], dtype=np.int64),
+        "recent_event_actor": np.asarray([POSITION_OWN_1], dtype=np.int64),
+        "recent_event_move": np.asarray([0 if cant else 7], dtype=np.int64),
+        "recent_event_flags": np.zeros((1, 3), dtype=np.float32),
+        "recent_event_mask": np.asarray([False]),
+        "prev_own_valid": np.asarray([True, False]),
+        "prev_own_kind": np.asarray([INTENT_MOVE, 0], dtype=np.int64),
+        "prev_own_move": np.asarray([7, 0], dtype=np.int64),
+        "prev_own_target": np.asarray([POSITION_IMPLICIT, 0], dtype=np.int64),
+    }
+
+
+def _batch_single_observation(
+    observation: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    return {key: value[None, ...] for key, value in observation.items()}
+
+
+class _ConsequenceAlignmentEnv:
+    num_envs = 1
+
+    def __init__(self) -> None:
+        self.step_index = 0
+
+    def step(self, actions):
+        del actions
+        if self.step_index == 0:
+            observation = _consequence_obs(1, field_value=10.0, cant=False)
+            done = False
+            info = {}
+        else:
+            # Auto-reset returns this unrelated observation.  The transition
+            # label must instead use the terminal public observation below.
+            observation = _consequence_obs(100, field_value=99.0, cant=False)
+            done = True
+            info = {
+                "final_observation": _consequence_obs(
+                    2,
+                    field_value=20.0,
+                    cant=True,
+                )
+            }
+        self.step_index += 1
+        return (
+            _batch_single_observation(observation),
+            _batched_masks(1),
+            np.asarray([0.0], dtype=np.float32),
+            np.asarray([done]),
+            [info],
+        )
+
+
+def test_public_consequences_align_next_and_terminal_observations_through_last_step() -> (
+    None
+):
+    initial = _batch_single_observation(
+        _consequence_obs(0, field_value=0.0, cant=False)
+    )
+    masks = _batched_masks(1)
+    buffer = RolloutBuffer(2, 1, initial, masks, torch.device("cpu"))
+    buffer.reset()
+
+    train_module.collect_synchronous_rollout(
+        parallel_env=_ConsequenceAlignmentEnv(),
+        agent=_DeterministicAgent(),
+        buffer=buffer,
+        obs=initial,
+        action_masks=masks,
+        hidden=None,
+        device=torch.device("cpu"),
+        num_steps=2,
+        tera_exploration_prob=0.0,
+        collect_timing=False,
+    )
+    batch = buffer.compute_gae(torch.zeros(1))
+
+    assert batch.public_consequence_resolution_labels[:, 0, 0].tolist() == [
+        PUBLIC_CONSEQUENCE_EXECUTED,
+        PUBLIC_CONSEQUENCE_CANT,
+    ]
+    assert batch.public_consequence_resolution_masks[:, 0, 0].tolist() == [
+        True,
+        True,
+    ]
+    assert batch.public_consequence_field_targets[:, 0, 0, 0].tolist() == [
+        10.0,
+        20.0,
+    ]
+    assert batch.public_consequence_field_masks[:, 0, 0].tolist() == [True, True]
 
 
 class _FailingParallelEnv:

@@ -54,7 +54,7 @@ Reset → Observe → Spatial Encoder → Memory → Action + Value → Step →
 - **Recurrent actor-critic**: both the policy and the value function see an LSTM-carried battle history.
 - **League self-play**: trained against a rotating pool of frozen past checkpoints.
 - **Three autoregressive decisions per turn**: slot-1 action → slot-2 action conditioned on slot 1 → terastallization choice conditioned on both.
-- **Separate team preview stage**: picks the 4-of-6 bring set first, then picks an ordered lead pair from those 4. Trained with REINFORCE plus opponent-model auxiliaries.
+- **Separate team preview stage**: picks the 4-of-6 bring set first, then picks an ordered lead pair from those 4. Trained with clipped on-policy PPO plus opponent-model auxiliaries.
 
 ### Battle-turn pipeline
 
@@ -79,7 +79,7 @@ synthetic preview observation
        canonical bring set (4 of 6)
        → ordered lead pair (2 of the 4)
   → OpponentPreviewHead (auxiliary bring + lead prediction)
-  → PreviewValueHead (baseline for REINFORCE)
+  → PreviewValueHead (preview-state baseline for clipped PPO)
 ```
 
 The spatial encoder, memory module, and their weights are shared between battle turns and team preview — only the heads differ.
@@ -120,7 +120,7 @@ Defined by `CONTINUOUS_DIM` in [observation.py:85](pokerl/env/observation.py#L85
 | Move PP fractions | 4 | `current_pp / max_pp` per slot — **own side only**; opponent entries stay zero |
 | Extra | 9 | protect counter, status counter, first turn, revealed, known move count, ability known, item known, tera known, is terastallized |
 
-**Important asymmetry:** PP is populated for own pokemon but zero for opponent pokemon. The model learns this as an implicit "is own" signal rather than having a separate flag. The cost is that it cannot track opponent PP depletion (e.g. knowing a Fake Out can't be used again). See [§10.2](#102-opponent-pp-features-always-zero).
+**Important asymmetry:** PP is populated for own pokemon but zero for opponent pokemon. The model learns this as an implicit "is own" signal rather than having a separate flag. The cost is that it cannot track opponent PP depletion, such as whether a low-PP move is exhausted or an opponent is close to being forced into Struggle. Fake Out's first-active-turn restriction is different: the explicit `first_turn` feature makes that timing observable and learnable. See [§10.2](#102-opponent-pp-features-always-zero).
 
 ### 2.2 Field Features — 36 dimensions
 
@@ -171,7 +171,7 @@ Entry point: [pokerl/model/agent.py](pokerl/model/agent.py). `PokeAgent` compose
 - `hidden_info_head` — `HiddenInfoHead` (policy-consumed compact belief encoder plus training-only attribute decoders)
 - `opponent_intent_head` — `OpponentIntentHead` (auxiliary semantic opponent-decision prediction only)
 - `value_head` — `ValueHead` for battle turns
-- `preview_value_head` — separate `ValueHead` used as the REINFORCE baseline at preview
+- `preview_value_head` — separate `ValueHead` used as the clipped-PPO baseline at preview
 
 If `ModelConfig.init_embeddings_from_stats` is true (the default), `GameData` initializes species and move embeddings from normalized base stats before the first forward pass — see [§3.11](#311-stat-based-embedding-initialization).
 
@@ -667,21 +667,24 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
 
 **Diagnostic:** approximate KL divergence `((ratio - 1) - log_ratio).mean()` — useful for checking whether the policy is updating too aggressively.
 
-**Trainer checkpoints:** resume checkpoints use a strict versioned format and are written through an atomic temporary-file replacement. Each is cross-checked by a unique ID against its own `<checkpoint>.league_state.json` companion. Together they contain the exact agent state, model class/configuration, categorical-vocabulary fingerprint and tensor schema, Adam state, global step, Python/NumPy/PyTorch CPU and CUDA RNG states, league membership/RNG, and team-pool identity/RNG. Resume rejects legacy formats and any missing, unexpected, shape-, dtype-, layout-, class-, model-config, vocabulary, companion-ID, or team-pool mismatch; it never silently loads a compatible subset or resets Adam. League checkpoints remain lightweight agent snapshots and cannot be passed to `--resume`.
+**Trainer checkpoints:** resume checkpoints use a strict versioned format and are written through an atomic temporary-file replacement. Each is cross-checked by a unique ID against its own `<checkpoint>.league_state.json` companion. Together they contain the exact agent state, model class/configuration, categorical-vocabulary fingerprint and tensor schema, Adam state, global step, completed-update boundary, Python/NumPy/PyTorch CPU and CUDA RNG states, league membership/RNG, and team-pool identity/RNG. The trainer and league completed-update counters must agree, so changing rollout geometry cannot silently reinterpret `global_step` as a different training schedule. Resume rejects legacy formats and any missing, unexpected, shape-, dtype-, layout-, class-, model-config, vocabulary, companion-ID, update-boundary, or team-pool mismatch; it never silently loads a compatible subset or resets Adam. League checkpoints remain lightweight agent snapshots and cannot be passed to `--resume`.
 
 ### 5.4 Team Preview Update
 
-`PPOTrainer.update_team_preview()` runs REINFORCE-with-baseline for preview decisions, because they happen once per battle (not per turn) and receive the final sparse reward much later than any individual action.
+`PPOTrainer.update_team_preview()` treats preview as a terminal contextual-bandit decision and applies clipped on-policy PPO. Preview happens once per battle and receives the final sparse reward; it is not assigned a shaped intermediate target.
 
 ```python
-advantage = episode_reward - preview_value.detach()
-policy_loss = -(log_prob * advantage).mean()
-value_loss = 0.5 * ((preview_value - episode_reward) ** 2).mean()
+advantage = episode_reward - old_preview_value
+ratio = exp(clamp(new_log_prob - old_log_prob))
+policy_loss = max(-advantage * ratio,
+                  -advantage * clip(ratio, 1 - clip_eps, 1 + clip_eps)).mean()
+value_loss = 0.5 * max((preview_value - episode_reward) ** 2,
+                       (clipped_preview_value - episode_reward) ** 2).mean()
 ```
 
-The **preview value head** is a dedicated `ValueHead` instance used only as the REINFORCE baseline. Using the same battle-turn value head would be awkward because it is trained on per-turn state-value, whereas the preview head needs to predict the final return from a synthetic preview state.
+The **preview value head** is a dedicated `ValueHead` instance used as the preview-state baseline. Using the same battle-turn value head would be awkward because it is trained on per-turn state-value, whereas the preview head needs to predict the final return from a synthetic preview state.
 
-**On-policy sampling:** every batched preview decision is tagged with the live policy version that produced it. When a battle spans an optimizer boundary, its eventual preview sample is excluded instead of training against newer weights. All current-version samples are used by default before battle PPO. They are processed in bounded 512-sample chunks whose globally normalized gradients are accumulated, clipped once, and applied as exactly one optimizer step. An optional deterministic uniform cap remains available for constrained experiments. Summaries report current samples available, samples used, and stale boundary samples excluded.
+**On-policy sampling:** every batched preview decision is tagged with the live policy version that produced it. When a battle spans an optimizer boundary, its eventual preview sample is excluded instead of training against newer weights. Immediately before optimization, the unchanged rollout policy reconstructs exact old log-probabilities and preview values under deployment (`eval`) semantics. Current-version samples are then reused for the configured PPO epochs in bounded minibatches, with ratio/value clipping and direct KL/clip diagnostics. Preview updates run before battle PPO; the reported pre-battle KL verifies that their shared-encoder change remains small. An optional deterministic uniform cap remains available for constrained experiments.
 
 **Auxiliary losses:**
 
@@ -702,7 +705,59 @@ With `team_preview_value_coef=0.5`, `team_preview_bring_coef=0.1`, `team_preview
 
 Those losses update the shared encoder stack (and hence `opp_reps`) as well as the opponent-preview head, through the same optimizer step as preview policy + value.
 
-### 5.5 Inference Batchers
+### 5.5 Action-conditioned public consequences
+
+Each legal move candidate now predicts consequences visible in the next public
+observation: whether the submitted move executed, failed, missed, or could not
+act; whether either explicitly targeted opponent produced a public `CANT`
+event; and the next public field prefix through Trick Room. Labels are matched
+only from complete public event segments to the exact previously submitted
+actor and move. Ambiguous, transformed, truncated, and overflowing segments
+are masked instead of guessed. Implicit targets supervise opponent `CANT` only
+when the matched public move is marked as spread, so self/field moves such as
+Protect and Trick Room cannot receive an ally's flinch credit.
+
+At battle end, poke-env marks the final current public-event segment complete:
+Showdown does not emit another `|turn|` delimiter after a terminal event, but
+the finished battle itself proves no more events belong to that turn. Live
+forced-replacement/current segments remain partial. This retains decisive
+terminal-action labels without accepting genuinely incomplete transitions.
+
+The predictor reuses the candidate scorer's hidden representation. Its
+softmax/sigmoid probabilities are detached before being valued by
+zero-initialized weights emitted from the current slot context. Therefore the
+new architecture begins with exactly the old action logits, actor gradients
+cannot turn the predictor into an
+ungrounded private code, and the predictor itself learns only from public
+transition labels. The adapter can still learn that, for example, a Fake Out
+candidate is likely to fail after `first_turn` expires or a repeated Protect
+has lower execution probability. Because the valuation weights depend on the
+current matchup, the same predicted field transition can be useful for a slow
+Trick Room composition and harmful for a fast one.
+
+This is auxiliary representation learning, not reward shaping or a rule
+override. The only reward remains terminal win/loss, only selected actions
+receive consequence labels, and the model is not given counterfactual
+simulator outcomes. Resolution cross-entropy, opponent-CANT binary
+cross-entropy, and next-field mean-squared error are normalized as three equal
+components before multiplication by `aux_public_consequence_coef`. Resolution
+uses a proper hierarchical likelihood: executed versus non-executed, followed
+by failure/miss/CANT type conditional on non-execution. This gives the rare
+failure-type task a full gradient without changing the calibrated-probability
+optimum. Within the field component, changed and unchanged public features
+receive equal weight when both occur, preventing the persistence majority from
+drowning out real transitions. Logs report per-resolution-class support/recall,
+resolution/CANT calibration and CANT positive recall/negative specificity,
+generic changed-feature errors, and separate Trick Room scalar-age versus true
+presence-transition errors against a persistence baseline, plus policy-adapter
+weight norm. The transition-balanced field objective is deliberately judged by
+MSE/skill rather than interpreted as a calibrated conditional mean.
+
+Because doubles resolves a joint turn, the next field and CANT targets are
+on-policy marginal outcomes under the observed partner and opponent actions;
+they are not claimed to be isolated causal counterfactual effects of one move.
+
+### 5.6 Inference Batchers
 
 Two helpers reduce the cost of per-env tiny forward passes:
 
@@ -780,21 +835,22 @@ Training against a fixed opponent (random, max-power greedy) produces a policy t
 
 ### 8.2 League structure
 
-A rolling pool of up to `league_size = 12` frozen past checkpoints. Every `league_update_interval = 10` PPO updates, `add_checkpoint(...)` snapshots the current policy to `checkpoint_dir/league/step_<global_step>.pt` and appends it to the pool. When the pool is full, the oldest checkpoint is evicted (`deque(maxlen=league_size)`). Opponent groups are resampled independently every `league_refresh_interval = 1` update. On updates where both happen, the snapshot is added first, so the newly frozen policy is immediately eligible for assignment.
+Every `league_update_interval = 10` PPO updates, `add_checkpoint(...)` snapshots the current policy to `checkpoint_dir/league/step_<global_step>.pt`. Every snapshot remains in the permanent archive and can reappear as an opponent. `league_size = 12` now bounds only the LRU model cache in each inference service, so archive growth does not imply unbounded CPU or CUDA model residency.
 
-The default two opponent groups preserve large inference batches within an update, while the faster refresh cadence supplies diversity across updates. Run summaries record the checkpoints assigned and actually observed, plus wins, losses, and draws per checkpoint and across the run.
+The default two opponent groups preserve large inference batches within an update. They are refreshed every `league_refresh_interval = 1` update and receive distinct checkpoints whenever at least two archive members exist. Checkpoint creation occurs before the draw, so a newly frozen policy is immediately eligible. Strict resume restores those already-drawn assignments with the league RNG instead of drawing a second time.
 
-**Sampling policy** ([league.py:549-562](pokerl/training/league.py#L549-L562)): 70% chance to sample from the *recent half*, 30% from the *older half*. Balances:
+**Sampling policy:** live-policy wins, losses, and draws form a discounted payoff estimate for each checkpoint. Because hundreds of battles in one rollout share one learner version, each nonempty checkpoint/update bucket contributes one outcome-proportion evidence unit, not one independent unit per battle. Evidence decays with `league_payoff_half_life_updates = 20`, and a symmetric Beta prior pulls unseen or stale estimates toward a 50% win probability.
 
-- **Exploitation** — playing against strong, recent opponents improves measured skill.
-- **Exploration** — playing against diverse, older opponents avoids exploitation holes where the current policy overfits to the most recent training partner.
+First-draw hard-PFSP priority is `(1 - p)^league_pfsp_exponent`, where `p` is the discounted current-policy win estimate. The normalized priority is mixed with `league_pfsp_uniform_fraction = 0.1` uniform archive coverage. Later group draws are conditional on earlier distinct selections. Compact per-update summaries report distribution entropy/effective support, the hardest checkpoint, and cache statistics; the full latest member distribution appears once at summary top level.
 
 ### 8.3 Inference architecture
 
 `_LeagueInferenceService` runs in a background thread:
 
 - Multiple parallel `LeaguePlayer` instances (one per concurrent battle) submit inference requests via `Future`.
-- Requests are buffered over a `coalesce_window_ms = 10ms` window, then grouped by `(checkpoint_path, kind)` — so all "checkpoint X, battle turn" requests across envs run in a single batched forward pass.
+- Requests are buffered over the configured coalescing window, then grouped by `(checkpoint_path, kind)` — so all "checkpoint X, battle turn" requests across envs run in a single batched forward pass.
+- Frozen models use a bounded LRU cache. Selecting an evicted historical checkpoint reloads it lazily without removing it from the permanent archive.
+- On CUDA, battle-action batches use a bounded graph cache for the current frozen checkpoints. Inputs and recurrent state are staged into fixed buffers, stochastic sampling noise is generated outside the graph in the same logical order as eager inference, and outputs are cloned before reuse. Capture failure disables the optimization and falls back to eager inference with explicit diagnostics; preview inference stays eager on CPU.
 - Responses are dispatched back to the waiting `LeaguePlayer`s.
 
 Without this, each `LeaguePlayer` would drive a per-env forward pass — extremely slow given Showdown's per-battle latency.
@@ -868,9 +924,10 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `team_preview_bring_coef` | 0.1 | bring-prediction aux weight |
 | `team_preview_lead_coef` | 0.05 | lead-prediction aux weight |
 | `team_preview_max_samples` | `None` | optional uniform preview cap (`None` uses all current samples) |
-| `preview_update_minibatch_size` | 512 | activation-bounded preview gradient chunk size |
+| `preview_update_minibatch_size` | 512 | maximum preview PPO minibatch size |
 | `aux_hidden_info_coef` | 0.25 | hidden-info prediction aux weight |
 | `aux_opponent_intent_coef` | 0.25 | semantic opponent-decision prediction aux weight |
+| `aux_public_consequence_coef` | 0.1 | positive selected-action public-transition prediction weight |
 | `diagnose_memory_gradients` | `False` | opt-in one-minibatch norms/cosines for weighted battle-PPO gradients on shared memory |
 | `rollout_steps` | 128 | steps per env before update |
 | `num_epochs` | 4 | PPO epochs per rollout |
@@ -883,10 +940,13 @@ All hyperparameters live in [pokerl/config.py](pokerl/config.py) as dataclasses.
 | `log_interval` | 10 | console log every N updates |
 | `save_interval` | 100 | save checkpoint every N updates |
 | `checkpoint_dir` | `"checkpoints"` | where to write checkpoints |
-| `league_size` | 12 | max past checkpoints |
+| `league_size` | 12 | max resident frozen models per inference service; archive is permanent |
 | `league_update_interval` | 10 | save to league every N updates |
 | `league_refresh_interval` | 1 | resample opponent groups every N updates |
 | `league_coalesce_ms` | 5.0 | inference coalescing window (ms) |
+| `league_payoff_half_life_updates` | 20.0 | half-life of clustered live-policy payoff evidence |
+| `league_pfsp_exponent` | 2.0 | hard-opponent PFSP priority exponent |
+| `league_pfsp_uniform_fraction` | 0.1 | uniform archive coverage mixed into PFSP |
 | `seed` | 0 | master seed used to derive recorded learner, league, and team streams |
 
 ---
@@ -905,7 +965,7 @@ Hash collisions mean multiple items share an embedding. There is also no stat-ba
 
 ### 10.2 Opponent PP features always zero
 
-The 4 PP dimensions in the continuous feature vector are zero for all opponent pokemon. The model learns "zero PP = opponent," but it can't track opponent PP depletion (e.g. knowing that Fake Out can't fire again, or that a Choice Band user is one Struggle away).
+The 4 PP dimensions in the continuous feature vector are zero for all opponent pokemon. The model learns "zero PP = opponent," but it cannot track whether a low-PP move is exhausted or an opponent is close to being forced into Struggle. This does **not** prevent learning Fake Out timing: `first_turn` is encoded explicitly for active pokemon and becomes true again when a pokemon switches back in.
 
 **Fix direction:** give opponent pokemon their own `continuous_dim` without PP, and separate the encodings — the model then cannot confuse "no PP info" with "full PP." Alternatively, expose a PP-inferred signal derived from move use counts in the battle log.
 
@@ -946,11 +1006,11 @@ Even with batching and multiple environments, Showdown battle latency dominates 
 
 **Still open:** profile the JavaScript request/protocol path on warmed long runs, and benchmark worker/runtime-loop/coalescing changes without startup-heavy measurements. Model micro-optimizations have a hard single-digit-percent ceiling unless the rollout share changes materially.
 
-### 10.8 League diversity is bounded by a small rolling window
+### 10.8 The league still follows one strategy-generating trajectory
 
-With `league_size=12` and `league_update_interval=10`, the pool spans at most ~120 updates back. If the policy converges slowly, the pool can contain policies that are all very similar.
+The permanent archive and payoff-aware PFSP prevent history eviction and resurface hard past policies, but every member is still a snapshot of the same main learner. Reweighting those opponents cannot invent a counter-strategy that never appeared on that trajectory. Separate learned exploiters remain deliberately deferred because they would consume substantial additional simulation compute on one machine and can overfit a single checkpoint.
 
-Mirrored checkpoint evaluation now provides the missing cycling diagnostic. The first 0/50/100/125/150 matrix showed strong improvement through update 100 and then a plateau, but no statistically supported non-transitive cycle. That argues for keeping permanent evaluation anchors now and introducing PFSP only when a larger matrix shows forgetting or recurrent hard opponents.
+Mirrored checkpoint evaluation remains necessary: online discounted payoffs estimate the changing main policy's current row against the archive, not the complete frozen-vs-frozen payoff matrix or a Nash mixture.
 
 See [LEAGUE_IMPROVEMENTS.md](LEAGUE_IMPROVEMENTS.md) for the league design space and [EVALUATION.md](EVALUATION.md) for the measured 150-update results and current priorities.
 
@@ -989,7 +1049,7 @@ The agent must discover hazard, weather, and terrain strategies entirely from sc
 │         ↓                                                              │
 │  ┌──────────────────────────────────────────────────────────────┐      │
 │  │  PPOTrainer.update_team_preview()                            │      │
-│  │  REINFORCE + preview value baseline + opponent-model aux     │      │
+│  │  clipped PPO + preview value baseline + opponent-model aux   │      │
 │  └──────────────────────────────────────────────────────────────┘      │
 └───────────────────────────────────────────────────────────────────────┘
 
@@ -1009,5 +1069,5 @@ Team preview:
     → Memory
     → TeamPreviewHead (canonical bring set → ordered lead pair)
     → OpponentPreviewHead (auxiliary)
-    → PreviewValueHead (REINFORCE baseline)
+    → PreviewValueHead (preview-state PPO baseline)
 ```

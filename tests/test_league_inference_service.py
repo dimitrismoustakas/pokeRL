@@ -1,5 +1,6 @@
 from concurrent.futures import Future
 from contextlib import contextmanager
+from collections import OrderedDict, defaultdict
 from threading import Condition
 import time
 
@@ -98,6 +99,11 @@ def _service_stub() -> _LeagueInferenceService:
     service._last_progress_at = time.perf_counter()
     service._thread = _AliveThread()
     service._models = {"checkpoint.pt": object()}
+    service._max_models = 12
+    service._cache_hits = 0
+    service._cache_misses = 0
+    service._cache_loads = 0
+    service._cache_evictions = 0
     service._host_batch_buffers = {}
     service._device_batch_buffers = {}
     service._prefetch_paths = set()
@@ -798,6 +804,70 @@ def test_league_staging_reuses_capacity_without_exposing_stale_rows() -> None:
     assert rebuilt_host is not grown_host
     assert rebuilt_host.schema != grown_host.schema
     assert rebuilt_host.capacity == 2
+
+
+def test_action_batch_size_profile_accumulates_once_per_batch() -> None:
+    class _Timing:
+        def __init__(self) -> None:
+            self.values = defaultdict(float)
+
+        def add(self, key: str, value: float) -> None:
+            self.values[key] += value
+
+        def increment(self, key: str, delta: int = 1) -> None:
+            self.values[key] += delta
+
+    service = _service_stub()
+    service._get_agent = lambda _checkpoint_path: _RecordingBatchAgent()
+    timing = _Timing()
+    requests = _staging_requests(4, offset=0)
+    for request in requests:
+        request.timing = timing
+
+    service._run_battle_batch("checkpoint.pt", requests)
+
+    assert timing.values["opponent_infer_action_requests"] == 4
+    assert timing.values["opponent_infer_action_batches"] == pytest.approx(1.0)
+    assert timing.values["opponent_infer_action_batch_size_sum"] == pytest.approx(4.0)
+
+
+def test_league_inference_model_cache_is_lru_bounded() -> None:
+    service = _service_stub()
+    service._models = OrderedDict()
+    service._max_models = 2
+    loaded: dict[str, object] = {}
+
+    def load_agent(path: str):
+        return loaded.setdefault(path, object())
+
+    service._load_agent = load_agent
+
+    first = service._get_agent("first.pt")
+    service._get_agent("second.pt")
+    assert service._get_agent("first.pt") is first
+    service._get_agent("third.pt")
+
+    assert list(service._models) == ["first.pt", "third.pt"]
+    assert service.cache_info() == {
+        "capacity": 2,
+        "resident_models": 2,
+        "hits": 1,
+        "misses": 3,
+        "loads": 3,
+        "evictions": 1,
+        "cuda_graphs_enabled": False,
+        "cuda_graph_capacity": 2,
+        "resident_cuda_graphs": 0,
+        "cuda_graph_hits": 0,
+        "cuda_graph_misses": 0,
+        "cuda_graph_captures": 0,
+        "cuda_graph_replays": 0,
+        "cuda_graph_evictions": 0,
+        "cuda_graph_fallbacks": 0,
+        "cuda_graph_real_rows": 0,
+        "cuda_graph_padded_rows": 0,
+        "cuda_graph_last_error": None,
+    }
 
 
 def test_league_staging_packs_cpu_before_entering_cuda_guard(

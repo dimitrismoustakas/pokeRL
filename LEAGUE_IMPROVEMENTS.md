@@ -1,6 +1,11 @@
 # League Self-Play: Improvement Options
 
-A design-space overview for improving the self-play league beyond the current rolling-window setup. This is a reference for *what the options are* and *what the tradeoffs look like*, not a committed plan. See [pokerl/training/league.py](pokerl/training/league.py) and [§8 of MODEL_EXPLANATION.md](MODEL_EXPLANATION.md#8-league-self-play) for the current implementation.
+A design-space overview for improving the current permanent-archive self-play
+league. This is a reference for *what the options are* and *what the tradeoffs
+look like*, not a committed plan. See
+[pokerl/training/league.py](pokerl/training/league.py) and
+[§8 of MODEL_EXPLANATION.md](MODEL_EXPLANATION.md#8-league-self-play) for the
+current implementation.
 
 ---
 
@@ -20,8 +25,8 @@ Heuristic opponents (random, max-power, scripted) are deliberately excluded here
 
 ## 2. Current state
 
-- Rolling pool of `league_size = 12` checkpoints, snapshot every `league_update_interval = 10` PPO updates. Pool spans at most ~120 updates of history; oldest evicted on overflow. The default two opponent groups are resampled every update independently of snapshot creation.
-- Sampling: 70% from the recent half, 30% from the older half. Uniform within each half. Outcomes are tracked per opponent for diagnosis, but they do not yet change sampling weights.
+- Permanent checkpoint archive, snapshot every `league_update_interval = 10` PPO updates. `league_size = 12` bounds the LRU inference cache rather than archive history. The default two opponent groups are resampled every update and receive distinct members whenever possible.
+- Sampling: implemented hard-opponent PFSP over exponentially discounted, update-clustered live-policy outcomes, mixed with 10% uniform archive coverage. Later group draws are conditional on earlier distinct selections.
 - Training summaries record wins, losses, and draws by opponent checkpoint. The evaluation harness now runs sampled or greedy checkpoint cross-play on pre-planned team pairs, mirrors player/team roles, and retains the raw payoff matrix.
 
 The first 0/50/100/125/150 matrix found strong improvement through update 100 and then a plateau, with no statistically supported cycle. The immediate gap is therefore **absolute and roster-specific skill**, not demonstrated league cycling: the same final checkpoint ranged from 14.5% to 94.7% against SimpleHeuristics depending on its own roster. See [EVALUATION.md](EVALUATION.md).
@@ -60,18 +65,18 @@ Organized by effort vs. expected payoff.
 
 The remaining work is orchestration: invoke the panel periodically during long runs and add held-out team populations.
 
-#### B. Prioritized Fictitious Self-Play (PFSP)
+#### B. Prioritized Fictitious Self-Play (PFSP) — implemented
 
-Track per-opponent win rate with an EMA. Replace the 70/30 recent/old rule with weighted sampling over the full pool:
+The trainer now replaces the 70/30 recent/old rule with weighted sampling over the full archive. Each checkpoint/update bucket contributes one outcome-proportion evidence unit, evidence has a configurable half-life, and hard-PFSP is mixed with uniform coverage:
 
 - `(1 − p)^α` — train against what we're losing to (AlphaStar's "hard" variant).
 - `p · (1 − p)` — train against coin-flip matchups (variance-focused, more conservative).
 
 If an old checkpoint starts beating the current agent, it gets sampled more, and the agent is forced to re-learn its counter. Small code change, directly addresses cycling.
 
-#### C. Don't evict — archive
+#### C. Don't evict — archive — implemented
 
-Checkpoint files are small. Keep them all on disk, but tier what's *resident* in the inference service: all of the last ~20, every 5th of the next ~50, every 25th beyond that. PFSP (B) handles "which to actually play." This preserves strategic diversity without unbounded memory. Pair well with (B): PFSP is only as useful as the pool it samples from.
+Checkpoint files remain permanently on disk and in paired league state. Each inference service uses a bounded LRU model cache (`league_size`, default 12); selecting an evicted member reloads it lazily. PFSP (B) decides which archived policy to play without unbounded model residency.
 
 ### Tier 2 — moderate effort, real payoff
 
@@ -105,7 +110,10 @@ Every N updates, identify the one historical checkpoint the current agent has th
 
 ## 5. Guardrails
 
-- **Do not make weak bots the main opponent distribution.** That would optimize for their exploitable quirks. The 150-update run did expose shared self-play blind spots, however, so a small measured tactical-curriculum or absolute-anchor fraction is now worth an A/B test. It should be retained only if it improves held-out teams and checkpoint cross-play, not merely bot win rate.
+- **Do not train against weak scripted bots.** That would optimize for their
+  exploitable quirks and does not scale with the game's strategy space. Keep
+  them as fixed, out-of-training diagnostic probes only. New strategic pressure
+  should come from self-play history or learned best responses.
 
 ---
 
@@ -113,10 +121,13 @@ Every N updates, identify the one historical checkpoint the current agent has th
 
 Given the current evidence and the single-GPU constraint:
 
-1. **Automate A and add held-out teams.** Keep the matrix, fixed bots, preview conditioning, and roster-stratified metrics as quality gates.
+1. **Automate A.** Keep the matrix, fixed bots, preview conditioning, and
+   roster-stratified metrics as quality gates. Add a legal held-out team
+   population once one can be supplied without randomly assembling invalid or
+   incoherent teams.
 2. **Fix the measured Tera, preview, and archetype failures.** These dominate current quality more clearly than league sampling does.
-3. **C — retain permanent evaluation anchors.** Archival is cheap even before it affects training.
-4. **B — add PFSP only after a larger matrix demonstrates forgetting, cycling, or stable hard opponents.** It should solve an observed failure rather than add inference fragmentation speculatively.
+3. **Implemented: B + C.** Retain every snapshot, bound resident models with an LRU cache, and sample distinct groups with discounted hard-PFSP plus uniform coverage.
+4. **Measure the new league.** Compare online payoff support with mirrored frozen-checkpoint matrices; PFSP cannot create strategies absent from the main trajectory.
 5. Revisit **D** and Tier 3 only if simpler measured corrections leave a league-specific failure.
 
 The evaluation harness now tells the truth: the current policy is improving, then plateauing, with serious shared strategic blind spots.

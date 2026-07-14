@@ -150,6 +150,12 @@ class PokeAgent(nn.Module):
         validate_actions: bool = True,
         include_value: bool = True,
         include_policy_stats: bool = True,
+        sampling_exponentials: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass for battle turns.
 
@@ -201,6 +207,7 @@ class PokeAgent(nn.Module):
             tera_exploration_prob=tera_exploration_prob,
             validate_actions=validate_actions,
             include_policy_stats=include_policy_stats,
+            sampling_exponentials=sampling_exponentials,
         )
 
         result = {

@@ -3,9 +3,11 @@
 import asyncio
 import copy
 import json
+import math
 import random
 import time
-from collections import deque
+from collections import OrderedDict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from concurrent.futures import CancelledError, Future, InvalidStateError
 from dataclasses import dataclass
@@ -26,6 +28,7 @@ from ..env.observation import (
     summarize_observation_mismatch,
 )
 from ..env.actions import (
+    NUM_TERA_CHOICES,
     SemanticActionIntent,
     SemanticActionSupervision,
     action_to_order,
@@ -45,12 +48,95 @@ from ..env.showdown_env import (
 from .cuda_execution import cuda_model_execution
 
 
-_LEAGUE_STATE_FORMAT_VERSION = 2
+_LEAGUE_STATE_FORMAT_VERSION = 3
 _LEAGUE_STATE_CONFIG_FIELDS = (
     "league_size",
     "league_update_interval",
     "league_refresh_interval",
+    "league_payoff_half_life_updates",
+    "league_pfsp_exponent",
+    "league_pfsp_uniform_fraction",
 )
+_LEAGUE_MEMBER_STATE_FIELDS = (
+    "path",
+    "step",
+    "created_update",
+    "discounted_wins",
+    "discounted_losses",
+    "last_payoff_update",
+    "lifetime_wins",
+    "lifetime_losses",
+    "lifetime_draws",
+)
+
+
+@dataclass
+class LeagueMember:
+    """One permanent archive member and its live-policy payoff evidence."""
+
+    path: str
+    step: int
+    created_update: int
+    discounted_wins: float = 0.0
+    discounted_losses: float = 0.0
+    last_payoff_update: int | None = None
+    lifetime_wins: int = 0
+    lifetime_losses: int = 0
+    lifetime_draws: int = 0
+
+    def payoff_evidence(
+        self,
+        update: int,
+        half_life_updates: float,
+    ) -> tuple[float, float]:
+        if self.last_payoff_update is None:
+            return 0.0, 0.0
+        if update < self.last_payoff_update:
+            raise ValueError(
+                "League payoff update cannot precede recorded evidence: "
+                f"update={update}, last={self.last_payoff_update}."
+            )
+        decay = 2.0 ** (-(update - self.last_payoff_update) / half_life_updates)
+        return self.discounted_wins * decay, self.discounted_losses * decay
+
+    def payoff_summary(
+        self,
+        update: int,
+        half_life_updates: float,
+    ) -> tuple[float, float]:
+        wins, losses = self.payoff_evidence(update, half_life_updates)
+        effective_games = wins + losses
+        # A symmetric Beta(1, 1) prior makes unseen and fully stale members
+        # neutral rather than spuriously easy or hard.
+        win_probability = (1.0 + wins) / (2.0 + effective_games)
+        return win_probability, effective_games
+
+    def record_outcomes(
+        self,
+        *,
+        update: int,
+        wins: int,
+        losses: int,
+        draws: int,
+        half_life_updates: float,
+    ) -> None:
+        games = wins + losses + draws
+        if games <= 0:
+            raise ValueError("League payoff update requires at least one outcome.")
+        discounted_wins, discounted_losses = self.payoff_evidence(
+            update,
+            half_life_updates,
+        )
+        # All games in a bucket share one learner version and assignment
+        # schedule, so they are clustered evidence rather than hundreds of
+        # independent policy observations. Each nonempty update contributes
+        # exactly one effective evidence unit.
+        self.discounted_wins = discounted_wins + (wins + 0.5 * draws) / games
+        self.discounted_losses = discounted_losses + (losses + 0.5 * draws) / games
+        self.last_payoff_update = update
+        self.lifetime_wins += wins
+        self.lifetime_losses += losses
+        self.lifetime_draws += draws
 
 
 def _tuples_to_lists(value):
@@ -104,6 +190,30 @@ class _DeviceBatchBuffers:
     group_tensors: dict[str, torch.Tensor]
 
 
+@dataclass
+class _CudaGraphExecutor:
+    """One fixed-shape CUDA graph tied to a frozen checkpoint's parameters."""
+
+    checkpoint_path: str
+    obs_schema: _BatchSchema
+    masks_schema: _BatchSchema
+    obs_host: _HostBatchBuffers
+    masks_host: _HostBatchBuffers
+    obs_device: _DeviceBatchBuffers | None
+    masks_device: _DeviceBatchBuffers | None
+    hidden: tuple[torch.Tensor, torch.Tensor] | None
+    sampling_exponentials: (
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None
+    )
+    graph: torch.cuda.CUDAGraph | None
+    output: dict[str, object]
+
+
 def _same_device(left: torch.device, right: torch.device) -> bool:
     return left.type == right.type and (
         right.index is None or left.index == right.index
@@ -119,6 +229,9 @@ class _LeagueInferenceService:
     """
 
     _CLOSE_TIMEOUT_SEC = 60.0
+    _CUDA_GRAPH_BATCH_SIZE = 36
+    _CUDA_GRAPH_CACHE_SIZE = 2
+    _CUDA_GRAPH_WARMUP_CALLS = 3
 
     def __init__(
         self,
@@ -126,8 +239,12 @@ class _LeagueInferenceService:
         device: torch.device,
         coalesce_window_sec: float,
         *,
+        max_models: int,
         greedy: bool = False,
+        enable_cuda_graphs: bool = False,
     ):
+        if max_models <= 0:
+            raise ValueError(f"max_models must be positive (got {max_models}).")
         self._agent_template = copy.deepcopy(agent_template).to(torch.device("cpu"))
         self._agent_template.eval()
         self._agent_template.requires_grad_(False)
@@ -135,9 +252,29 @@ class _LeagueInferenceService:
         self._cuda_stream: torch.cuda.Stream | None = None
         self._coalesce_window_sec = max(0.0, coalesce_window_sec)
         self._greedy = greedy
-        self._models: dict[str, PokeAgent] = {}
+        self._max_models = max_models
+        self._models: OrderedDict[str, PokeAgent] = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_loads = 0
+        self._cache_evictions = 0
         self._host_batch_buffers: dict[str, _HostBatchBuffers] = {}
         self._device_batch_buffers: dict[str, _DeviceBatchBuffers] = {}
+        self._cuda_graphs_enabled = bool(
+            enable_cuda_graphs
+            and device.type == "cuda"
+            and hasattr(torch.cuda, "CUDAGraph")
+        )
+        self._cuda_graphs: OrderedDict[str, _CudaGraphExecutor] = OrderedDict()
+        self._cuda_graph_hits = 0
+        self._cuda_graph_misses = 0
+        self._cuda_graph_captures = 0
+        self._cuda_graph_replays = 0
+        self._cuda_graph_evictions = 0
+        self._cuda_graph_fallbacks = 0
+        self._cuda_graph_real_rows = 0
+        self._cuda_graph_padded_rows = 0
+        self._cuda_graph_last_error: str | None = None
         self._prefetch_paths: set[str] = set()
         self._pending: list[_InferenceRequest] = []
         self._active_requests: list[_InferenceRequest] = []
@@ -156,16 +293,7 @@ class _LeagueInferenceService:
         self._thread.start()
 
     def ensure_checkpoint(self, checkpoint_path: str) -> None:
-        with self._condition:
-            self._raise_if_unavailable_locked()
-            if checkpoint_path in self._models:
-                return
-
-        agent_copy = self._load_agent(checkpoint_path)
-
-        with self._condition:
-            self._raise_if_unavailable_locked()
-            self._models.setdefault(checkpoint_path, agent_copy)
+        self._get_agent(checkpoint_path)
 
     def prefetch_checkpoint(self, checkpoint_path: str) -> None:
         future: Future = Future()
@@ -175,6 +303,8 @@ class _LeagueInferenceService:
                 checkpoint_path in self._models
                 or checkpoint_path in self._prefetch_paths
             ):
+                if checkpoint_path in self._models:
+                    self._touch_model_locked(checkpoint_path)
                 return
             self._prefetch_paths.add(checkpoint_path)
             future.set_running_or_notify_cancel()
@@ -191,6 +321,30 @@ class _LeagueInferenceService:
             self._pending.append(request)
             self._submitted_requests += 1
             self._condition.notify()
+
+    def cache_info(self) -> dict[str, object]:
+        """Return a consistent snapshot of bounded model-cache diagnostics."""
+        with self._condition:
+            return {
+                "capacity": self._max_models,
+                "resident_models": len(self._models),
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "loads": self._cache_loads,
+                "evictions": self._cache_evictions,
+                "cuda_graphs_enabled": getattr(self, "_cuda_graphs_enabled", False),
+                "cuda_graph_capacity": self._CUDA_GRAPH_CACHE_SIZE,
+                "resident_cuda_graphs": len(getattr(self, "_cuda_graphs", {})),
+                "cuda_graph_hits": getattr(self, "_cuda_graph_hits", 0),
+                "cuda_graph_misses": getattr(self, "_cuda_graph_misses", 0),
+                "cuda_graph_captures": getattr(self, "_cuda_graph_captures", 0),
+                "cuda_graph_replays": getattr(self, "_cuda_graph_replays", 0),
+                "cuda_graph_evictions": getattr(self, "_cuda_graph_evictions", 0),
+                "cuda_graph_fallbacks": getattr(self, "_cuda_graph_fallbacks", 0),
+                "cuda_graph_real_rows": getattr(self, "_cuda_graph_real_rows", 0),
+                "cuda_graph_padded_rows": getattr(self, "_cuda_graph_padded_rows", 0),
+                "cuda_graph_last_error": getattr(self, "_cuda_graph_last_error", None),
+            }
 
     def prune_checkpoints(self, keep_paths: set[str]) -> None:
         future: Future = Future()
@@ -308,6 +462,7 @@ class _LeagueInferenceService:
         # work. Keep that destruction in the same execution domain as model
         # inference and learner work.
         with cuda_model_execution(self._device):
+            self._clear_cuda_graphs()
             with self._condition:
                 self._models.clear()
             getattr(self, "_device_batch_buffers", {}).clear()
@@ -458,6 +613,11 @@ class _LeagueInferenceService:
             failed = self._failed_requests
             closed = self._closed
             model_count = len(self._models)
+            cache_capacity = self._max_models
+            cache_hits = self._cache_hits
+            cache_misses = self._cache_misses
+            cache_loads = self._cache_loads
+            cache_evictions = self._cache_evictions
 
         active_key_text = None
         if active_key is not None:
@@ -470,7 +630,10 @@ class _LeagueInferenceService:
             f"active_phase_age_sec={active_phase_age} "
             f"oldest_pending_age_sec={oldest_pending_age} "
             f"submitted={submitted} completed={completed} failed={failed} "
-            f"model_count={model_count} last_progress_age_sec={last_progress_age}"
+            f"model_count={model_count}/{cache_capacity} cache_hits={cache_hits} "
+            f"cache_misses={cache_misses} cache_loads={cache_loads} "
+            f"cache_evictions={cache_evictions} "
+            f"last_progress_age_sec={last_progress_age}"
         )
 
     def _raise_if_unavailable_locked(self) -> None:
@@ -649,22 +812,37 @@ class _LeagueInferenceService:
             )
         return buffers, batch_size
 
-    @staticmethod
     def _allocate_host_batch_buffers(
+        self,
         schema: _BatchSchema,
         capacity: int,
+        *,
+        pin_memory: bool = False,
     ) -> _HostBatchBuffers:
         group_sizes: dict[str, int] = {}
         for _, shape, dtype in schema:
             row_size = int(np.prod(shape, dtype=np.int64))
             group_sizes[dtype] = group_sizes.get(dtype, 0) + capacity * row_size
-        group_arrays = {
-            dtype: np.empty(size, dtype=np.dtype(dtype))
-            for dtype, size in group_sizes.items()
-        }
-        group_tensors = {
-            dtype: torch.from_numpy(value) for dtype, value in group_arrays.items()
-        }
+        if pin_memory:
+            group_tensors = {
+                dtype: torch.empty(
+                    size,
+                    dtype=torch.from_numpy(np.empty((), dtype=np.dtype(dtype))).dtype,
+                    pin_memory=True,
+                )
+                for dtype, size in group_sizes.items()
+            }
+            group_arrays = {
+                dtype: value.numpy() for dtype, value in group_tensors.items()
+            }
+        else:
+            group_arrays = {
+                dtype: np.empty(size, dtype=np.dtype(dtype))
+                for dtype, size in group_sizes.items()
+            }
+            group_tensors = {
+                dtype: torch.from_numpy(value) for dtype, value in group_arrays.items()
+            }
         group_offsets = dict.fromkeys(group_sizes, 0)
         arrays: dict[str, np.ndarray] = {}
         tensors: dict[str, torch.Tensor] = {}
@@ -796,6 +974,419 @@ class _LeagueInferenceService:
         if self._device.type == "cuda" and self._cuda_stream is not None:
             self._cuda_stream.synchronize()
 
+    def _run_cuda_graph_battle_batch(
+        self,
+        checkpoint_path: str,
+        agent: PokeAgent,
+        requests: list[_InferenceRequest],
+        request_masks: list[dict[str, np.ndarray]],
+    ) -> bool:
+        """Run one logical request batch through bounded fixed-shape graphs."""
+        chunk_size = self._CUDA_GRAPH_BATCH_SIZE
+        chunk_results: list[
+            tuple[np.ndarray, list[tuple[torch.Tensor, torch.Tensor] | None]]
+        ] = []
+        cpu_pack_sec = 0.0
+        replay_sec = 0.0
+        capture_sec = 0.0
+        replay_count = 0
+        lock_wait_started = time.perf_counter()
+        saved_rng: torch.Tensor | None = None
+        try:
+            self._set_active_phase("cuda_graph_lock_wait")
+            with cuda_model_execution(self._device):
+                lock_wait_sec = time.perf_counter() - lock_wait_started
+                saved_rng = torch.cuda.get_rng_state(self._device).clone()
+                sampling_exponentials = self._make_sampling_exponentials(
+                    agent,
+                    len(requests),
+                )
+                for start in range(0, len(requests), chunk_size):
+                    stop = min(start + chunk_size, len(requests))
+                    chunk = requests[start:stop]
+                    chunk_masks = request_masks[start:stop]
+                    pack_started = time.perf_counter()
+                    self._set_active_phase("cuda_graph_cpu_pack")
+                    executor = self._prepare_cuda_graph_executor(
+                        checkpoint_path,
+                        [request.obs for request in chunk],
+                        chunk_masks,
+                    )
+                    cpu_pack_sec += time.perf_counter() - pack_started
+
+                    if executor.graph is None:
+                        capture_started = time.perf_counter()
+                        self._set_active_phase("cuda_graph_capture")
+                        self._capture_cuda_graph(executor, agent, chunk)
+                        capture_sec += time.perf_counter() - capture_started
+                    replay_started = time.perf_counter()
+                    self._set_active_phase("cuda_graph_replay")
+                    actions, hidden_views = self._replay_cuda_graph(
+                        executor,
+                        chunk,
+                        sampling_exponentials=(
+                            None
+                            if sampling_exponentials is None
+                            else tuple(
+                                values[start:stop] for values in sampling_exponentials
+                            )
+                        ),
+                    )
+                    replay_sec += time.perf_counter() - replay_started
+                    replay_count += 1
+                    chunk_results.append((actions, hidden_views))
+        except Exception as exc:
+            # Capture is an optional execution optimization. Restore the exact
+            # pre-attempt RNG state so eager fallback samples the same policy it
+            # would have sampled if graphs had never been attempted.
+            with cuda_model_execution(self._device):
+                if saved_rng is not None:
+                    torch.cuda.set_rng_state(saved_rng, self._device)
+                self._cuda_graph_fallbacks += 1
+                self._cuda_graph_last_error = f"{type(exc).__name__}: {exc}"
+                self._cuda_graphs_enabled = False
+                self._clear_cuda_graphs()
+            return False
+
+        self._cuda_graph_replays += replay_count
+        self._cuda_graph_real_rows += len(requests)
+        self._cuda_graph_padded_rows += replay_count * chunk_size - len(requests)
+
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_cpu_pack_sec",
+            cpu_pack_sec,
+        )
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_cuda_graph_replay_sec",
+            replay_sec,
+        )
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_cuda_graph_capture_sec",
+            capture_sec,
+        )
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_cuda_graph_lock_wait_sec",
+            lock_wait_sec,
+        )
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_cuda_graph_replays",
+            float(len(chunk_results)),
+        )
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_cuda_graph_real_rows",
+            float(len(requests)),
+        )
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_cuda_graph_padded_rows",
+            float(len(chunk_results) * chunk_size - len(requests)),
+        )
+
+        result_index = 0
+        for actions, hidden_views in chunk_results:
+            for chunk_index in range(len(actions)):
+                request = requests[result_index]
+                self._try_set_future_result(
+                    request.future,
+                    (actions[chunk_index], hidden_views[chunk_index]),
+                )
+                result_index += 1
+        return True
+
+    def _make_sampling_exponentials(
+        self,
+        agent: PokeAgent,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if getattr(self, "_greedy", False):
+            return None
+        if self._cuda_stream is None:
+            self._cuda_stream = torch.cuda.Stream(device=self._device)
+        num_actions = agent.action_head.num_actions
+        with torch.cuda.stream(self._cuda_stream):
+            return (
+                torch.empty(
+                    (batch_size, num_actions),
+                    device=self._device,
+                ).exponential_(),
+                torch.empty(
+                    (batch_size, num_actions),
+                    device=self._device,
+                ).exponential_(),
+                torch.empty(
+                    (batch_size, NUM_TERA_CHOICES),
+                    device=self._device,
+                ).exponential_(),
+            )
+
+    def _prepare_cuda_graph_executor(
+        self,
+        checkpoint_path: str,
+        observations: list[dict[str, np.ndarray]],
+        masks: list[dict[str, np.ndarray]],
+    ) -> _CudaGraphExecutor:
+        obs_schema = self._batch_schema(observations, cache_key="battle_obs")
+        masks_schema = self._batch_schema(masks, cache_key="battle_masks")
+        graphs = self._cuda_graphs
+        executor = graphs.get(checkpoint_path)
+        if executor is not None and (
+            executor.obs_schema != obs_schema or executor.masks_schema != masks_schema
+        ):
+            self._evict_cuda_graph(checkpoint_path)
+            executor = None
+
+        if executor is None:
+            self._cuda_graph_misses += 1
+            while len(graphs) >= self._CUDA_GRAPH_CACHE_SIZE:
+                stale_path = next(iter(graphs))
+                self._evict_cuda_graph(stale_path)
+            obs_host = self._allocate_host_batch_buffers(
+                obs_schema,
+                self._CUDA_GRAPH_BATCH_SIZE,
+                pin_memory=True,
+            )
+            masks_host = self._allocate_host_batch_buffers(
+                masks_schema,
+                self._CUDA_GRAPH_BATCH_SIZE,
+                pin_memory=True,
+            )
+            executor = _CudaGraphExecutor(
+                checkpoint_path=checkpoint_path,
+                obs_schema=obs_schema,
+                masks_schema=masks_schema,
+                obs_host=obs_host,
+                masks_host=masks_host,
+                obs_device=None,
+                masks_device=None,
+                hidden=None,
+                sampling_exponentials=None,
+                graph=None,
+                output={},
+            )
+            graphs[checkpoint_path] = executor
+        else:
+            self._cuda_graph_hits += 1
+            graphs.move_to_end(checkpoint_path)
+
+        self._pack_padded_cuda_graph_input(
+            executor.obs_host,
+            observations,
+        )
+        self._pack_padded_cuda_graph_input(
+            executor.masks_host,
+            masks,
+        )
+        return executor
+
+    @staticmethod
+    def _pack_padded_cuda_graph_input(
+        buffers: _HostBatchBuffers,
+        mappings: list[dict[str, np.ndarray]],
+    ) -> None:
+        batch_size = len(mappings)
+        if not 0 < batch_size <= buffers.capacity:
+            raise ValueError(
+                "CUDA graph input batch must be within its fixed capacity."
+            )
+        for key, _, _ in buffers.schema:
+            np.stack(
+                [mapping[key] for mapping in mappings],
+                axis=0,
+                out=buffers.arrays[key][:batch_size],
+                casting="no",
+            )
+            if batch_size < buffers.capacity:
+                buffers.arrays[key][batch_size:] = buffers.arrays[key][batch_size - 1]
+
+    def _capture_cuda_graph(
+        self,
+        executor: _CudaGraphExecutor,
+        agent: PokeAgent,
+        requests: list[_InferenceRequest],
+    ) -> None:
+        if self._cuda_stream is None:
+            self._cuda_stream = torch.cuda.Stream(device=self._device)
+        obs_buffers = self._allocate_device_batch_buffers(
+            executor.obs_host,
+            force_bool=False,
+        )
+        masks_buffers = self._allocate_device_batch_buffers(
+            executor.masks_host,
+            force_bool=True,
+        )
+        if (
+            len(executor.masks_host.group_tensors) != 1
+            or next(iter(executor.masks_host.group_tensors.values())).dtype
+            != torch.bool
+        ):
+            raise RuntimeError("CUDA graph action masks must be boolean tensors.")
+        executor.obs_device = obs_buffers
+        executor.masks_device = masks_buffers
+        with torch.inference_mode():
+            executor.hidden = agent.initial_hidden(self._CUDA_GRAPH_BATCH_SIZE)
+            executor.sampling_exponentials = (
+                torch.ones(
+                    (self._CUDA_GRAPH_BATCH_SIZE, agent.action_head.num_actions),
+                    device=self._device,
+                ),
+                torch.ones(
+                    (self._CUDA_GRAPH_BATCH_SIZE, agent.action_head.num_actions),
+                    device=self._device,
+                ),
+                torch.ones(
+                    (self._CUDA_GRAPH_BATCH_SIZE, NUM_TERA_CHOICES),
+                    device=self._device,
+                ),
+            )
+
+        saved_rng = torch.cuda.get_rng_state(self._device).clone()
+        try:
+            with torch.cuda.stream(self._cuda_stream), torch.inference_mode():
+                self._copy_cuda_graph_inputs(executor)
+                self._stage_cuda_graph_hidden(executor, requests)
+                for _ in range(self._CUDA_GRAPH_WARMUP_CALLS):
+                    agent(
+                        executor.obs_device.tensors,
+                        executor.hidden,
+                        action_masks=executor.masks_device.tensors,
+                        greedy=getattr(self, "_greedy", False),
+                        include_value=False,
+                        include_policy_stats=False,
+                        sampling_exponentials=executor.sampling_exponentials,
+                    )
+            self._cuda_stream.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with (
+                torch.cuda.graph(graph, stream=self._cuda_stream),
+                torch.inference_mode(),
+            ):
+                output = agent(
+                    executor.obs_device.tensors,
+                    executor.hidden,
+                    action_masks=executor.masks_device.tensors,
+                    greedy=getattr(self, "_greedy", False),
+                    include_value=False,
+                    include_policy_stats=False,
+                    sampling_exponentials=executor.sampling_exponentials,
+                )
+            self._cuda_stream.synchronize()
+            executor.graph = graph
+            executor.output = output
+            self._cuda_graph_captures += 1
+        finally:
+            torch.cuda.set_rng_state(saved_rng, self._device)
+            torch.cuda.synchronize(self._device)
+
+    def _copy_cuda_graph_inputs(self, executor: _CudaGraphExecutor) -> None:
+        if executor.obs_device is None or executor.masks_device is None:
+            raise RuntimeError("CUDA graph device inputs were not allocated.")
+        for group_key, source in executor.obs_host.group_tensors.items():
+            destination = executor.obs_device.group_tensors[group_key]
+            destination.copy_(source, non_blocking=True)
+        # Action masks are normalized to one packed bool allocation.
+        mask_destination = next(iter(executor.masks_device.group_tensors.values()))
+        mask_source = next(iter(executor.masks_host.group_tensors.values()))
+        mask_destination.copy_(mask_source, non_blocking=True)
+
+    def _stage_cuda_graph_hidden(
+        self,
+        executor: _CudaGraphExecutor,
+        requests: list[_InferenceRequest],
+    ) -> None:
+        if executor.hidden is None:
+            return
+        static_h, static_c = executor.hidden
+        static_h.zero_()
+        static_c.zero_()
+        batch_size = len(requests)
+        if all(request.hidden is not None for request in requests):
+            h = torch.cat(
+                [self._to_inference_device(request.hidden[0]) for request in requests],
+                dim=1,
+            )
+            c = torch.cat(
+                [self._to_inference_device(request.hidden[1]) for request in requests],
+                dim=1,
+            )
+            static_h[:, :batch_size].copy_(h)
+            static_c[:, :batch_size].copy_(c)
+            return
+        for index, request in enumerate(requests):
+            if request.hidden is None:
+                continue
+            static_h[:, index : index + 1].copy_(
+                self._to_inference_device(request.hidden[0])
+            )
+            static_c[:, index : index + 1].copy_(
+                self._to_inference_device(request.hidden[1])
+            )
+
+    def _replay_cuda_graph(
+        self,
+        executor: _CudaGraphExecutor,
+        requests: list[_InferenceRequest],
+        sampling_exponentials: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None,
+    ) -> tuple[np.ndarray, list[tuple[torch.Tensor, torch.Tensor] | None]]:
+        if self._cuda_stream is None or executor.graph is None:
+            raise RuntimeError("CUDA graph executor was not captured.")
+        batch_size = len(requests)
+        with torch.cuda.stream(self._cuda_stream), torch.inference_mode():
+            self._copy_cuda_graph_inputs(executor)
+            self._stage_cuda_graph_hidden(executor, requests)
+            if executor.sampling_exponentials is None:
+                raise RuntimeError("CUDA graph sampling inputs were not allocated.")
+            for static_values in executor.sampling_exponentials:
+                static_values.fill_(1.0)
+            if sampling_exponentials is not None:
+                for static_values, source_values in zip(
+                    executor.sampling_exponentials,
+                    sampling_exponentials,
+                    strict=True,
+                ):
+                    static_values[:batch_size].copy_(source_values)
+            executor.graph.replay()
+            output_hidden = executor.output.get("hidden")
+            if output_hidden is None:
+                stable_hidden = None
+            else:
+                stable_hidden = (
+                    output_hidden[0][:, :batch_size].clone(),
+                    output_hidden[1][:, :batch_size].clone(),
+                )
+        self._cuda_stream.synchronize()
+        actions_tensor = executor.output.get("actions")
+        if not isinstance(actions_tensor, torch.Tensor):
+            raise RuntimeError("CUDA graph output omitted actions.")
+        actions = actions_tensor[:batch_size].cpu().numpy()
+        hidden_views = [
+            self._slice_hidden(stable_hidden, index) for index in range(batch_size)
+        ]
+        return actions, hidden_views
+
+    def _evict_cuda_graph(self, checkpoint_path: str) -> None:
+        executor = getattr(self, "_cuda_graphs", {}).pop(checkpoint_path, None)
+        if executor is not None:
+            self._cuda_graph_evictions += 1
+
+    def _clear_cuda_graphs(self) -> None:
+        graphs = getattr(self, "_cuda_graphs", None)
+        if graphs is None:
+            return
+        self._cuda_graph_evictions += len(graphs)
+        graphs.clear()
+
     def _run_battle_batch(
         self, checkpoint_path: str, requests: list[_InferenceRequest]
     ) -> None:
@@ -803,15 +1394,15 @@ class _LeagueInferenceService:
         agent = self._get_agent(checkpoint_path)
         batch_started = time.perf_counter()
         batch_size = len(requests)
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_action_batch_size_sum",
+            float(batch_size),
+        )
         for request in requests:
             self._increment_timing(request.timing, "opponent_infer_action_requests")
             self._add_timing(
                 request.timing, "opponent_infer_action_batches", 1.0 / batch_size
-            )
-            self._add_timing(
-                request.timing,
-                "opponent_infer_action_batch_size_sum",
-                float(batch_size),
             )
             self._increment_timing(
                 request.timing, "opponent_infer_action_queue_wait_calls"
@@ -829,6 +1420,15 @@ class _LeagueInferenceService:
             if request.masks is None:
                 raise RuntimeError("Battle inference request was missing action masks.")
             request_masks.append(request.masks)
+
+        if getattr(self, "_cuda_graphs_enabled", False):
+            if self._run_cuda_graph_battle_batch(
+                checkpoint_path,
+                agent,
+                requests,
+                request_masks,
+            ):
+                return
 
         self._set_active_phase("cpu_pack")
         cpu_pack_started = time.perf_counter()
@@ -938,15 +1538,15 @@ class _LeagueInferenceService:
         agent = self._get_agent(checkpoint_path)
         batch_started = time.perf_counter()
         batch_size = len(requests)
+        self._add_batch_timing(
+            requests,
+            "opponent_infer_preview_batch_size_sum",
+            float(batch_size),
+        )
         for request in requests:
             self._increment_timing(request.timing, "opponent_infer_preview_requests")
             self._add_timing(
                 request.timing, "opponent_infer_preview_batches", 1.0 / batch_size
-            )
-            self._add_timing(
-                request.timing,
-                "opponent_infer_preview_batch_size_sum",
-                float(batch_size),
             )
             self._increment_timing(
                 request.timing, "opponent_infer_preview_queue_wait_calls"
@@ -1050,12 +1650,14 @@ class _LeagueInferenceService:
         # frame can hold the final CUDA reference after the execution guard is
         # released. Multiple queued prune requests coalesce to the newest set.
         with cuda_model_execution(self._device):
+            stale_paths = [
+                path for path in list(self._models) if path not in keep_paths
+            ]
+            for path in stale_paths:
+                self._evict_cuda_graph(path)
             with self._condition:
-                stale_models = [
-                    self._models.pop(path)
-                    for path in list(self._models)
-                    if path not in keep_paths
-                ]
+                stale_models = [self._models.pop(path) for path in stale_paths]
+                self._cache_evictions += len(stale_models)
                 self._prefetch_paths.intersection_update(keep_paths)
             stale_models.clear()
 
@@ -1065,12 +1667,47 @@ class _LeagueInferenceService:
     def _get_agent(self, checkpoint_path: str) -> PokeAgent:
         with self._condition:
             agent = self._models.get(checkpoint_path)
-        if agent is None:
-            loaded_agent = self._load_agent(checkpoint_path)
-            with self._condition:
-                agent = self._models.setdefault(checkpoint_path, loaded_agent)
-                self._prefetch_paths.discard(checkpoint_path)
+            if agent is not None:
+                self._cache_hits += 1
+                self._touch_model_locked(checkpoint_path)
+                return agent
+            self._cache_misses += 1
+
+        loaded_agent = self._load_agent(checkpoint_path)
+        stale_models: list[PokeAgent] = []
+        stale_paths: list[str] = []
+        with self._condition:
+            self._raise_if_unavailable_locked()
+            agent = self._models.get(checkpoint_path)
+            if agent is None:
+                agent = loaded_agent
+                self._models[checkpoint_path] = agent
+                self._cache_loads += 1
+            else:
+                # Another caller completed the same load while this copy was
+                # being constructed. Retire the redundant copy below.
+                stale_models.append(loaded_agent)
+            self._touch_model_locked(checkpoint_path)
+            self._prefetch_paths.discard(checkpoint_path)
+            while len(self._models) > self._max_models:
+                stale_path, stale = self._models.popitem(last=False)
+                stale_paths.append(stale_path)
+                stale_models.append(stale)
+                self._cache_evictions += 1
+
+        # CUDA model destruction can enqueue allocator work. Keep final
+        # reference release in the model execution domain, just like pruning.
+        if stale_models:
+            with cuda_model_execution(self._device):
+                for path in stale_paths:
+                    self._evict_cuda_graph(path)
+                stale_models.clear()
         return agent
+
+    def _touch_model_locked(self, checkpoint_path: str) -> None:
+        move_to_end = getattr(self._models, "move_to_end", None)
+        if callable(move_to_end):
+            move_to_end(checkpoint_path)
 
     def _load_agent(self, checkpoint_path: str) -> PokeAgent:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -1728,11 +2365,11 @@ class LeaguePlayer(Player):
 
 
 class League:
-    """Manages a pool of opponent checkpoints for self-play training.
+    """Permanent self-play archive with payoff-aware opponent sampling.
 
-    Opponents are sampled from a rolling window of past checkpoints, with a
-    bias towards recent ones (70%) over older ones (30%) to track current skill
-    while retaining some diversity.
+    Every snapshot remains eligible on disk. ``TrainingConfig.league_size``
+    bounds only each inference service's resident model cache, preventing the
+    permanent archive from causing unbounded CPU or CUDA memory growth.
     """
 
     def __init__(
@@ -1758,12 +2395,16 @@ class League:
         self.preview_inference_device = (
             torch.device("cpu") if device.type == "cuda" else self.inference_device
         )
-        self.checkpoints: deque[str] = deque(maxlen=config.league_size)
+        self.checkpoints: list[str] = []
+        self._members: dict[str, LeagueMember] = {}
+        self._current_update = 0
         self._inference = _LeagueInferenceService(
             agent_template,
             self.inference_device,
             coalesce_window_sec=config.league_coalesce_ms / 1000.0,
+            max_models=config.league_size,
             greedy=inference_greedy,
+            enable_cuda_graphs=config.league_cuda_graphs,
         )
         if self.preview_inference_device == self.inference_device:
             self._preview_inference = self._inference
@@ -1772,19 +2413,206 @@ class League:
                 agent_template,
                 self.preview_inference_device,
                 coalesce_window_sec=config.league_coalesce_ms / 1000.0,
+                max_models=config.league_size,
                 greedy=inference_greedy,
+                enable_cuda_graphs=False,
             )
 
-    def add_checkpoint(self, agent: PokeAgent, step: int):
-        """Snapshot the current agent as a new league member."""
+    @property
+    def current_update(self) -> int:
+        """Last completed update represented by the payoff/archive state."""
+        return self._current_update
+
+    def add_checkpoint(
+        self,
+        agent: PokeAgent,
+        step: int,
+        *,
+        update: int | None = None,
+    ) -> None:
+        """Snapshot the current agent as a permanent archive member."""
+        if step < 0:
+            raise ValueError(f"League checkpoint step must be non-negative: {step}.")
+        member_update = self._current_update if update is None else update
+        if member_update < self._current_update:
+            raise ValueError(
+                "League checkpoint update cannot move backwards: "
+                f"current={self._current_update}, requested={member_update}."
+            )
         path = f"{self.config.checkpoint_dir}/league/step_{step}.pt"
+        if path in self._members:
+            raise ValueError(f"League archive already contains {path!r}.")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"checkpoint_type": "league", "agent": agent.state_dict()}, path)
         self.checkpoints.append(path)
-        keep_paths = set(self.checkpoints)
-        for service in self._inference_services():
-            service.prune_checkpoints(keep_paths)
-            service.prefetch_checkpoint(path)
+        self._members[path] = LeagueMember(
+            path=path,
+            step=step,
+            created_update=member_update,
+        )
+        self._current_update = member_update
+
+    def record_outcomes(
+        self,
+        counts: Mapping[str | None, Mapping[str, int]],
+        *,
+        update: int,
+    ) -> None:
+        """Update discounted current-policy payoffs before the next PFSP draw."""
+        if update < self._current_update:
+            raise ValueError(
+                "League outcome update cannot move backwards: "
+                f"current={self._current_update}, requested={update}."
+            )
+        for checkpoint_path, bucket in counts.items():
+            if checkpoint_path is None:
+                continue
+            member = self._members.get(checkpoint_path)
+            if member is None:
+                raise KeyError(
+                    "Outcome was attributed to a checkpoint outside the permanent "
+                    f"league archive: {checkpoint_path!r}."
+                )
+            if set(bucket) != {"wins", "losses", "draws"}:
+                raise ValueError(
+                    f"League outcome bucket has invalid keys for {checkpoint_path!r}."
+                )
+            values = tuple(bucket[name] for name in ("wins", "losses", "draws"))
+            if any(type(value) is not int or value < 0 for value in values):
+                raise ValueError(
+                    "League outcome counts must be non-negative integers for "
+                    f"{checkpoint_path!r}: {values}."
+                )
+            wins, losses, draws = values
+            if wins + losses + draws == 0:
+                continue
+            member.record_outcomes(
+                update=update,
+                wins=wins,
+                losses=losses,
+                draws=draws,
+                half_life_updates=self.config.league_payoff_half_life_updates,
+            )
+        self._current_update = update
+
+    def sample_checkpoint_paths(
+        self,
+        count: int,
+        *,
+        update: int | None = None,
+    ) -> list[str]:
+        """PFSP-sample distinct archive members whenever enough exist."""
+        if count <= 0:
+            raise ValueError(f"Opponent sample count must be positive (got {count}).")
+        sample_update = self._resolve_sampling_update(update)
+        paths = self._draw_checkpoint_paths(count, sample_update)
+        for path in set(paths):
+            for service in self._inference_services():
+                service.prefetch_checkpoint(path)
+        return paths
+
+    def sampling_distribution(
+        self,
+        *,
+        update: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Return the exact auditable PFSP distribution in archive order."""
+        sample_update = self._resolve_sampling_update(update)
+        if not self.checkpoints:
+            return []
+
+        rows: list[dict[str, object]] = []
+        hard_weights: list[float] = []
+        for path in self.checkpoints:
+            member = self._members[path]
+            win_probability, effective_games = member.payoff_summary(
+                sample_update,
+                self.config.league_payoff_half_life_updates,
+            )
+            hard_weight = (1.0 - win_probability) ** self.config.league_pfsp_exponent
+            hard_weights.append(hard_weight)
+            rows.append(
+                {
+                    "checkpoint_path": path,
+                    "step": member.step,
+                    "created_update": member.created_update,
+                    "current_policy_win_probability": win_probability,
+                    "discounted_effective_update_equivalents": effective_games,
+                    "last_payoff_update": member.last_payoff_update,
+                    "payoff_staleness_updates": (
+                        None
+                        if member.last_payoff_update is None
+                        else sample_update - member.last_payoff_update
+                    ),
+                    "lifetime_wins": member.lifetime_wins,
+                    "lifetime_losses": member.lifetime_losses,
+                    "lifetime_draws": member.lifetime_draws,
+                }
+            )
+
+        hard_total = math.fsum(hard_weights)
+        member_count = len(rows)
+        uniform_probability = 1.0 / member_count
+        uniform_fraction = self.config.league_pfsp_uniform_fraction
+        for row, hard_weight in zip(rows, hard_weights, strict=True):
+            hard_probability = (
+                hard_weight / hard_total if hard_total > 0.0 else uniform_probability
+            )
+            # This is the unconditional first draw. Later opponent-group draws
+            # are renormalized after removing earlier members.
+            row["first_draw_probability"] = (
+                1.0 - uniform_fraction
+            ) * hard_probability + uniform_fraction * uniform_probability
+        return rows
+
+    def describe(
+        self,
+        *,
+        update: int | None = None,
+        include_members: bool = True,
+    ) -> dict[str, object]:
+        sample_update = self._resolve_sampling_update(update)
+        services = self._inference_services()
+        cache = {"action": services[0].cache_info()}
+        if len(services) > 1:
+            cache["preview"] = services[1].cache_info()
+        rows = self.sampling_distribution(update=sample_update)
+        probabilities = [float(row["first_draw_probability"]) for row in rows]
+        entropy = -math.fsum(
+            probability * math.log(probability)
+            for probability in probabilities
+            if probability > 0.0
+        )
+        hardest = (
+            min(
+                rows,
+                key=lambda row: float(row["current_policy_win_probability"]),
+            )
+            if rows
+            else None
+        )
+        result: dict[str, object] = {
+            "archive_size": len(self.checkpoints),
+            "resident_cache_capacity": self.config.league_size,
+            "sampling_update": sample_update,
+            "payoff_half_life_updates": self.config.league_payoff_half_life_updates,
+            "pfsp_exponent": self.config.league_pfsp_exponent,
+            "pfsp_uniform_fraction": self.config.league_pfsp_uniform_fraction,
+            "first_draw_entropy": entropy,
+            "first_draw_effective_support": math.exp(entropy) if rows else 0.0,
+            "first_draw_probability_min": min(probabilities, default=0.0),
+            "first_draw_probability_max": max(probabilities, default=0.0),
+            "hardest_checkpoint_path": (
+                None if hardest is None else hardest["checkpoint_path"]
+            ),
+            "hardest_current_policy_win_probability": (
+                None if hardest is None else hardest["current_policy_win_probability"]
+            ),
+            "inference_cache": cache,
+        }
+        if include_members:
+            result["members"] = rows
+        return result
 
     def make_opponent(
         self,
@@ -1824,12 +2652,9 @@ class League:
         )
 
     def sample_checkpoint_path(self) -> str | None:
-        path = self._sample_checkpoint()
-        if path is None:
+        if not self.checkpoints:
             return None
-        for service in self._inference_services():
-            service.prefetch_checkpoint(path)
-        return path
+        return self.sample_checkpoint_paths(1)[0]
 
     def save_state(
         self,
@@ -1844,10 +2669,18 @@ class League:
         league_config = {
             field: getattr(self.config, field) for field in _LEAGUE_STATE_CONFIG_FIELDS
         }
+        members = [
+            {
+                field: getattr(self._members[checkpoint_path], field)
+                for field in _LEAGUE_MEMBER_STATE_FIELDS
+            }
+            for checkpoint_path in self.checkpoints
+        ]
         payload = {
             "format_version": _LEAGUE_STATE_FORMAT_VERSION,
             "league_config": league_config,
-            "checkpoints": list(self.checkpoints),
+            "current_update": self._current_update,
+            "members": members,
             "rng_state": _tuples_to_lists(self._rng.getstate()),
             "extra_state": _tuples_to_lists(extra_state or {}),
         }
@@ -1872,15 +2705,35 @@ class League:
             _LEAGUE_STATE_CONFIG_FIELDS
         ):
             raise ValueError("League state has an invalid league_config.")
+        positive_integer_fields = (
+            "league_size",
+            "league_update_interval",
+            "league_refresh_interval",
+        )
         if any(
-            isinstance(saved_league_config[field], bool)
-            or not isinstance(saved_league_config[field], int)
+            type(saved_league_config[field]) is not int
             or saved_league_config[field] <= 0
-            for field in _LEAGUE_STATE_CONFIG_FIELDS
+            for field in positive_integer_fields
         ):
-            raise ValueError(
-                "League state league_config values must be positive integers."
-            )
+            raise ValueError("League state schedule values must be positive integers.")
+        for field in (
+            "league_payoff_half_life_updates",
+            "league_pfsp_exponent",
+            "league_pfsp_uniform_fraction",
+        ):
+            value = saved_league_config[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"League state has invalid numeric {field!r}.")
+        if saved_league_config["league_payoff_half_life_updates"] <= 0.0:
+            raise ValueError("League payoff half-life must be positive.")
+        if saved_league_config["league_pfsp_exponent"] <= 0.0:
+            raise ValueError("League PFSP exponent must be positive.")
+        if not 0.0 <= saved_league_config["league_pfsp_uniform_fraction"] <= 1.0:
+            raise ValueError("League PFSP uniform fraction must be within [0, 1].")
         expected_league_config = {
             field: getattr(self.config, field) for field in _LEAGUE_STATE_CONFIG_FIELDS
         }
@@ -1889,18 +2742,79 @@ class League:
                 "Configured league schedule does not match the resume state: "
                 f"configured={expected_league_config}, saved={saved_league_config}."
             )
-        saved_league_size = saved_league_config["league_size"]
-        paths = payload.get("checkpoints")
-        if not isinstance(paths, list) or not all(
-            isinstance(checkpoint_path, str) for checkpoint_path in paths
-        ):
-            raise ValueError("League state checkpoints must be a list of paths.")
-        if not paths:
-            raise ValueError("League state checkpoints must not be empty.")
-        if len(paths) > saved_league_size:
-            raise ValueError("League state contains more checkpoints than league_size.")
+        current_update = payload.get("current_update")
+        if type(current_update) is not int or current_update < 0:
+            raise ValueError("League state current_update must be non-negative.")
+        saved_members = payload.get("members")
+        if not isinstance(saved_members, list) or not saved_members:
+            raise ValueError("League state members must be a non-empty list.")
+
+        members: list[LeagueMember] = []
+        for raw_member in saved_members:
+            if not isinstance(raw_member, dict) or set(raw_member) != set(
+                _LEAGUE_MEMBER_STATE_FIELDS
+            ):
+                raise ValueError("League state contains an invalid member record.")
+            path_value = raw_member["path"]
+            if not isinstance(path_value, str) or not path_value:
+                raise ValueError("League member path must be a non-empty string.")
+            for field in (
+                "step",
+                "created_update",
+                "lifetime_wins",
+                "lifetime_losses",
+                "lifetime_draws",
+            ):
+                value = raw_member[field]
+                if type(value) is not int or value < 0:
+                    raise ValueError(
+                        f"League member {field!r} must be a non-negative integer."
+                    )
+            if raw_member["created_update"] > current_update:
+                raise ValueError("League member was created after the saved update.")
+            last_payoff_update = raw_member["last_payoff_update"]
+            if last_payoff_update is not None and (
+                type(last_payoff_update) is not int or last_payoff_update < 0
+            ):
+                raise ValueError(
+                    "League member last_payoff_update must be null or non-negative."
+                )
+            if last_payoff_update is not None and last_payoff_update > current_update:
+                raise ValueError("League member payoff evidence is from the future.")
+            for field in ("discounted_wins", "discounted_losses"):
+                value = raw_member[field]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value < 0.0
+                ):
+                    raise ValueError(
+                        f"League member {field!r} must be finite and non-negative."
+                    )
+            if last_payoff_update is None and (
+                raw_member["discounted_wins"] != 0.0
+                or raw_member["discounted_losses"] != 0.0
+            ):
+                raise ValueError(
+                    "League member without a payoff update cannot contain evidence."
+                )
+            members.append(
+                LeagueMember(
+                    path=path_value,
+                    step=raw_member["step"],
+                    created_update=raw_member["created_update"],
+                    discounted_wins=float(raw_member["discounted_wins"]),
+                    discounted_losses=float(raw_member["discounted_losses"]),
+                    last_payoff_update=last_payoff_update,
+                    lifetime_wins=raw_member["lifetime_wins"],
+                    lifetime_losses=raw_member["lifetime_losses"],
+                    lifetime_draws=raw_member["lifetime_draws"],
+                )
+            )
+        paths = [member.path for member in members]
         if len(set(paths)) != len(paths):
-            raise ValueError("League state contains duplicate checkpoint paths.")
+            raise ValueError("League state contains duplicate archive paths.")
         missing_paths = [
             checkpoint_path
             for checkpoint_path in paths
@@ -1922,9 +2836,9 @@ class League:
             raise ValueError("League state extra_state must be an object.")
 
         self._rng.setstate(rng_state)
-        self.checkpoints.clear()
-        for p in paths:
-            self.checkpoints.append(p)
+        self.checkpoints = paths
+        self._members = {member.path: member for member in members}
+        self._current_update = current_update
         keep_paths = set(self.checkpoints)
         for service in self._inference_services():
             service.prune_checkpoints(keep_paths)
@@ -1949,16 +2863,59 @@ class League:
         return (self._inference, preview_inference)
 
     def _sample_checkpoint(self) -> str | None:
-        """Sample a checkpoint path. 70% recent half, 30% older half."""
-        checkpoints = list(self.checkpoints)
-        if not checkpoints:
+        """Internal single PFSP draw without inference prefetch."""
+        if not self.checkpoints:
             return None
+        return self._draw_checkpoint_paths(1, self._current_update)[0]
 
-        mid = len(checkpoints) // 2
+    def _resolve_sampling_update(self, update: int | None) -> int:
+        sample_update = self._current_update if update is None else update
+        if type(sample_update) is not int or sample_update < 0:
+            raise ValueError(
+                f"League sampling update must be non-negative (got {sample_update})."
+            )
+        if sample_update < self._current_update:
+            raise ValueError(
+                "League sampling update cannot move backwards: "
+                f"current={self._current_update}, requested={sample_update}."
+            )
+        return sample_update
 
-        if len(checkpoints) < 2 or self._rng.random() < 0.7:
-            recent = checkpoints[mid:] if mid < len(checkpoints) else checkpoints
-            return self._rng.choice(recent)
-        else:
-            older = checkpoints[:mid] if mid > 0 else checkpoints
-            return self._rng.choice(older)
+    def _draw_checkpoint_paths(self, count: int, update: int) -> list[str]:
+        rows = self.sampling_distribution(update=update)
+        if not rows:
+            return []
+
+        available_paths = [str(row["checkpoint_path"]) for row in rows]
+        available_weights = [float(row["first_draw_probability"]) for row in rows]
+        sampled: list[str] = []
+
+        # First exhaust a weighted-without-replacement draw, guaranteeing
+        # distinct opponent groups whenever the archive is large enough.
+        unique_draws = min(count, len(available_paths))
+        for _ in range(unique_draws):
+            index = self._weighted_index(available_weights)
+            sampled.append(available_paths.pop(index))
+            available_weights.pop(index)
+
+        # During initial seeding a single member may need to serve multiple
+        # groups. Once enough members exist, this branch is never reached.
+        if len(sampled) < count:
+            full_paths = [str(row["checkpoint_path"]) for row in rows]
+            full_weights = [float(row["first_draw_probability"]) for row in rows]
+            for _ in range(count - len(sampled)):
+                sampled.append(full_paths[self._weighted_index(full_weights)])
+        return sampled
+
+    def _weighted_index(self, weights: list[float]) -> int:
+        total = math.fsum(weights)
+        if total <= 0.0 or not math.isfinite(total):
+            raise RuntimeError(f"Invalid PFSP sampling weights: {weights!r}.")
+        threshold = self._rng.random() * total
+        cumulative = 0.0
+        for index, weight in enumerate(weights):
+            cumulative += weight
+            if threshold < cumulative:
+                return index
+        # Floating-point roundoff can place the threshold at the endpoint.
+        return len(weights) - 1

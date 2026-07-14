@@ -9,6 +9,7 @@ from ..env.actions import (
     NUM_SLOT_INTENT_COMPONENTS,
     NUM_TERA_INTENT_COMPONENTS,
 )
+from ..public_consequence import PUBLIC_CONSEQUENCE_FIELD_DIM
 
 
 @dataclass
@@ -40,6 +41,12 @@ class RolloutBatch:
     opponent_intent_slot_masks: torch.Tensor  # (steps, envs, 2, 4) bool
     opponent_intent_tera_labels: torch.Tensor  # (steps, envs, 2) long
     opponent_intent_tera_masks: torch.Tensor  # (steps, envs, 2) bool
+    public_consequence_resolution_labels: torch.Tensor  # (steps, envs, 2) long
+    public_consequence_resolution_masks: torch.Tensor  # (steps, envs, 2) bool
+    public_consequence_cant_targets: torch.Tensor  # (steps, envs, 2, 2) float
+    public_consequence_cant_masks: torch.Tensor  # (steps, envs, 2, 2) bool
+    public_consequence_field_targets: torch.Tensor  # (steps, envs, 2, 33) float
+    public_consequence_field_masks: torch.Tensor  # (steps, envs, 2) bool
     num_steps: int
     num_envs: int
     initial_hidden_h: torch.Tensor | None = None  # (num_envs, hidden_dim)
@@ -169,6 +176,42 @@ class RolloutBuffer:
             dtype=torch.bool,
             device=device,
         )
+        self._public_consequence_resolution_labels = torch.full(
+            (num_steps, num_envs, 2),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+        self._public_consequence_resolution_masks = torch.zeros(
+            (num_steps, num_envs, 2),
+            dtype=torch.bool,
+            device=device,
+        )
+        self._public_consequence_cant_targets = torch.zeros(
+            (num_steps, num_envs, 2, 2),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._public_consequence_cant_masks = torch.zeros(
+            (num_steps, num_envs, 2, 2),
+            dtype=torch.bool,
+            device=device,
+        )
+        self._public_consequence_field_targets = torch.zeros(
+            (
+                num_steps,
+                num_envs,
+                2,
+                PUBLIC_CONSEQUENCE_FIELD_DIM,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._public_consequence_field_masks = torch.zeros(
+            (num_steps, num_envs, 2),
+            dtype=torch.bool,
+            device=device,
+        )
         # Tracks the timestep within the current rollout at which each env's
         # active episode began. Used to retroactively fill aux labels on done.
         self._episode_start = [0] * num_envs
@@ -186,6 +229,12 @@ class RolloutBuffer:
         opponent_intent_slot_masks: torch.Tensor | None = None,
         opponent_intent_tera_labels: torch.Tensor | None = None,
         opponent_intent_tera_masks: torch.Tensor | None = None,
+        public_consequence_resolution_labels: torch.Tensor | None = None,
+        public_consequence_resolution_masks: torch.Tensor | None = None,
+        public_consequence_cant_targets: torch.Tensor | None = None,
+        public_consequence_cant_masks: torch.Tensor | None = None,
+        public_consequence_field_targets: torch.Tensor | None = None,
+        public_consequence_field_masks: torch.Tensor | None = None,
         aux_label_obs: dict[str, torch.Tensor] | None = None,
         done_env_indices: np.ndarray | list[int] | tuple[int, ...] | None = None,
     ) -> None:
@@ -229,6 +278,43 @@ class RolloutBuffer:
             )
         else:
             self._opponent_intent_tera_masks[slot].fill_(False)
+
+        if public_consequence_resolution_labels is not None:
+            self._public_consequence_resolution_labels[slot].copy_(
+                public_consequence_resolution_labels.detach()
+            )
+        else:
+            self._public_consequence_resolution_labels[slot].fill_(-1)
+        if public_consequence_resolution_masks is not None:
+            self._public_consequence_resolution_masks[slot].copy_(
+                public_consequence_resolution_masks.detach()
+            )
+        else:
+            self._public_consequence_resolution_masks[slot].fill_(False)
+        if public_consequence_cant_targets is not None:
+            self._public_consequence_cant_targets[slot].copy_(
+                public_consequence_cant_targets.detach()
+            )
+        else:
+            self._public_consequence_cant_targets[slot].zero_()
+        if public_consequence_cant_masks is not None:
+            self._public_consequence_cant_masks[slot].copy_(
+                public_consequence_cant_masks.detach()
+            )
+        else:
+            self._public_consequence_cant_masks[slot].fill_(False)
+        if public_consequence_field_targets is not None:
+            self._public_consequence_field_targets[slot].copy_(
+                public_consequence_field_targets.detach()
+            )
+        else:
+            self._public_consequence_field_targets[slot].zero_()
+        if public_consequence_field_masks is not None:
+            self._public_consequence_field_masks[slot].copy_(
+                public_consequence_field_masks.detach()
+            )
+        else:
+            self._public_consequence_field_masks[slot].fill_(False)
 
         # Retroactively fill aux labels for completed episodes. Terminal slots
         # are matched by their episode-local source index rather than output
@@ -371,6 +457,16 @@ class RolloutBuffer:
             opponent_intent_slot_masks=self._opponent_intent_slot_masks,
             opponent_intent_tera_labels=self._opponent_intent_tera_labels,
             opponent_intent_tera_masks=self._opponent_intent_tera_masks,
+            public_consequence_resolution_labels=(
+                self._public_consequence_resolution_labels
+            ),
+            public_consequence_resolution_masks=(
+                self._public_consequence_resolution_masks
+            ),
+            public_consequence_cant_targets=self._public_consequence_cant_targets,
+            public_consequence_cant_masks=self._public_consequence_cant_masks,
+            public_consequence_field_targets=self._public_consequence_field_targets,
+            public_consequence_field_masks=self._public_consequence_field_masks,
             num_steps=self.num_steps,
             num_envs=self.num_envs,
             initial_hidden_h=self._initial_hidden_h,
@@ -408,6 +504,12 @@ class RolloutBuffer:
         self._opponent_intent_slot_masks.fill_(False)
         self._opponent_intent_tera_labels.fill_(-1)
         self._opponent_intent_tera_masks.fill_(False)
+        self._public_consequence_resolution_labels.fill_(-1)
+        self._public_consequence_resolution_masks.fill_(False)
+        self._public_consequence_cant_targets.zero_()
+        self._public_consequence_cant_masks.fill_(False)
+        self._public_consequence_field_targets.zero_()
+        self._public_consequence_field_masks.fill_(False)
         # New rollout starts a fresh episode-start tracker for every env.
         self._episode_start = [0] * self.num_envs
 

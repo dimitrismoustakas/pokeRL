@@ -27,6 +27,11 @@ from pokerl.env.actions import (
     NUM_TERA_INTENT_COMPONENTS,
 )
 from pokerl.model.agent import PokeAgent
+from pokerl.public_consequence import (
+    PUBLIC_CONSEQUENCE_FIELD_DIM,
+    PUBLIC_CONSEQUENCE_OBSERVATION_KEYS,
+    encode_public_consequence,
+)
 from pokerl.env.showdown_env import (
     BattleEnv,
     LoopThread,
@@ -382,7 +387,37 @@ def parse_args() -> argparse.Namespace:
         "--league-size",
         type=int,
         default=None,
-        help="Override how many frozen checkpoints are retained in the self-play league.",
+        help=(
+            "Maximum frozen checkpoint models resident in each inference cache. "
+            "Every league snapshot remains in the permanent on-disk archive."
+        ),
+    )
+    parser.add_argument(
+        "--league-payoff-half-life-updates",
+        type=float,
+        default=None,
+        help="Half-life for current-policy opponent payoff evidence.",
+    )
+    parser.add_argument(
+        "--league-pfsp-exponent",
+        type=float,
+        default=None,
+        help="Exponent applied to PFSP hard-opponent priorities.",
+    )
+    parser.add_argument(
+        "--league-pfsp-uniform-fraction",
+        type=float,
+        default=None,
+        help="Uniform archive-coverage fraction mixed into PFSP sampling.",
+    )
+    parser.add_argument(
+        "--league-cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use bounded CUDA graphs for frozen battle-opponent inference. "
+            "Disable with --no-league-cuda-graphs for eager A/B runs."
+        ),
     )
     parser.add_argument(
         "--team-preview-max-samples",
@@ -394,10 +429,7 @@ def parse_args() -> argparse.Namespace:
         "--preview-update-minibatch-size",
         type=int,
         default=None,
-        help=(
-            "Preview samples per gradient-accumulation chunk. All chunks form "
-            "one optimizer step."
-        ),
+        help="Maximum preview PPO minibatch size.",
     )
     parser.add_argument(
         "--tera-exploration-start",
@@ -442,6 +474,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Coefficient on masked semantic opponent-intent prediction "
             "(kind/move/target/switch/Tera)."
+        ),
+    )
+    parser.add_argument(
+        "--aux-public-consequence-coef",
+        type=float,
+        default=None,
+        help=(
+            "Positive coefficient on masked public action-consequence prediction "
+            "(resolution, opponent CANT, and next public field)."
         ),
     )
     parser.add_argument(
@@ -525,6 +566,10 @@ def build_configs(
         "league_update_interval": args.league_update_interval,
         "league_refresh_interval": args.league_refresh_interval,
         "league_coalesce_ms": args.league_coalesce_ms,
+        "league_payoff_half_life_updates": args.league_payoff_half_life_updates,
+        "league_pfsp_exponent": args.league_pfsp_exponent,
+        "league_pfsp_uniform_fraction": args.league_pfsp_uniform_fraction,
+        "league_cuda_graphs": args.league_cuda_graphs,
         "team_preview_max_samples": args.team_preview_max_samples,
         "preview_update_minibatch_size": args.preview_update_minibatch_size,
         "tera_exploration_start": args.tera_exploration_start,
@@ -534,6 +579,7 @@ def build_configs(
         "tera_slot_entropy_coef": args.tera_slot_entropy_coef,
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
         "aux_opponent_intent_coef": args.aux_opponent_intent_coef,
+        "aux_public_consequence_coef": args.aux_public_consequence_coef,
         "diagnose_memory_gradients": args.diagnose_memory_gradients,
     }
     for field_name, value in overrides.items():
@@ -584,17 +630,37 @@ def resolve_update_bounds(
     total_timesteps: int,
     steps_per_update: int,
     global_step: int,
+    completed_updates: int,
     additional_updates: bool,
 ) -> tuple[int, int]:
     """Return completed and target update counts for this invocation."""
     if steps_per_update <= 0:
         raise ValueError("steps_per_update must be positive.")
-    requested_updates = total_timesteps // steps_per_update
-    updates_done = global_step // steps_per_update
-    target_update = (
-        updates_done + requested_updates if additional_updates else requested_updates
-    )
-    return updates_done, target_update
+    if type(completed_updates) is not int or completed_updates < 0:
+        raise ValueError("completed_updates must be a non-negative integer.")
+    if type(global_step) is not int or global_step < 0:
+        raise ValueError("global_step must be a non-negative integer.")
+    if additional_updates:
+        requested_updates = total_timesteps // steps_per_update
+    else:
+        remaining_steps = max(0, total_timesteps - global_step)
+        requested_updates = math.ceil(remaining_steps / steps_per_update)
+    target_update = completed_updates + requested_updates
+    return completed_updates, target_update
+
+
+def validate_resume_update_state(
+    *,
+    trainer_completed_updates: int,
+    league_current_update: int,
+) -> None:
+    """Reject a trainer/league pair that describes different update boundaries."""
+    if trainer_completed_updates != league_current_update:
+        raise ValueError(
+            "Trainer checkpoint and paired league state disagree on completed "
+            f"updates: trainer={trainer_completed_updates}, "
+            f"league={league_current_update}."
+        )
 
 
 def resolve_tera_exploration_decay_updates(
@@ -712,23 +778,16 @@ def make_team_pair_provider(team_pool: TeamPool | None):
     return provider
 
 
-def _sample_league_checkpoint(league: League, *, action: str) -> str:
-    checkpoint_path = league.sample_checkpoint_path()
-    if checkpoint_path is None:
-        raise RuntimeError(
-            f"League opponent {action} requested, but the league is empty. "
-            "This should not happen if the league was seeded before training."
-        )
-    return checkpoint_path
-
-
 def _sample_checkpoints_by_group(
     league: League, opponent_groups: int
 ) -> dict[int, str]:
-    return {
-        opponent_group: _sample_league_checkpoint(league, action="assignment")
-        for opponent_group in range(opponent_groups)
-    }
+    paths = league.sample_checkpoint_paths(opponent_groups)
+    if len(paths) != opponent_groups:
+        raise RuntimeError(
+            "League returned the wrong number of opponent assignments: "
+            f"requested={opponent_groups}, returned={len(paths)}."
+        )
+    return dict(enumerate(paths))
 
 
 def make_envs(
@@ -740,9 +799,30 @@ def make_envs(
     team_preview_batcher: TeamPreviewBatcher | None = None,
     team_pair_provider=None,
     collect_timing: bool = False,
+    initial_checkpoint_by_group: dict[int, str] | None = None,
 ) -> ParallelBattleEnv:
     """Create parallel battle environments backed by league opponents."""
-    checkpoint_by_group = _sample_checkpoints_by_group(league, opponent_groups)
+    if initial_checkpoint_by_group is None:
+        checkpoint_by_group = _sample_checkpoints_by_group(league, opponent_groups)
+    else:
+        expected_groups = set(range(opponent_groups))
+        if set(initial_checkpoint_by_group) != expected_groups:
+            raise ValueError(
+                "Initial opponent assignments do not match configured groups: "
+                f"expected={sorted(expected_groups)}, "
+                f"saved={sorted(initial_checkpoint_by_group)}."
+            )
+        archive_paths = set(league.checkpoints)
+        if any(
+            not isinstance(path, str) or path not in archive_paths
+            for path in initial_checkpoint_by_group.values()
+        ):
+            raise ValueError(
+                "Initial opponent assignments must reference archived checkpoints."
+            )
+        checkpoint_by_group = dict(initial_checkpoint_by_group)
+        # Loading strict resume assignments must not consume another PFSP RNG
+        # draw. ``make_opponent`` prefetches each restored checkpoint below.
     loop_count = resolve_battle_loop_count(
         env_config.battle_loop_count,
         env_config.num_envs,
@@ -802,13 +882,12 @@ def _sample_refresh_assignments(
     league: League,
 ) -> list[tuple[BattleEnv, str]]:
     assignments: list[tuple[BattleEnv, str]] = []
-    checkpoint_by_group: dict[int, str] = {}
+    groups = sorted({int(env.config.opponent_group) for env in parallel_env.envs})
+    sampled_paths = league.sample_checkpoint_paths(len(groups))
+    checkpoint_by_group = dict(zip(groups, sampled_paths, strict=True))
     for env in parallel_env.envs:
         opponent_group = int(env.config.opponent_group)
-        checkpoint_path = checkpoint_by_group.get(opponent_group)
-        if checkpoint_path is None:
-            checkpoint_path = _sample_league_checkpoint(league, action="refresh")
-            checkpoint_by_group[opponent_group] = checkpoint_path
+        checkpoint_path = checkpoint_by_group[opponent_group]
         assignments.append((env, checkpoint_path))
     return assignments
 
@@ -859,7 +938,7 @@ def _maintain_league_after_update(
     """Snapshot first, then sample next-battle opponents from the new pool."""
     checkpoint_added = update % config.league_update_interval == 0
     if checkpoint_added:
-        league.add_checkpoint(agent, global_step)
+        league.add_checkpoint(agent, global_step, update=update)
 
     assignments: dict[int, str] = {}
     if update < num_updates and update % config.league_refresh_interval == 0:
@@ -1014,10 +1093,40 @@ def collect_synchronous_rollout(
         opponent_intent_tera_labels_np,
         dtype=bool,
     )
+    public_consequence_resolution_labels_np = np.empty(
+        (parallel_env.num_envs, 2),
+        dtype=np.int64,
+    )
+    public_consequence_resolution_masks_np = np.empty_like(
+        public_consequence_resolution_labels_np,
+        dtype=bool,
+    )
+    public_consequence_cant_targets_np = np.empty(
+        (parallel_env.num_envs, 2, 2),
+        dtype=np.float32,
+    )
+    public_consequence_cant_masks_np = np.empty_like(
+        public_consequence_cant_targets_np,
+        dtype=bool,
+    )
+    public_consequence_field_targets_np = np.empty(
+        (parallel_env.num_envs, 2, PUBLIC_CONSEQUENCE_FIELD_DIM),
+        dtype=np.float32,
+    )
+    public_consequence_field_masks_np = np.empty(
+        (parallel_env.num_envs, 2),
+        dtype=bool,
+    )
     opponent_intent_slot_labels_device: torch.Tensor | None = None
     opponent_intent_slot_masks_device: torch.Tensor | None = None
     opponent_intent_tera_labels_device: torch.Tensor | None = None
     opponent_intent_tera_masks_device: torch.Tensor | None = None
+    public_consequence_resolution_labels_device: torch.Tensor | None = None
+    public_consequence_resolution_masks_device: torch.Tensor | None = None
+    public_consequence_cant_targets_device: torch.Tensor | None = None
+    public_consequence_cant_masks_device: torch.Tensor | None = None
+    public_consequence_field_targets_device: torch.Tensor | None = None
+    public_consequence_field_masks_device: torch.Tensor | None = None
     aux_label_obs_device_buffers: dict[str, torch.Tensor] | None = None
 
     for _ in range(num_steps):
@@ -1093,7 +1202,38 @@ def collect_synchronous_rollout(
         opponent_intent_slot_masks_np.fill(False)
         opponent_intent_tera_labels_np.fill(-1)
         opponent_intent_tera_masks_np.fill(False)
+        public_consequence_resolution_labels_np.fill(-1)
+        public_consequence_resolution_masks_np.fill(False)
+        public_consequence_cant_targets_np.fill(0.0)
+        public_consequence_cant_masks_np.fill(False)
+        public_consequence_field_targets_np.fill(0.0)
+        public_consequence_field_masks_np.fill(False)
         for env_index, info in enumerate(infos):
+            if dones[env_index]:
+                consequence_observation = info.get("final_observation")
+                if consequence_observation is None:
+                    raise RuntimeError(
+                        "Auto-reset transition omitted final_observation for "
+                        "terminal auxiliary labels."
+                    )
+            else:
+                consequence_observation = {
+                    key: next_obs[key][env_index]
+                    for key in PUBLIC_CONSEQUENCE_OBSERVATION_KEYS
+                    if key in next_obs
+                }
+            consequence = encode_public_consequence(consequence_observation)
+            public_consequence_resolution_labels_np[env_index] = (
+                consequence.resolution_labels
+            )
+            public_consequence_resolution_masks_np[env_index] = (
+                consequence.resolution_masks
+            )
+            public_consequence_cant_targets_np[env_index] = consequence.cant_targets
+            public_consequence_cant_masks_np[env_index] = consequence.cant_masks
+            public_consequence_field_targets_np[env_index] = consequence.field_targets
+            public_consequence_field_masks_np[env_index] = consequence.field_masks
+
             slot_labels = info.get("opponent_intent_slot_labels")
             if slot_labels is None:
                 continue
@@ -1147,6 +1287,53 @@ def collect_synchronous_rollout(
         opponent_intent_slot_masks_device = opponent_intent_slot_masks_t
         opponent_intent_tera_labels_device = opponent_intent_tera_labels_t
         opponent_intent_tera_masks_device = opponent_intent_tera_masks_t
+
+        public_consequence_resolution_labels_t = array_to_device(
+            public_consequence_resolution_labels_np,
+            device,
+            dtype=torch.long,
+            buffer=public_consequence_resolution_labels_device,
+        )
+        public_consequence_resolution_masks_t = array_to_device(
+            public_consequence_resolution_masks_np,
+            device,
+            dtype=torch.bool,
+            buffer=public_consequence_resolution_masks_device,
+        )
+        public_consequence_cant_targets_t = array_to_device(
+            public_consequence_cant_targets_np,
+            device,
+            dtype=torch.float32,
+            buffer=public_consequence_cant_targets_device,
+        )
+        public_consequence_cant_masks_t = array_to_device(
+            public_consequence_cant_masks_np,
+            device,
+            dtype=torch.bool,
+            buffer=public_consequence_cant_masks_device,
+        )
+        public_consequence_field_targets_t = array_to_device(
+            public_consequence_field_targets_np,
+            device,
+            dtype=torch.float32,
+            buffer=public_consequence_field_targets_device,
+        )
+        public_consequence_field_masks_t = array_to_device(
+            public_consequence_field_masks_np,
+            device,
+            dtype=torch.bool,
+            buffer=public_consequence_field_masks_device,
+        )
+        public_consequence_resolution_labels_device = (
+            public_consequence_resolution_labels_t
+        )
+        public_consequence_resolution_masks_device = (
+            public_consequence_resolution_masks_t
+        )
+        public_consequence_cant_targets_device = public_consequence_cant_targets_t
+        public_consequence_cant_masks_device = public_consequence_cant_masks_t
+        public_consequence_field_targets_device = public_consequence_field_targets_t
+        public_consequence_field_masks_device = public_consequence_field_masks_t
 
         done_env_indices = np.flatnonzero(dones)
         aux_label_obs_t = None
@@ -1208,6 +1395,14 @@ def collect_synchronous_rollout(
             opponent_intent_slot_masks=opponent_intent_slot_masks_t,
             opponent_intent_tera_labels=opponent_intent_tera_labels_t,
             opponent_intent_tera_masks=opponent_intent_tera_masks_t,
+            public_consequence_resolution_labels=(
+                public_consequence_resolution_labels_t
+            ),
+            public_consequence_resolution_masks=(public_consequence_resolution_masks_t),
+            public_consequence_cant_targets=public_consequence_cant_targets_t,
+            public_consequence_cant_masks=public_consequence_cant_masks_t,
+            public_consequence_field_targets=public_consequence_field_targets_t,
+            public_consequence_field_masks=public_consequence_field_masks_t,
             aux_label_obs=aux_label_obs_t,
             done_env_indices=done_env_indices,
         )
@@ -1232,11 +1427,55 @@ def _league_state_path_for_resume(resume_checkpoint: str) -> Path:
     return Path(resume_checkpoint).resolve().with_suffix(".league_state.json")
 
 
+def _serialize_opponent_assignments(
+    assignments: dict[int, str],
+    league: League,
+) -> dict[str, str]:
+    expected_groups = set(range(len(assignments)))
+    if not assignments or set(assignments) != expected_groups:
+        raise ValueError(
+            "Opponent assignments must use contiguous group indices starting at zero."
+        )
+    archive_paths = set(league.checkpoints)
+    if any(
+        not isinstance(path, str) or path not in archive_paths
+        for path in assignments.values()
+    ):
+        raise ValueError("Opponent assignments must reference archived checkpoints.")
+    return {str(group): assignments[group] for group in sorted(assignments)}
+
+
+def _restore_opponent_assignments(
+    value: object,
+    *,
+    opponent_groups: int,
+    league: League,
+) -> dict[int, str]:
+    if not isinstance(value, dict):
+        raise ValueError("Paired league state omitted opponent assignments.")
+    expected_keys = {str(group) for group in range(opponent_groups)}
+    if set(value) != expected_keys:
+        raise ValueError(
+            "Saved opponent assignments do not match configured opponent groups."
+        )
+    archive_paths = set(league.checkpoints)
+    restored: dict[int, str] = {}
+    for group in range(opponent_groups):
+        checkpoint_path = value[str(group)]
+        if not isinstance(checkpoint_path, str) or checkpoint_path not in archive_paths:
+            raise ValueError(
+                "Saved opponent assignment references a checkpoint outside the archive."
+            )
+        restored[group] = checkpoint_path
+    return restored
+
+
 def _save_training_state(
     league: League,
     checkpoint_path: str,
     team_pool: TeamPool | None,
     training_state_id: str,
+    opponent_assignments: dict[int, str],
 ) -> None:
     team_pool_state = (
         None
@@ -1251,6 +1490,10 @@ def _save_training_state(
         extra_state={
             "training_state_id": training_state_id,
             "team_pool": team_pool_state,
+            "opponent_assignments": _serialize_opponent_assignments(
+                opponent_assignments,
+                league,
+            ),
         },
     )
 
@@ -1558,6 +1801,7 @@ def train():
     )
 
     # --- Resume from checkpoint ---
+    restored_opponent_assignments: dict[int, str] | None = None
     if args.resume:
         trainer.load(args.resume)
         print(
@@ -1575,6 +1819,10 @@ def train():
             raise ValueError(
                 "Trainer checkpoint and paired league state have different IDs."
             )
+        validate_resume_update_state(
+            trainer_completed_updates=trainer.completed_updates,
+            league_current_update=league.current_update,
+        )
         saved_team_pool = extra_state.get("team_pool")
         if team_pool is None:
             if saved_team_pool is not None:
@@ -1592,6 +1840,11 @@ def train():
             if not isinstance(team_pool_rng_state, tuple):
                 raise ValueError("Paired league state has invalid team-pool RNG state.")
             team_pool.restore_rng_state(team_pool_rng_state)
+        restored_opponent_assignments = _restore_opponent_assignments(
+            extra_state.get("opponent_assignments"),
+            opponent_groups=opponent_groups,
+            league=league,
+        )
         print(
             f"Restored league from {league_state!s}: {len(league.checkpoints)} checkpoint(s)"
         )
@@ -1611,7 +1864,7 @@ def train():
     team_preview_batcher = TeamPreviewBatcher(
         agent,
         device,
-        policy_version=trainer.global_step // steps_per_update,
+        policy_version=trainer.completed_updates,
     )
     team_preview_fn = make_team_preview_fn(team_preview_batcher)
     team_pair_provider = make_team_pair_provider(team_pool)
@@ -1624,6 +1877,7 @@ def train():
         team_preview_batcher=team_preview_batcher,
         team_pair_provider=team_pair_provider,
         collect_timing=collect_timing,
+        initial_checkpoint_by_group=restored_opponent_assignments,
     )
     current_opponent_assignments = _current_opponent_assignments(parallel_env)
     run_assigned_opponents = set(current_opponent_assignments.values())
@@ -1660,11 +1914,18 @@ def train():
             "tera_slot_entropy_coef": train_config.tera_slot_entropy_coef,
             "aux_hidden_info_coef": train_config.aux_hidden_info_coef,
             "aux_opponent_intent_coef": train_config.aux_opponent_intent_coef,
+            "aux_public_consequence_coef": (train_config.aux_public_consequence_coef),
             "diagnose_memory_gradients": train_config.diagnose_memory_gradients,
             "league_size": train_config.league_size,
             "league_update_interval": train_config.league_update_interval,
             "league_refresh_interval": train_config.league_refresh_interval,
             "league_coalesce_ms": train_config.league_coalesce_ms,
+            "league_cuda_graphs": train_config.league_cuda_graphs,
+            "league_payoff_half_life_updates": (
+                train_config.league_payoff_half_life_updates
+            ),
+            "league_pfsp_exponent": train_config.league_pfsp_exponent,
+            "league_pfsp_uniform_fraction": (train_config.league_pfsp_uniform_fraction),
             "league_inference_device": str(league.inference_device),
             "league_preview_inference_device": str(league.preview_inference_device),
             "collect_timing": collect_timing,
@@ -1681,6 +1942,7 @@ def train():
             "observed_checkpoint_paths": [],
             "outcomes": _summarize_opponent_outcomes(run_opponent_outcomes),
         },
+        "league": league.describe(include_members=True),
         "updates": [],
     }
 
@@ -1706,6 +1968,7 @@ def train():
             total_timesteps=train_config.total_timesteps,
             steps_per_update=steps_per_update,
             global_step=trainer.global_step,
+            completed_updates=trainer.completed_updates,
             additional_updates=args.resume is not None and args.num_updates is not None,
         )
         tera_exploration_decay_updates = resolve_tera_exploration_decay_updates(
@@ -1727,9 +1990,12 @@ def train():
         print("Backend: local BattleStream")
         print(f"Opponent groups: {opponent_groups}")
         print(
-            "League cadence: "
+            f"League: permanent archive, resident cache {train_config.league_size}; "
             f"snapshot every {train_config.league_update_interval} update(s), "
-            f"refresh every {train_config.league_refresh_interval} update(s)"
+            f"refresh every {train_config.league_refresh_interval} update(s); "
+            f"payoff half-life {train_config.league_payoff_half_life_updates:g}; "
+            f"PFSP exponent {train_config.league_pfsp_exponent:g} with "
+            f"{train_config.league_pfsp_uniform_fraction:.0%} uniform coverage"
         )
         local_summary = battlestream_summary(env_config)
         print(
@@ -1967,6 +2233,9 @@ def train():
             # The updated policy enters the league before opponent groups are
             # resampled, making a newly created snapshot eligible immediately.
             league_maintenance_started = time.perf_counter()
+            # Outcomes came from the just-collected live policy. Update the
+            # discounted payoff row before drawing the next PFSP opponents.
+            league.record_outcomes(update_opponent_outcomes, update=update)
             with cuda_model_execution(device):
                 league_maintenance = _maintain_league_after_update(
                     update=update,
@@ -1991,6 +2260,13 @@ def train():
                 )
                 print(f"League updated (pool: {len(league.checkpoints)}){refresh_note}")
 
+            if league.current_update != update:
+                raise RuntimeError(
+                    "League maintenance did not finish at the current update: "
+                    f"expected={update}, actual={league.current_update}."
+                )
+            trainer.completed_updates = update
+
             # Save league state after adding the current snapshot so a trainer
             # checkpoint and its paired .league_state.json describe one point
             # in training.
@@ -2004,6 +2280,7 @@ def train():
                     path,
                     team_pool,
                     training_state_id,
+                    current_opponent_assignments,
                 )
                 with cuda_model_execution(device):
                     trainer.save(path, training_state_id=training_state_id)
@@ -2136,6 +2413,7 @@ def train():
                 "checkpoint_sec": checkpoint_sec,
                 "league_update_sec": league_update_sec,
                 "league_checkpoint_added": league_maintenance.checkpoint_added,
+                "league": league.describe(update=update, include_members=False),
                 "update_wall_sec": update_wall_sec,
                 "update_wall_steps_per_second": (
                     steps_per_update / update_wall_sec if update_wall_sec > 0 else 0.0
@@ -2182,6 +2460,12 @@ def train():
             run_summary["tera"] = summarize_first_tera_turns(
                 run_first_tera_turns,
                 len(episode_rewards),
+            )
+            # Keep the complete latest archive distribution once at top level;
+            # per-update rows retain only compact PFSP/cache diagnostics.
+            run_summary["league"] = league.describe(
+                update=update,
+                include_members=True,
             )
             run_summary["updates"].append(update_summary)
             run_summary["status"] = "running"
@@ -2254,6 +2538,7 @@ def train():
             final_path,
             team_pool,
             training_state_id,
+            current_opponent_assignments,
         )
         with cuda_model_execution(device):
             trainer.save(final_path, training_state_id=training_state_id)

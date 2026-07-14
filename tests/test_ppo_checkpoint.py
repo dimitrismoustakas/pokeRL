@@ -1,4 +1,3 @@
-from collections import deque
 import copy
 from dataclasses import dataclass
 import random
@@ -10,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from pokerl.config import TrainingConfig
-from pokerl.training.league import League
+from pokerl.training.league import League, LeagueMember
 from pokerl.training.ppo import (
     TRAINER_CHECKPOINT_FORMAT_VERSION,
     PPOTrainer,
@@ -79,6 +78,7 @@ def test_trainer_checkpoint_roundtrips(tmp_path) -> None:
     loss = trainer.agent.linear(torch.tensor([[0.5, -1.0]])).square().sum()
     assert trainer._apply_update_step(loss)
     trainer.global_step = 123
+    trainer.completed_updates = 7
     checkpoint_path = tmp_path / "trainer.pt"
     expected_agent = copy.deepcopy(trainer.agent.state_dict())
     expected_optimizer = copy.deepcopy(trainer.optimizer.state_dict())
@@ -115,6 +115,7 @@ def test_trainer_checkpoint_roundtrips(tmp_path) -> None:
     loaded.load(str(checkpoint_path))
 
     assert loaded.global_step == 123
+    assert loaded.completed_updates == 7
     assert loaded.loaded_training_state_id == raw_checkpoint["training_state_id"]
     _assert_nested_equal(loaded.agent.state_dict(), expected_agent)
     _assert_nested_equal(loaded.optimizer.state_dict(), expected_optimizer)
@@ -158,6 +159,35 @@ def test_trainer_load_rejects_wrong_checkpoint_format_version(tmp_path) -> None:
     torch.save(checkpoint, checkpoint_path)
 
     with pytest.raises(ValueError, match="unsupported format_version"):
+        trainer.load(str(checkpoint_path))
+
+
+def test_trainer_load_rejects_previous_v4_checkpoint_schema(tmp_path) -> None:
+    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    checkpoint_path = tmp_path / "trainer_v4.pt"
+    trainer.save(str(checkpoint_path))
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    checkpoint["format_version"] = 4
+    checkpoint.pop("completed_updates")
+    torch.save(checkpoint, checkpoint_path)
+
+    with pytest.raises(ValueError, match="unsupported format_version=4"):
+        trainer.load(str(checkpoint_path))
+
+
+@pytest.mark.parametrize("completed_updates", [True, -1, 1.5])
+def test_trainer_load_rejects_invalid_completed_updates(
+    tmp_path,
+    completed_updates,
+) -> None:
+    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    checkpoint_path = tmp_path / "trainer.pt"
+    trainer.save(str(checkpoint_path))
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    checkpoint["completed_updates"] = completed_updates
+    torch.save(checkpoint, checkpoint_path)
+
+    with pytest.raises(ValueError, match="completed_updates"):
         trainer.load(str(checkpoint_path))
 
 
@@ -231,7 +261,9 @@ def test_league_checkpoint_is_marked_as_league(tmp_path) -> None:
     config = TrainingConfig(checkpoint_dir=str(tmp_path))
     league = object.__new__(League)
     league.config = config
-    league.checkpoints = deque(maxlen=config.league_size)
+    league.checkpoints = []
+    league._members = {}
+    league._current_update = 0
     league._inference = SimpleNamespace(
         prune_checkpoints=lambda keep_paths: None,
         prefetch_checkpoint=lambda checkpoint_path: None,
@@ -250,8 +282,20 @@ def test_league_checkpoint_is_marked_as_league(tmp_path) -> None:
 def test_league_sampling_uses_its_own_reproducible_rng() -> None:
     left = object.__new__(League)
     right = object.__new__(League)
-    left.checkpoints = deque((f"step_{index}.pt" for index in range(12)), maxlen=12)
-    right.checkpoints = deque(left.checkpoints, maxlen=12)
+    left.config = TrainingConfig()
+    right.config = TrainingConfig()
+    left.checkpoints = [f"step_{index}.pt" for index in range(12)]
+    right.checkpoints = list(left.checkpoints)
+    left._members = {
+        path: LeagueMember(path=path, step=index, created_update=0)
+        for index, path in enumerate(left.checkpoints)
+    }
+    right._members = {
+        path: LeagueMember(path=path, step=index, created_update=0)
+        for index, path in enumerate(right.checkpoints)
+    }
+    left._current_update = 0
+    right._current_update = 0
     left._rng = random.Random(37)
     right._rng = random.Random(37)
 

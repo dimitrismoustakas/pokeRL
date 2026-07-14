@@ -119,6 +119,30 @@ def test_hidden_info_metrics_are_unknown_only_additive_and_gradient_free() -> No
     assert all(tensor.grad is None for tensor in logits.values())
 
 
+def test_hidden_info_metrics_batch_device_scalar_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logits, terminal_labels, label_valid, public_obs = _belief_fixture()
+
+    def fail_scalar_extraction(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError(
+            "per-metric tensor scalar extraction synchronized the device"
+        )
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_scalar_extraction)
+    monkeypatch.setattr(torch.Tensor, "__bool__", fail_scalar_extraction)
+    metrics = hidden_info_belief_additive_metrics(
+        logits,
+        terminal_labels,
+        label_valid,
+        public_obs,
+    )
+
+    assert metrics["aux_item_unknown_count"] == 1.0
+    assert metrics["aux_move_unknown_recall_at_4_count"] == 2.0
+    assert all(isinstance(value, float) for value in metrics.values())
+
+
 def test_hidden_info_metrics_require_exact_terminal_targets() -> None:
     logits, terminal_labels, label_valid, public_obs = _belief_fixture()
     terminal_labels["opp_continuous"][..., ITEM_KNOWN_OFFSET] = 0.0
@@ -183,6 +207,43 @@ def test_opponent_intent_metrics_report_only_unforced_semantic_components() -> N
     assert metrics["opp_intent_tera_use_top1_correct"] == 1.0
     assert metrics["opp_intent_tera_use_count"] == 1.0
     assert metrics["opp_intent_tera_slot_count"] == 0.0
+
+
+def test_opponent_intent_metrics_batch_device_scalar_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logits = {
+        "opp_intent_kind_logits": torch.zeros((1, 2, 3)),
+        "opp_intent_move_logits": torch.zeros((1, 2, 3)),
+        "opp_intent_target_logits": torch.zeros((1, 2, 5)),
+        "opp_intent_switch_species_logits": torch.zeros((1, 2, 6)),
+        "opp_intent_tera_use_logits": torch.zeros((1, 2)),
+        "opp_intent_tera_slot_logits": torch.zeros((1, 2)),
+    }
+    slot_labels = torch.tensor([[[0, 0, -1, -1], [0, 0, -1, -1]]])
+    slot_masks = torch.tensor(
+        [[[True, False, False, False], [False, True, False, False]]]
+    )
+
+    def fail_scalar_extraction(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError(
+            "per-metric tensor scalar extraction synchronized the device"
+        )
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_scalar_extraction)
+    monkeypatch.setattr(torch.Tensor, "__bool__", fail_scalar_extraction)
+    metrics = opponent_intent_additive_metrics(
+        logits,
+        slot_labels,
+        slot_masks,
+        torch.tensor([[0, -1]]),
+        torch.tensor([[True, False]]),
+    )
+
+    assert metrics["opp_intent_kind_count"] == 1.0
+    assert metrics["opp_intent_move_count"] == 1.0
+    assert metrics["opp_intent_tera_use_count"] == 1.0
+    assert all(isinstance(value, float) for value in metrics.values())
 
 
 def test_aux_metrics_reject_out_of_range_targets() -> None:

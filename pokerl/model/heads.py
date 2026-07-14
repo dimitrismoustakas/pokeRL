@@ -19,9 +19,16 @@ from ..env.actions import (
     decode_action,
 )
 from ..env.observation import TERASTALLIZED_OFFSET
+from ..public_consequence import (
+    NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+    PUBLIC_CONSEQUENCE_FIELD_DIM,
+)
 
 
-def _sample_categorical_logits(logits: torch.Tensor) -> torch.Tensor:
+def _sample_categorical_logits(
+    logits: torch.Tensor,
+    exponential: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Sample from categorical logits with the Gumbel-max trick.
 
     If ``E`` is exponential(1), ``-log(E)`` is a standard Gumbel sample.
@@ -29,7 +36,16 @@ def _sample_categorical_logits(logits: torch.Tensor) -> torch.Tensor:
     probabilities while avoiding an unnecessary softmax.
     """
     sample_logits = logits.detach()
-    exponential = torch.empty_like(sample_logits).exponential_()
+    if exponential is None:
+        exponential = torch.empty_like(sample_logits).exponential_()
+    elif (
+        exponential.shape != sample_logits.shape
+        or exponential.dtype != sample_logits.dtype
+        or exponential.device != sample_logits.device
+    ):
+        raise ValueError(
+            "External categorical exponentials must exactly match the logits."
+        )
     return (sample_logits - exponential.log()).argmax(dim=1)
 
 
@@ -185,6 +201,25 @@ class ActionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        # Predict public consequences for every candidate from the same hidden
+        # representation used by its raw policy score.  The compact adapter is
+        # the only route from these predictions back into the policy logits.
+        # Its inputs are detached so actor gradients cannot train the
+        # consequence model into a convenient (but ungrounded) latent code.
+        self.public_consequence_head = nn.Linear(
+            hidden_dim,
+            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES
+            + 2
+            + PUBLIC_CONSEQUENCE_FIELD_DIM,
+        )
+        self.public_consequence_policy_adapter = nn.Linear(
+            hidden_dim,
+            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES
+            + 2
+            + PUBLIC_CONSEQUENCE_FIELD_DIM,
+            bias=False,
+        )
+        nn.init.zeros_(self.public_consequence_policy_adapter.weight)
         # Factor Tera into an optimal-stopping-style gate (use now vs wait)
         # and a conditional slot choice. The resulting marginal is still the
         # exact three-choice distribution {none, slot 0, slot 1} consumed by
@@ -288,6 +323,12 @@ class ActionHead(nn.Module):
         tera_exploration_prob: float = 0.0,
         validate_actions: bool = True,
         include_policy_stats: bool = True,
+        sampling_exponentials: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+        | None = None,
     ) -> dict[str, torch.Tensor]:
         if "joint" not in masks or "can_tera" not in masks:
             raise ValueError("ActionHead expected mask keys {'joint', 'can_tera'}.")
@@ -340,7 +381,7 @@ class ActionHead(nn.Module):
                 opp_reserve_mask,
             )
         query1 = self.query1_fuse(torch.cat([base_query1, reserve_summary1], dim=-1))
-        logits1 = self._score_actions(
+        logits1, public_consequence_1 = self._score_actions(
             query1,
             rep1,
             rep2,
@@ -355,6 +396,9 @@ class ActionHead(nn.Module):
             actions=None if actions is None else actions[:, 0],
             greedy=greedy,
             include_stats=include_policy_stats,
+            sampling_exponential=(
+                None if sampling_exponentials is None else sampling_exponentials[0]
+            ),
         )
 
         # A sampled action comes directly from masked logits. Re-reading its
@@ -395,7 +439,7 @@ class ActionHead(nn.Module):
                 opp_reserve_mask,
             )
         query2 = self.query2_fuse(torch.cat([base_query2, reserve_summary2], dim=-1))
-        logits2 = self._score_actions(
+        logits2, public_consequence_2 = self._score_actions(
             query2,
             rep2,
             rep1,
@@ -410,6 +454,9 @@ class ActionHead(nn.Module):
             actions=None if actions is None else actions[:, 1],
             greedy=greedy,
             include_stats=include_policy_stats,
+            sampling_exponential=(
+                None if sampling_exponentials is None else sampling_exponentials[1]
+            ),
         )
 
         if (
@@ -488,7 +535,12 @@ class ActionHead(nn.Module):
             tera_choice = (
                 base_tera_log_probs.argmax(dim=1)
                 if greedy
-                else _sample_categorical_logits(tera_sampling_logits)
+                else _sample_categorical_logits(
+                    tera_sampling_logits,
+                    None
+                    if sampling_exponentials is None
+                    else sampling_exponentials[2],
+                )
             )
         else:
             tera_choice = actions[:, 2]
@@ -527,6 +579,27 @@ class ActionHead(nn.Module):
             result["base_tera_none_prob"] = base_tera_probs[:, TERA_NONE]
             result["base_tera_has_real_choice"] = tera_mask.sum(dim=-1) >= 2
             result["base_tera_has_slot_choice"] = tera_mask[:, 1:].sum(dim=-1) >= 2
+            result["public_consequence_resolution_logits"] = torch.stack(
+                [
+                    public_consequence_1["resolution_logits"][batch_indices, a1],
+                    public_consequence_2["resolution_logits"][batch_indices, a2],
+                ],
+                dim=1,
+            )
+            result["public_consequence_cant_logits"] = torch.stack(
+                [
+                    public_consequence_1["cant_logits"][batch_indices, a1],
+                    public_consequence_2["cant_logits"][batch_indices, a2],
+                ],
+                dim=1,
+            )
+            result["public_consequence_field_logits"] = torch.stack(
+                [
+                    public_consequence_1["field_logits"][batch_indices, a1],
+                    public_consequence_2["field_logits"][batch_indices, a2],
+                ],
+                dim=1,
+            )
         return result
 
     @staticmethod
@@ -695,6 +768,7 @@ class ActionHead(nn.Module):
         actions: torch.Tensor | None,
         greedy: bool,
         include_stats: bool = True,
+        sampling_exponential: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if include_stats:
             log_probs = torch.log_softmax(logits, dim=-1)
@@ -703,7 +777,7 @@ class ActionHead(nn.Module):
                 selected = (
                     logits.argmax(dim=1)
                     if greedy
-                    else _sample_categorical_logits(logits)
+                    else _sample_categorical_logits(logits, sampling_exponential)
                 )
             else:
                 selected = actions
@@ -715,7 +789,7 @@ class ActionHead(nn.Module):
             if greedy:
                 selected = logits.argmax(dim=1)
             else:
-                selected = _sample_categorical_logits(logits)
+                selected = _sample_categorical_logits(logits, sampling_exponential)
         else:
             selected = actions
         return selected, None, None
@@ -729,7 +803,7 @@ class ActionHead(nn.Module):
         opp_active_reps: torch.Tensor,
         matchup_features: torch.Tensor,
         action_features: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         query_features = query.unsqueeze(1).expand(-1, self.num_actions, -1)
         action_features = action_features.unsqueeze(0).expand(query.shape[0], -1, -1)
         entity_features = self.entity_proj(
@@ -738,11 +812,56 @@ class ActionHead(nn.Module):
             )
         )
         matchup_emb = self.matchup_proj(matchup_features)
-        return self.score(
-            torch.cat(
-                [query_features, action_features, entity_features, matchup_emb], dim=-1
-            )
-        ).squeeze(-1)
+        candidate_inputs = torch.cat(
+            [query_features, action_features, entity_features, matchup_emb], dim=-1
+        )
+        # Preserve the original raw score path exactly while exposing its
+        # existing hidden candidate representation to the auxiliary model.
+        score_hidden = self.score[1](self.score[0](candidate_inputs))
+        raw_logits = self.score[2](score_hidden).squeeze(-1)
+
+        consequence_logits = self.public_consequence_head(score_hidden)
+        resolution_logits, cant_logits, field_logits = consequence_logits.split(
+            (
+                NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+                2,
+                PUBLIC_CONSEQUENCE_FIELD_DIM,
+            ),
+            dim=-1,
+        )
+        detached_predictions = torch.cat(
+            [
+                resolution_logits.softmax(dim=-1),
+                cant_logits.sigmoid(),
+                field_logits.sigmoid(),
+            ],
+            dim=-1,
+        ).detach()
+        # Value the grounded outcomes in the current slot context.  A global
+        # scalar valuation could learn that execution is generally preferable
+        # to failure, but could not express that (for example) activating
+        # Trick Room is useful for one matchup and harmful for another.  The
+        # zero-initialized state-conditioned weights preserve the old logits
+        # exactly at initialization, while the detached predictions still
+        # prevent actor gradients from changing the world model itself.
+        consequence_weights = self.public_consequence_policy_adapter(query).unsqueeze(
+            1
+        )
+        consequence_residual = (
+            consequence_weights * detached_predictions
+        ).sum(dim=-1) / math.sqrt(detached_predictions.shape[-1])
+        # Only moves receive exact public-consequence supervision.  Applying
+        # this adapter to switches or pass would let arbitrary out-of-
+        # distribution predictions influence decisions they were never
+        # trained to describe.
+        consequence_residual = consequence_residual * self._action_is_move.to(
+            dtype=consequence_residual.dtype
+        ).unsqueeze(0)
+        return raw_logits + consequence_residual, {
+            "resolution_logits": resolution_logits,
+            "cant_logits": cant_logits,
+            "field_logits": field_logits,
+        }
 
     def _static_action_features(self) -> torch.Tensor:
         parameters = (

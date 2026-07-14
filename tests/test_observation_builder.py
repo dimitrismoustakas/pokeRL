@@ -11,7 +11,10 @@ from poke_env.teambuilder.teambuilder import Teambuilder
 from pokerl.data import GameData, UNKNOWN_IDX
 from pokerl.env.observation import (
     ABILITY_KNOWN_OFFSET,
+    FIELD_OPP_SIDE_OFFSET,
     FIELD_OPPONENT_USED_TERA_OFFSET,
+    FIELD_OWN_SIDE_OFFSET,
+    FIELD_TIMER_CAPS,
     FIELD_TRICK_ROOM_OFFSET,
     FIELD_TURN_OFFSET,
     FIELD_USED_TERA_OFFSET,
@@ -351,11 +354,93 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
     assert field[0] == 0.0  # weather is active
     assert field[3] == 1.0  # rain slot
     assert field[9] == pytest.approx(3 / 8)  # weather age
-    assert field[23] == pytest.approx(3 / 4)  # own tailwind age
-    assert field[FIELD_TRICK_ROOM_OFFSET] == pytest.approx(3 / 5)
+    assert field[23] == pytest.approx(4 / 4)  # own tailwind active-turn count
+    assert field[FIELD_TRICK_ROOM_OFFSET] == pytest.approx(4 / 5)
     assert field[FIELD_USED_TERA_OFFSET] == 1.0
     assert field[FIELD_OPPONENT_USED_TERA_OFFSET] == 0.0
     assert field[FIELD_TURN_OFFSET] == pytest.approx(4 / 20)
+
+
+def _timed_condition_battle() -> SimpleNamespace:
+    return SimpleNamespace(
+        weather={},
+        fields={},
+        side_conditions={},
+        opponent_side_conditions={},
+        turn=7,
+        used_tera=False,
+        opponent_used_tera=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("container_name", "condition", "feature_offset", "timer_cap"),
+    [
+        (
+            "fields",
+            Field.TRICK_ROOM,
+            FIELD_TRICK_ROOM_OFFSET,
+            FIELD_TIMER_CAPS["trick_room"],
+        ),
+        (
+            "side_conditions",
+            SideCondition.REFLECT,
+            FIELD_OWN_SIDE_OFFSET + 4,
+            FIELD_TIMER_CAPS["screen"],
+        ),
+        (
+            "side_conditions",
+            SideCondition.LIGHT_SCREEN,
+            FIELD_OWN_SIDE_OFFSET + 5,
+            FIELD_TIMER_CAPS["screen"],
+        ),
+        (
+            "side_conditions",
+            SideCondition.AURORA_VEIL,
+            FIELD_OWN_SIDE_OFFSET + 6,
+            FIELD_TIMER_CAPS["screen"],
+        ),
+        (
+            "side_conditions",
+            SideCondition.TAILWIND,
+            FIELD_OWN_SIDE_OFFSET + 7,
+            FIELD_TIMER_CAPS["tailwind"],
+        ),
+        (
+            "opponent_side_conditions",
+            SideCondition.TAILWIND,
+            FIELD_OPP_SIDE_OFFSET + 7,
+            FIELD_TIMER_CAPS["tailwind"],
+        ),
+    ],
+)
+def test_timed_condition_age_reserves_zero_for_absence_and_counts_active_turns(
+    container_name: str,
+    condition: Field | SideCondition,
+    feature_offset: int,
+    timer_cap: int,
+) -> None:
+    battle = _timed_condition_battle()
+    absent = ObservationBuilder._encode_field(battle)
+    assert absent[feature_offset] == 0.0
+
+    started_turn = battle.turn
+    setattr(battle, container_name, {condition: started_turn})
+    ages = []
+    for elapsed_turns in range(timer_cap):
+        battle.turn = started_turn + elapsed_turns
+        encoded = ObservationBuilder._encode_field(battle)
+        ages.append(encoded[feature_offset])
+
+    assert ages == pytest.approx(
+        [(elapsed_turns + 1) / timer_cap for elapsed_turns in range(timer_cap)]
+    )
+    assert ages[0] > 0.0
+    assert ages == sorted(ages)
+
+    battle.turn += timer_cap
+    clipped = ObservationBuilder._encode_field(battle)
+    assert clipped[feature_offset] == 1.0
 
 
 def test_opponent_source_indices_remain_stable_when_actives_switch() -> None:

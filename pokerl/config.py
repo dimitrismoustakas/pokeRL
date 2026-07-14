@@ -71,14 +71,14 @@ class TrainingConfig:
     # Use every current-policy preview sample by default. An explicit cap still
     # provides deterministic uniform subsampling for constrained experiments.
     team_preview_max_samples: int | None = None
-    # Preview samples are accumulated in chunks into one globally weighted
-    # optimizer step, bounding activation memory without changing the update.
+    # Maximum preview PPO minibatch size.
     preview_update_minibatch_size: int = 512
-    # Auxiliary prediction losses do not modify rewards. Their full decoders and
-    # trainer-only labels stay outside inference; the hidden-info head's compact
-    # public-state belief residual is consumed by the battle policy and value.
+    # Auxiliary prediction losses do not modify rewards, and every target is
+    # trainer-only. Compact public-state beliefs and detached public-consequence
+    # probabilities may still condition the deployed policy.
     aux_hidden_info_coef: float = 0.25
     aux_opponent_intent_coef: float = 0.25
+    aux_public_consequence_coef: float = 0.1
     diagnose_memory_gradients: bool = False
 
     # Batching
@@ -102,11 +102,23 @@ class TrainingConfig:
     tera_exploration_end: float = 0.0
     tera_exploration_decay_fraction: float = 0.25
 
-    # League
+    # League. Every snapshot remains in the on-disk archive. ``league_size``
+    # bounds only the number of frozen models resident in each inference
+    # service; it no longer limits archive membership.
     league_size: int = 12
     league_update_interval: int = 10
     league_refresh_interval: int = 1
     league_coalesce_ms: float = 5.0
+    # Online current-policy results form an exponentially discounted payoff
+    # estimate for each archived opponent. PFSP focuses on opponents the live
+    # policy struggles against while retaining a uniform coverage component.
+    league_payoff_half_life_updates: float = 20.0
+    league_pfsp_exponent: float = 2.0
+    league_pfsp_uniform_fraction: float = 0.1
+    # Collapse the many small frozen-opponent CUDA launches into one replay.
+    # The graph path is inference-only and falls back to eager execution on
+    # non-CUDA devices or when graph capture is unavailable.
+    league_cuda_graphs: bool = True
 
     def __post_init__(self) -> None:
         if not 0 <= self.seed < 2**32:
@@ -122,6 +134,20 @@ class TrainingConfig:
             raise ValueError(
                 "league_refresh_interval must be positive "
                 f"(got {self.league_refresh_interval})."
+            )
+        for name, value in (
+            ("league_payoff_half_life_updates", self.league_payoff_half_life_updates),
+            ("league_pfsp_exponent", self.league_pfsp_exponent),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive (got {value}).")
+        if (
+            not math.isfinite(self.league_pfsp_uniform_fraction)
+            or not 0.0 <= self.league_pfsp_uniform_fraction <= 1.0
+        ):
+            raise ValueError(
+                "league_pfsp_uniform_fraction must be finite and within [0, 1] "
+                f"(got {self.league_pfsp_uniform_fraction})."
             )
         if (
             self.team_preview_max_samples is not None
@@ -139,11 +165,22 @@ class TrainingConfig:
         for name, value in (
             ("tera_gate_entropy_coef", self.tera_gate_entropy_coef),
             ("tera_slot_entropy_coef", self.tera_slot_entropy_coef),
+            ("aux_hidden_info_coef", self.aux_hidden_info_coef),
+            ("aux_opponent_intent_coef", self.aux_opponent_intent_coef),
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(
                     f"{name} must be finite and non-negative (got {value})."
                 )
+        if (
+            not math.isfinite(self.aux_public_consequence_coef)
+            or self.aux_public_consequence_coef <= 0.0
+        ):
+            raise ValueError(
+                "aux_public_consequence_coef must be finite and positive because "
+                "the policy architecture consumes its grounded predictions "
+                f"(got {self.aux_public_consequence_coef})."
+            )
         for name, value in (
             ("tera_exploration_start", self.tera_exploration_start),
             ("tera_exploration_end", self.tera_exploration_end),

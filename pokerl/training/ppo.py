@@ -29,15 +29,21 @@ from ..env.observation import (
     TERA_KNOWN_OFFSET,
 )
 from ..model.agent import PokeAgent
+from ..public_consequence import (
+    NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+    PUBLIC_CONSEQUENCE_EXECUTED,
+    PUBLIC_CONSEQUENCE_FIELD_DIM,
+)
 from .aux_metrics import (
     hidden_info_belief_additive_metrics,
     opponent_intent_additive_metrics,
+    public_consequence_additive_metrics,
 )
 from .rollout import RolloutBatch
 
 
 # Increment when trainer-checkpoint semantics or same-shaped model inputs change.
-TRAINER_CHECKPOINT_FORMAT_VERSION = 3
+TRAINER_CHECKPOINT_FORMAT_VERSION = 5
 
 
 def _qualified_type_name(value: object) -> str:
@@ -257,6 +263,7 @@ class PPOTrainer:
             else ()
         )
         self.global_step = 0
+        self.completed_updates = 0
         self.loaded_training_state_id: str | None = None
 
     def _make_optimizer(self) -> torch.optim.Adam:
@@ -363,6 +370,16 @@ class PPOTrainer:
         opponent_intent_slot_masks_all = batch.opponent_intent_slot_masks
         opponent_intent_tera_labels_all = batch.opponent_intent_tera_labels
         opponent_intent_tera_masks_all = batch.opponent_intent_tera_masks
+        public_consequence_resolution_labels_all = (
+            batch.public_consequence_resolution_labels
+        )
+        public_consequence_resolution_masks_all = (
+            batch.public_consequence_resolution_masks
+        )
+        public_consequence_cant_targets_all = batch.public_consequence_cant_targets
+        public_consequence_cant_masks_all = batch.public_consequence_cant_masks
+        public_consequence_field_targets_all = batch.public_consequence_field_targets
+        public_consequence_field_masks_all = batch.public_consequence_field_masks
         hidden_info_enabled = (
             self.config.aux_hidden_info_coef != 0.0
             and bool(aux_labels_all)
@@ -377,10 +394,27 @@ class PPOTrainer:
                 or opponent_intent_tera_masks_all.any().item()
             )
         )
+        public_consequence_enabled = (
+            self.config.aux_public_consequence_coef != 0.0
+            and hasattr(
+                getattr(self.agent, "action_head", None),
+                "public_consequence_head",
+            )
+            and bool(
+                public_consequence_resolution_masks_all.any().item()
+                or public_consequence_cant_masks_all.any().item()
+                or public_consequence_field_masks_all.any().item()
+            )
+        )
         if hidden_info_enabled:
             metric_sums["aux_hidden_info_loss"] = torch.zeros((), device=self.device)
         if opponent_intent_enabled:
             metric_sums["aux_opponent_intent_loss"] = torch.zeros(
+                (),
+                device=self.device,
+            )
+        if public_consequence_enabled:
+            metric_sums["aux_public_consequence_loss"] = torch.zeros(
                 (),
                 device=self.device,
             )
@@ -477,6 +511,9 @@ class PPOTrainer:
                 all_base_tera_real_choices: list[torch.Tensor] = []
                 all_base_tera_slot_choices: list[torch.Tensor] = []
                 all_values: list[torch.Tensor] = []
+                all_public_consequence_resolution_logits: list[torch.Tensor] = []
+                all_public_consequence_cant_logits: list[torch.Tensor] = []
+                all_public_consequence_field_logits: list[torch.Tensor] = []
                 head_chunk_steps = max(1, min(T, self._HEAD_BATCH_TARGET // E_mb))
                 for start in range(0, T, head_chunk_steps):
                     end = min(start + head_chunk_steps, T)
@@ -553,6 +590,16 @@ class PPOTrainer:
                     all_base_tera_slot_choices.append(
                         action_out["base_tera_has_slot_choice"]
                     )
+                    if public_consequence_enabled:
+                        all_public_consequence_resolution_logits.append(
+                            action_out["public_consequence_resolution_logits"]
+                        )
+                        all_public_consequence_cant_logits.append(
+                            action_out["public_consequence_cant_logits"]
+                        )
+                        all_public_consequence_field_logits.append(
+                            action_out["public_consequence_field_logits"]
+                        )
                     all_values.append(value_t)
 
                 log_probs_flat = torch.cat(all_log_probs)
@@ -566,6 +613,29 @@ class PPOTrainer:
                 base_tera_real_choices_flat = torch.cat(all_base_tera_real_choices)
                 base_tera_slot_choices_flat = torch.cat(all_base_tera_slot_choices)
                 values_flat = torch.cat(all_values)
+                public_consequence_out = None
+                if public_consequence_enabled:
+                    public_consequence_out = {
+                        "public_consequence_resolution_logits": torch.cat(
+                            all_public_consequence_resolution_logits
+                        ).reshape(
+                            T,
+                            E_mb,
+                            2,
+                            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+                        ),
+                        "public_consequence_cant_logits": torch.cat(
+                            all_public_consequence_cant_logits
+                        ).reshape(T, E_mb, 2, 2),
+                        "public_consequence_field_logits": torch.cat(
+                            all_public_consequence_field_logits
+                        ).reshape(
+                            T,
+                            E_mb,
+                            2,
+                            PUBLIC_CONSEQUENCE_FIELD_DIM,
+                        ),
+                    }
 
                 # Policy loss (clipped surrogate objective).
                 log_ratio = log_probs_flat - mb_old_lp
@@ -665,11 +735,15 @@ class PPOTrainer:
                 # tera-type/move-set from spatial reps plus recurrent belief
                 # state. Opponent intent: predict only non-forced semantic
                 # choices (kind/move/target/switch/Tera) from memory plus the
-                # public teams. Both target families remain trainer-private.
+                # public teams. Public consequence: predict the next observable
+                # resolution/CANT/field outcome of each chosen action. All
+                # targets remain trainer-private and rewards remain terminal.
                 hidden_info_loss = None
                 opponent_intent_loss = None
+                public_consequence_loss = None
                 hidden_info_out = None
                 opponent_intent_out = None
+                public_consequence_persistence_mb = None
                 if hidden_info_enabled:
                     aux_labels_mb = {
                         key: value[:, mb_envs] for key, value in aux_labels_all.items()
@@ -724,6 +798,46 @@ class PPOTrainer:
                         + self.config.aux_opponent_intent_coef * opponent_intent_loss
                     )
 
+                if public_consequence_enabled:
+                    public_consequence_resolution_labels_mb = (
+                        public_consequence_resolution_labels_all[:, mb_envs]
+                    )
+                    public_consequence_resolution_masks_mb = (
+                        public_consequence_resolution_masks_all[:, mb_envs]
+                    )
+                    public_consequence_cant_targets_mb = (
+                        public_consequence_cant_targets_all[:, mb_envs]
+                    )
+                    public_consequence_cant_masks_mb = (
+                        public_consequence_cant_masks_all[:, mb_envs]
+                    )
+                    public_consequence_field_targets_mb = (
+                        public_consequence_field_targets_all[:, mb_envs]
+                    )
+                    public_consequence_field_masks_mb = (
+                        public_consequence_field_masks_all[:, mb_envs]
+                    )
+                    public_consequence_persistence_mb = (
+                        mb_obs_seq["field"][..., :PUBLIC_CONSEQUENCE_FIELD_DIM]
+                        .unsqueeze(-2)
+                        .expand(*public_consequence_field_targets_mb.shape)
+                    )
+                    public_consequence_loss = self._public_consequence_loss(
+                        logits=public_consequence_out,
+                        resolution_labels=public_consequence_resolution_labels_mb,
+                        resolution_masks=public_consequence_resolution_masks_mb,
+                        cant_targets=public_consequence_cant_targets_mb,
+                        cant_masks=public_consequence_cant_masks_mb,
+                        field_targets=public_consequence_field_targets_mb,
+                        field_masks=public_consequence_field_masks_mb,
+                        persistence_fields=public_consequence_persistence_mb,
+                    )
+                    loss = (
+                        loss
+                        + self.config.aux_public_consequence_coef
+                        * public_consequence_loss
+                    )
+
                 pending_aux_diagnostics: dict[str, float] = {}
                 if epoch == self.config.num_epochs - 1:
                     if hidden_info_out is not None:
@@ -748,6 +862,19 @@ class PPOTrainer:
                                 opponent_intent_tera_masks_mb,
                             )
                         )
+                    if public_consequence_out is not None:
+                        pending_aux_diagnostics.update(
+                            public_consequence_additive_metrics(
+                                public_consequence_out,
+                                public_consequence_resolution_labels_mb,
+                                public_consequence_resolution_masks_mb,
+                                public_consequence_cant_targets_mb,
+                                public_consequence_cant_masks_mb,
+                                public_consequence_field_targets_mb,
+                                public_consequence_field_masks_mb,
+                                public_consequence_persistence_mb,
+                            )
+                        )
 
                 pending_memory_diagnostics = None
                 if (
@@ -767,6 +894,15 @@ class PPOTrainer:
                         support_tensors.append(
                             opponent_intent_slot_masks_mb.sum()
                             + opponent_intent_tera_masks_mb.sum()
+                        )
+                    if public_consequence_loss is not None:
+                        support_names.append(
+                            "memory_grad_public_consequence_valid_components"
+                        )
+                        support_tensors.append(
+                            public_consequence_resolution_masks_mb.sum()
+                            + public_consequence_cant_masks_mb.sum()
+                            + public_consequence_field_masks_mb.sum()
                         )
                     support_values = (
                         torch.stack(support_tensors).detach().to(device="cpu").tolist()
@@ -792,6 +928,11 @@ class PPOTrainer:
                     if opponent_intent_loss is not None:
                         objectives["opponent_intent"] = (
                             self.config.aux_opponent_intent_coef * opponent_intent_loss
+                        )
+                    if public_consequence_loss is not None:
+                        objectives["public_consequence"] = (
+                            self.config.aux_public_consequence_coef
+                            * public_consequence_loss
                         )
                     if all(value > 0 for value in support.values()):
                         pending_memory_diagnostics = self._gradient_diagnostics(
@@ -883,6 +1024,10 @@ class PPOTrainer:
                         metric_sums["aux_opponent_intent_loss"].add_(
                             opponent_intent_loss.detach()
                         )
+                    if public_consequence_enabled:
+                        metric_sums["aux_public_consequence_loss"].add_(
+                            public_consequence_loss.detach()
+                        )
                 num_updates += 1
 
         if num_updates == 0:
@@ -946,6 +1091,11 @@ class PPOTrainer:
             .norm()
             .item()
         )
+        averaged["public_consequence_adapter_weight_norm"] = (
+            self.agent.action_head.public_consequence_policy_adapter.weight.detach()
+            .norm()
+            .item()
+        )
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
@@ -992,6 +1142,109 @@ class PPOTrainer:
             ):
                 numerator = sums.get(f"{prefix}_{source}", 0.0)
                 result[f"{prefix}_{target}"] = numerator / count if count > 0.0 else 0.0
+
+        resolution_prefix = "aux_public_consequence_resolution"
+        resolution_count = sums.get(f"{resolution_prefix}_count", 0.0)
+        result[f"{resolution_prefix}_count"] = resolution_count
+        result[f"{resolution_prefix}_accuracy"] = (
+            sums.get(f"{resolution_prefix}_top1_correct", 0.0) / resolution_count
+            if resolution_count > 0.0
+            else 0.0
+        )
+        for source, target in (("nll_sum", "nll"), ("brier_sum", "brier")):
+            result[f"{resolution_prefix}_{target}"] = (
+                sums.get(f"{resolution_prefix}_{source}", 0.0) / resolution_count
+                if resolution_count > 0.0
+                else 0.0
+            )
+        for class_name in ("executed", "failed", "missed", "cant"):
+            class_prefix = f"{resolution_prefix}_{class_name}"
+            class_count = sums.get(f"{class_prefix}_count", 0.0)
+            result[f"{class_prefix}_count"] = class_count
+            result[f"{class_prefix}_recall"] = (
+                sums.get(f"{class_prefix}_correct", 0.0) / class_count
+                if class_count > 0.0
+                else 0.0
+            )
+            result[f"{class_prefix}_nll"] = (
+                sums.get(f"{class_prefix}_nll_sum", 0.0) / class_count
+                if class_count > 0.0
+                else 0.0
+            )
+
+        cant_prefix = "aux_public_consequence_cant"
+        cant_count = sums.get(f"{cant_prefix}_count", 0.0)
+        result[f"{cant_prefix}_count"] = cant_count
+        for source, target in (
+            ("positive", "prevalence"),
+            ("predicted_positive", "predicted_positive_rate"),
+            ("correct", "accuracy"),
+            ("nll_sum", "nll"),
+            ("brier_sum", "brier"),
+        ):
+            result[f"{cant_prefix}_{target}"] = (
+                sums.get(f"{cant_prefix}_{source}", 0.0) / cant_count
+                if cant_count > 0.0
+                else 0.0
+            )
+        cant_positive = sums.get(f"{cant_prefix}_positive", 0.0)
+        cant_negative = sums.get(f"{cant_prefix}_negative", 0.0)
+        result[f"{cant_prefix}_positive_recall"] = (
+            sums.get(f"{cant_prefix}_true_positive", 0.0) / cant_positive
+            if cant_positive > 0.0
+            else 0.0
+        )
+        result[f"{cant_prefix}_negative_specificity"] = (
+            sums.get(f"{cant_prefix}_true_negative", 0.0) / cant_negative
+            if cant_negative > 0.0
+            else 0.0
+        )
+
+        field_prefix = "aux_public_consequence_field"
+        field_count = sums.get(f"{field_prefix}_count", 0.0)
+        field_mse = (
+            sums.get(f"{field_prefix}_mse_sum", 0.0) / field_count
+            if field_count > 0.0
+            else 0.0
+        )
+        persistence_mse = (
+            sums.get(f"{field_prefix}_persistence_mse_sum", 0.0) / field_count
+            if field_count > 0.0
+            else 0.0
+        )
+        result[f"{field_prefix}_count"] = field_count
+        result[f"{field_prefix}_mse"] = field_mse
+        result[f"{field_prefix}_persistence_mse"] = persistence_mse
+        result[f"{field_prefix}_mse_skill"] = (
+            1.0 - field_mse / persistence_mse if persistence_mse > 0.0 else 0.0
+        )
+        for suffix in (
+            "changed",
+            "trick_room",
+            "trick_room_value_changed",
+            "trick_room_presence_changed",
+        ):
+            diagnostic_prefix = f"{field_prefix}_{suffix}"
+            diagnostic_count = sums.get(f"{diagnostic_prefix}_count", 0.0)
+            diagnostic_mse = (
+                sums.get(f"{diagnostic_prefix}_mse_sum", 0.0) / diagnostic_count
+                if diagnostic_count > 0.0
+                else 0.0
+            )
+            diagnostic_persistence_mse = (
+                sums.get(f"{diagnostic_prefix}_persistence_mse_sum", 0.0)
+                / diagnostic_count
+                if diagnostic_count > 0.0
+                else 0.0
+            )
+            result[f"{diagnostic_prefix}_count"] = diagnostic_count
+            result[f"{diagnostic_prefix}_mse"] = diagnostic_mse
+            result[f"{diagnostic_prefix}_persistence_mse"] = diagnostic_persistence_mse
+            result[f"{diagnostic_prefix}_mse_skill"] = (
+                1.0 - diagnostic_mse / diagnostic_persistence_mse
+                if diagnostic_persistence_mse > 0.0
+                else 0.0
+            )
         return result
 
     @staticmethod
@@ -1289,132 +1542,379 @@ class PPOTrainer:
             return logits["opp_intent_kind_logits"].sum() * 0.0
         return torch.stack(component_losses).mean()
 
+    @staticmethod
+    def _public_consequence_loss(
+        logits: Mapping[str, torch.Tensor],
+        resolution_labels: torch.Tensor,
+        resolution_masks: torch.Tensor,
+        cant_targets: torch.Tensor,
+        cant_masks: torch.Tensor,
+        field_targets: torch.Tensor,
+        field_masks: torch.Tensor,
+        persistence_fields: torch.Tensor,
+    ) -> torch.Tensor:
+        """Average normalized loss across available public-outcome tasks.
+
+        Absolute public-field prediction is dominated by features that simply
+        persist from the current observation.  Within the field task, changed
+        and unchanged observed features therefore contribute one normalized
+        component each when both are present.  A minibatch containing only one
+        group falls back to that group's mean without changing the outer task
+        normalization.
+        """
+        required = {
+            "public_consequence_resolution_logits",
+            "public_consequence_cant_logits",
+            "public_consequence_field_logits",
+        }
+        missing = sorted(required.difference(logits))
+        if missing:
+            raise ValueError(f"logits is missing key(s): {', '.join(missing)}.")
+        if resolution_labels.shape != resolution_masks.shape:
+            raise ValueError(
+                "Public consequence resolution labels/masks must share shape."
+            )
+        if resolution_labels.ndim < 1 or resolution_labels.shape[-1] != 2:
+            raise ValueError(
+                "Public consequence resolution labels must end with two action slots."
+            )
+        base_shape = tuple(resolution_labels.shape)
+        resolution_logits = logits["public_consequence_resolution_logits"]
+        if resolution_logits.shape != (
+            *base_shape,
+            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+        ):
+            raise ValueError(
+                "Public consequence resolution logits have incompatible shape."
+            )
+        if cant_targets.shape != (*base_shape, 2) or cant_masks.shape != (
+            *base_shape,
+            2,
+        ):
+            raise ValueError(
+                "Public consequence CANT targets/masks must have shape (..., 2, 2)."
+            )
+        cant_logits = logits["public_consequence_cant_logits"]
+        if cant_logits.shape != cant_targets.shape:
+            raise ValueError(
+                "Public consequence CANT logits must match CANT target shape."
+            )
+        expected_field_shape = (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM)
+        if field_targets.shape != expected_field_shape:
+            raise ValueError(
+                "Public consequence field targets have incompatible shape."
+            )
+        if persistence_fields.shape != expected_field_shape:
+            raise ValueError(
+                "Public consequence persistence fields have incompatible shape."
+            )
+        if field_masks.shape != base_shape:
+            raise ValueError(
+                "Public consequence field masks must match resolution-label shape."
+            )
+        field_logits = logits["public_consequence_field_logits"]
+        if field_logits.shape != expected_field_shape:
+            raise ValueError("Public consequence field logits have incompatible shape.")
+
+        component_losses: list[torch.Tensor] = []
+        resolution_selected = resolution_masks.reshape(-1).to(torch.bool)
+        if resolution_selected.any():
+            selected_resolution_logits = resolution_logits.reshape(
+                -1, NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES
+            )[resolution_selected]
+            selected_resolution_labels = resolution_labels.reshape(-1)[
+                resolution_selected
+            ]
+            nonexecuted = selected_resolution_labels != PUBLIC_CONSEQUENCE_EXECUTED
+            execution_logits = torch.stack(
+                (
+                    selected_resolution_logits[:, PUBLIC_CONSEQUENCE_EXECUTED],
+                    torch.logsumexp(selected_resolution_logits[:, 1:], dim=-1),
+                ),
+                dim=-1,
+            )
+            resolution_losses = [
+                F.cross_entropy(execution_logits, nonexecuted.to(torch.long))
+            ]
+            if nonexecuted.any():
+                resolution_losses.append(
+                    F.cross_entropy(
+                        selected_resolution_logits[nonexecuted, 1:],
+                        selected_resolution_labels[nonexecuted] - 1,
+                    )
+                )
+            # This proper hierarchical decomposition keeps the calibrated
+            # optimum of the original four-way likelihood.  Normalizing the
+            # conditional failure-type task independently prevents its
+            # gradients from being multiplied by the rarity of non-execution.
+            component_losses.append(torch.stack(resolution_losses).mean())
+
+        cant_selected = cant_masks.to(torch.bool)
+        if cant_selected.any():
+            component_losses.append(
+                F.binary_cross_entropy_with_logits(
+                    cant_logits[cant_selected],
+                    cant_targets.to(cant_logits.dtype)[cant_selected],
+                )
+            )
+
+        field_selected = field_masks.to(torch.bool)
+        if field_selected.any():
+            typed_field_targets = field_targets.to(field_logits.dtype)
+            typed_persistence = persistence_fields.to(field_logits.dtype)
+            field_errors = field_logits.sigmoid() - typed_field_targets
+            field_errors = field_errors.square()
+            selected_features = field_selected.unsqueeze(-1).expand_as(field_errors)
+            changed_features = selected_features & (
+                (typed_field_targets - typed_persistence).abs() > 1e-6
+            )
+            unchanged_features = selected_features & ~changed_features
+            field_group_losses = []
+            if changed_features.any():
+                field_group_losses.append(field_errors[changed_features].mean())
+            if unchanged_features.any():
+                field_group_losses.append(field_errors[unchanged_features].mean())
+            component_losses.append(torch.stack(field_group_losses).mean())
+
+        if not component_losses:
+            return resolution_logits.sum() * 0.0
+        # Every available task contributes equally regardless of output width
+        # or label frequency; the configured coefficient weights the complete
+        # auxiliary objective rather than growing with added target fields.
+        return torch.stack(component_losses).mean()
+
     def update_team_preview(
         self,
         data: list[tuple[dict, np.ndarray, float, np.ndarray]],
     ) -> dict[str, float]:
-        """REINFORCE update for team preview decisions.
+        """Update preview policy under the same eval semantics used for rollout."""
+        was_training = self.agent.training
+        memory = getattr(self.agent, "memory", None)
+        recurrent = getattr(memory, "lstm", None)
+        recurrent_was_training = (
+            recurrent.training if isinstance(recurrent, nn.LSTM) else None
+        )
+        self.agent.eval()
+        if isinstance(recurrent, nn.LSTM):
+            if recurrent.dropout != 0.0:
+                raise RuntimeError(
+                    "Exact deployment-semantic preview PPO requires a dropout-free "
+                    "LSTM when differentiating through cuDNN."
+                )
+            # cuDNN refuses LSTM backward after an eval-mode forward even when
+            # the module has no train/eval-dependent behavior.  This one-layer
+            # LSTM has zero dropout, so setting only the recurrent primitive's
+            # flag keeps its numerical semantics identical while enabling the
+            # differentiable preview pass.  Every other module remains in eval.
+            recurrent.train(True)
+        try:
+            return self._update_team_preview_eval(data)
+        finally:
+            self.agent.train(was_training)
+            if recurrent_was_training is not None:
+                recurrent.train(recurrent_was_training)
 
-        Called once per PPO update cycle using all team preview decisions made
-        during the rollout. Each entry is ``(obs_dict, picks_np, episode_reward,
-        opponent_picks_np)`` where episode_reward is +1 for a win and -1 for a loss.
+    def _update_team_preview_eval(
+        self,
+        data: list[tuple[dict, np.ndarray, float, np.ndarray]],
+    ) -> dict[str, float]:
+        """Clipped on-policy update for terminal team-preview decisions.
 
-        Uses the value function as a baseline to reduce gradient variance.
+        The policy is unchanged while a rollout is collected, and callers
+        exclude preview decisions produced by an older policy version.  We can
+        therefore reconstruct the exact behavior log-probability and value
+        immediately before the first optimizer step instead of adding more
+        work to the latency-sensitive live preview path.  Those frozen
+        quantities support the same clipped sample reuse used by battle PPO.
 
-        Returns a dict of preview-loss metrics for logging.
+        Each entry is ``(obs_dict, picks_np, episode_reward,
+        opponent_picks_np)`` where the reward is the unshaped terminal outcome.
         """
         if not data:
             raise ValueError("Team-preview update requires at least one sample.")
 
         sample_count = len(data)
-        chunk_size = min(self.config.preview_update_minibatch_size, sample_count)
-        # Bring supervision is normalized over valid Pokemon slots rather than
-        # samples. Compute its global denominator up front so chunks reproduce
-        # the exact full-batch objective even when masks differ between them.
-        valid_bring_slots = sum(
-            int(np.count_nonzero(~np.asarray(sample[0]["opp_mask"], dtype=bool)))
-            for sample in data
+        obs_all = {
+            key: torch.from_numpy(np.stack([sample[0][key] for sample in data])).to(
+                self.device
+            )
+            for key in data[0][0]
+        }
+        picks_all = torch.from_numpy(np.stack([sample[1] for sample in data])).to(
+            device=self.device,
+            dtype=torch.long,
         )
-        bring_denominator = float(max(valid_bring_slots, 1))
+        rewards_all = torch.tensor(
+            [sample[2] for sample in data],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        opponent_picks_all = torch.from_numpy(
+            np.stack([sample[3] for sample in data])
+        ).to(device=self.device, dtype=torch.long)
+
+        requested_minibatches = min(self.config.num_minibatches, sample_count)
+        target_minibatch_size = max(
+            1,
+            (sample_count + requested_minibatches - 1) // requested_minibatches,
+        )
+        minibatch_size = min(
+            self.config.preview_update_minibatch_size,
+            target_minibatch_size,
+        )
+
+        # Snapshot the exact behavior policy before any shared parameter is
+        # updated.  Chunking bounds activations and avoids increasing live
+        # simulator/reset latency with behavior metadata collection.
+        old_log_prob_parts: list[torch.Tensor] = []
+        old_value_parts: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, sample_count, minibatch_size):
+                stop = min(start + minibatch_size, sample_count)
+                behavior = self.agent.team_preview(
+                    {key: value[start:stop] for key, value in obs_all.items()},
+                    picks=picks_all[start:stop],
+                    include_opponent_preview=False,
+                )
+                old_log_prob_parts.append(behavior["log_prob"].detach())
+                old_value_parts.append(behavior["preview_value"].detach())
+        old_log_prob_all = torch.cat(old_log_prob_parts)
+        old_value_all = torch.cat(old_value_parts)
+        advantages_all = rewards_all - old_value_all
+        if not all(
+            torch.isfinite(value).all().item()
+            for value in (
+                old_log_prob_all,
+                old_value_all,
+                advantages_all,
+            )
+        ):
+            return {"team_preview_skipped_nonfinite": 1.0}
 
         metric_sums = {
-            "policy": torch.zeros((), device=self.device),
-            "value": torch.zeros((), device=self.device),
-            "entropy": torch.zeros((), device=self.device),
-            "bring": torch.zeros((), device=self.device),
-            "lead": torch.zeros((), device=self.device),
+            "policy": 0.0,
+            "value": 0.0,
+            "entropy": 0.0,
+            "bring": 0.0,
+            "lead": 0.0,
+            "approx_kl": 0.0,
+            "clip": 0.0,
+            "value_clip": 0.0,
         }
-        self.optimizer.zero_grad(set_to_none=True)
+        metric_samples = 0
+        metric_bring_slots = 0
+        optimizer_steps = 0
+        max_approx_kl = 0.0
 
-        for start in range(0, sample_count, chunk_size):
-            chunk = data[start : start + chunk_size]
-            obs_batch = {
-                key: torch.from_numpy(
-                    np.stack([sample[0][key] for sample in chunk])
-                ).to(self.device)
-                for key in chunk[0][0]
-            }
-            picks_batch = torch.from_numpy(
-                np.stack([sample[1] for sample in chunk])
-            ).to(device=self.device, dtype=torch.long)
-            rewards_batch = torch.tensor(
-                [sample[2] for sample in chunk],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            opponent_picks_batch = torch.from_numpy(
-                np.stack([sample[3] for sample in chunk])
-            ).to(device=self.device, dtype=torch.long)
+        for _epoch in range(self.config.num_epochs):
+            permutation = torch.randperm(sample_count, device=self.device)
+            for start in range(0, sample_count, minibatch_size):
+                indices = permutation[start : start + minibatch_size]
+                obs_batch = {
+                    key: value.index_select(0, indices)
+                    for key, value in obs_all.items()
+                }
+                picks_batch = picks_all.index_select(0, indices)
+                rewards_batch = rewards_all.index_select(0, indices)
+                opponent_picks_batch = opponent_picks_all.index_select(0, indices)
+                old_log_prob = old_log_prob_all.index_select(0, indices)
+                old_value = old_value_all.index_select(0, indices)
+                advantages = advantages_all.index_select(0, indices)
 
-            out = self.agent.team_preview(obs_batch, picks=picks_batch)
-            log_prob = out["log_prob"]
-            entropy = out["entropy"]
-            baselines = out["preview_value"]
-            bring_logits = out["opponent_bring_logits"]
-            lead_pair_logits = out["opponent_lead_pair_logits"]
+                out = self.agent.team_preview(obs_batch, picks=picks_batch)
+                log_prob = out["log_prob"]
+                entropy = out["entropy"]
+                values = out["preview_value"]
+                bring_logits = out["opponent_bring_logits"]
+                lead_pair_logits = out["opponent_lead_pair_logits"]
 
-            # Accumulate globally normalized sums. Calling backward on each
-            # scaled chunk frees its activations while producing precisely one
-            # full-batch gradient for the optimizer step below.
-            advantages = rewards_batch - baselines.detach()
-            policy_sum = -(log_prob * advantages).sum()
-            entropy_sum = entropy.sum()
-            value_sum = 0.5 * (baselines - rewards_batch).pow(2).sum()
-
-            team_size = bring_logits.shape[1]
-            bring_targets = torch.zeros_like(bring_logits)
-            bring_targets.scatter_(1, opponent_picks_batch, 1.0)
-            valid_slots = (~obs_batch["opp_mask"]).to(bring_logits.dtype)
-            bring_sum = (
-                F.binary_cross_entropy_with_logits(
-                    bring_logits,
-                    bring_targets,
-                    reduction="none",
+                log_ratio = log_prob - old_log_prob
+                bounded_log_ratio = log_ratio.clamp(
+                    min=-self._LOG_RATIO_CLAMP,
+                    max=self._LOG_RATIO_CLAMP,
                 )
-                * valid_slots
-            ).sum()
+                ratio = bounded_log_ratio.exp()
+                unclipped_policy = -advantages * ratio
+                clipped_policy = -advantages * ratio.clamp(
+                    1.0 - self.config.clip_eps,
+                    1.0 + self.config.clip_eps,
+                )
+                policy_loss = torch.maximum(
+                    unclipped_policy,
+                    clipped_policy,
+                ).mean()
+                entropy_mean = entropy.mean()
 
-            lead_targets = (
-                opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
-            )
-            lead_sum = F.cross_entropy(
-                lead_pair_logits,
-                lead_targets,
-                reduction="sum",
-            )
+                value_delta = values - old_value
+                clipped_values = old_value + value_delta.clamp(
+                    -self.config.clip_eps,
+                    self.config.clip_eps,
+                )
+                value_loss = (
+                    0.5
+                    * torch.maximum(
+                        (values - rewards_batch).pow(2),
+                        (clipped_values - rewards_batch).pow(2),
+                    ).mean()
+                )
 
-            chunk_loss = (
-                policy_sum / sample_count
-                - self.config.entropy_coef * entropy_sum / sample_count
-                + self.config.team_preview_value_coef * value_sum / sample_count
-                + self.config.team_preview_bring_coef * bring_sum / bring_denominator
-                + self.config.team_preview_lead_coef * lead_sum / sample_count
-            )
-            if not torch.isfinite(chunk_loss).item():
-                self.optimizer.zero_grad(set_to_none=True)
-                return {"team_preview_skipped_nonfinite": 1.0}
-            chunk_loss.backward()
+                team_size = bring_logits.shape[1]
+                bring_targets = torch.zeros_like(bring_logits)
+                bring_targets.scatter_(1, opponent_picks_batch, 1.0)
+                valid_slots = (~obs_batch["opp_mask"]).to(bring_logits.dtype)
+                valid_bring_slots = int(valid_slots.sum().item())
+                bring_loss = (
+                    F.binary_cross_entropy_with_logits(
+                        bring_logits,
+                        bring_targets,
+                        reduction="none",
+                    )
+                    * valid_slots
+                ).sum() / max(valid_bring_slots, 1)
 
-            metric_sums["policy"].add_(policy_sum.detach())
-            metric_sums["value"].add_(value_sum.detach())
-            metric_sums["entropy"].add_(entropy_sum.detach())
-            metric_sums["bring"].add_(bring_sum.detach())
-            metric_sums["lead"].add_(lead_sum.detach())
+                lead_targets = (
+                    opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
+                )
+                lead_loss = F.cross_entropy(lead_pair_logits, lead_targets)
 
-        total_norm = nn.utils.clip_grad_norm_(
-            self._trainable_params,
-            self.config.max_grad_norm,
-        )
-        if not torch.isfinite(total_norm).item():
-            self.optimizer.zero_grad(set_to_none=True)
-            return {"team_preview_skipped_nonfinite": 1.0}
-        self.optimizer.step()
+                loss = (
+                    policy_loss
+                    - self.config.entropy_coef * entropy_mean
+                    + self.config.team_preview_value_coef * value_loss
+                    + self.config.team_preview_bring_coef * bring_loss
+                    + self.config.team_preview_lead_coef * lead_loss
+                )
+                if not self._apply_update_step(loss):
+                    return {"team_preview_skipped_nonfinite": 1.0}
 
-        policy_loss = metric_sums["policy"] / sample_count
-        value_loss = metric_sums["value"] / sample_count
-        entropy_mean = metric_sums["entropy"] / sample_count
-        bring_loss = metric_sums["bring"] / bring_denominator
-        lead_loss = metric_sums["lead"] / sample_count
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1.0) - bounded_log_ratio).mean()
+                    clip_fraction = (
+                        ((ratio - 1.0).abs() > self.config.clip_eps).float().mean()
+                    )
+                    value_clip_fraction = (
+                        (value_delta.abs() > self.config.clip_eps).float().mean()
+                    )
+                    batch_size = int(indices.numel())
+                    metric_samples += batch_size
+                    metric_bring_slots += valid_bring_slots
+                    metric_sums["policy"] += policy_loss.item() * batch_size
+                    metric_sums["value"] += value_loss.item() * batch_size
+                    metric_sums["entropy"] += entropy_mean.item() * batch_size
+                    metric_sums["bring"] += bring_loss.item() * valid_bring_slots
+                    metric_sums["lead"] += lead_loss.item() * batch_size
+                    metric_sums["approx_kl"] += approx_kl.item() * batch_size
+                    metric_sums["clip"] += clip_fraction.item() * batch_size
+                    metric_sums["value_clip"] += value_clip_fraction.item() * batch_size
+                    max_approx_kl = max(max_approx_kl, approx_kl.item())
+                    optimizer_steps += 1
+
+        denominator = float(max(metric_samples, 1))
+        policy_loss = torch.tensor(metric_sums["policy"] / denominator)
+        value_loss = torch.tensor(metric_sums["value"] / denominator)
+        entropy_mean = torch.tensor(metric_sums["entropy"] / denominator)
+        bring_loss = torch.tensor(metric_sums["bring"] / max(metric_bring_slots, 1))
+        lead_loss = torch.tensor(metric_sums["lead"] / denominator)
         loss = (
             policy_loss
             - self.config.entropy_coef * entropy_mean
@@ -1429,6 +1929,14 @@ class PPOTrainer:
             "team_preview_entropy": entropy_mean.item(),
             "team_preview_bring_loss": bring_loss.item(),
             "team_preview_lead_loss": lead_loss.item(),
+            "team_preview_approx_kl": metric_sums["approx_kl"] / denominator,
+            "team_preview_max_approx_kl": max_approx_kl,
+            "team_preview_clip_fraction": metric_sums["clip"] / denominator,
+            "team_preview_value_clip_fraction": (
+                metric_sums["value_clip"] / denominator
+            ),
+            "team_preview_optimizer_steps": float(optimizer_steps),
+            "team_preview_epochs": float(self.config.num_epochs),
         }
 
     def save(self, path: str, *, training_state_id: str | None = None) -> None:
@@ -1447,6 +1955,7 @@ class PPOTrainer:
                     "agent": self.agent.state_dict(),
                     "optimizer": self.optimizer.state_dict(),
                     "global_step": self.global_step,
+                    "completed_updates": self.completed_updates,
                     "training_state_id": state_id,
                     "rng_state": _capture_rng_state(),
                 },
@@ -1480,6 +1989,7 @@ class PPOTrainer:
             "agent",
             "optimizer",
             "global_step",
+            "completed_updates",
             "training_state_id",
             "model_metadata",
             "rng_state",
@@ -1502,6 +2012,16 @@ class PPOTrainer:
             raise ValueError("Trainer checkpoint global_step must be an integer.")
         if global_step < 0:
             raise ValueError("Trainer checkpoint global_step must be non-negative.")
+        completed_updates = checkpoint["completed_updates"]
+        if isinstance(completed_updates, bool) or not isinstance(
+            completed_updates,
+            int,
+        ):
+            raise ValueError("Trainer checkpoint completed_updates must be an integer.")
+        if completed_updates < 0:
+            raise ValueError(
+                "Trainer checkpoint completed_updates must be non-negative."
+            )
         training_state_id = checkpoint["training_state_id"]
         if not isinstance(training_state_id, str) or not training_state_id:
             raise ValueError(
@@ -1525,5 +2045,6 @@ class PPOTrainer:
             ) from exc
         self.optimizer = loaded_optimizer
         self.global_step = global_step
+        self.completed_updates = completed_updates
         self.loaded_training_state_id = training_state_id
         _restore_rng_state(rng_state)

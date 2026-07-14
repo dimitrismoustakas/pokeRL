@@ -1,4 +1,3 @@
-from collections import deque
 from pathlib import Path
 import random
 from types import SimpleNamespace
@@ -7,16 +6,48 @@ import pytest
 
 import scripts.train as train_module
 from pokerl.config import EnvConfig, TrainingConfig
-from pokerl.training.league import League
+from pokerl.training.league import League, LeagueMember
 from scripts.train import (
     _league_state_path_for_resume,
     _maintain_league_after_update,
     _record_opponent_outcome,
+    _restore_opponent_assignments,
     _sample_refresh_assignments,
+    _serialize_opponent_assignments,
     _summarize_opponent_outcomes,
     make_league_opponent_factory,
     make_envs,
 )
+
+
+def _league_state_stub(
+    paths: list[str],
+    *,
+    config: TrainingConfig,
+    seed: int,
+) -> League:
+    league = object.__new__(League)
+    league.config = config
+    league.checkpoints = list(paths)
+    league._members = {
+        path: LeagueMember(path=path, step=index, created_update=index)
+        for index, path in enumerate(paths)
+    }
+    league._current_update = len(paths)
+    league._rng = random.Random(seed)
+    league._inference = SimpleNamespace(
+        prune_checkpoints=lambda paths: None,
+        prefetch_checkpoint=lambda path: None,
+        cache_info=lambda: {
+            "capacity": config.league_size,
+            "resident_models": 0,
+            "hits": 0,
+            "misses": 0,
+            "loads": 0,
+            "evictions": 0,
+        },
+    )
+    return league
 
 
 def test_sample_refresh_assignments_groups_by_opponent_group() -> None:
@@ -28,7 +59,9 @@ def test_sample_refresh_assignments_groups_by_opponent_group() -> None:
     ]
     parallel_env = SimpleNamespace(envs=envs)
     samples = iter(["step_a.pt", "step_b.pt"])
-    league = SimpleNamespace(sample_checkpoint_path=lambda: next(samples))
+    league = SimpleNamespace(
+        sample_checkpoint_paths=lambda count: [next(samples) for _ in range(count)]
+    )
 
     assignments = _sample_refresh_assignments(parallel_env, league)
 
@@ -83,7 +116,7 @@ def test_make_envs_groups_initial_opponent_checkpoints(monkeypatch) -> None:
         return checkpoint_path
 
     league = SimpleNamespace(
-        sample_checkpoint_path=lambda: next(samples),
+        sample_checkpoint_paths=lambda count: [next(samples) for _ in range(count)],
         make_opponent=make_opponent,
     )
 
@@ -107,19 +140,73 @@ def test_make_envs_groups_initial_opponent_checkpoints(monkeypatch) -> None:
     assert make_opponent_calls == ["step_a.pt", "step_b.pt", "step_a.pt", "step_b.pt"]
 
 
+def test_make_envs_reuses_restored_assignments_without_pfsp_draw(monkeypatch) -> None:
+    class FakeLoopThread:
+        def __init__(self):
+            self.loop = "loop"
+
+        @classmethod
+        def start(cls):
+            return cls()
+
+        def close(self):
+            return None
+
+    class FakeBattleEnv:
+        def __init__(self, config, game_data, opponent_factory, **kwargs):
+            del game_data, kwargs
+            self.config = config
+            self.opponent = opponent_factory("loop")
+
+    class FakeParallelBattleEnv:
+        def __init__(self, envs, collect_timing=False, loop_threads=None):
+            del collect_timing, loop_threads
+            self.envs = envs
+
+    monkeypatch.setattr(train_module, "LoopThread", FakeLoopThread)
+    monkeypatch.setattr(train_module, "BattleEnv", FakeBattleEnv)
+    monkeypatch.setattr(train_module, "ParallelBattleEnv", FakeParallelBattleEnv)
+    make_opponent_calls: list[str] = []
+
+    def make_opponent(loop, checkpoint_path=None):
+        del loop
+        make_opponent_calls.append(checkpoint_path)
+        return checkpoint_path
+
+    league = SimpleNamespace(
+        checkpoints=["step_a.pt", "step_b.pt"],
+        sample_checkpoint_paths=lambda count: pytest.fail(
+            f"strict resume must not redraw {count} opponent(s)"
+        ),
+        make_opponent=make_opponent,
+    )
+
+    parallel_env = make_envs(
+        EnvConfig(num_envs=2, battle_loop_count=1),
+        game_data=object(),
+        league=league,
+        opponent_groups=2,
+        team_preview_fn=lambda obs: None,
+        initial_checkpoint_by_group={0: "step_b.pt", 1: "step_a.pt"},
+    )
+
+    assert [env.opponent for env in parallel_env.envs] == ["step_b.pt", "step_a.pt"]
+    assert make_opponent_calls == ["step_b.pt", "step_a.pt"]
+
+
 def test_league_snapshot_is_added_before_refresh_sampling() -> None:
     events: list[str] = []
 
     class FakeLeague:
         checkpoints = ["old.pt"]
 
-        def add_checkpoint(self, _agent, step: int) -> None:
+        def add_checkpoint(self, _agent, step: int, *, update: int) -> None:
             events.append(f"add:{step}")
             self.checkpoints.append("new.pt")
 
-        def sample_checkpoint_path(self) -> str:
+        def sample_checkpoint_paths(self, count: int) -> list[str]:
             events.append("sample")
-            return self.checkpoints[-1]
+            return [self.checkpoints[-1]] * count
 
     class FakeEnv:
         config = SimpleNamespace(opponent_group=0)
@@ -150,12 +237,12 @@ def test_refresh_cadence_is_independent_of_snapshot_cadence() -> None:
     events: list[str] = []
 
     class FakeLeague:
-        def add_checkpoint(self, _agent, step: int) -> None:
+        def add_checkpoint(self, _agent, step: int, *, update: int) -> None:
             events.append(f"add:{step}")
 
-        def sample_checkpoint_path(self) -> str:
+        def sample_checkpoint_paths(self, count: int) -> list[str]:
             events.append("sample")
-            return "existing.pt"
+            return ["existing.pt"] * count
 
     class FakeEnv:
         config = SimpleNamespace(opponent_group=0)
@@ -225,6 +312,121 @@ def test_opponent_outcomes_include_draws_unknown_paths_and_totals() -> None:
     ]
 
 
+def test_discounted_payoff_treats_each_update_as_one_evidence_unit() -> None:
+    path = "step_a.pt"
+    league = _league_state_stub(
+        [path],
+        config=TrainingConfig(league_payoff_half_life_updates=20.0),
+        seed=7,
+    )
+    league._current_update = 0
+
+    league.record_outcomes(
+        {path: {"wins": 800, "losses": 200, "draws": 0}},
+        update=1,
+    )
+
+    member = league._members[path]
+    assert member.discounted_wins == pytest.approx(0.8)
+    assert member.discounted_losses == pytest.approx(0.2)
+    assert member.lifetime_wins == 800
+    assert member.lifetime_losses == 200
+    row = league.sampling_distribution(update=1)[0]
+    assert row["discounted_effective_update_equivalents"] == pytest.approx(1.0)
+    assert row["current_policy_win_probability"] == pytest.approx(0.6)
+
+
+def test_stale_payoff_evidence_decays_toward_neutral() -> None:
+    path = "step_a.pt"
+    league = _league_state_stub(
+        [path],
+        config=TrainingConfig(league_payoff_half_life_updates=20.0),
+        seed=7,
+    )
+    league._current_update = 0
+    league.record_outcomes(
+        {path: {"wins": 0, "losses": 1000, "draws": 0}},
+        update=1,
+    )
+
+    fresh = league.sampling_distribution(update=1)[0]
+    stale = league.sampling_distribution(update=21)[0]
+
+    assert fresh["current_policy_win_probability"] == pytest.approx(1.0 / 3.0)
+    assert stale["discounted_effective_update_equivalents"] == pytest.approx(0.5)
+    assert stale["current_policy_win_probability"] == pytest.approx(0.4)
+
+
+def test_hard_pfsp_distribution_has_uniform_floor_and_compact_summary() -> None:
+    paths = ["easy.pt", "neutral.pt", "hard.pt"]
+    league = _league_state_stub(
+        paths,
+        config=TrainingConfig(league_pfsp_uniform_fraction=0.1),
+        seed=11,
+    )
+    league._current_update = 0
+    league.record_outcomes(
+        {
+            paths[0]: {"wins": 100, "losses": 0, "draws": 0},
+            paths[2]: {"wins": 0, "losses": 100, "draws": 0},
+        },
+        update=1,
+    )
+
+    rows = league.sampling_distribution(update=1)
+    probabilities = {
+        row["checkpoint_path"]: row["first_draw_probability"] for row in rows
+    }
+
+    assert sum(probabilities.values()) == pytest.approx(1.0)
+    assert all(probability >= 0.1 / 3 for probability in probabilities.values())
+    assert probabilities["hard.pt"] > probabilities["neutral.pt"]
+    assert probabilities["neutral.pt"] > probabilities["easy.pt"]
+    compact = league.describe(update=1, include_members=False)
+    assert "members" not in compact
+    assert compact["hardest_checkpoint_path"] == "hard.pt"
+    assert 1.0 <= compact["first_draw_effective_support"] <= 3.0
+
+
+def test_group_sampling_is_distinct_when_archive_allows_it() -> None:
+    paths = ["step_a.pt", "step_b.pt", "step_c.pt"]
+    league = _league_state_stub(paths, config=TrainingConfig(), seed=13)
+
+    for _ in range(50):
+        sampled = league.sample_checkpoint_paths(2)
+        assert len(sampled) == len(set(sampled)) == 2
+
+    single = _league_state_stub(["only.pt"], config=TrainingConfig(), seed=13)
+    assert single.sample_checkpoint_paths(2) == ["only.pt", "only.pt"]
+
+
+def test_opponent_assignment_state_roundtrips_without_sampling() -> None:
+    paths = ["step_a.pt", "step_b.pt"]
+    league = _league_state_stub(paths, config=TrainingConfig(), seed=17)
+    assignments = {0: paths[1], 1: paths[0]}
+
+    serialized = _serialize_opponent_assignments(assignments, league)
+    restored = _restore_opponent_assignments(
+        serialized,
+        opponent_groups=2,
+        league=league,
+    )
+
+    assert serialized == {"0": paths[1], "1": paths[0]}
+    assert restored == assignments
+
+
+def test_restored_assignment_rejects_non_archive_checkpoint() -> None:
+    league = _league_state_stub(["step_a.pt"], config=TrainingConfig(), seed=17)
+
+    with pytest.raises(ValueError, match="outside the archive"):
+        _restore_opponent_assignments(
+            {"0": "missing.pt"},
+            opponent_groups=1,
+            league=league,
+        )
+
+
 def test_make_envs_closes_partial_envs_and_all_loops_after_failure(monkeypatch) -> None:
     events: list[str] = []
 
@@ -258,7 +460,9 @@ def test_make_envs_closes_partial_envs_and_all_loops_after_failure(monkeypatch) 
 
     monkeypatch.setattr(train_module, "LoopThread", FakeLoopThread)
     monkeypatch.setattr(train_module, "BattleEnv", FakeBattleEnv)
-    league = SimpleNamespace(sample_checkpoint_path=lambda: "step_a.pt")
+    league = SimpleNamespace(
+        sample_checkpoint_paths=lambda count: ["step_a.pt"] * count
+    )
 
     with pytest.raises(RuntimeError, match="injected environment"):
         make_envs(
@@ -286,7 +490,9 @@ def test_make_envs_closes_loops_created_before_loop_start_failure(monkeypatch) -
             return SimpleNamespace(close=lambda: events.append("loop-0"))
 
     monkeypatch.setattr(train_module, "LoopThread", FakeLoopThread)
-    league = SimpleNamespace(sample_checkpoint_path=lambda: "step_a.pt")
+    league = SimpleNamespace(
+        sample_checkpoint_paths=lambda count: ["step_a.pt"] * count
+    )
 
     with pytest.raises(RuntimeError, match="injected loop"):
         make_envs(
@@ -328,14 +534,11 @@ def test_league_state_roundtrips_membership_rng_and_extra_state(tmp_path) -> Non
     for checkpoint_path in checkpoint_paths:
         checkpoint_path.touch()
 
-    source = object.__new__(League)
-    source.config = TrainingConfig(league_size=3)
-    source.checkpoints = deque(
-        (str(path) for path in checkpoint_paths),
-        maxlen=3,
+    source = _league_state_stub(
+        [str(path) for path in checkpoint_paths],
+        config=TrainingConfig(league_size=3),
+        seed=37,
     )
-    source._rng = random.Random(37)
-    source._inference = SimpleNamespace(prune_checkpoints=lambda paths: None)
     state_path = tmp_path / "step_3.league_state.json"
     source.save_state(
         str(state_path),
@@ -343,11 +546,11 @@ def test_league_state_roundtrips_membership_rng_and_extra_state(tmp_path) -> Non
     )
     expected_samples = [source._sample_checkpoint() for _ in range(12)]
 
-    target = object.__new__(League)
-    target.config = TrainingConfig(league_size=3)
-    target.checkpoints = deque(maxlen=3)
-    target._rng = random.Random(999)
-    target._inference = SimpleNamespace(prune_checkpoints=lambda paths: None)
+    target = _league_state_stub(
+        [],
+        config=TrainingConfig(league_size=3),
+        seed=999,
+    )
     extra_state = target.load_state(str(state_path))
 
     assert list(target.checkpoints) == [str(path) for path in checkpoint_paths]
@@ -356,21 +559,41 @@ def test_league_state_roundtrips_membership_rng_and_extra_state(tmp_path) -> Non
     assert not state_path.with_suffix(".json.tmp").exists()
 
 
+def test_permanent_archive_state_can_exceed_resident_cache_capacity(tmp_path) -> None:
+    checkpoint_paths = [tmp_path / f"step_{index}.pt" for index in range(5)]
+    for checkpoint_path in checkpoint_paths:
+        checkpoint_path.touch()
+    paths = [str(path) for path in checkpoint_paths]
+    config = TrainingConfig(league_size=2)
+    source = _league_state_stub(paths, config=config, seed=23)
+    state_path = tmp_path / "archive.league_state.json"
+    source.save_state(str(state_path))
+    target = _league_state_stub([], config=config, seed=999)
+
+    target.load_state(str(state_path))
+
+    assert target.checkpoints == paths
+    assert len(target.checkpoints) == 5
+    assert target.config.league_size == 2
+
+
 def test_league_state_rejects_missing_checkpoint(tmp_path) -> None:
     checkpoint_path = tmp_path / "step_1.pt"
     checkpoint_path.touch()
-    source = object.__new__(League)
-    source.config = TrainingConfig(league_size=3)
-    source.checkpoints = deque([str(checkpoint_path)], maxlen=3)
-    source._rng = random.Random(37)
+    source = _league_state_stub(
+        [str(checkpoint_path)],
+        config=TrainingConfig(league_size=3),
+        seed=37,
+    )
     state_path = tmp_path / "step_1.league_state.json"
     source.save_state(str(state_path))
     checkpoint_path.unlink()
 
-    target = object.__new__(League)
-    target.config = TrainingConfig(league_size=3)
-    target.checkpoints = deque(maxlen=3)
-    target._rng = random.Random(999)
+    target = _league_state_stub(
+        [],
+        config=TrainingConfig(league_size=3),
+        seed=999,
+    )
 
     with pytest.raises(FileNotFoundError, match="every saved league checkpoint"):
         target.load_state(str(state_path))
@@ -379,17 +602,19 @@ def test_league_state_rejects_missing_checkpoint(tmp_path) -> None:
 def test_league_state_rejects_changed_league_size(tmp_path) -> None:
     checkpoint_path = tmp_path / "step_1.pt"
     checkpoint_path.touch()
-    source = object.__new__(League)
-    source.config = TrainingConfig(league_size=3)
-    source.checkpoints = deque([str(checkpoint_path)], maxlen=3)
-    source._rng = random.Random(37)
+    source = _league_state_stub(
+        [str(checkpoint_path)],
+        config=TrainingConfig(league_size=3),
+        seed=37,
+    )
     state_path = tmp_path / "step_1.league_state.json"
     source.save_state(str(state_path))
 
-    target = object.__new__(League)
-    target.config = TrainingConfig(league_size=4)
-    target.checkpoints = deque(maxlen=4)
-    target._rng = random.Random(999)
+    target = _league_state_stub(
+        [],
+        config=TrainingConfig(league_size=4),
+        seed=999,
+    )
 
     with pytest.raises(ValueError, match="league schedule does not match"):
         target.load_state(str(state_path))
@@ -405,18 +630,20 @@ def test_league_state_rejects_changed_league_size(tmp_path) -> None:
 def test_league_state_rejects_changed_schedule(tmp_path, field, value) -> None:
     checkpoint_path = tmp_path / "step_1.pt"
     checkpoint_path.touch()
-    source = object.__new__(League)
-    source.config = TrainingConfig(league_size=3)
-    source.checkpoints = deque([str(checkpoint_path)], maxlen=3)
-    source._rng = random.Random(37)
+    source = _league_state_stub(
+        [str(checkpoint_path)],
+        config=TrainingConfig(league_size=3),
+        seed=37,
+    )
     state_path = tmp_path / "step_1.league_state.json"
     source.save_state(str(state_path))
 
     config_kwargs = {"league_size": 3, field: value}
-    target = object.__new__(League)
-    target.config = TrainingConfig(**config_kwargs)
-    target.checkpoints = deque(maxlen=3)
-    target._rng = random.Random(999)
+    target = _league_state_stub(
+        [],
+        config=TrainingConfig(**config_kwargs),
+        seed=999,
+    )
 
     with pytest.raises(ValueError, match="league schedule does not match"):
         target.load_state(str(state_path))

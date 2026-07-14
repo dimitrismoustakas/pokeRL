@@ -20,6 +20,7 @@ from scripts.train import (
     resolve_tera_exploration_decay_updates,
     resolve_update_bounds,
     tera_exploration_probability,
+    validate_resume_update_state,
 )
 
 
@@ -181,6 +182,41 @@ def test_league_refresh_cli_is_independent_of_snapshot_interval(monkeypatch) -> 
     assert train_config.league_refresh_interval == 3
 
 
+def test_payoff_aware_league_cli_overrides(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--league-size",
+            "9",
+            "--league-payoff-half-life-updates",
+            "12.5",
+            "--league-pfsp-exponent",
+            "1.5",
+            "--league-pfsp-uniform-fraction",
+            "0.2",
+        ],
+    )
+
+    _, _, config = build_configs(parse_args())
+
+    assert config.league_size == 9
+    assert config.league_payoff_half_life_updates == pytest.approx(12.5)
+    assert config.league_pfsp_exponent == pytest.approx(1.5)
+    assert config.league_pfsp_uniform_fraction == pytest.approx(0.2)
+
+
+def test_frozen_opponent_cuda_graph_cli_can_disable_optimization(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["train", "--no-league-cuda-graphs"],
+    )
+
+    _, _, config = build_configs(parse_args())
+
+    assert config.league_cuda_graphs is False
+
+
 def test_factorized_tera_cli_overrides(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
@@ -211,6 +247,17 @@ def test_factorized_tera_defaults_leave_unmodified_training_tail() -> None:
     assert config.tera_exploration_start == pytest.approx(0.15)
     assert config.tera_exploration_end == 0.0
     assert config.tera_exploration_decay_fraction == pytest.approx(0.25)
+
+
+def test_public_consequence_cli_override(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["train", "--aux-public-consequence-coef", "0.075"],
+    )
+
+    _, _, config = build_configs(parse_args())
+
+    assert config.aux_public_consequence_coef == pytest.approx(0.075)
 
 
 def test_tera_exploration_decay_uses_planned_update_horizon() -> None:
@@ -268,6 +315,23 @@ def test_league_intervals_must_be_positive(field_name: str) -> None:
         TrainingConfig(**values)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("league_payoff_half_life_updates", 0.0),
+        ("league_pfsp_exponent", 0.0),
+        ("league_pfsp_uniform_fraction", -0.1),
+        ("league_pfsp_uniform_fraction", 1.1),
+    ],
+)
+def test_payoff_aware_league_config_rejects_invalid_values(
+    field_name: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        TrainingConfig(**{field_name: value})
+
+
 def test_training_seed_streams_are_recorded_and_separate() -> None:
     streams = configure_training_randomness(41, team_pool_seed=None)
 
@@ -300,6 +364,7 @@ def test_num_updates_are_additional_when_resuming() -> None:
         total_timesteps=steps_per_update,
         steps_per_update=steps_per_update,
         global_step=158 * steps_per_update,
+        completed_updates=158,
         additional_updates=True,
     ) == (158, 159)
 
@@ -311,8 +376,35 @@ def test_total_timestep_target_remains_absolute_when_resuming() -> None:
         total_timesteps=200 * steps_per_update,
         steps_per_update=steps_per_update,
         global_step=158 * steps_per_update,
+        completed_updates=158,
         additional_updates=False,
     ) == (158, 200)
+
+
+def test_absolute_timestep_target_uses_samples_after_rollout_geometry_change() -> None:
+    old_steps_per_update = 9_216
+    new_steps_per_update = 4_608
+
+    assert resolve_update_bounds(
+        total_timesteps=4_000_000,
+        steps_per_update=new_steps_per_update,
+        global_step=400 * old_steps_per_update,
+        completed_updates=400,
+        additional_updates=False,
+    ) == (400, 469)
+
+
+def test_resume_update_state_requires_exact_trainer_league_boundary() -> None:
+    validate_resume_update_state(
+        trainer_completed_updates=158,
+        league_current_update=158,
+    )
+
+    with pytest.raises(ValueError, match="trainer=158, league=157"):
+        validate_resume_update_state(
+            trainer_completed_updates=158,
+            league_current_update=157,
+        )
 
 
 def test_resolve_opponent_groups_defaults_to_two_when_possible() -> None:

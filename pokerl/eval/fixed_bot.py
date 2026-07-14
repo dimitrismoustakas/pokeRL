@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from poke_env.battle import DoubleBattle, Pokemon
+from poke_env.battle import DoubleBattle, Field, Pokemon
 from poke_env.data import GenData
 from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPlayer
 from poke_env.teambuilder.teambuilder import Teambuilder
@@ -431,7 +431,9 @@ _MOVE_OPPORTUNITY_GROUPS = {
             "banefulbunker",
             "burningbulwark",
             "detect",
+            "endure",
             "kingsshield",
+            "maxguard",
             "obstruct",
             "protect",
             "silktrap",
@@ -443,6 +445,47 @@ _MOVE_OPPORTUNITY_GROUPS = {
     "fake_out": frozenset({"fakeout"}),
     "tailwind": frozenset({"tailwind"}),
 }
+
+_CONTEXTUAL_MOVE_GROUPS = (
+    "protect_like_fresh",
+    "protect_like_repeat",
+    "trick_room_setup",
+    "trick_room_cancel",
+    "fake_out_first_turn",
+    "fake_out_late",
+)
+
+
+def _active_pokemon_for_slot(battle: DoubleBattle, slot: int) -> Pokemon | None:
+    active_pokemon = getattr(battle, "active_pokemon", ())
+    if slot >= len(active_pokemon):
+        return None
+    return active_pokemon[slot]
+
+
+def _trick_room_is_active(battle: DoubleBattle) -> bool:
+    return Field.TRICK_ROOM in getattr(battle, "fields", {})
+
+
+def _contextual_move_group(
+    battle: DoubleBattle,
+    slot: int,
+    move_id: str,
+) -> str | None:
+    """Classify mechanics whose useful opportunity depends on live state."""
+    active_pokemon = _active_pokemon_for_slot(battle, slot)
+    if move_id in _MOVE_OPPORTUNITY_GROUPS["protect_like"]:
+        protect_counter = int(getattr(active_pokemon, "protect_counter", 0))
+        return "protect_like_repeat" if protect_counter > 0 else "protect_like_fresh"
+    if move_id == "trickroom":
+        return "trick_room_cancel" if _trick_room_is_active(battle) else "trick_room_setup"
+    if move_id == "fakeout":
+        return (
+            "fake_out_first_turn"
+            if bool(getattr(active_pokemon, "first_turn", False))
+            else "fake_out_late"
+        )
+    return None
 
 
 def _record_action_opportunities(
@@ -456,6 +499,19 @@ def _record_action_opportunities(
     for label, diagnostic_moves in _MOVE_OPPORTUNITY_GROUPS.items():
         if move_ids & diagnostic_moves:
             stats[f"{label}_opportunities"] += 1
+
+    contextual_groups = {
+        contextual_group
+        for move_id in move_ids
+        if (contextual_group := _contextual_move_group(battle, slot, move_id))
+        is not None
+    }
+    for contextual_group in contextual_groups:
+        stats[f"{contextual_group}_opportunities"] += 1
+    if move_ids & _MOVE_OPPORTUNITY_GROUPS["protect_like"]:
+        active_pokemon = _active_pokemon_for_slot(battle, slot)
+        prior_successes = int(getattr(active_pokemon, "protect_counter", 0))
+        stats[f"protect_like_prior_{min(prior_successes, 4)}_opportunities"] += 1
 
     switches = (
         battle.available_switches[slot] if slot < len(battle.available_switches) else []
@@ -561,6 +617,13 @@ def _classify_slot_action(
     for label, diagnostic_moves in _MOVE_OPPORTUNITY_GROUPS.items():
         if move_id in diagnostic_moves:
             stats[f"{label}_actions"] += 1
+    contextual_group = _contextual_move_group(battle, slot, move_id)
+    if contextual_group is not None:
+        stats[f"{contextual_group}_actions"] += 1
+    if move_id in _MOVE_OPPORTUNITY_GROUPS["protect_like"]:
+        active_pokemon = _active_pokemon_for_slot(battle, slot)
+        prior_successes = int(getattr(active_pokemon, "protect_counter", 0))
+        stats[f"protect_like_prior_{min(prior_successes, 4)}_actions"] += 1
 
     if base_power > 0 and best_base_power > 0:
         if base_power == best_base_power:
@@ -667,6 +730,13 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
             )
             for label in _MOVE_OPPORTUNITY_GROUPS
         },
+        **{
+            f"{label}_choice_rate_when_available": _safe_rate(
+                counts.get(f"{label}_actions", 0),
+                counts.get(f"{label}_opportunities", 0),
+            )
+            for label in _CONTEXTUAL_MOVE_GROUPS
+        },
         "switch_choice_rate_when_available": _safe_rate(
             counts.get("switch_actions", 0),
             counts.get("switch_opportunities", 0),
@@ -695,6 +765,29 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
             counts.get("double_protect_turns", 0),
             joint_decisions,
         ),
+        "double_protect_like_turn_rate": _safe_rate(
+            counts.get("double_protect_like_turns", 0),
+            joint_decisions,
+        ),
+        "protect_like_success_rate": _safe_rate(
+            counts.get("protect_like_successes", 0),
+            counts.get("protect_like_attempts", 0),
+        ),
+        "protect_like_fresh_success_rate": _safe_rate(
+            counts.get("protect_like_fresh_successes", 0),
+            counts.get("protect_like_fresh_attempts", 0),
+        ),
+        "protect_like_repeat_success_rate": _safe_rate(
+            counts.get("protect_like_repeat_successes", 0),
+            counts.get("protect_like_repeat_attempts", 0),
+        ),
+        **{
+            f"{label}_battle_choice_rate_when_available": _safe_rate(
+                counts.get(f"{label}_action_battles", 0),
+                counts.get(f"{label}_opportunity_battles", 0),
+            )
+            for label in _CONTEXTUAL_MOVE_GROUPS
+        },
     }
 
     power = {
@@ -716,6 +809,33 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
         "counts": counts,
         "rates": rates,
         "power": power,
+        "protect_chain": [
+            {
+                "prior_successes": prior_successes if prior_successes < 4 else "4+",
+                "opportunities": counts.get(
+                    f"protect_like_prior_{prior_successes}_opportunities", 0
+                ),
+                "actions": counts.get(
+                    f"protect_like_prior_{prior_successes}_actions", 0
+                ),
+                "successes": counts.get(
+                    f"protect_like_prior_{prior_successes}_successes", 0
+                ),
+                "choice_rate_when_available": _safe_rate(
+                    counts.get(f"protect_like_prior_{prior_successes}_actions", 0),
+                    counts.get(
+                        f"protect_like_prior_{prior_successes}_opportunities", 0
+                    ),
+                ),
+                "success_rate_when_chosen": _safe_rate(
+                    counts.get(
+                        f"protect_like_prior_{prior_successes}_successes", 0
+                    ),
+                    counts.get(f"protect_like_prior_{prior_successes}_attempts", 0),
+                ),
+            }
+            for prior_successes in range(5)
+        ],
     }
 
 
@@ -812,6 +932,68 @@ def _classify_joint_action(
         for action in action_descriptions
     ):
         stats["double_protect_turns"] += 1
+    if all(
+        action.get("kind") == "move"
+        and action.get("move") in _MOVE_OPPORTUNITY_GROUPS["protect_like"]
+        for action in action_descriptions
+    ):
+        stats["double_protect_like_turns"] += 1
+    return stats
+
+
+def _classify_battle_mechanics(
+    battle_action_stats: Counter[str],
+) -> Counter[str]:
+    """Collapse opportunity/action counts to one observation per battle."""
+    stats: Counter[str] = Counter(evaluated_battles=1)
+    for label in _CONTEXTUAL_MOVE_GROUPS:
+        if battle_action_stats.get(f"{label}_opportunities", 0) > 0:
+            stats[f"{label}_opportunity_battles"] += 1
+        if battle_action_stats.get(f"{label}_actions", 0) > 0:
+            stats[f"{label}_action_battles"] += 1
+    return stats
+
+
+def _protect_attempt_contexts(
+    battle: DoubleBattle,
+    action_descriptions: list[dict[str, object]],
+) -> list[tuple[Pokemon, int]]:
+    """Capture selected Protect-family users before the simulator mutates state."""
+    contexts: list[tuple[Pokemon, int]] = []
+    for action in action_descriptions:
+        if (
+            action.get("kind") != "move"
+            or action.get("move") not in _MOVE_OPPORTUNITY_GROUPS["protect_like"]
+        ):
+            continue
+        pokemon = _active_pokemon_for_slot(battle, int(action["slot"]))
+        if pokemon is not None:
+            contexts.append((pokemon, int(pokemon.protect_counter)))
+    return contexts
+
+
+def _classify_protect_outcomes(
+    contexts: list[tuple[Pokemon, int]],
+) -> Counter[str]:
+    """Use poke-env's post-turn Protect counter to score attempt outcomes."""
+    stats: Counter[str] = Counter()
+    for pokemon, prior_successes in contexts:
+        bucket = min(prior_successes, 4)
+        repeated = prior_successes > 0
+        succeeded = int(pokemon.protect_counter) > prior_successes
+        stats["protect_like_attempts"] += 1
+        stats[f"protect_like_prior_{bucket}_attempts"] += 1
+        stats[
+            "protect_like_repeat_attempts" if repeated else "protect_like_fresh_attempts"
+        ] += 1
+        if succeeded:
+            stats["protect_like_successes"] += 1
+            stats[f"protect_like_prior_{bucket}_successes"] += 1
+            stats[
+                "protect_like_repeat_successes"
+                if repeated
+                else "protect_like_fresh_successes"
+            ] += 1
     return stats
 
 
@@ -876,11 +1058,24 @@ def _summarize_battle_behavior(
         if result.get("first_tera_turn")
     ]
     tera_turn_counts = Counter(tera_turns)
+    tera_slot_counts = Counter(
+        int(result["first_tera_slot"])
+        for result in tera_used_games
+        if result.get("first_tera_slot") is not None
+    )
+    turn_one_tera_games = sum(turn == 1 for turn in tera_turns)
     switch_counts = [int(result.get("switch_actions", 0)) for result in battle_results]
 
     return {
         "games_with_tera": len(tera_used_games),
+        "games_without_tera": len(tera_unused_games),
         "tera_game_rate": _safe_rate(len(tera_used_games), len(battle_results)),
+        "turn_one_tera_rate_all_games": _safe_rate(
+            turn_one_tera_games, len(battle_results)
+        ),
+        "turn_one_tera_rate_when_used": _safe_rate(
+            turn_one_tera_games, len(tera_used_games)
+        ),
         "win_rate_when_tera_used": _safe_rate(
             sum(1 for result in tera_used_games if result.get("won")),
             len(tera_used_games),
@@ -897,6 +1092,14 @@ def _summarize_battle_behavior(
                 "rate": _safe_rate(int(count), len(tera_used_games)),
             }
             for turn, count in sorted(tera_turn_counts.items())
+        ],
+        "first_tera_slot_distribution": [
+            {
+                "slot": int(slot),
+                "count": int(count),
+                "rate": _safe_rate(int(count), len(tera_used_games)),
+            }
+            for slot, count in sorted(tera_slot_counts.items())
         ],
         "avg_switch_actions_per_game": float(np.mean(switch_counts))
         if switch_counts
@@ -1050,6 +1253,7 @@ def evaluate_policy_vs_fixed_bot(
             battle_action_stats: Counter[str] = Counter()
             first_tera_turn: int | None = None
             first_tera_step: int | None = None
+            first_tera_slot: int | None = None
 
             while not done:
                 if max_turns > 0 and step_count >= max_turns:
@@ -1085,6 +1289,14 @@ def evaluate_policy_vs_fixed_bot(
                 ):
                     first_tera_turn = int(getattr(battle, "turn", 0))
                     first_tera_step = step_count + 1
+                    first_tera_slot = next(
+                        int(description["slot"])
+                        for description in action_descriptions
+                        if description["tera"]
+                    )
+                protect_contexts = _protect_attempt_contexts(
+                    battle, action_descriptions
+                )
                 trace.append(
                     {
                         "decision_step": step_count + 1,
@@ -1095,6 +1307,9 @@ def evaluate_policy_vs_fixed_bot(
                 )
 
                 obs, masks, reward, done, info = env.step(actions)
+                protect_outcomes = _classify_protect_outcomes(protect_contexts)
+                action_stats.update(protect_outcomes)
+                battle_action_stats.update(protect_outcomes)
                 step_count += 1
 
             won = reward > 0
@@ -1104,6 +1319,7 @@ def evaluate_policy_vs_fixed_bot(
             )
             battle_turns.append(battle_turn)
             decision_steps.append(step_count)
+            action_stats.update(_classify_battle_mechanics(battle_action_stats))
 
             if "team_preview_obs" not in info or "team_preview_picks" not in info:
                 raise RuntimeError(
@@ -1175,6 +1391,7 @@ def evaluate_policy_vs_fixed_bot(
                 "tera_used": first_tera_turn is not None,
                 "first_tera_turn": first_tera_turn,
                 "first_tera_decision_step": first_tera_step,
+                "first_tera_slot": first_tera_slot,
                 "switch_actions": int(battle_action_stats.get("switch_actions", 0)),
             }
             battle_results.append(battle_result)

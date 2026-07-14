@@ -729,9 +729,11 @@ class ObservationBuilder:
         started_turn = conditions.get(condition)
         if started_turn is None or not isinstance(started_turn, int):
             return 0.0
-        return ObservationBuilder._normalized_timer_age(
-            current_turn, started_turn, timer_cap
-        )
+        # These timed conditions have no separate presence bit. Reserve zero for
+        # absence and number active turns from one so their activation turn is
+        # observable as well.
+        turns_active = max(current_turn - started_turn, 0) + 1
+        return min(turns_active, timer_cap) / float(timer_cap)
 
     @staticmethod
     def _normalized_timer_age(

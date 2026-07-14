@@ -115,7 +115,7 @@ def _capture_head_logits(head: ActionHead):
         captured.append(output.detach().clone())
 
     handles = [
-        head.score.register_forward_hook(capture),
+        head.score[2].register_forward_hook(capture),
         head.tera_score.register_forward_hook(capture),
     ]
     return captured, handles
@@ -172,6 +172,12 @@ def test_vectorized_effectiveness_preserves_gradient_enabled_head_gradients() ->
         strict=True,
     ):
         assert optimized_name == reference_name
+        if optimized_name.startswith("public_consequence_head."):
+            # Actor gradients deliberately stop at the detached consequence
+            # probabilities; this head is grounded only by its auxiliary loss.
+            assert optimized_parameter.grad is None
+            assert reference_parameter.grad is None
+            continue
         assert optimized_parameter.grad is not None
         assert reference_parameter.grad is not None
         assert torch.equal(optimized_parameter.grad, reference_parameter.grad)

@@ -42,9 +42,13 @@ $env:POKERL_SHOWDOWN_DIR = "C:\path\to\pokemon-showdown"
 & .\.venv\Scripts\python.exe .\scripts\train.py --device cpu --num-envs 2 --rollout-steps 8 --total-timesteps 32 --num-epochs 1 --num-minibatches 1 --log-interval 1
 ```
 
-Training logs include rollout time, PPO update time, completed episodes, average completed battle duration, and average completed battle turns for the current update.
+Training logs include rollout time, PPO update time, completed episodes,
+average completed battle duration/turns, preview PPO KL and clipping, league
+payoff coverage, resolution/CANT calibration, and public-field transition
+MSE/support. Those consequence labels come only from exact public protocol
+transitions; they do not change the sparse terminal win/loss reward.
 
-`--resume` accepts only versioned trainer checkpoints produced by the exact same model class, configuration, categorical vocabulary, and tensor schema. Trainer checkpoints and their uniquely paired league-state files are atomically replaced and cross-checked; together they restore Adam, global step, Python/NumPy/PyTorch RNG, league sampling, and team-pool sampling. Lightweight league snapshots are evaluation/opponent artifacts and cannot resume training.
+`--resume` accepts only versioned trainer checkpoints produced by the exact same model class, configuration, categorical vocabulary, and tensor schema. Trainer checkpoints and their uniquely paired league-state files are atomically replaced and cross-checked; together they restore Adam, global step, the exact completed-update boundary, Python/NumPy/PyTorch RNG, league sampling, and team-pool sampling. Lightweight league snapshots are evaluation/opponent artifacts and cannot resume training.
 
 To train on a fixed Regulation F pool with team preview (bring 4 of 6):
 
@@ -90,12 +94,22 @@ To tune how many frozen opponents are shared across the env batch:
 ```
 
 The two opponent groups are resampled every update by default, while a new
-frozen policy is added to the league every 10 updates. This increases opponent
-variety over time without splitting each update into smaller inference batches.
-Use `--league-refresh-interval` and `--league-update-interval` to tune the two
-cadences independently. `--seed` records and derives separate league and team
-sampling streams; asynchronous battles still do not guarantee bitwise-identical
+frozen policy is added to the permanent archive every 10 updates. Discounted
+current-policy outcomes drive hard-opponent PFSP sampling, with a uniform
+coverage component, and group assignments are distinct whenever the archive
+contains enough members. `--league-size` bounds resident frozen models per
+inference service rather than archive history. Use `--league-refresh-interval`,
+`--league-update-interval`, and the `--league-pfsp-*` options to tune this
+schedule. `--seed` records separate league and team streams; paired resume state
+also restores the already-sampled opponent assignments so it does not consume
+an extra PFSP draw. Asynchronous battles still do not guarantee bitwise-identical
 runs.
+
+On CUDA, frozen battle-policy inference uses a bounded CUDA-graph cache by
+default. It preserves sampled actions and CUDA RNG state while removing repeated
+launch overhead; unsupported devices or capture failures fall back to eager
+inference and are reported in league cache diagnostics. Use
+`--no-league-cuda-graphs` only for debugging or an eager A/B comparison.
 
 For a short local BattleStream scaling benchmark over two rollout->PPO rounds:
 

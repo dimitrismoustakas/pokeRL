@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import copy
 import sys
 
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from pokerl.config import TrainingConfig
 from pokerl.training.preview import (
@@ -287,9 +287,11 @@ class _TinyPreviewAgent(torch.nn.Module):
         self.bring_scale = torch.nn.Parameter(torch.linspace(-0.4, 0.5, 6))
         self.lead_scale = torch.nn.Parameter(torch.linspace(-0.3, 0.4, 36))
         self.batch_sizes: list[int] = []
+        self.training_modes: list[bool] = []
 
-    def team_preview(self, obs, *, picks):
+    def team_preview(self, obs, *, picks, **_kwargs):
         self.batch_sizes.append(int(picks.shape[0]))
+        self.training_modes.append(self.training)
         score = self.score(obs["features"]).squeeze(-1)
         pick_signal = picks.to(score.dtype).sum(dim=-1) * 0.01
         return {
@@ -323,53 +325,156 @@ def _preview_samples(count: int):
     return samples
 
 
-def test_chunked_preview_update_matches_full_batch_and_steps_once() -> None:
+def test_preview_ppo_reuses_samples_in_bounded_minibatches() -> None:
     from pokerl.training.ppo import PPOTrainer
 
     torch.manual_seed(13)
-    full_agent = _TinyPreviewAgent()
-    chunked_agent = copy.deepcopy(full_agent)
-    full_trainer = PPOTrainer(
-        full_agent,
+    agent = _TinyPreviewAgent()
+    trainer = PPOTrainer(
+        agent,
         TrainingConfig(
             lr=3e-4,
             max_grad_norm=0.05,
-            preview_update_minibatch_size=64,
-        ),
-        torch.device("cpu"),
-    )
-    chunked_trainer = PPOTrainer(
-        chunked_agent,
-        TrainingConfig(
-            lr=3e-4,
-            max_grad_norm=0.05,
+            num_epochs=2,
+            num_minibatches=2,
             preview_update_minibatch_size=3,
         ),
         torch.device("cpu"),
     )
     samples = _preview_samples(7)
 
-    full_metrics = full_trainer.update_team_preview(samples)
-    chunked_metrics = chunked_trainer.update_team_preview(samples)
+    metrics = trainer.update_team_preview(samples)
 
-    assert full_agent.batch_sizes == [7]
-    assert chunked_agent.batch_sizes == [3, 3, 1]
-    assert chunked_metrics == pytest.approx(full_metrics, rel=2e-6, abs=2e-7)
-    for full_parameter, chunked_parameter in zip(
-        full_agent.parameters(),
-        chunked_agent.parameters(),
-        strict=True,
-    ):
-        assert torch.allclose(
-            chunked_parameter,
-            full_parameter,
-            rtol=2e-6,
-            atol=2e-7,
-        )
+    # One behavior-policy snapshot plus two optimizer epochs, each split into
+    # the same bounded 3/3/1 batches.
+    assert agent.batch_sizes == [3, 3, 1] * 3
+    assert metrics["team_preview_optimizer_steps"] == 6.0
+    assert metrics["team_preview_epochs"] == 2.0
+    assert metrics["team_preview_approx_kl"] >= 0.0
+    assert 0.0 <= metrics["team_preview_clip_fraction"] <= 1.0
+    assert 0.0 <= metrics["team_preview_value_clip_fraction"] <= 1.0
     optimizer_steps = {
-        int(state["step"].item()) for state in chunked_trainer.optimizer.state.values()
+        int(state["step"].item()) for state in trainer.optimizer.state.values()
     }
-    assert optimizer_steps == {1}
+    assert optimizer_steps == {6}
+
+
+@pytest.mark.parametrize("initial_training", [False, True])
+def test_preview_ppo_uses_eval_semantics_and_restores_mode(
+    initial_training: bool,
+) -> None:
+    from pokerl.training.ppo import PPOTrainer
+
+    agent = _TinyPreviewAgent()
+    agent.train(initial_training)
+    trainer = PPOTrainer(
+        agent,
+        TrainingConfig(num_epochs=1, num_minibatches=1),
+        torch.device("cpu"),
+    )
+
+    trainer.update_team_preview(_preview_samples(1))
+
+    assert agent.training is initial_training
+    assert agent.training_modes == [False, False]
+
+
+class _TinyPreviewAgentWithLSTM(_TinyPreviewAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.memory = nn.Module()
+        self.memory.lstm = nn.LSTM(1, 1, batch_first=True)
+        self.recurrent_training_modes: list[bool] = []
+
+    def team_preview(self, obs, *, picks, **kwargs):
+        self.recurrent_training_modes.append(self.memory.lstm.training)
+        recurrent, _ = self.memory.lstm(obs["features"][:, :1].unsqueeze(1))
+        recurrent_features = recurrent.squeeze(1).expand(-1, 2)
+        recurrent_obs = dict(obs)
+        recurrent_obs["features"] = obs["features"] + recurrent_features
+        return super().team_preview(recurrent_obs, picks=picks, **kwargs)
+
+
+@pytest.mark.parametrize("initial_training", [False, True])
+def test_preview_ppo_enables_dropout_free_lstm_backward_and_restores_mode(
+    initial_training: bool,
+) -> None:
+    from pokerl.training.ppo import PPOTrainer
+
+    agent = _TinyPreviewAgentWithLSTM()
+    agent.train(initial_training)
+    trainer = PPOTrainer(
+        agent,
+        TrainingConfig(num_epochs=1, num_minibatches=1),
+        torch.device("cpu"),
+    )
+
+    trainer.update_team_preview(_preview_samples(1))
+
+    assert agent.training is initial_training
+    assert agent.memory.lstm.training is initial_training
+    assert agent.training_modes == [False, False]
+    assert agent.recurrent_training_modes == [True, True]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_preview_ppo_allows_cudnn_lstm_backward_under_eval_semantics() -> None:
+    from pokerl.training.ppo import PPOTrainer
+
+    agent = _TinyPreviewAgentWithLSTM()
+    trainer = PPOTrainer(
+        agent,
+        TrainingConfig(num_epochs=1, num_minibatches=1),
+        torch.device("cuda"),
+    )
+
+    metrics = trainer.update_team_preview(_preview_samples(2))
+
+    assert "team_preview_skipped_nonfinite" not in metrics
+    assert np.isfinite(metrics["team_preview_loss"])
+
+
+@pytest.mark.parametrize("initial_training", [False, True])
+def test_preview_ppo_restores_mode_after_error(initial_training: bool) -> None:
+    from pokerl.training.ppo import PPOTrainer
+
+    agent = _TinyPreviewAgent()
+    agent.train(initial_training)
+    trainer = PPOTrainer(agent, TrainingConfig(), torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="at least one sample"):
+        trainer.update_team_preview([])
+
+    assert agent.training is initial_training
+
+
+class _ExtremeLogRatioPreviewAgent(_TinyPreviewAgent):
+    def team_preview(self, obs, *, picks, **kwargs):
+        out = super().team_preview(obs, picks=picks, **kwargs)
+        call_offset = 0.0 if len(self.batch_sizes) == 1 else 1_000.0
+        out["log_prob"] = out["log_prob"] * 0.0 + call_offset
+        out["preview_value"] = out["preview_value"] * 0.0
+        return out
+
+
+def test_preview_ppo_bounds_extreme_log_ratio() -> None:
+    from pokerl.training.ppo import PPOTrainer
+
+    agent = _ExtremeLogRatioPreviewAgent()
+    trainer = PPOTrainer(
+        agent,
+        TrainingConfig(num_epochs=1, num_minibatches=1),
+        torch.device("cpu"),
+    )
+    sample = _preview_samples(1)
+    sample[0] = (*sample[0][:2], -1.0, sample[0][3])
+
+    metrics = trainer.update_team_preview(sample)
+
+    assert "team_preview_skipped_nonfinite" not in metrics
+    assert np.isfinite(metrics["team_preview_loss"])
+    assert np.isfinite(metrics["team_preview_approx_kl"])
+    assert np.isfinite(metrics["team_preview_max_approx_kl"])
 
 
 def test_nonfinite_preview_chunk_discards_accumulated_gradients() -> None:

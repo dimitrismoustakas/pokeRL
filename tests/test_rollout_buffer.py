@@ -216,6 +216,49 @@ def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidd
     assert not batch.opponent_intent_tera_masks.any()
     assert torch.all(batch.opponent_intent_slot_labels == -1)
     assert torch.all(batch.opponent_intent_tera_labels == -1)
+    assert not batch.public_consequence_resolution_masks.any()
+    assert not batch.public_consequence_cant_masks.any()
+    assert not batch.public_consequence_field_masks.any()
+    assert torch.all(batch.public_consequence_resolution_labels == -1)
+    assert not batch.public_consequence_cant_targets.any()
+    assert not batch.public_consequence_field_targets.any()
+
+
+def test_rollout_buffer_reset_clears_public_consequence_labels() -> None:
+    device = torch.device("cpu")
+    obs = _obs(0, 1)
+    masks = _mask(1)
+    buffer = RolloutBuffer(1, 1, obs, masks, device)
+    common = (
+        _obs_to_tensor(obs, device),
+        torch.zeros((1, 3), dtype=torch.long),
+        _obs_to_tensor(masks, device),
+        torch.zeros(1),
+        torch.zeros(1),
+        torch.zeros(1),
+        torch.zeros(1, dtype=torch.bool),
+    )
+    buffer.reset()
+    buffer.add(
+        *common,
+        public_consequence_resolution_labels=torch.tensor([[2, 3]]),
+        public_consequence_resolution_masks=torch.ones((1, 2), dtype=torch.bool),
+        public_consequence_cant_targets=torch.ones((1, 2, 2)),
+        public_consequence_cant_masks=torch.ones((1, 2, 2), dtype=torch.bool),
+        public_consequence_field_targets=torch.ones((1, 2, 33)),
+        public_consequence_field_masks=torch.ones((1, 2), dtype=torch.bool),
+    )
+
+    buffer.reset()
+    buffer.add(*common)
+    batch = buffer.compute_gae(torch.zeros(1))
+
+    assert torch.all(batch.public_consequence_resolution_labels == -1)
+    assert not batch.public_consequence_resolution_masks.any()
+    assert not batch.public_consequence_cant_targets.any()
+    assert not batch.public_consequence_cant_masks.any()
+    assert not batch.public_consequence_field_targets.any()
+    assert not batch.public_consequence_field_masks.any()
 
 
 def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> None:
@@ -567,6 +610,89 @@ def test_ppo_trainer_updates_from_device_resident_sequence_batch() -> None:
         agent.hidden_info_head.policy_belief_adapter.weight.detach().norm().item()
     )
     assert agent.belief_condition_calls == 2
+
+
+def test_ppo_trainer_updates_public_consequence_model_from_rollout_labels() -> None:
+    device = torch.device("cpu")
+    num_steps = 2
+    num_envs = 2
+    action_mask = {
+        "joint": np.ones(
+            (num_envs, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool
+        ),
+        "can_tera": np.ones((num_envs, 2), dtype=bool),
+    }
+
+    def consequence_obs(step: int) -> dict[str, np.ndarray]:
+        obs = _ppo_obs(step, num_envs)
+        obs["field"] = np.full((num_envs, 36), step / 10.0, dtype=np.float32)
+        return obs
+
+    agent = _DummyAgent().to(device)
+    initial_consequence_weight = (
+        agent.action_head.public_consequence_head.weight.detach().clone()
+    )
+    config = TrainingConfig(
+        num_epochs=1,
+        num_minibatches=1,
+        aux_hidden_info_coef=0.0,
+        aux_opponent_intent_coef=0.0,
+    )
+    trainer = PPOTrainer(agent, config, device)
+    buffer = RolloutBuffer(
+        num_steps,
+        num_envs,
+        consequence_obs(0),
+        action_mask,
+        device,
+    )
+    buffer.reset(initial_hidden=agent.initial_hidden(num_envs))
+
+    for step in range(num_steps):
+        obs_t = _obs_to_tensor(consequence_obs(step), device)
+        masks_t = {
+            key: torch.from_numpy(value).to(device)
+            for key, value in action_mask.items()
+        }
+        with torch.no_grad():
+            out = agent(obs_t, action_masks=masks_t)
+        buffer.add(
+            obs_t,
+            out["actions"],
+            masks_t,
+            out["log_prob"],
+            out["value"],
+            torch.tensor([1.0, -1.0]),
+            torch.tensor([False, step == num_steps - 1]),
+            public_consequence_resolution_labels=torch.tensor(
+                [[0, 1], [2, 3]], dtype=torch.long
+            ),
+            public_consequence_resolution_masks=torch.ones(
+                num_envs, 2, dtype=torch.bool
+            ),
+            public_consequence_cant_targets=torch.tensor(
+                [[[0.0, 1.0], [1.0, 0.0]], [[1.0, 1.0], [0.0, 0.0]]]
+            ),
+            public_consequence_cant_masks=torch.ones(num_envs, 2, 2, dtype=torch.bool),
+            public_consequence_field_targets=torch.full(
+                (num_envs, 2, 33), 0.5 + step / 10.0
+            ),
+            public_consequence_field_masks=torch.ones(num_envs, 2, dtype=torch.bool),
+        )
+
+    metrics = trainer.update(buffer.compute_gae(torch.zeros(num_envs)))
+
+    assert np.isfinite(metrics["aux_public_consequence_loss"])
+    assert metrics["aux_public_consequence_resolution_count"] == 8.0
+    assert metrics["aux_public_consequence_cant_count"] == 16.0
+    assert metrics["aux_public_consequence_field_count"] == 8.0
+    assert np.isfinite(metrics["aux_public_consequence_field_mse"])
+    assert np.isfinite(metrics["aux_public_consequence_field_persistence_mse"])
+    assert metrics["public_consequence_adapter_weight_norm"] >= 0.0
+    assert not torch.equal(
+        agent.action_head.public_consequence_head.weight,
+        initial_consequence_weight,
+    )
 
 
 def test_actor_and_value_objectives_reach_belief_adapter() -> None:
