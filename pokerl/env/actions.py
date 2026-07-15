@@ -623,17 +623,28 @@ def _request_move_entry(move: Move, battle: DoubleBattle, slot: int) -> dict | N
 
 
 def _hydrate_move_for_request(move: Move, battle: DoubleBattle, slot: int) -> Move:
-    """Copy a move and attach the current request target, if any.
+    """Return a move carrying the current request's slot and target metadata.
 
-    ``poke-env`` uses ``Move.request_index`` to preserve the request slot used
-    when emitting the order and ``Move.request_target`` to disambiguate target
-    classes such as ``randomNormal``.
-    Cloning avoids leaking per-turn request state across reused move objects.
+    Modern ``poke-env`` attaches both values while constructing
+    ``DoubleBattle.available_moves`` and clears them before parsing the next
+    request. Reusing that move avoids rescanning ``last_request`` and cloning
+    every legal move on every policy decision. A fallback remains for tests or
+    third-party battle objects that provide only partially hydrated moves.
     """
-    hydrated = Move(move.id, gen=move.gen)
+    request_index = getattr(move, "request_index", None)
+    request_target = getattr(move, "request_target", None)
+    if request_index is not None and request_target is not None:
+        return move
+
+    # An omitted request target is meaningful for forced/random moves. Confirm
+    # that it was actually omitted before accepting a target-less hydrated move.
     move_request = _request_move_entry(move, battle, slot)
     target = None if move_request is None else move_request.get("target")
-    hydrated.request_index = getattr(move, "request_index", None)
+    if request_index is not None and target is None:
+        return move
+
+    hydrated = Move(move.id, gen=move.gen)
+    hydrated.request_index = request_index
     if target is not None:
         hydrated.request_target = target
     return hydrated
