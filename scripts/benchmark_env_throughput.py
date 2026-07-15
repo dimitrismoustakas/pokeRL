@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,12 @@ from poke_env.player import MaxBasePowerPlayer, RandomPlayer, SimpleHeuristicsPl
 
 from pokerl.config import EnvConfig
 from pokerl.data import GameData
-from pokerl.env.actions import FIRST_SLOT_MASK_ROW, NUM_TARGETS, PASS_ACTION, SWITCH_OFFSET
+from pokerl.env.actions import (
+    FIRST_SLOT_MASK_ROW,
+    NUM_TARGETS,
+    PASS_ACTION,
+    SWITCH_OFFSET,
+)
 from pokerl.env.showdown_env import (
     BattleEnv,
     LoopThread,
@@ -34,12 +40,38 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark pokeRL env/local BattleStream throughput without model training."
     )
-    parser.add_argument("--battle-format", default="gen9vgc2026regf", help="Showdown battle format.")
-    parser.add_argument("--showdown-dir", default=None, help="Pokemon Showdown checkout for local BattleStream.")
-    parser.add_argument("--num-envs", type=int, default=72, help="Number of parallel BattleEnv instances.")
-    parser.add_argument("--worker-count", type=int, default=None, help="Local BattleStream worker count.")
-    parser.add_argument("--battles-per-worker", type=int, default=None, help="Max battles per local worker.")
-    parser.add_argument("--runtime-loop-count", type=int, default=None, help="Local BattleStream runtime loop count.")
+    parser.add_argument(
+        "--battle-format", default="gen9vgc2026regf", help="Showdown battle format."
+    )
+    parser.add_argument(
+        "--showdown-dir",
+        default=None,
+        help="Pokemon Showdown checkout for local BattleStream.",
+    )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=72,
+        help="Number of parallel BattleEnv instances.",
+    )
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=None,
+        help="Local BattleStream worker count.",
+    )
+    parser.add_argument(
+        "--battles-per-worker",
+        type=int,
+        default=None,
+        help="Max battles per local worker.",
+    )
+    parser.add_argument(
+        "--runtime-loop-count",
+        type=int,
+        default=None,
+        help="Local BattleStream runtime loop count.",
+    )
     parser.add_argument(
         "--battle-loop-count",
         type=int,
@@ -52,7 +84,19 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Seconds to wait for a local BattleStream battle to produce protocol output.",
     )
-    parser.add_argument("--steps", type=int, default=256, help="Vector env steps to run after reset.")
+    parser.add_argument(
+        "--steps", type=int, default=256, help="Vector env steps to run after reset."
+    )
+    parser.add_argument(
+        "--scheduling",
+        choices=("barrier", "as-completed"),
+        default="barrier",
+        help=(
+            "How controlled-side actions are scheduled. 'barrier' matches the "
+            "training collector; 'as-completed' measures the simulator upper "
+            "bound when fast environments do not wait for stragglers."
+        ),
+    )
     parser.add_argument(
         "--policy",
         choices=("legal-first", "random-legal", "max-power"),
@@ -76,10 +120,20 @@ def parse_args() -> argparse.Namespace:
         default="pool",
         help="Which team pool subset to sample from.",
     )
-    parser.add_argument("--team-pool-seed", type=int, default=0, help="Seed for team-pool sampling.")
-    parser.add_argument("--seed", type=int, default=0, help="RNG seed for random-legal policy.")
-    parser.add_argument("--collect-timing", action="store_true", help="Collect BattleEnv timing counters.")
-    parser.add_argument("--summary-path", default=None, help="Optional JSON summary path.")
+    parser.add_argument(
+        "--team-pool-seed", type=int, default=0, help="Seed for team-pool sampling."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="RNG seed for random-legal policy."
+    )
+    parser.add_argument(
+        "--collect-timing",
+        action="store_true",
+        help="Collect BattleEnv timing counters.",
+    )
+    parser.add_argument(
+        "--summary-path", default=None, help="Optional JSON summary path."
+    )
     return parser.parse_args()
 
 
@@ -120,16 +174,21 @@ def _max_power_action(
     legal_actions = np.flatnonzero(slot_mask)
     regular_moves = legal_actions[legal_actions < SWITCH_OFFSET]
     if regular_moves.size:
+
         def move_power(action: int) -> int:
             return battle.available_moves[slot][action // NUM_TARGETS].base_power or 0
 
         best_power = max(move_power(action) for action in regular_moves)
-        strongest = [int(action) for action in regular_moves if move_power(action) == best_power]
+        strongest = [
+            int(action) for action in regular_moves if move_power(action) == best_power
+        ]
         return int(rng.choice(strongest))
     return _preferred_legal_action(slot_mask, rng)
 
 
-def _legal_tera_choices(can_tera: np.ndarray, action_1: int, action_2: int) -> np.ndarray:
+def _legal_tera_choices(
+    can_tera: np.ndarray, action_1: int, action_2: int
+) -> np.ndarray:
     legal = [0]
     if can_tera[0] and action_1 < SWITCH_OFFSET:
         legal.append(1)
@@ -155,21 +214,128 @@ def _choose_actions(
             action_2 = int(joint_masks[env_index, action_1 + 1].argmax())
             tera = 0
         elif policy == "random-legal":
-            action_1 = _preferred_legal_action(joint_masks[env_index, FIRST_SLOT_MASK_ROW], rng)
-            action_2 = _preferred_legal_action(joint_masks[env_index, action_1 + 1], rng)
-            tera = int(rng.choice(_legal_tera_choices(can_tera[env_index], action_1, action_2)))
+            action_1 = _preferred_legal_action(
+                joint_masks[env_index, FIRST_SLOT_MASK_ROW], rng
+            )
+            action_2 = _preferred_legal_action(
+                joint_masks[env_index, action_1 + 1], rng
+            )
+            tera = int(
+                rng.choice(_legal_tera_choices(can_tera[env_index], action_1, action_2))
+            )
         elif policy == "max-power":
             battle = env.last_battle
             if battle is None:
                 raise RuntimeError("max-power policy requires an active battle.")
-            action_1 = _max_power_action(battle, 0, joint_masks[env_index, FIRST_SLOT_MASK_ROW], rng)
-            action_2 = _max_power_action(battle, 1, joint_masks[env_index, action_1 + 1], rng)
+            action_1 = _max_power_action(
+                battle, 0, joint_masks[env_index, FIRST_SLOT_MASK_ROW], rng
+            )
+            action_2 = _max_power_action(
+                battle, 1, joint_masks[env_index, action_1 + 1], rng
+            )
             tera = 0
         else:
             raise ValueError(f"Unsupported policy: {policy}")
         actions[env_index] = (action_1, action_2, tera)
 
     return actions
+
+
+def _choose_single_action(
+    *,
+    policy: str,
+    mask: dict[str, np.ndarray],
+    env: BattleEnv,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    batched_mask = {key: value[np.newaxis, ...] for key, value in mask.items()}
+    return _choose_actions(
+        policy=policy,
+        masks=batched_mask,
+        envs=[env],
+        rng=rng,
+    )[0]
+
+
+def _step_and_reset(
+    env: BattleEnv,
+    action: np.ndarray,
+) -> tuple[dict, dict[str, np.ndarray], float, bool, dict]:
+    obs, mask, reward, done, info = env.step(action)
+    if done:
+        info["final_observation"] = obs
+        obs, mask = env.reset()
+        info["episode_reward"] = reward
+    return obs, mask, reward, done, info
+
+
+def _run_as_completed(
+    *,
+    parallel_env: ParallelBattleEnv,
+    initial_masks: dict[str, np.ndarray],
+    steps: int,
+    policy: str,
+    rng: np.random.Generator,
+) -> tuple[int, list[float], list[int]]:
+    """Advance each environment independently for a fixed number of steps.
+
+    This is deliberately a diagnostic upper bound, not the PPO collector: it
+    uses a trivial CPU policy and therefore does not account for the batching
+    trade-off of recurrent GPU inference.
+    """
+
+    completed_battles = 0
+    episode_secs: list[float] = []
+    episode_turns: list[int] = []
+    completed_steps = [0] * parallel_env.num_envs
+    futures: dict[Future, int] = {}
+
+    def submit(
+        executor: ThreadPoolExecutor,
+        env_index: int,
+        mask: dict[str, np.ndarray],
+    ) -> None:
+        action = _choose_single_action(
+            policy=policy,
+            mask=mask,
+            env=parallel_env.envs[env_index],
+            rng=rng,
+        )
+        future = executor.submit(
+            _step_and_reset,
+            parallel_env.envs[env_index],
+            action,
+        )
+        futures[future] = env_index
+
+    with ThreadPoolExecutor(max_workers=parallel_env.num_envs) as executor:
+        for env_index in range(parallel_env.num_envs):
+            submit(
+                executor,
+                env_index,
+                {key: value[env_index] for key, value in initial_masks.items()},
+            )
+
+        while futures:
+            ready, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in ready:
+                env_index = futures.pop(future)
+                _obs, mask, _reward, _done, info = future.result()
+                completed_steps[env_index] += 1
+                if "episode_reward" in info:
+                    completed_battles += 1
+                    if "episode_sec" in info:
+                        episode_secs.append(float(info["episode_sec"]))
+                    if "battle_turn" in info:
+                        episode_turns.append(int(info["battle_turn"]))
+                if completed_steps[env_index] < steps:
+                    submit(executor, env_index, mask)
+
+    if any(step_count != steps for step_count in completed_steps):
+        raise RuntimeError(
+            "As-completed benchmark ended with missing environment steps."
+        )
+    return completed_battles, episode_secs, episode_turns
 
 
 def _build_opponent_factory(env_config: EnvConfig, opponent_name: str):
@@ -298,22 +464,31 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         obs, masks = parallel_env.reset()
         reset_sec = time.perf_counter() - reset_started
         run_started = time.perf_counter()
-        for _ in range(args.steps):
-            actions = _choose_actions(
+        if args.scheduling == "as-completed":
+            completed_battles, episode_secs, episode_turns = _run_as_completed(
+                parallel_env=parallel_env,
+                initial_masks=masks,
+                steps=args.steps,
                 policy=args.policy,
-                masks=masks,
-                envs=parallel_env.envs,
                 rng=rng,
             )
-            obs, masks, _rewards, _dones, infos = parallel_env.step(actions)
-            for info in infos:
-                if "episode_reward" not in info:
-                    continue
-                completed_battles += 1
-                if "episode_sec" in info:
-                    episode_secs.append(float(info["episode_sec"]))
-                if "battle_turn" in info:
-                    episode_turns.append(int(info["battle_turn"]))
+        else:
+            for _ in range(args.steps):
+                actions = _choose_actions(
+                    policy=args.policy,
+                    masks=masks,
+                    envs=parallel_env.envs,
+                    rng=rng,
+                )
+                obs, masks, _rewards, _dones, infos = parallel_env.step(actions)
+                for info in infos:
+                    if "episode_reward" not in info:
+                        continue
+                    completed_battles += 1
+                    if "episode_sec" in info:
+                        episode_secs.append(float(info["episode_sec"]))
+                    if "battle_turn" in info:
+                        episode_turns.append(int(info["battle_turn"]))
         run_sec = time.perf_counter() - run_started
         timing = parallel_env.snapshot_timing() if args.collect_timing else {}
     finally:
@@ -325,6 +500,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "battle_format": env_config.battle_format,
             "num_envs": args.num_envs,
             "steps": args.steps,
+            "scheduling": args.scheduling,
             "policy": args.policy,
             "opponent": args.opponent,
             "team_pool_format": args.team_pool_format,
@@ -341,7 +517,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "vector_steps_per_sec": args.steps / run_sec if run_sec > 0 else 0.0,
             "completed_battles": completed_battles,
             "avg_episode_sec": float(np.mean(episode_secs)) if episode_secs else 0.0,
-            "avg_episode_turns": float(np.mean(episode_turns)) if episode_turns else 0.0,
+            "avg_episode_turns": float(np.mean(episode_turns))
+            if episode_turns
+            else 0.0,
             "timing": timing,
         },
     }

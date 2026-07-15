@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import random
@@ -48,7 +49,7 @@ from ..env.showdown_env import (
 from .cuda_execution import cuda_model_execution
 
 
-_LEAGUE_STATE_FORMAT_VERSION = 3
+_LEAGUE_STATE_FORMAT_VERSION = 4
 _LEAGUE_STATE_CONFIG_FIELDS = (
     "league_size",
     "league_update_interval",
@@ -59,6 +60,8 @@ _LEAGUE_STATE_CONFIG_FIELDS = (
 )
 _LEAGUE_MEMBER_STATE_FIELDS = (
     "path",
+    "checkpoint_sha256",
+    "archive_source",
     "step",
     "created_update",
     "discounted_wins",
@@ -68,6 +71,8 @@ _LEAGUE_MEMBER_STATE_FIELDS = (
     "lifetime_losses",
     "lifetime_draws",
 )
+_LEAGUE_MEMBER_SOURCES = frozenset({"self_play_snapshot", "admitted_external"})
+_SHA256_HEX_LENGTH = 64
 
 
 @dataclass
@@ -75,6 +80,8 @@ class LeagueMember:
     """One permanent archive member and its live-policy payoff evidence."""
 
     path: str
+    checkpoint_sha256: str
+    archive_source: str
     step: int
     created_update: int
     discounted_wins: float = 0.0
@@ -145,6 +152,30 @@ def _tuples_to_lists(value):
     if isinstance(value, dict):
         return {key: _tuples_to_lists(item) for key, item in value.items()}
     return value
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == _SHA256_HEX_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _checkpoint_file_sha256(
+    path: str | Path,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> str:
+    """Hash exact checkpoint bytes without retaining them in memory."""
+    source = Path(path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"League checkpoint does not exist: {source!s}")
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _lists_to_tuples(value):
@@ -220,6 +251,29 @@ def _same_device(left: torch.device, right: torch.device) -> bool:
     )
 
 
+_ACTION_BATCH_SIZE_BUCKETS = (
+    (1, "1"),
+    (2, "2"),
+    (4, "3-4"),
+    (8, "5-8"),
+    (12, "9-12"),
+    (16, "13-16"),
+    (24, "17-24"),
+    (36, "25-36"),
+)
+
+
+def _action_batch_size_bucket(batch_size: int) -> str:
+    for upper_bound, label in _ACTION_BATCH_SIZE_BUCKETS:
+        if batch_size <= upper_bound:
+            return label
+    return ">36"
+
+
+def _empty_action_batch_size_histogram() -> dict[str, int]:
+    return {label: 0 for _, label in _ACTION_BATCH_SIZE_BUCKETS} | {">36": 0}
+
+
 class _LeagueInferenceService:
     """Shared batched inference for league opponents.
 
@@ -229,8 +283,8 @@ class _LeagueInferenceService:
     """
 
     _CLOSE_TIMEOUT_SEC = 60.0
-    _CUDA_GRAPH_BATCH_SIZE = 36
-    _CUDA_GRAPH_CACHE_SIZE = 2
+    _DEFAULT_CUDA_GRAPH_BATCH_SIZE = 16
+    _DEFAULT_CUDA_GRAPH_CACHE_SIZE = 4
     _CUDA_GRAPH_WARMUP_CALLS = 3
 
     def __init__(
@@ -242,9 +296,17 @@ class _LeagueInferenceService:
         max_models: int,
         greedy: bool = False,
         enable_cuda_graphs: bool = False,
+        cuda_graph_batch_size: int = _DEFAULT_CUDA_GRAPH_BATCH_SIZE,
+        cuda_graph_cache_size: int = _DEFAULT_CUDA_GRAPH_CACHE_SIZE,
     ):
         if max_models <= 0:
             raise ValueError(f"max_models must be positive (got {max_models}).")
+        for name, value in (
+            ("cuda_graph_batch_size", cuda_graph_batch_size),
+            ("cuda_graph_cache_size", cuda_graph_cache_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer (got {value}).")
         self._agent_template = copy.deepcopy(agent_template).to(torch.device("cpu"))
         self._agent_template.eval()
         self._agent_template.requires_grad_(False)
@@ -265,6 +327,8 @@ class _LeagueInferenceService:
             and device.type == "cuda"
             and hasattr(torch.cuda, "CUDAGraph")
         )
+        self._cuda_graph_batch_size = cuda_graph_batch_size
+        self._cuda_graph_cache_size = cuda_graph_cache_size
         self._cuda_graphs: OrderedDict[str, _CudaGraphExecutor] = OrderedDict()
         self._cuda_graph_hits = 0
         self._cuda_graph_misses = 0
@@ -275,6 +339,7 @@ class _LeagueInferenceService:
         self._cuda_graph_real_rows = 0
         self._cuda_graph_padded_rows = 0
         self._cuda_graph_last_error: str | None = None
+        self._action_batch_size_histogram = _empty_action_batch_size_histogram()
         self._prefetch_paths: set[str] = set()
         self._pending: list[_InferenceRequest] = []
         self._active_requests: list[_InferenceRequest] = []
@@ -332,8 +397,16 @@ class _LeagueInferenceService:
                 "misses": self._cache_misses,
                 "loads": self._cache_loads,
                 "evictions": self._cache_evictions,
+                "action_batch_size_histogram": dict(
+                    getattr(
+                        self,
+                        "_action_batch_size_histogram",
+                        _empty_action_batch_size_histogram(),
+                    )
+                ),
                 "cuda_graphs_enabled": getattr(self, "_cuda_graphs_enabled", False),
-                "cuda_graph_capacity": self._CUDA_GRAPH_CACHE_SIZE,
+                "cuda_graph_batch_size": self._cuda_graph_batch_size,
+                "cuda_graph_capacity": self._cuda_graph_cache_size,
                 "resident_cuda_graphs": len(getattr(self, "_cuda_graphs", {})),
                 "cuda_graph_hits": getattr(self, "_cuda_graph_hits", 0),
                 "cuda_graph_misses": getattr(self, "_cuda_graph_misses", 0),
@@ -982,7 +1055,7 @@ class _LeagueInferenceService:
         request_masks: list[dict[str, np.ndarray]],
     ) -> bool:
         """Run one logical request batch through bounded fixed-shape graphs."""
-        chunk_size = self._CUDA_GRAPH_BATCH_SIZE
+        chunk_size = self._cuda_graph_batch_size
         chunk_results: list[
             tuple[np.ndarray, list[tuple[torch.Tensor, torch.Tensor] | None]]
         ] = []
@@ -1143,17 +1216,17 @@ class _LeagueInferenceService:
 
         if executor is None:
             self._cuda_graph_misses += 1
-            while len(graphs) >= self._CUDA_GRAPH_CACHE_SIZE:
+            while len(graphs) >= self._cuda_graph_cache_size:
                 stale_path = next(iter(graphs))
                 self._evict_cuda_graph(stale_path)
             obs_host = self._allocate_host_batch_buffers(
                 obs_schema,
-                self._CUDA_GRAPH_BATCH_SIZE,
+                self._cuda_graph_batch_size,
                 pin_memory=True,
             )
             masks_host = self._allocate_host_batch_buffers(
                 masks_schema,
-                self._CUDA_GRAPH_BATCH_SIZE,
+                self._cuda_graph_batch_size,
                 pin_memory=True,
             )
             executor = _CudaGraphExecutor(
@@ -1229,18 +1302,18 @@ class _LeagueInferenceService:
         executor.obs_device = obs_buffers
         executor.masks_device = masks_buffers
         with torch.inference_mode():
-            executor.hidden = agent.initial_hidden(self._CUDA_GRAPH_BATCH_SIZE)
+            executor.hidden = agent.initial_hidden(self._cuda_graph_batch_size)
             executor.sampling_exponentials = (
                 torch.ones(
-                    (self._CUDA_GRAPH_BATCH_SIZE, agent.action_head.num_actions),
+                    (self._cuda_graph_batch_size, agent.action_head.num_actions),
                     device=self._device,
                 ),
                 torch.ones(
-                    (self._CUDA_GRAPH_BATCH_SIZE, agent.action_head.num_actions),
+                    (self._cuda_graph_batch_size, agent.action_head.num_actions),
                     device=self._device,
                 ),
                 torch.ones(
-                    (self._CUDA_GRAPH_BATCH_SIZE, NUM_TERA_CHOICES),
+                    (self._cuda_graph_batch_size, NUM_TERA_CHOICES),
                     device=self._device,
                 ),
             )
@@ -1390,6 +1463,9 @@ class _LeagueInferenceService:
     def _run_battle_batch(
         self, checkpoint_path: str, requests: list[_InferenceRequest]
     ) -> None:
+        histogram = self._action_batch_size_histogram
+        bucket = _action_batch_size_bucket(len(requests))
+        histogram[bucket] += 1
         self._set_active_phase("get_agent")
         agent = self._get_agent(checkpoint_path)
         batch_started = time.perf_counter()
@@ -2393,11 +2469,14 @@ class League:
         self._rng = rng if rng is not None else random.Random(config.seed)
         self.inference_device = device
         self.preview_inference_device = (
-            torch.device("cpu") if device.type == "cuda" else self.inference_device
+            self.inference_device
+            if config.league_preview_device == "action"
+            else torch.device("cpu")
         )
         self.checkpoints: list[str] = []
         self._members: dict[str, LeagueMember] = {}
         self._current_update = 0
+        self._frozen_population = False
         self._inference = _LeagueInferenceService(
             agent_template,
             self.inference_device,
@@ -2405,6 +2484,8 @@ class League:
             max_models=config.league_size,
             greedy=inference_greedy,
             enable_cuda_graphs=config.league_cuda_graphs,
+            cuda_graph_batch_size=config.league_cuda_graph_batch_size,
+            cuda_graph_cache_size=config.league_cuda_graph_cache_size,
         )
         if self.preview_inference_device == self.inference_device:
             self._preview_inference = self._inference
@@ -2416,12 +2497,50 @@ class League:
                 max_models=config.league_size,
                 greedy=inference_greedy,
                 enable_cuda_graphs=False,
+                cuda_graph_batch_size=config.league_cuda_graph_batch_size,
+                cuda_graph_cache_size=config.league_cuda_graph_cache_size,
             )
 
     @property
     def current_update(self) -> int:
         """Last completed update represented by the payoff/archive state."""
         return self._current_update
+
+    def install_frozen_population(self, checkpoint_paths: list[str]) -> None:
+        """Install immutable external checkpoints for inference-only phases.
+
+        A best-response phase owns its sampling distribution outside ``League``.
+        This mode reuses the mature batched inference and ``LeaguePlayer`` path
+        while defensively disabling every adaptive-archive operation.
+        """
+        if self.checkpoints or self._members or self._current_update != 0:
+            raise RuntimeError(
+                "Frozen population must be installed into an empty League."
+            )
+        if not checkpoint_paths:
+            raise ValueError("Frozen population requires at least one checkpoint.")
+        if len(set(checkpoint_paths)) != len(checkpoint_paths):
+            raise ValueError("Frozen population contains duplicate checkpoint paths.")
+        resolved_paths: list[str] = []
+        for raw_path in checkpoint_paths:
+            if not isinstance(raw_path, str) or not raw_path:
+                raise ValueError(
+                    "Frozen population checkpoint paths must be non-empty strings."
+                )
+            resolved = Path(raw_path).expanduser().resolve()
+            if not resolved.is_file():
+                raise FileNotFoundError(
+                    f"Frozen population checkpoint does not exist: {resolved!s}"
+                )
+            resolved_paths.append(str(resolved))
+        self.checkpoints = resolved_paths
+        self._frozen_population = True
+
+    def _require_adaptive_archive(self, operation: str) -> None:
+        if getattr(self, "_frozen_population", False):
+            raise RuntimeError(
+                f"Cannot {operation} an inference-only frozen population."
+            )
 
     def add_checkpoint(
         self,
@@ -2431,6 +2550,7 @@ class League:
         update: int | None = None,
     ) -> None:
         """Snapshot the current agent as a permanent archive member."""
+        self._require_adaptive_archive("add a checkpoint to")
         if step < 0:
             raise ValueError(f"League checkpoint step must be non-negative: {step}.")
         member_update = self._current_update if update is None else update
@@ -2444,13 +2564,99 @@ class League:
             raise ValueError(f"League archive already contains {path!r}.")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"checkpoint_type": "league", "agent": agent.state_dict()}, path)
+        checkpoint_sha256 = _checkpoint_file_sha256(path)
         self.checkpoints.append(path)
         self._members[path] = LeagueMember(
             path=path,
+            checkpoint_sha256=checkpoint_sha256,
+            archive_source="self_play_snapshot",
             step=step,
             created_update=member_update,
         )
         self._current_update = member_update
+
+    def add_admitted_checkpoint(
+        self,
+        checkpoint_path: str | Path,
+        checkpoint_sha256: str,
+        *,
+        step: int,
+        update: int | None = None,
+    ) -> str:
+        """Add an already-admitted frozen policy to the adaptive main archive.
+
+        The decision to admit a policy deliberately lives outside ``League``.
+        This method only installs a checkpoint with a verified immutable byte
+        identity.  It starts with the same neutral payoff prior as an ordinary
+        self-play snapshot, after which the main policy's online outcomes feed
+        the existing PFSP evidence path.
+
+        Returns the canonical checkpoint path used as the league member key.
+        """
+        self._require_adaptive_archive("add an admitted checkpoint to")
+        if type(step) is not int or step < 0:
+            raise ValueError(
+                f"Admitted checkpoint step must be a non-negative integer: {step!r}."
+            )
+        if not _is_sha256(checkpoint_sha256):
+            raise ValueError(
+                "Admitted checkpoint sha256 must be 64 lowercase hexadecimal digits."
+            )
+        member_update = self._current_update if update is None else update
+        if type(member_update) is not int or member_update < 0:
+            raise ValueError(
+                "Admitted checkpoint update must be a non-negative integer: "
+                f"{member_update!r}."
+            )
+        if member_update < self._current_update:
+            raise ValueError(
+                "Admitted checkpoint update cannot move backwards: "
+                f"current={self._current_update}, requested={member_update}."
+            )
+
+        if not isinstance(checkpoint_path, (str, Path)) or not str(checkpoint_path):
+            raise ValueError("Admitted checkpoint path must be non-empty.")
+        resolved = Path(checkpoint_path).expanduser().resolve()
+        actual_sha256 = _checkpoint_file_sha256(resolved)
+        if actual_sha256 != checkpoint_sha256:
+            raise ValueError(
+                "Admitted checkpoint hash mismatch for "
+                f"{resolved!s}: expected={checkpoint_sha256}, "
+                f"actual={actual_sha256}."
+            )
+        canonical_path = str(resolved)
+        existing_resolved_paths = {
+            str(Path(path).expanduser().resolve()) for path in self.checkpoints
+        }
+        if canonical_path in existing_resolved_paths:
+            raise ValueError(
+                "League archive already contains admitted checkpoint path "
+                f"{canonical_path!r}."
+            )
+        duplicate_identity = next(
+            (
+                member.path
+                for member in self._members.values()
+                if member.checkpoint_sha256 == checkpoint_sha256
+            ),
+            None,
+        )
+        if duplicate_identity is not None:
+            raise ValueError(
+                "League archive already contains checkpoint bytes "
+                f"{checkpoint_sha256} at {duplicate_identity!r}."
+            )
+
+        self.checkpoints.append(canonical_path)
+        self._members[canonical_path] = LeagueMember(
+            path=canonical_path,
+            checkpoint_sha256=checkpoint_sha256,
+            archive_source="admitted_external",
+            step=step,
+            created_update=member_update,
+        )
+        self._current_update = member_update
+        return canonical_path
 
     def record_outcomes(
         self,
@@ -2459,6 +2665,7 @@ class League:
         update: int,
     ) -> None:
         """Update discounted current-policy payoffs before the next PFSP draw."""
+        self._require_adaptive_archive("record outcomes in")
         if update < self._current_update:
             raise ValueError(
                 "League outcome update cannot move backwards: "
@@ -2502,6 +2709,7 @@ class League:
         update: int | None = None,
     ) -> list[str]:
         """PFSP-sample distinct archive members whenever enough exist."""
+        self._require_adaptive_archive("PFSP-sample from")
         if count <= 0:
             raise ValueError(f"Opponent sample count must be positive (got {count}).")
         sample_update = self._resolve_sampling_update(update)
@@ -2517,6 +2725,7 @@ class League:
         update: int | None = None,
     ) -> list[dict[str, object]]:
         """Return the exact auditable PFSP distribution in archive order."""
+        self._require_adaptive_archive("compute a PFSP distribution for")
         sample_update = self._resolve_sampling_update(update)
         if not self.checkpoints:
             return []
@@ -2534,6 +2743,8 @@ class League:
             rows.append(
                 {
                     "checkpoint_path": path,
+                    "checkpoint_sha256": member.checkpoint_sha256,
+                    "archive_source": member.archive_source,
                     "step": member.step,
                     "created_update": member.created_update,
                     "current_policy_win_probability": win_probability,
@@ -2571,6 +2782,20 @@ class League:
         update: int | None = None,
         include_members: bool = True,
     ) -> dict[str, object]:
+        if getattr(self, "_frozen_population", False):
+            services = self._inference_services()
+            cache = {"action": services[0].cache_info()}
+            if len(services) > 1:
+                cache["preview"] = services[1].cache_info()
+            result: dict[str, object] = {
+                "mode": "frozen_population_inference",
+                "archive_size": len(self.checkpoints),
+                "resident_cache_capacity": self.config.league_size,
+                "inference_cache": cache,
+            }
+            if include_members:
+                result["checkpoint_paths"] = list(self.checkpoints)
+            return result
         sample_update = self._resolve_sampling_update(update)
         services = self._inference_services()
         cache = {"action": services[0].cache_info()}
@@ -2633,6 +2858,11 @@ class League:
         )
         if path is None:
             return None
+        if getattr(self, "_frozen_population", False) and path not in self.checkpoints:
+            raise ValueError(
+                "Frozen-population opponent path is outside the pinned population: "
+                f"{path!r}."
+            )
         for service in self._inference_services():
             service.prefetch_checkpoint(path)
 
@@ -2663,6 +2893,7 @@ class League:
         extra_state: dict[str, object] | None = None,
     ) -> None:
         """Atomically persist league membership and private sampling state."""
+        self._require_adaptive_archive("save adaptive league state for")
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(target.suffix + ".tmp")
@@ -2692,6 +2923,7 @@ class League:
 
     def load_state(self, path: str) -> dict[str, object]:
         """Strictly restore checkpoint paths and the league sampling state."""
+        self._require_adaptive_archive("load adaptive league state into")
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("League state must contain a versioned JSON object.")
@@ -2758,6 +2990,18 @@ class League:
             path_value = raw_member["path"]
             if not isinstance(path_value, str) or not path_value:
                 raise ValueError("League member path must be a non-empty string.")
+            checkpoint_sha256 = raw_member["checkpoint_sha256"]
+            if not _is_sha256(checkpoint_sha256):
+                raise ValueError(
+                    "League member checkpoint_sha256 must be 64 lowercase "
+                    "hexadecimal digits."
+                )
+            archive_source = raw_member["archive_source"]
+            if archive_source not in _LEAGUE_MEMBER_SOURCES:
+                raise ValueError(
+                    "League member archive_source must be one of "
+                    f"{sorted(_LEAGUE_MEMBER_SOURCES)!r}."
+                )
             for field in (
                 "step",
                 "created_update",
@@ -2802,6 +3046,8 @@ class League:
             members.append(
                 LeagueMember(
                     path=path_value,
+                    checkpoint_sha256=checkpoint_sha256,
+                    archive_source=archive_source,
                     step=raw_member["step"],
                     created_update=raw_member["created_update"],
                     discounted_wins=float(raw_member["discounted_wins"]),
@@ -2824,6 +3070,19 @@ class League:
             raise FileNotFoundError(
                 "Strict resume requires every saved league checkpoint; missing: "
                 + ", ".join(missing_paths)
+            )
+        hash_mismatches: list[str] = []
+        for member in members:
+            actual_sha256 = _checkpoint_file_sha256(member.path)
+            if actual_sha256 != member.checkpoint_sha256:
+                hash_mismatches.append(
+                    f"{member.path} (expected={member.checkpoint_sha256}, "
+                    f"actual={actual_sha256})"
+                )
+        if hash_mismatches:
+            raise ValueError(
+                "Strict resume requires the exact saved league checkpoint bytes; "
+                "hash mismatch: " + ", ".join(hash_mismatches)
             )
         rng_state = _lists_to_tuples(payload.get("rng_state"))
         try:

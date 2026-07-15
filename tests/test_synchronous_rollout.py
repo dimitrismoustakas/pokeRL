@@ -5,16 +5,20 @@ import pytest
 import torch
 
 import scripts.train as train_module
+from pokerl.data import MOVE_SCOPE_SCOPED
 from pokerl.env.actions import INTENT_MOVE
 from pokerl.env.observation import (
     EVENT_KIND_TO_INDEX,
     FIELD_TURN_OFFSET,
+    NUM_PUBLIC_EVENT_FLAGS,
+    NUM_PUBLIC_TARGET_POSITIONS,
+    NUM_TARGET_OUTCOME_FEATURES,
     POSITION_IMPLICIT,
     POSITION_OWN_1,
 )
 from pokerl.public_consequence import (
-    PUBLIC_CONSEQUENCE_CANT,
-    PUBLIC_CONSEQUENCE_EXECUTED,
+    MOVE_BRANCH_SCOPED,
+    NONMOVE_REASON_CANT,
 )
 from pokerl.training.rollout import RolloutBuffer
 from poke_env.battle import PublicBattleEventKind
@@ -282,7 +286,18 @@ def _consequence_obs(
         "recent_event_kind": np.asarray([event_kind], dtype=np.int64),
         "recent_event_actor": np.asarray([POSITION_OWN_1], dtype=np.int64),
         "recent_event_move": np.asarray([0 if cant else 7], dtype=np.int64),
-        "recent_event_flags": np.zeros((1, 3), dtype=np.float32),
+        "recent_event_source_move": np.zeros(1, dtype=np.int64),
+        "recent_event_move_scope": np.asarray(
+            [0 if cant else MOVE_SCOPE_SCOPED], dtype=np.int64
+        ),
+        "recent_event_flags": np.zeros((1, NUM_PUBLIC_EVENT_FLAGS), dtype=np.float32),
+        "recent_event_target_outcomes": np.zeros(
+            (1, NUM_PUBLIC_TARGET_POSITIONS, NUM_TARGET_OUTCOME_FEATURES),
+            dtype=np.float32,
+        ),
+        "recent_event_target_activation_move": np.zeros(
+            (1, NUM_PUBLIC_TARGET_POSITIONS), dtype=np.int64
+        ),
         "recent_event_mask": np.asarray([False]),
         "prev_own_valid": np.asarray([True, False]),
         "prev_own_kind": np.asarray([INTENT_MOVE, 0], dtype=np.int64),
@@ -355,14 +370,18 @@ def test_public_consequences_align_next_and_terminal_observations_through_last_s
     )
     batch = buffer.compute_gae(torch.zeros(1))
 
-    assert batch.public_consequence_resolution_labels[:, 0, 0].tolist() == [
-        PUBLIC_CONSEQUENCE_EXECUTED,
-        PUBLIC_CONSEQUENCE_CANT,
+    assert batch.public_consequence_move_emitted_targets[:, 0, 0].tolist() == [
+        1.0,
+        0.0,
     ]
-    assert batch.public_consequence_resolution_masks[:, 0, 0].tolist() == [
+    assert batch.public_consequence_move_emitted_masks[:, 0, 0].tolist() == [
         True,
         True,
     ]
+    assert batch.public_consequence_move_branch_labels[0, 0, 0] == MOVE_BRANCH_SCOPED
+    assert batch.public_consequence_nonmove_reason_labels[1, 0, 0] == (
+        NONMOVE_REASON_CANT
+    )
     assert batch.public_consequence_field_targets[:, 0, 0, 0].tolist() == [
         10.0,
         20.0,

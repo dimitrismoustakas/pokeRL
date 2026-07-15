@@ -35,6 +35,32 @@ def test_checked_in_team_pool_manifest_loads() -> None:
     assert pool.size == 77
 
 
+def test_heldout_team_pool_is_evaluation_only() -> None:
+    manifest_path = Path("data/team_pools/gen9vgc2026regf_heldout/manifest.json")
+
+    with pytest.raises(ValueError, match="evaluation-only"):
+        load_team_pool(manifest_path, subset="pool", seed=0)
+
+    heldout = load_team_pool(
+        manifest_path,
+        subset="pool",
+        seed=0,
+        usage="evaluation",
+    )
+    assert heldout.size == 11
+
+
+def test_team_pool_training_metadata_fails_closed(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        '{"format":"test","purpose":"evaluation_only","pool":[]}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="boolean allow_training"):
+        load_team_pool(manifest_path)
+
+
 def test_team_pool_rng_state_and_population_signature_roundtrip() -> None:
     entries = [
         TeamPoolEntry(title="A", file="a", packed_team="a-packed"),

@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 import random
 from types import SimpleNamespace
@@ -7,11 +8,16 @@ import pytest
 import scripts.train as train_module
 from pokerl.config import EnvConfig, TrainingConfig
 from pokerl.training.league import League, LeagueMember
+from pokerl.training.phase import FrozenMixtureSampler, MixtureWeight, PhaseRunState
 from scripts.train import (
+    FrozenPhaseOpponentSource,
     _league_state_path_for_resume,
+    _maintain_best_response_after_update,
     _maintain_league_after_update,
+    _phase_state_path_for_resume,
     _record_opponent_outcome,
     _restore_opponent_assignments,
+    _save_best_response_training_state,
     _sample_refresh_assignments,
     _serialize_opponent_assignments,
     _summarize_opponent_outcomes,
@@ -30,7 +36,19 @@ def _league_state_stub(
     league.config = config
     league.checkpoints = list(paths)
     league._members = {
-        path: LeagueMember(path=path, step=index, created_update=index)
+        path: LeagueMember(
+            path=path,
+            checkpoint_sha256=hashlib.sha256(
+                (
+                    Path(path).read_bytes()
+                    if Path(path).is_file()
+                    else path.encode("utf-8")
+                )
+            ).hexdigest(),
+            archive_source="self_play_snapshot",
+            step=index,
+            created_update=index,
+        )
         for index, path in enumerate(paths)
     }
     league._current_update = len(paths)
@@ -71,6 +89,54 @@ def test_sample_refresh_assignments_groups_by_opponent_group() -> None:
         (envs[2], "step_a.pt"),
         (envs[3], "step_b.pt"),
     ]
+
+
+def test_frozen_refresh_sampler_never_falls_back_to_adaptive_league() -> None:
+    envs = [
+        SimpleNamespace(config=SimpleNamespace(opponent_group=0)),
+        SimpleNamespace(config=SimpleNamespace(opponent_group=1)),
+    ]
+    parallel_env = SimpleNamespace(envs=envs)
+    league = SimpleNamespace(
+        sample_checkpoint_paths=lambda count: pytest.fail(
+            f"adaptive league sampled {count} target(s)"
+        )
+    )
+    draws: list[int] = []
+
+    assignments = _sample_refresh_assignments(
+        parallel_env,
+        league,
+        lambda count: draws.append(count) or ["pinned-a.pt", "pinned-b.pt"],
+    )
+
+    assert draws == [2]
+    assert assignments == [
+        (envs[0], "pinned-a.pt"),
+        (envs[1], "pinned-b.pt"),
+    ]
+
+
+def test_frozen_phase_opponent_source_maps_only_exact_mixture_support() -> None:
+    sampler = FrozenMixtureSampler(
+        [MixtureWeight("main-a", 0.5), MixtureWeight("main-b", 0.5)],
+        seed=7,
+    )
+    source = FrozenPhaseOpponentSource(
+        sampler=sampler,
+        checkpoint_by_policy_id={
+            "main-a": "a.pt",
+            "main-b": "b.pt",
+        },
+    )
+
+    assert set(source.sample_checkpoint_paths(20)) == {"a.pt", "b.pt"}
+    assert sampler.draw_count == 20
+    with pytest.raises(ValueError, match="exactly match"):
+        FrozenPhaseOpponentSource(
+            sampler=sampler,
+            checkpoint_by_policy_id={"main-a": "a.pt"},
+        )
 
 
 def test_make_envs_groups_initial_opponent_checkpoints(monkeypatch) -> None:
@@ -267,6 +333,44 @@ def test_refresh_cadence_is_independent_of_snapshot_cadence() -> None:
     assert events == ["sample", "stage:existing.pt"]
     assert maintenance.checkpoint_added is False
     assert maintenance.assignments_by_group == {0: "existing.pt"}
+
+
+def test_best_response_maintenance_only_refreshes_from_pinned_sampler() -> None:
+    events: list[str] = []
+
+    class FrozenLeague:
+        def sample_checkpoint_paths(self, _count: int) -> list[str]:
+            pytest.fail("best-response maintenance must not call adaptive PFSP")
+
+        def add_checkpoint(self, *_args, **_kwargs) -> None:
+            pytest.fail("best-response learner must not snapshot itself")
+
+        def record_outcomes(self, *_args, **_kwargs) -> None:
+            pytest.fail("best-response target payoffs must not adapt")
+
+    class FakeEnv:
+        config = SimpleNamespace(opponent_group=0)
+
+        def stage_next_opponent_checkpoint(self, checkpoint_path: str) -> bool:
+            events.append(f"stage:{checkpoint_path}")
+            return True
+
+    def sample_pinned(count: int) -> list[str]:
+        events.append(f"sample:{count}")
+        return ["pinned.pt"] * count
+
+    maintenance = _maintain_best_response_after_update(
+        update=2,
+        num_updates=10,
+        parallel_env=SimpleNamespace(envs=[FakeEnv()]),
+        league=FrozenLeague(),
+        config=SimpleNamespace(league_refresh_interval=2),
+        checkpoint_sampler=sample_pinned,
+    )
+
+    assert events == ["sample:1", "stage:pinned.pt"]
+    assert maintenance.checkpoint_added is False
+    assert maintenance.assignments_by_group == {0: "pinned.pt"}
 
 
 def test_opponent_outcomes_include_draws_unknown_paths_and_totals() -> None:
@@ -527,6 +631,210 @@ def test_league_state_path_for_resume_is_paired_with_exact_checkpoint() -> None:
     assert _league_state_path_for_resume(resume_path) == Path(resume_path).with_suffix(
         ".league_state.json"
     )
+
+
+def test_best_response_state_pairs_phase_hash_sampler_and_trainer_id(tmp_path) -> None:
+    checkpoint_path = tmp_path / "step_123.pt"
+    target_path = str((tmp_path / "target.pt").resolve())
+    sampler = FrozenMixtureSampler([MixtureWeight("main", 1.0)], seed=11)
+    sampler.sample_policy_ids(5)
+    team_rng = random.Random(17).getstate()
+    team_pool = SimpleNamespace(
+        signature=lambda: "3" * 64,
+        rng_state=lambda: team_rng,
+    )
+    league = SimpleNamespace(checkpoints=[target_path])
+
+    _save_best_response_training_state(
+        checkpoint_path=str(checkpoint_path),
+        phase=SimpleNamespace(
+            phase_hash="1" * 64,
+            target_population_revision_id="2" * 64,
+        ),
+        sampler=sampler,
+        team_pool=team_pool,
+        training_state_id="trainer-id",
+        completed_updates=9,
+        opponent_assignments={0: target_path},
+        league=league,
+    )
+
+    state_path = _phase_state_path_for_resume(str(checkpoint_path))
+    state = PhaseRunState.load(state_path)
+    assert state.phase_hash == "1" * 64
+    assert state.target_population_revision_id == "2" * 64
+    assert state.training_state_id == "trainer-id"
+    assert state.completed_updates == 9
+    assert state.sampler_state["draw_count"] == 5
+    assert state.team_pool_signature == "3" * 64
+    assert state.opponent_assignments == ((0, target_path),)
+    assert not _league_state_path_for_resume(str(checkpoint_path)).exists()
+
+
+def test_frozen_population_mode_disables_every_adaptive_archive_operation(
+    tmp_path,
+) -> None:
+    checkpoint_paths = [tmp_path / "a.pt", tmp_path / "b.pt"]
+    for checkpoint_path in checkpoint_paths:
+        checkpoint_path.touch()
+    league = object.__new__(League)
+    league.config = TrainingConfig()
+    league.checkpoints = []
+    league._members = {}
+    league._current_update = 0
+    league._frozen_population = False
+    league._inference = SimpleNamespace(
+        cache_info=lambda: {"resident_models": 0},
+    )
+
+    league.install_frozen_population([str(path) for path in checkpoint_paths])
+
+    assert league.checkpoints == [str(path.resolve()) for path in checkpoint_paths]
+    assert league.describe(include_members=True)["mode"] == (
+        "frozen_population_inference"
+    )
+    with pytest.raises(RuntimeError, match="add a checkpoint"):
+        league.add_checkpoint(object(), step=1)
+    with pytest.raises(RuntimeError, match="record outcomes"):
+        league.record_outcomes({}, update=1)
+    with pytest.raises(RuntimeError, match="PFSP-sample"):
+        league.sample_checkpoint_paths(1)
+    with pytest.raises(RuntimeError, match="save adaptive league state"):
+        league.save_state(str(tmp_path / "league.json"))
+    with pytest.raises(RuntimeError, match="add an admitted checkpoint"):
+        league.add_admitted_checkpoint(
+            checkpoint_paths[0],
+            hashlib.sha256(checkpoint_paths[0].read_bytes()).hexdigest(),
+            step=1,
+        )
+
+
+def test_admitted_checkpoint_joins_adaptive_pfsp_and_exact_state(
+    tmp_path,
+) -> None:
+    snapshot_path = tmp_path / "snapshot.pt"
+    snapshot_path.write_bytes(b"main snapshot")
+    admitted_path = tmp_path / "exploiter.pt"
+    admitted_path.write_bytes(b"evaluated exploiter")
+    admitted_sha256 = hashlib.sha256(admitted_path.read_bytes()).hexdigest()
+    config = TrainingConfig(league_size=1)
+    league = _league_state_stub(
+        [str(snapshot_path)],
+        config=config,
+        seed=37,
+    )
+
+    canonical_path = league.add_admitted_checkpoint(
+        admitted_path,
+        admitted_sha256,
+        step=91,
+        update=2,
+    )
+
+    assert canonical_path == str(admitted_path.resolve())
+    assert league.checkpoints == [str(snapshot_path), canonical_path]
+    member = league._members[canonical_path]
+    assert member.checkpoint_sha256 == admitted_sha256
+    assert member.archive_source == "admitted_external"
+    assert member.created_update == 2
+    neutral_rows = {
+        row["checkpoint_path"]: row for row in league.sampling_distribution(update=2)
+    }
+    assert neutral_rows[canonical_path]["first_draw_probability"] == pytest.approx(0.5)
+    assert neutral_rows[canonical_path]["checkpoint_sha256"] == admitted_sha256
+    assert neutral_rows[canonical_path]["archive_source"] == "admitted_external"
+
+    league.record_outcomes(
+        {canonical_path: {"wins": 0, "losses": 20, "draws": 0}},
+        update=3,
+    )
+    rows = {
+        row["checkpoint_path"]: row for row in league.sampling_distribution(update=3)
+    }
+    assert (
+        rows[canonical_path]["current_policy_win_probability"]
+        < rows[str(snapshot_path)]["current_policy_win_probability"]
+    )
+    assert (
+        rows[canonical_path]["first_draw_probability"]
+        > rows[str(snapshot_path)]["first_draw_probability"]
+    )
+
+    state_path = tmp_path / "main.league_state.json"
+    league.save_state(str(state_path), extra_state={"marker": "exact"})
+    restored = _league_state_stub([], config=config, seed=999)
+    extra_state = restored.load_state(str(state_path))
+
+    assert extra_state == {"marker": "exact"}
+    assert restored.checkpoints == league.checkpoints
+    assert restored._members[canonical_path] == member
+    assert restored.current_update == 3
+    # The permanent archive may exceed the bounded resident inference cache.
+    assert len(restored.checkpoints) == 2
+    assert restored.config.league_size == 1
+
+
+def test_admitted_checkpoint_rejects_hash_and_duplicate_identity(
+    tmp_path,
+) -> None:
+    first_path = tmp_path / "first.pt"
+    first_path.write_bytes(b"same immutable bytes")
+    alias_path = tmp_path / "second.pt"
+    alias_path.write_bytes(first_path.read_bytes())
+    checkpoint_sha256 = hashlib.sha256(first_path.read_bytes()).hexdigest()
+    league = _league_state_stub([], config=TrainingConfig(), seed=7)
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        league.add_admitted_checkpoint(
+            tmp_path / "missing.pt",
+            checkpoint_sha256,
+            step=1,
+        )
+    with pytest.raises(ValueError, match="hash mismatch"):
+        league.add_admitted_checkpoint(
+            first_path,
+            "0" * 64,
+            step=1,
+        )
+    assert league.checkpoints == []
+
+    canonical_path = league.add_admitted_checkpoint(
+        first_path,
+        checkpoint_sha256,
+        step=1,
+    )
+    with pytest.raises(ValueError, match="already contains admitted checkpoint path"):
+        league.add_admitted_checkpoint(
+            first_path.parent / "." / first_path.name,
+            checkpoint_sha256,
+            step=2,
+        )
+    with pytest.raises(ValueError, match="already contains checkpoint bytes"):
+        league.add_admitted_checkpoint(
+            alias_path,
+            checkpoint_sha256,
+            step=2,
+        )
+    assert league.checkpoints == [canonical_path]
+
+
+def test_league_state_rejects_mutated_checkpoint_bytes(tmp_path) -> None:
+    checkpoint_path = tmp_path / "admitted.pt"
+    checkpoint_path.write_bytes(b"admitted bytes")
+    checkpoint_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+    source = _league_state_stub([], config=TrainingConfig(), seed=37)
+    source.add_admitted_checkpoint(
+        checkpoint_path,
+        checkpoint_sha256,
+        step=4,
+    )
+    state_path = tmp_path / "main.league_state.json"
+    source.save_state(str(state_path))
+    checkpoint_path.write_bytes(b"silently replaced bytes")
+    target = _league_state_stub([], config=TrainingConfig(), seed=999)
+
+    with pytest.raises(ValueError, match="exact saved league checkpoint bytes"):
+        target.load_state(str(state_path))
 
 
 def test_league_state_roundtrips_membership_rng_and_extra_state(tmp_path) -> None:

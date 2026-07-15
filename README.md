@@ -44,8 +44,8 @@ $env:POKERL_SHOWDOWN_DIR = "C:\path\to\pokemon-showdown"
 
 Training logs include rollout time, PPO update time, completed episodes,
 average completed battle duration/turns, preview PPO KL and clipping, league
-payoff coverage, resolution/CANT calibration, and public-field transition
-MSE/support. Those consequence labels come only from exact public protocol
+payoff coverage, and conditional emitted/branch/route/interaction/CANT/field
+calibration. Those consequence labels come only from exact public protocol
 transitions; they do not change the sparse terminal win/loss reward.
 
 `--resume` accepts only versioned trainer checkpoints produced by the exact same model class, configuration, categorical vocabulary, and tensor schema. Trainer checkpoints and their uniquely paired league-state files are atomically replaced and cross-checked; together they restore Adam, global step, the exact completed-update boundary, Python/NumPy/PyTorch RNG, league sampling, and team-pool sampling. Lightweight league snapshots are evaluation/opponent artifacts and cannot resume training.
@@ -61,13 +61,41 @@ sample both trained policies on a pre-planned schedule and mirror every team
 pair across the two player roles:
 
 ```powershell
-& .\.venv\Scripts\python.exe .\scripts\evaluate_anchor.py --checkpoint checkpoints\current.pt --anchor checkpoints\anchor.pt --games 64 --action-mode sample --summary-path logs\anchor_eval.json
+& .\.venv\Scripts\python.exe .\scripts\evaluate_anchor.py --checkpoint checkpoints\current.pt --checkpoint-policy-id main-12 --anchor checkpoints\anchor.pt --anchor-policy-id main-11 --games 64 --action-mode sample --summary-path logs\main-12-v-main-11.json
 ```
 
 `--games` is the number per role, so this command runs 128 battles. Use
 `--action-mode argmax` only as a separate deterministic diagnostic; the same
 mode is applied to both checkpoints. Results separate wins/losses/draws, include
-95% intervals, and retain per-game teams and preview choices.
+95% intervals, and retain per-game teams and preview choices. The summary also
+pins both checkpoint SHA-256 digests, battle format, team-pool and categorical
+vocabulary signatures, and a hash of the mirrored role/team schedule. Summary
+files are immutable: choose a new path rather than overwriting completed
+evidence.
+
+Sampled mirrored summaries can close an empirical population row. Write each
+new member as the exact JSON returned by `PolicyMember.to_dict()`, with its
+checkpoint path interpreted relative to that member file, then build a child:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\build_population_revision.py --parent populations\revision-3.json --member-spec populations\main-exploiter-4.member.json --evidence logs\main-exploiter-4-v-main-1.json --evidence logs\main-exploiter-4-v-main-2.json --evidence logs\main-exploiter-4-v-main-3.json --output populations\revision-4.json
+```
+
+The builder verifies the summary bytes, checkpoint bytes, both role schedules,
+W/L/D aggregation, and all signatures. It inherits already-verified parent
+pairs and writes nothing unless the child has exactly one evidence artifact for
+every unordered policy pair. Greedy (`argmax`) diagnostics are rejected for
+training meta-games. There is deliberately no win-rate admission threshold or
+reward shaping: a trained oracle enters the finite game only after its complete
+frozen cross-play row exists.
+
+After an external controller has verified that child revision and selected the
+member to expose to the adaptive main learner, `League.add_admitted_checkpoint`
+installs its exact checkpoint bytes as a permanent, neutral-prior PFSP member.
+The league then updates its difficulty estimate from ordinary on-policy results
+against the changing main policy. This last installation is deliberately an
+explicit update-boundary operation; the repository does not silently admit a
+checkpoint merely because a best-response training phase finished.
 
 For an absolute fixed-bot diagnostic with action, Tera, and team-preview
 telemetry:
@@ -83,9 +111,15 @@ roster, exactly enumerate all 180 legal bring/lead choices:
 & .\.venv\Scripts\python.exe .\scripts\evaluate_preview_policy.py --checkpoint checkpoints\current.pt --summary-path logs\preview_eval.json
 ```
 
-The default Regulation F manifest currently contains only teams used for
-training. Treat those results as in-distribution until a separate evaluation
-population is supplied with `--team-pool-manifest`.
+The default Regulation F manifest contains only teams used for training. An
+eleven-team tournament-derived panel is checked in separately at
+`data/team_pools/gen9vgc2026regf_heldout/manifest.json`; it covers hyper
+offense, balance, control, and several forms of Trick Room. Pass that manifest
+with `--team-pool-manifest` to any evaluation command. Its metadata marks it
+evaluation-only, and the training loader rejects it rather than silently
+leaking held-out teams into rollout or PFSP. It is a development validation
+panel once results have informed design choices, not a permanently sealed test
+set.
 
 To tune how many frozen opponents are shared across the env batch:
 

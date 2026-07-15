@@ -131,6 +131,53 @@ def test_trainer_checkpoint_roundtrips(tmp_path) -> None:
         )
 
 
+def test_weight_only_initializer_loads_exact_model_with_fresh_training_state(
+    tmp_path,
+) -> None:
+    source = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    loss = source.agent.linear(torch.tensor([[0.5, -1.0]])).square().sum()
+    assert source._apply_update_step(loss)
+    source.global_step = 1234
+    source.completed_updates = 19
+    expected_agent = copy.deepcopy(source.agent.state_dict())
+    checkpoint_path = tmp_path / "source.pt"
+    source.save(str(checkpoint_path), training_state_id="source-state")
+
+    target = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    random.seed(101)
+    np.random.seed(202)
+    torch.manual_seed(303)
+    target.initialize_from_trainer_weights(str(checkpoint_path))
+    actual_random = [random.random() for _ in range(3)]
+    actual_numpy = np.random.random(3)
+    actual_torch = torch.rand(3)
+
+    random.seed(101)
+    np.random.seed(202)
+    torch.manual_seed(303)
+    assert actual_random == [random.random() for _ in range(3)]
+    np.testing.assert_array_equal(actual_numpy, np.random.random(3))
+    torch.testing.assert_close(actual_torch, torch.rand(3), rtol=0.0, atol=0.0)
+    _assert_nested_equal(target.agent.state_dict(), expected_agent)
+    assert target.optimizer.state_dict()["state"] == {}
+    assert target.global_step == 0
+    assert target.completed_updates == 0
+    assert target.loaded_training_state_id is None
+    assert target.initialized_from_training_state_id == "source-state"
+
+
+def test_weight_only_initializer_rejects_league_checkpoint(tmp_path) -> None:
+    target = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    checkpoint_path = tmp_path / "league.pt"
+    torch.save(
+        {"checkpoint_type": "league", "agent": target.agent.state_dict()},
+        checkpoint_path,
+    )
+
+    with pytest.raises(ValueError, match="versioned trainer checkpoint"):
+        target.initialize_from_trainer_weights(str(checkpoint_path))
+
+
 def test_trainer_load_rejects_legacy_trainer_checkpoint_without_version(
     tmp_path,
 ) -> None:
@@ -287,11 +334,23 @@ def test_league_sampling_uses_its_own_reproducible_rng() -> None:
     left.checkpoints = [f"step_{index}.pt" for index in range(12)]
     right.checkpoints = list(left.checkpoints)
     left._members = {
-        path: LeagueMember(path=path, step=index, created_update=0)
+        path: LeagueMember(
+            path=path,
+            checkpoint_sha256=f"{index:064x}",
+            archive_source="self_play_snapshot",
+            step=index,
+            created_update=0,
+        )
         for index, path in enumerate(left.checkpoints)
     }
     right._members = {
-        path: LeagueMember(path=path, step=index, created_update=0)
+        path: LeagueMember(
+            path=path,
+            checkpoint_sha256=f"{index:064x}",
+            archive_source="self_play_snapshot",
+            step=index,
+            created_update=0,
+        )
         for index, path in enumerate(right.checkpoints)
     }
     left._current_update = 0

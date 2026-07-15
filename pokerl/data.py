@@ -13,6 +13,27 @@ from poke_env.data import GenData
 
 UNKNOWN_IDX = 0  # reserved for unknown / unobserved
 
+MOVE_SCOPE_UNKNOWN = 0
+MOVE_SCOPE_SCOPED = 1
+MOVE_SCOPE_TARGETED = 2
+NUM_MOVE_SCOPES = 3
+
+_SCOPED_MOVE_TARGETS = frozenset(
+    {"self", "allyside", "allies", "allyteam", "foeside", "all", "scripted"}
+)
+_TARGETED_MOVE_TARGETS = frozenset(
+    {
+        "normal",
+        "adjacentfoe",
+        "any",
+        "randomnormal",
+        "adjacentally",
+        "adjacentallyorself",
+        "alladjacentfoes",
+        "alladjacent",
+    }
+)
+
 
 class GameData:
     """Builds vocab mappings and stat tables from poke-env's gen data."""
@@ -25,10 +46,13 @@ class GameData:
         self.species_to_idx = self._build_vocab(data.pokedex.keys())
         self.move_to_idx = self._build_vocab(data.moves.keys())
         self.abilities_to_idx = self._build_vocab(
-            a for pokemon in data.pokedex.values()
+            a
+            for pokemon in data.pokedex.values()
             for a in (pokemon.get("abilities") or {}).values()
         )
-        self.item_to_idx = self._build_vocab(self._known_item_ids(data.pokedex.values(), gen))
+        self.item_to_idx = self._build_vocab(
+            self._known_item_ids(data.pokedex.values(), gen)
+        )
         self.type_to_idx = self._build_vocab(data.type_chart.keys())
         self._item_vocab_size = max(item_vocab_size, len(self.item_to_idx))
         self._item_hash_offset = len(self.item_to_idx)
@@ -101,7 +125,11 @@ class GameData:
                 continue
             entry = self._moves.get(move_id, {})
             mat[idx, 0] = (entry.get("basePower", 0) or 0) / 250.0
-            mat[idx, 1] = (entry.get("accuracy", 100) or 100) / 100.0
+            # Showdown represents moves which bypass the accuracy check with
+            # the boolean ``true``.  Python's ``bool`` is an ``int`` subclass,
+            # so dividing it by 100 silently encoded always-hit moves as 0.01.
+            accuracy = entry.get("accuracy", 100)
+            mat[idx, 1] = 1.0 if accuracy is True else (accuracy or 100) / 100.0
             mat[idx, 2] = (entry.get("pp", 0) or 0) / 64.0
         return mat
 
@@ -126,7 +154,9 @@ class GameData:
         for move_id, idx in self.move_to_idx.items():
             if idx == UNKNOWN_IDX:
                 continue
-            category = str(self._moves.get(move_id, {}).get("category", "Status")).lower()
+            category = str(
+                self._moves.get(move_id, {}).get("category", "Status")
+            ).lower()
             indices[idx] = category_to_idx.get(category, 0)
         return indices
 
@@ -138,6 +168,57 @@ class GameData:
                 continue
             priority = float(self._moves.get(move_id, {}).get("priority", 0) or 0)
             values[idx] = np.clip(priority / 7.0, -1.0, 1.0)
+        return values
+
+    def move_bypasses_accuracy_vector(self) -> np.ndarray:
+        """Return whether each move bypasses accuracy/evasion checks.
+
+        Showdown represents this mechanic with boolean ``true``. Numeric 100
+        remains subject to accuracy and evasion stages, so the two cases need
+        distinct model features even though both have base accuracy 1.0.
+        """
+
+        values = np.zeros(self.num_moves, dtype=np.float32)
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            values[idx] = float(self._moves.get(move_id, {}).get("accuracy") is True)
+        return values
+
+    def move_ignores_evasion_vector(self) -> np.ndarray:
+        """Return whether each move ignores only the target's evasion stage."""
+
+        values = np.zeros(self.num_moves, dtype=np.float32)
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            values[idx] = float(
+                bool(self._moves.get(move_id, {}).get("ignoreEvasion", False))
+            )
+        return values
+
+    def move_target_scope_vector(self) -> np.ndarray:
+        """Classify whether a move resolves at public targets or at a scope."""
+
+        values = np.full(self.num_moves, MOVE_SCOPE_UNKNOWN, dtype=np.int64)
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            target = str(self._moves.get(move_id, {}).get("target", "")).lower()
+            if target in _SCOPED_MOVE_TARGETS:
+                values[idx] = MOVE_SCOPE_SCOPED
+            elif target in _TARGETED_MOVE_TARGETS:
+                values[idx] = MOVE_SCOPE_TARGETED
+        return values
+
+    def move_multihit_vector(self) -> np.ndarray:
+        """Return whether each move can emit a public multi-hit count."""
+
+        values = np.zeros(self.num_moves, dtype=np.float32)
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            values[idx] = float(bool(self._moves.get(move_id, {}).get("multihit")))
         return values
 
     def move_target_flags(self) -> np.ndarray:
@@ -285,7 +366,9 @@ class GameData:
         if env_override:
             path = Path(env_override)
             if not path.exists():
-                raise RuntimeError(f"POKERL_SHOWDOWN_ITEM_EXPORT points to a missing file: {path}")
+                raise RuntimeError(
+                    f"POKERL_SHOWDOWN_ITEM_EXPORT points to a missing file: {path}"
+                )
             return path
 
         local_appdata = os.environ.get("LOCALAPPDATA")

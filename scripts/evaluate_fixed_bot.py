@@ -187,6 +187,7 @@ def main() -> None:
         manifest_path,
         subset=args.team_pool_subset,
         seed=args.team_pool_seed,
+        usage="evaluation",
     )
     if args.model_team_title:
         model_team_spec = select_team_spec_by_title(

@@ -921,7 +921,6 @@ class BattleEnv:
         self._pending_player_request_id: int | None = None
 
         try:
-            obs_builder = ObservationBuilder(game_data, config.team_size)
             player_options = dict(player_kwargs or {})
             reserved_player_keys = {"battle_format", "loop", "server_configuration"}
             unexpected_keys = reserved_player_keys.intersection(player_options)
@@ -930,6 +929,7 @@ class BattleEnv:
                 raise ValueError(
                     f"BattleEnv manages {bad_keys}; do not pass them via player_kwargs."
                 )
+            obs_builder = ObservationBuilder(game_data, config.team_size)
             player_options.setdefault(
                 "account_configuration",
                 make_local_account_configuration("agent"),

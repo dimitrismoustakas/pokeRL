@@ -3,6 +3,13 @@
 import torch
 import torch.nn as nn
 
+from ..data import NUM_MOVE_SCOPES
+from ..env.observation import (
+    NUM_PUBLIC_EVENT_FLAGS,
+    NUM_PUBLIC_TARGET_POSITIONS,
+    NUM_TARGET_OUTCOME_FEATURES,
+)
+
 
 class PokemonEncoder(nn.Module):
     """Encodes a single pokemon's features into a fixed-size representation.
@@ -159,11 +166,25 @@ class RecentEventEncoder(nn.Module):
         self.kind_emb = nn.Embedding(num_event_kinds, 8, padding_idx=0)
         self.position_emb = nn.Embedding(num_positions, 8, padding_idx=0)
         self.move_emb = nn.Embedding(num_moves, 16, padding_idx=0)
+        self.move_scope_emb = nn.Embedding(NUM_MOVE_SCOPES, 4, padding_idx=0)
         self.species_emb = nn.Embedding(num_species, 16, padding_idx=0)
         self.type_emb = nn.Embedding(num_types, 8, padding_idx=0)
         self.intent_kind_emb = nn.Embedding(num_intent_kinds, 8, padding_idx=0)
         self.event_projection = nn.Sequential(
-            nn.Linear(8 + 8 + 8 + 16 + 16 + 8 + 3, 64),
+            nn.Linear(
+                8
+                + 8
+                + 8
+                + 16
+                + 16
+                + 4
+                + 16
+                + 8
+                + NUM_PUBLIC_EVENT_FLAGS
+                + NUM_PUBLIC_TARGET_POSITIONS * NUM_TARGET_OUTCOME_FEATURES
+                + NUM_PUBLIC_TARGET_POSITIONS * 16,
+                64,
+            ),
             nn.ReLU(),
         )
         self.event_memory = nn.GRU(64, 64, batch_first=True)
@@ -182,15 +203,47 @@ class RecentEventEncoder(nn.Module):
         if "recent_event_kind" not in obs:
             return reference.new_zeros((batch_size, self.out_dim))
 
+        source_moves = obs.get("recent_event_source_move")
+        if source_moves is None:
+            source_moves = torch.zeros_like(obs["recent_event_move"])
+        move_scopes = obs.get("recent_event_move_scope")
+        if move_scopes is None:
+            move_scopes = torch.zeros_like(obs["recent_event_move"])
+        activation_moves = obs.get("recent_event_target_activation_move")
+        if activation_moves is None:
+            activation_moves = torch.zeros(
+                (
+                    batch_size,
+                    obs["recent_event_kind"].shape[1],
+                    NUM_PUBLIC_TARGET_POSITIONS,
+                ),
+                dtype=torch.long,
+                device=reference.device,
+            )
+        target_outcomes = obs.get("recent_event_target_outcomes")
+        if target_outcomes is None:
+            target_outcomes = reference.new_zeros(
+                (
+                    batch_size,
+                    obs["recent_event_kind"].shape[1],
+                    NUM_PUBLIC_TARGET_POSITIONS,
+                    NUM_TARGET_OUTCOME_FEATURES,
+                )
+            )
+
         event_tokens = torch.cat(
             [
                 self.kind_emb(obs["recent_event_kind"]),
                 self.position_emb(obs["recent_event_actor"]),
                 self.position_emb(obs["recent_event_target"]),
                 self.move_emb(obs["recent_event_move"]),
+                self.move_emb(source_moves),
+                self.move_scope_emb(move_scopes),
                 self.species_emb(obs["recent_event_species"]),
                 self.type_emb(obs["recent_event_tera_type"]),
                 obs["recent_event_flags"],
+                target_outcomes.flatten(start_dim=-2),
+                self.move_emb(activation_moves).flatten(start_dim=-2),
             ],
             dim=-1,
         )

@@ -1,11 +1,13 @@
 """Action head (autoregressive for doubles) and value head."""
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..data import MOVE_SCOPE_SCOPED, MOVE_SCOPE_TARGETED
 from ..env.actions import (
     ACTIONS_PER_SLOT,
     FIRST_SLOT_MASK_ROW,
@@ -14,13 +16,22 @@ from ..env.actions import (
     NUM_MOVES,
     NUM_TARGETS,
     NUM_TERA_CHOICES,
+    SWITCH_OFFSET,
     TARGET_NONE,
     TERA_NONE,
     decode_action,
 )
-from ..env.observation import TERASTALLIZED_OFFSET
+from ..env.observation import (
+    BOOSTS_OFFSET,
+    NUM_PUBLIC_TARGET_POSITIONS,
+    TERASTALLIZED_OFFSET,
+)
 from ..public_consequence import (
-    NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+    MAX_PUBLIC_HIT_COUNT,
+    MOVE_BRANCH_TARGET_PHASE,
+    NUM_MOVE_BRANCHES,
+    NUM_NONMOVE_REASONS,
+    NUM_TARGET_INTERACTION_REASONS,
     PUBLIC_CONSEQUENCE_FIELD_DIM,
 )
 
@@ -47,6 +58,15 @@ def _sample_categorical_logits(
             "External categorical exponentials must exactly match the logits."
         )
     return (sample_logits - exponential.log()).argmax(dim=1)
+
+
+class _PublicConsequenceState(NamedTuple):
+    """Inputs retained only long enough to decode the selected action."""
+
+    score_hidden: torch.Tensor
+    public_target_reps: torch.Tensor
+    target_mechanics: torch.Tensor
+    all_logits: dict[str, torch.Tensor] | None
 
 
 class MaskedSetAttention(nn.Module):
@@ -132,8 +152,22 @@ class ActionHead(nn.Module):
     over {no tera, tera slot 0, tera slot 1}.
     """
 
-    _MATCHUP_FEATURE_DIM = 22
+    _MATCHUP_FEATURE_DIM = 27
     _TARGET_FLAG_DIM = 6
+    _TARGET_MECHANICS_DIM = 6
+    # Immediate public target outcomes are a small conditional prediction
+    # problem.  Keeping their latent narrower than the policy candidate state
+    # avoids expanding every move/target pair to the full action-head width.
+    _MAX_TARGET_CONSEQUENCE_LATENT_DIM = 64
+    _PUBLIC_CONSEQUENCE_ADAPTER_DIM = (
+        1
+        + NUM_NONMOVE_REASONS
+        + NUM_MOVE_BRANCHES
+        + NUM_PUBLIC_TARGET_POSITIONS
+        * (2 + NUM_TARGET_INTERACTION_REASONS + MAX_PUBLIC_HIT_COUNT)
+        + 2
+        + PUBLIC_CONSEQUENCE_FIELD_DIM
+    )
     _INITIAL_TERA_USE_PROB = 0.20
 
     def __init__(
@@ -145,6 +179,10 @@ class ActionHead(nn.Module):
         move_type_lookup: torch.Tensor | None = None,
         move_base_power_lookup: torch.Tensor | None = None,
         move_accuracy_lookup: torch.Tensor | None = None,
+        move_bypasses_accuracy_lookup: torch.Tensor | None = None,
+        move_ignores_evasion_lookup: torch.Tensor | None = None,
+        move_target_scope_lookup: torch.Tensor | None = None,
+        move_multihit_lookup: torch.Tensor | None = None,
         move_priority_lookup: torch.Tensor | None = None,
         move_category_lookup: torch.Tensor | None = None,
         move_target_flags: torch.Tensor | None = None,
@@ -206,17 +244,38 @@ class ActionHead(nn.Module):
         # the only route from these predictions back into the policy logits.
         # Its inputs are detached so actor gradients cannot train the
         # consequence model into a convenient (but ungrounded) latent code.
-        self.public_consequence_head = nn.Linear(
+        self.public_consequence_action_head = nn.Linear(
             hidden_dim,
-            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES
+            1
+            + NUM_NONMOVE_REASONS
+            + NUM_MOVE_BRANCHES
             + 2
             + PUBLIC_CONSEQUENCE_FIELD_DIM,
         )
+        target_consequence_dim = min(
+            hidden_dim, self._MAX_TARGET_CONSEQUENCE_LATENT_DIM
+        )
+        self.public_consequence_target_candidate_proj = nn.Linear(
+            hidden_dim, target_consequence_dim
+        )
+        self.public_consequence_target_entity_proj = nn.Linear(
+            pokemon_dim, target_consequence_dim
+        )
+        self.public_consequence_target_position_emb = nn.Embedding(
+            NUM_PUBLIC_TARGET_POSITIONS,
+            target_consequence_dim,
+        )
+        self.public_consequence_target_mechanics_proj = nn.Sequential(
+            nn.Linear(self._TARGET_MECHANICS_DIM, target_consequence_dim),
+            nn.ReLU(),
+        )
+        self.public_consequence_target_head = nn.Linear(
+            target_consequence_dim,
+            2 + NUM_TARGET_INTERACTION_REASONS + MAX_PUBLIC_HIT_COUNT,
+        )
         self.public_consequence_policy_adapter = nn.Linear(
             hidden_dim,
-            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES
-            + 2
-            + PUBLIC_CONSEQUENCE_FIELD_DIM,
+            self._PUBLIC_CONSEQUENCE_ADAPTER_DIM,
             bias=False,
         )
         nn.init.zeros_(self.public_consequence_policy_adapter.weight)
@@ -259,6 +318,10 @@ class ActionHead(nn.Module):
                 move_type_lookup,
                 move_base_power_lookup,
                 move_accuracy_lookup,
+                move_bypasses_accuracy_lookup,
+                move_ignores_evasion_lookup,
+                move_target_scope_lookup,
+                move_multihit_lookup,
                 move_priority_lookup,
                 move_category_lookup,
                 move_target_flags,
@@ -278,6 +341,26 @@ class ActionHead(nn.Module):
         self.register_buffer(
             "_move_accuracy_lookup",
             self._ensure_float_buffer(move_accuracy_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_bypasses_accuracy_lookup",
+            self._ensure_float_buffer(move_bypasses_accuracy_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_ignores_evasion_lookup",
+            self._ensure_float_buffer(move_ignores_evasion_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_target_scope_lookup",
+            self._ensure_long_buffer(move_target_scope_lookup),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_move_multihit_lookup",
+            self._ensure_float_buffer(move_multihit_lookup),
             persistent=False,
         )
         self.register_buffer(
@@ -362,6 +445,17 @@ class ActionHead(nn.Module):
             batch_size=batch_size,
             device=device,
         )
+        public_target_reps = torch.stack([rep1, rep2, opp1, opp2], dim=1)
+        target_mechanics_1 = self._candidate_public_target_mechanics(
+            matchup_context,
+            actor_slot=0,
+            matchup_features=matchup_features_1,
+        )
+        target_mechanics_2 = self._candidate_public_target_mechanics(
+            matchup_context,
+            actor_slot=1,
+            matchup_features=matchup_features_2,
+        )
 
         base_query1 = self.query1(torch.cat([context, rep1, rep2, opp1, opp2], dim=-1))
         reserve_item_projections = None
@@ -381,7 +475,7 @@ class ActionHead(nn.Module):
                 opp_reserve_mask,
             )
         query1 = self.query1_fuse(torch.cat([base_query1, reserve_summary1], dim=-1))
-        logits1, public_consequence_1 = self._score_actions(
+        logits1, public_consequence_state_1 = self._score_actions(
             query1,
             rep1,
             rep2,
@@ -389,6 +483,8 @@ class ActionHead(nn.Module):
             opp_active_reps,
             matchup_features_1,
             action_features,
+            public_target_reps,
+            target_mechanics_1,
         )
         logits1 = logits1.masked_fill(~mask1, -1e8)
         a1, log_prob1, entropy1 = self._categorical_choice(
@@ -439,7 +535,7 @@ class ActionHead(nn.Module):
                 opp_reserve_mask,
             )
         query2 = self.query2_fuse(torch.cat([base_query2, reserve_summary2], dim=-1))
-        logits2, public_consequence_2 = self._score_actions(
+        logits2, public_consequence_state_2 = self._score_actions(
             query2,
             rep2,
             rep1,
@@ -447,6 +543,8 @@ class ActionHead(nn.Module):
             opp_active_reps,
             matchup_features_2,
             action_features,
+            public_target_reps,
+            target_mechanics_2,
         )
         logits2 = logits2.masked_fill(~mask2, -1e8)
         a2, log_prob2, entropy2 = self._categorical_choice(
@@ -537,9 +635,7 @@ class ActionHead(nn.Module):
                 if greedy
                 else _sample_categorical_logits(
                     tera_sampling_logits,
-                    None
-                    if sampling_exponentials is None
-                    else sampling_exponentials[2],
+                    None if sampling_exponentials is None else sampling_exponentials[2],
                 )
             )
         else:
@@ -579,27 +675,32 @@ class ActionHead(nn.Module):
             result["base_tera_none_prob"] = base_tera_probs[:, TERA_NONE]
             result["base_tera_has_real_choice"] = tera_mask.sum(dim=-1) >= 2
             result["base_tera_has_slot_choice"] = tera_mask[:, 1:].sum(dim=-1) >= 2
-            result["public_consequence_resolution_logits"] = torch.stack(
-                [
-                    public_consequence_1["resolution_logits"][batch_indices, a1],
-                    public_consequence_2["resolution_logits"][batch_indices, a2],
-                ],
-                dim=1,
+            public_consequence_1 = self._selected_public_consequence_logits(
+                public_consequence_state_1,
+                a1,
             )
-            result["public_consequence_cant_logits"] = torch.stack(
-                [
-                    public_consequence_1["cant_logits"][batch_indices, a1],
-                    public_consequence_2["cant_logits"][batch_indices, a2],
-                ],
-                dim=1,
+            public_consequence_2 = self._selected_public_consequence_logits(
+                public_consequence_state_2,
+                a2,
             )
-            result["public_consequence_field_logits"] = torch.stack(
-                [
-                    public_consequence_1["field_logits"][batch_indices, a1],
-                    public_consequence_2["field_logits"][batch_indices, a2],
-                ],
-                dim=1,
-            )
+            for consequence_name in (
+                "move_emitted_logits",
+                "nonmove_reason_logits",
+                "move_branch_logits",
+                "route_logits",
+                "interaction_logits",
+                "interaction_reason_logits",
+                "hit_count_logits",
+                "cant_logits",
+                "field_logits",
+            ):
+                result[f"public_consequence_{consequence_name}"] = torch.stack(
+                    [
+                        public_consequence_1[consequence_name],
+                        public_consequence_2[consequence_name],
+                    ],
+                    dim=1,
+                )
         return result
 
     @staticmethod
@@ -803,7 +904,9 @@ class ActionHead(nn.Module):
         opp_active_reps: torch.Tensor,
         matchup_features: torch.Tensor,
         action_features: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        public_target_reps: torch.Tensor,
+        target_mechanics: torch.Tensor,
+    ) -> tuple[torch.Tensor, _PublicConsequenceState]:
         query_features = query.unsqueeze(1).expand(-1, self.num_actions, -1)
         action_features = action_features.unsqueeze(0).expand(query.shape[0], -1, -1)
         entity_features = self.entity_proj(
@@ -820,48 +923,236 @@ class ActionHead(nn.Module):
         score_hidden = self.score[1](self.score[0](candidate_inputs))
         raw_logits = self.score[2](score_hidden).squeeze(-1)
 
-        consequence_logits = self.public_consequence_head(score_hidden)
-        resolution_logits, cant_logits, field_logits = consequence_logits.split(
+        # Actor gradients never enter the consequence model: the adapter consumes
+        # detached probabilities.  Decode every candidate without autograd for
+        # that policy feature, then (during PPO) recompute only the two selected
+        # candidates below so auxiliary gradients do not build a 27-action graph.
+        recompute_selected = torch.is_grad_enabled()
+        with torch.no_grad():
+            all_consequence_logits = self._all_public_consequence_logits(
+                score_hidden.detach(),
+                public_target_reps.detach(),
+                target_mechanics.detach(),
+            )
+            detached_predictions = self._public_consequence_adapter_predictions(
+                all_consequence_logits,
+                matchup_features.detach(),
+            )
+
+        # Value the grounded outcomes in the current slot context.  A global
+        # scalar valuation could learn that execution is generally preferable
+        # to failure, but could not express that (for example) activating Trick
+        # Room is useful for one matchup and harmful for another.
+        consequence_weights = self.public_consequence_policy_adapter(query).unsqueeze(1)
+        consequence_residual = (consequence_weights * detached_predictions).sum(
+            dim=-1
+        ) / math.sqrt(detached_predictions.shape[-1])
+        consequence_residual = consequence_residual * self._action_is_move.to(
+            dtype=consequence_residual.dtype
+        ).unsqueeze(0)
+        state = _PublicConsequenceState(
+            score_hidden=score_hidden,
+            public_target_reps=public_target_reps,
+            target_mechanics=target_mechanics,
+            # In inference the already decoded tensors are also the selected
+            # output.  PPO needs a gradient-bearing selected recomputation.
+            all_logits=None if recompute_selected else all_consequence_logits,
+        )
+        return raw_logits + consequence_residual, state
+
+    def _public_consequence_action_logits(
+        self,
+        score_hidden: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        action_consequence_logits = self.public_consequence_action_head(score_hidden)
+        (
+            move_emitted_logits,
+            nonmove_reason_logits,
+            move_branch_logits,
+            cant_logits,
+            field_logits,
+        ) = action_consequence_logits.split(
             (
-                NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+                1,
+                NUM_NONMOVE_REASONS,
+                NUM_MOVE_BRANCHES,
                 2,
                 PUBLIC_CONSEQUENCE_FIELD_DIM,
             ),
             dim=-1,
         )
-        detached_predictions = torch.cat(
-            [
-                resolution_logits.softmax(dim=-1),
-                cant_logits.sigmoid(),
-                field_logits.sigmoid(),
-            ],
-            dim=-1,
-        ).detach()
-        # Value the grounded outcomes in the current slot context.  A global
-        # scalar valuation could learn that execution is generally preferable
-        # to failure, but could not express that (for example) activating
-        # Trick Room is useful for one matchup and harmful for another.  The
-        # zero-initialized state-conditioned weights preserve the old logits
-        # exactly at initialization, while the detached predictions still
-        # prevent actor gradients from changing the world model itself.
-        consequence_weights = self.public_consequence_policy_adapter(query).unsqueeze(
-            1
-        )
-        consequence_residual = (
-            consequence_weights * detached_predictions
-        ).sum(dim=-1) / math.sqrt(detached_predictions.shape[-1])
-        # Only moves receive exact public-consequence supervision.  Applying
-        # this adapter to switches or pass would let arbitrary out-of-
-        # distribution predictions influence decisions they were never
-        # trained to describe.
-        consequence_residual = consequence_residual * self._action_is_move.to(
-            dtype=consequence_residual.dtype
-        ).unsqueeze(0)
-        return raw_logits + consequence_residual, {
-            "resolution_logits": resolution_logits,
+        move_emitted_logits = move_emitted_logits.squeeze(-1)
+        return {
+            "move_emitted_logits": move_emitted_logits,
+            "nonmove_reason_logits": nonmove_reason_logits,
+            "move_branch_logits": move_branch_logits,
             "cant_logits": cant_logits,
             "field_logits": field_logits,
         }
+
+    def _public_consequence_target_logits(
+        self,
+        move_score_hidden: torch.Tensor,
+        public_target_reps: torch.Tensor,
+        target_mechanics: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Decode move/target pairs with additive, amortized projections."""
+
+        target_rep_features = self.public_consequence_target_entity_proj(
+            public_target_reps
+        ).unsqueeze(1)
+        target_positions = self.public_consequence_target_position_emb.weight.view(
+            1, 1, NUM_PUBLIC_TARGET_POSITIONS, -1
+        )
+        target_candidate_features = self.public_consequence_target_candidate_proj(
+            move_score_hidden
+        ).unsqueeze(2)
+        target_mechanics_features = self.public_consequence_target_mechanics_proj(
+            target_mechanics
+        )
+        target_hidden = F.relu(
+            target_candidate_features
+            + target_rep_features
+            + target_positions
+            + target_mechanics_features
+        )
+        target_consequence_logits = self.public_consequence_target_head(target_hidden)
+        (
+            route_logits,
+            interaction_logits,
+            interaction_reason_logits,
+            hit_count_logits,
+        ) = target_consequence_logits.split(
+            (1, 1, NUM_TARGET_INTERACTION_REASONS, MAX_PUBLIC_HIT_COUNT),
+            dim=-1,
+        )
+        route_logits = route_logits.squeeze(-1)
+        interaction_logits = interaction_logits.squeeze(-1)
+        return {
+            "route_logits": route_logits,
+            "interaction_logits": interaction_logits,
+            "interaction_reason_logits": interaction_reason_logits,
+            "hit_count_logits": hit_count_logits,
+        }
+
+    def _all_public_consequence_logits(
+        self,
+        score_hidden: torch.Tensor,
+        public_target_reps: torch.Tensor,
+        target_mechanics: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        logits = self._public_consequence_action_logits(score_hidden)
+        move_target_logits = self._public_consequence_target_logits(
+            score_hidden[:, :SWITCH_OFFSET],
+            public_target_reps,
+            target_mechanics,
+        )
+        for name, move_logits in move_target_logits.items():
+            nonmove_shape = (
+                move_logits.shape[0],
+                self.num_actions - SWITCH_OFFSET,
+                *move_logits.shape[2:],
+            )
+            logits[name] = torch.cat(
+                [move_logits, move_logits.new_zeros(nonmove_shape)],
+                dim=1,
+            )
+        return logits
+
+    def _selected_public_consequence_logits(
+        self,
+        state: _PublicConsequenceState,
+        selected_actions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch_indices = torch.arange(
+            selected_actions.shape[0], device=selected_actions.device
+        )
+        if state.all_logits is not None:
+            return {
+                name: value[batch_indices, selected_actions]
+                for name, value in state.all_logits.items()
+            }
+
+        selected_hidden = state.score_hidden[batch_indices, selected_actions]
+        logits = self._public_consequence_action_logits(selected_hidden)
+        move_indices = selected_actions.clamp(max=SWITCH_OFFSET - 1)
+        selected_mechanics = state.target_mechanics[batch_indices, move_indices]
+        target_logits = self._public_consequence_target_logits(
+            selected_hidden.unsqueeze(1),
+            state.public_target_reps,
+            selected_mechanics.unsqueeze(1),
+        )
+        is_move = self._action_is_move[selected_actions]
+        for name, value in target_logits.items():
+            value = value.squeeze(1)
+            mask_shape = (is_move.shape[0],) + (1,) * (value.ndim - 1)
+            logits[name] = value * is_move.reshape(mask_shape).to(value.dtype)
+        return logits
+
+    def _public_consequence_adapter_predictions(
+        self,
+        logits: dict[str, torch.Tensor],
+        matchup_features: torch.Tensor,
+    ) -> torch.Tensor:
+        move_emitted_logits = logits["move_emitted_logits"]
+        nonmove_reason_logits = logits["nonmove_reason_logits"]
+        move_branch_logits = logits["move_branch_logits"]
+        route_logits = logits["route_logits"]
+        interaction_logits = logits["interaction_logits"]
+        interaction_reason_logits = logits["interaction_reason_logits"]
+        hit_count_logits = logits["hit_count_logits"]
+
+        move_probability = move_emitted_logits.sigmoid()
+        nonmove_joint = (1.0 - move_probability).unsqueeze(-1) * (
+            nonmove_reason_logits.softmax(dim=-1)
+        )
+        move_event_probabilities = torch.cat(
+            [move_probability.unsqueeze(-1), nonmove_joint], dim=-1
+        )
+        move_branch_joint = move_probability.unsqueeze(-1) * move_branch_logits.softmax(
+            dim=-1
+        )
+        target_phase_probability = move_branch_joint[
+            ..., MOVE_BRANCH_TARGET_PHASE
+        ].unsqueeze(-1)
+        route_joint = target_phase_probability * route_logits.sigmoid()
+        # A marker is an observed target interaction, not whole-move failure:
+        # Clear Amulet can block Parting Shot's stat drop while its pivot still
+        # succeeds.  The adapter receives grounded probabilities, never a
+        # hand-written positive/negative valuation of that marker.
+        marked_joint = route_joint * interaction_logits.sigmoid()
+        unmarked_joint = route_joint - marked_joint
+        interaction_reason_joint = marked_joint.unsqueeze(
+            -1
+        ) * interaction_reason_logits.softmax(dim=-1)
+        multihit_candidate = matchup_features[..., 9].unsqueeze(-1).unsqueeze(-1)
+        hit_count_joint = (
+            unmarked_joint.unsqueeze(-1)
+            * hit_count_logits.softmax(dim=-1)
+            * multihit_candidate
+        )
+        target_predictions = torch.cat(
+            [
+                route_joint.unsqueeze(-1),
+                unmarked_joint.unsqueeze(-1),
+                interaction_reason_joint,
+                hit_count_joint,
+            ],
+            dim=-1,
+        ).flatten(start_dim=-2)
+        target_predictions = target_predictions * self._action_is_move.to(
+            dtype=target_predictions.dtype
+        ).view(1, self.num_actions, 1)
+        return torch.cat(
+            [
+                move_event_probabilities,
+                move_branch_joint,
+                target_predictions,
+                logits["cant_logits"].sigmoid(),
+                logits["field_logits"].sigmoid(),
+            ],
+            dim=-1,
+        )
 
     def _static_action_features(self) -> torch.Tensor:
         parameters = (
@@ -1004,6 +1295,7 @@ class ActionHead(nn.Module):
             "own_active_indices": own_active_indices,
             "own_types_active": own_types_active,
             "own_cont_active": own_cont_active,
+            "opp_cont_active": opp_cont_active,
             "opp_def_type_1": opp_def_type_1,
             "opp_def_type_2": opp_def_type_2,
             "opp_present": opp_present,
@@ -1088,6 +1380,10 @@ class ActionHead(nn.Module):
         move_types = self._move_type_lookup[action_move_ids]
         base_power = self._move_base_power_lookup[action_move_ids]
         accuracy = self._move_accuracy_lookup[action_move_ids]
+        bypasses_accuracy = self._move_bypasses_accuracy_lookup[action_move_ids]
+        ignores_evasion = self._move_ignores_evasion_lookup[action_move_ids]
+        target_scopes = self._move_target_scope_lookup[action_move_ids]
+        is_multihit = self._move_multihit_lookup[action_move_ids]
         priority = self._move_priority_lookup[action_move_ids]
         categories = self._move_category_lookup[action_move_ids]
         target_flags = self._move_target_flags[action_move_ids]
@@ -1219,6 +1515,11 @@ class ActionHead(nn.Module):
                 is_pass,
                 base_power * is_move,
                 accuracy * is_move,
+                bypasses_accuracy * is_move,
+                ignores_evasion * is_move,
+                (target_scopes == MOVE_SCOPE_SCOPED).to(torch.float32) * is_move,
+                (target_scopes == MOVE_SCOPE_TARGETED).to(torch.float32) * is_move,
+                is_multihit * is_move,
                 priority * is_move,
                 (categories == 0).to(dtype=torch.float32) * is_move,
                 (categories == 1).to(dtype=torch.float32) * is_move,
@@ -1243,6 +1544,63 @@ class ActionHead(nn.Module):
             dim=-1,
         )
         return features
+
+    def _candidate_public_target_mechanics(
+        self,
+        matchup_context: dict[str, torch.Tensor] | None,
+        *,
+        actor_slot: int,
+        matchup_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expose source accuracy and each public target's evasion explicitly."""
+
+        batch_size = matchup_features.shape[0]
+        if matchup_context is None:
+            return matchup_features.new_zeros(
+                (
+                    batch_size,
+                    SWITCH_OFFSET,
+                    NUM_PUBLIC_TARGET_POSITIONS,
+                    self._TARGET_MECHANICS_DIM,
+                )
+            )
+        own_continuous = matchup_context["own_cont_active"]
+        opponent_continuous = matchup_context["opp_cont_active"]
+        source_accuracy_stage = own_continuous[:, actor_slot, BOOSTS_OFFSET + 5]
+        target_evasion_stage = torch.cat(
+            [
+                own_continuous[:, :, BOOSTS_OFFSET + 6],
+                opponent_continuous[:, :, BOOSTS_OFFSET + 6],
+            ],
+            dim=1,
+        )
+        own_present = torch.stack(
+            [
+                self._active_slot_present_from_context(matchup_context, 0),
+                self._active_slot_present_from_context(matchup_context, 1),
+            ],
+            dim=1,
+        )
+        target_present = torch.cat(
+            [own_present, matchup_context["opp_present"]], dim=1
+        ).to(matchup_features.dtype)
+        target_shape = (
+            batch_size,
+            SWITCH_OFFSET,
+            NUM_PUBLIC_TARGET_POSITIONS,
+        )
+        move_matchup_features = matchup_features[:, :SWITCH_OFFSET]
+        return torch.stack(
+            [
+                move_matchup_features[..., 4].unsqueeze(-1).expand(target_shape),
+                move_matchup_features[..., 5].unsqueeze(-1).expand(target_shape),
+                move_matchup_features[..., 6].unsqueeze(-1).expand(target_shape),
+                source_accuracy_stage[:, None, None].expand(target_shape),
+                target_evasion_stage[:, None, :].expand(target_shape),
+                target_present[:, None, :].expand(target_shape),
+            ],
+            dim=-1,
+        )
 
     @staticmethod
     def _active_slot_present_from_context(

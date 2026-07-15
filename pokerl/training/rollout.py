@@ -9,6 +9,7 @@ from ..env.actions import (
     NUM_SLOT_INTENT_COMPONENTS,
     NUM_TERA_INTENT_COMPONENTS,
 )
+from ..env.observation import NUM_PUBLIC_TARGET_POSITIONS
 from ..public_consequence import PUBLIC_CONSEQUENCE_FIELD_DIM
 
 
@@ -41,8 +42,20 @@ class RolloutBatch:
     opponent_intent_slot_masks: torch.Tensor  # (steps, envs, 2, 4) bool
     opponent_intent_tera_labels: torch.Tensor  # (steps, envs, 2) long
     opponent_intent_tera_masks: torch.Tensor  # (steps, envs, 2) bool
-    public_consequence_resolution_labels: torch.Tensor  # (steps, envs, 2) long
-    public_consequence_resolution_masks: torch.Tensor  # (steps, envs, 2) bool
+    public_consequence_move_emitted_targets: torch.Tensor
+    public_consequence_move_emitted_masks: torch.Tensor
+    public_consequence_nonmove_reason_labels: torch.Tensor
+    public_consequence_nonmove_reason_masks: torch.Tensor
+    public_consequence_move_branch_labels: torch.Tensor
+    public_consequence_move_branch_masks: torch.Tensor
+    public_consequence_route_targets: torch.Tensor
+    public_consequence_route_masks: torch.Tensor
+    public_consequence_interaction_targets: torch.Tensor
+    public_consequence_interaction_masks: torch.Tensor
+    public_consequence_interaction_reason_labels: torch.Tensor
+    public_consequence_interaction_reason_masks: torch.Tensor
+    public_consequence_hit_count_labels: torch.Tensor
+    public_consequence_hit_count_masks: torch.Tensor
     public_consequence_cant_targets: torch.Tensor  # (steps, envs, 2, 2) float
     public_consequence_cant_masks: torch.Tensor  # (steps, envs, 2, 2) bool
     public_consequence_field_targets: torch.Tensor  # (steps, envs, 2, 33) float
@@ -176,17 +189,67 @@ class RolloutBuffer:
             dtype=torch.bool,
             device=device,
         )
-        self._public_consequence_resolution_labels = torch.full(
+        self._public_consequence_move_emitted_targets = torch.zeros(
             (num_steps, num_envs, 2),
-            fill_value=-1,
-            dtype=torch.long,
+            dtype=torch.float32,
             device=device,
         )
-        self._public_consequence_resolution_masks = torch.zeros(
+        self._public_consequence_move_emitted_masks = torch.zeros(
             (num_steps, num_envs, 2),
             dtype=torch.bool,
             device=device,
         )
+        for label_name in (
+            "nonmove_reason",
+            "move_branch",
+        ):
+            setattr(
+                self,
+                f"_public_consequence_{label_name}_labels",
+                torch.full(
+                    (num_steps, num_envs, 2),
+                    fill_value=-1,
+                    dtype=torch.long,
+                    device=device,
+                ),
+            )
+            setattr(
+                self,
+                f"_public_consequence_{label_name}_masks",
+                torch.zeros(
+                    (num_steps, num_envs, 2),
+                    dtype=torch.bool,
+                    device=device,
+                ),
+            )
+        target_shape = (num_steps, num_envs, 2, NUM_PUBLIC_TARGET_POSITIONS)
+        for target_name in ("route", "interaction"):
+            setattr(
+                self,
+                f"_public_consequence_{target_name}_targets",
+                torch.zeros(target_shape, dtype=torch.float32, device=device),
+            )
+            setattr(
+                self,
+                f"_public_consequence_{target_name}_masks",
+                torch.zeros(target_shape, dtype=torch.bool, device=device),
+            )
+        for label_name in ("interaction_reason", "hit_count"):
+            setattr(
+                self,
+                f"_public_consequence_{label_name}_labels",
+                torch.full(
+                    target_shape,
+                    fill_value=-1,
+                    dtype=torch.long,
+                    device=device,
+                ),
+            )
+            setattr(
+                self,
+                f"_public_consequence_{label_name}_masks",
+                torch.zeros(target_shape, dtype=torch.bool, device=device),
+            )
         self._public_consequence_cant_targets = torch.zeros(
             (num_steps, num_envs, 2, 2),
             dtype=torch.float32,
@@ -229,8 +292,20 @@ class RolloutBuffer:
         opponent_intent_slot_masks: torch.Tensor | None = None,
         opponent_intent_tera_labels: torch.Tensor | None = None,
         opponent_intent_tera_masks: torch.Tensor | None = None,
-        public_consequence_resolution_labels: torch.Tensor | None = None,
-        public_consequence_resolution_masks: torch.Tensor | None = None,
+        public_consequence_move_emitted_targets: torch.Tensor | None = None,
+        public_consequence_move_emitted_masks: torch.Tensor | None = None,
+        public_consequence_nonmove_reason_labels: torch.Tensor | None = None,
+        public_consequence_nonmove_reason_masks: torch.Tensor | None = None,
+        public_consequence_move_branch_labels: torch.Tensor | None = None,
+        public_consequence_move_branch_masks: torch.Tensor | None = None,
+        public_consequence_route_targets: torch.Tensor | None = None,
+        public_consequence_route_masks: torch.Tensor | None = None,
+        public_consequence_interaction_targets: torch.Tensor | None = None,
+        public_consequence_interaction_masks: torch.Tensor | None = None,
+        public_consequence_interaction_reason_labels: torch.Tensor | None = None,
+        public_consequence_interaction_reason_masks: torch.Tensor | None = None,
+        public_consequence_hit_count_labels: torch.Tensor | None = None,
+        public_consequence_hit_count_masks: torch.Tensor | None = None,
         public_consequence_cant_targets: torch.Tensor | None = None,
         public_consequence_cant_masks: torch.Tensor | None = None,
         public_consequence_field_targets: torch.Tensor | None = None,
@@ -279,18 +354,32 @@ class RolloutBuffer:
         else:
             self._opponent_intent_tera_masks[slot].fill_(False)
 
-        if public_consequence_resolution_labels is not None:
-            self._public_consequence_resolution_labels[slot].copy_(
-                public_consequence_resolution_labels.detach()
-            )
-        else:
-            self._public_consequence_resolution_labels[slot].fill_(-1)
-        if public_consequence_resolution_masks is not None:
-            self._public_consequence_resolution_masks[slot].copy_(
-                public_consequence_resolution_masks.detach()
-            )
-        else:
-            self._public_consequence_resolution_masks[slot].fill_(False)
+        consequence_values = {
+            "move_emitted_targets": public_consequence_move_emitted_targets,
+            "move_emitted_masks": public_consequence_move_emitted_masks,
+            "nonmove_reason_labels": public_consequence_nonmove_reason_labels,
+            "nonmove_reason_masks": public_consequence_nonmove_reason_masks,
+            "move_branch_labels": public_consequence_move_branch_labels,
+            "move_branch_masks": public_consequence_move_branch_masks,
+            "route_targets": public_consequence_route_targets,
+            "route_masks": public_consequence_route_masks,
+            "interaction_targets": public_consequence_interaction_targets,
+            "interaction_masks": public_consequence_interaction_masks,
+            "interaction_reason_labels": public_consequence_interaction_reason_labels,
+            "interaction_reason_masks": public_consequence_interaction_reason_masks,
+            "hit_count_labels": public_consequence_hit_count_labels,
+            "hit_count_masks": public_consequence_hit_count_masks,
+        }
+        for consequence_name, consequence_value in consequence_values.items():
+            destination = getattr(self, f"_public_consequence_{consequence_name}")[slot]
+            if consequence_value is not None:
+                destination.copy_(consequence_value.detach())
+            elif consequence_name.endswith("labels"):
+                destination.fill_(-1)
+            elif consequence_name.endswith("masks"):
+                destination.fill_(False)
+            else:
+                destination.zero_()
         if public_consequence_cant_targets is not None:
             self._public_consequence_cant_targets[slot].copy_(
                 public_consequence_cant_targets.detach()
@@ -457,11 +546,43 @@ class RolloutBuffer:
             opponent_intent_slot_masks=self._opponent_intent_slot_masks,
             opponent_intent_tera_labels=self._opponent_intent_tera_labels,
             opponent_intent_tera_masks=self._opponent_intent_tera_masks,
-            public_consequence_resolution_labels=(
-                self._public_consequence_resolution_labels
+            public_consequence_move_emitted_targets=(
+                self._public_consequence_move_emitted_targets
             ),
-            public_consequence_resolution_masks=(
-                self._public_consequence_resolution_masks
+            public_consequence_move_emitted_masks=(
+                self._public_consequence_move_emitted_masks
+            ),
+            public_consequence_nonmove_reason_labels=(
+                self._public_consequence_nonmove_reason_labels
+            ),
+            public_consequence_nonmove_reason_masks=(
+                self._public_consequence_nonmove_reason_masks
+            ),
+            public_consequence_move_branch_labels=(
+                self._public_consequence_move_branch_labels
+            ),
+            public_consequence_move_branch_masks=(
+                self._public_consequence_move_branch_masks
+            ),
+            public_consequence_route_targets=self._public_consequence_route_targets,
+            public_consequence_route_masks=self._public_consequence_route_masks,
+            public_consequence_interaction_targets=(
+                self._public_consequence_interaction_targets
+            ),
+            public_consequence_interaction_masks=(
+                self._public_consequence_interaction_masks
+            ),
+            public_consequence_interaction_reason_labels=(
+                self._public_consequence_interaction_reason_labels
+            ),
+            public_consequence_interaction_reason_masks=(
+                self._public_consequence_interaction_reason_masks
+            ),
+            public_consequence_hit_count_labels=(
+                self._public_consequence_hit_count_labels
+            ),
+            public_consequence_hit_count_masks=(
+                self._public_consequence_hit_count_masks
             ),
             public_consequence_cant_targets=self._public_consequence_cant_targets,
             public_consequence_cant_masks=self._public_consequence_cant_masks,
@@ -504,8 +625,19 @@ class RolloutBuffer:
         self._opponent_intent_slot_masks.fill_(False)
         self._opponent_intent_tera_labels.fill_(-1)
         self._opponent_intent_tera_masks.fill_(False)
-        self._public_consequence_resolution_labels.fill_(-1)
-        self._public_consequence_resolution_masks.fill_(False)
+        self._public_consequence_move_emitted_targets.zero_()
+        self._public_consequence_move_emitted_masks.fill_(False)
+        for label_name in (
+            "nonmove_reason",
+            "move_branch",
+            "interaction_reason",
+            "hit_count",
+        ):
+            getattr(self, f"_public_consequence_{label_name}_labels").fill_(-1)
+            getattr(self, f"_public_consequence_{label_name}_masks").fill_(False)
+        for target_name in ("route", "interaction"):
+            getattr(self, f"_public_consequence_{target_name}_targets").zero_()
+            getattr(self, f"_public_consequence_{target_name}_masks").fill_(False)
         self._public_consequence_cant_targets.zero_()
         self._public_consequence_cant_masks.fill_(False)
         self._public_consequence_field_targets.zero_()

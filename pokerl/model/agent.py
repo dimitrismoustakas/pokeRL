@@ -104,6 +104,16 @@ class PokeAgent(nn.Module):
             move_type_lookup=torch.from_numpy(game_data.move_type_indices()),
             move_base_power_lookup=torch.from_numpy(move_stats[:, 0]),
             move_accuracy_lookup=torch.from_numpy(move_stats[:, 1]),
+            move_bypasses_accuracy_lookup=torch.from_numpy(
+                game_data.move_bypasses_accuracy_vector()
+            ),
+            move_ignores_evasion_lookup=torch.from_numpy(
+                game_data.move_ignores_evasion_vector()
+            ),
+            move_target_scope_lookup=torch.from_numpy(
+                game_data.move_target_scope_vector()
+            ),
+            move_multihit_lookup=torch.from_numpy(game_data.move_multihit_vector()),
             move_priority_lookup=torch.from_numpy(game_data.move_priority_vector()),
             move_category_lookup=torch.from_numpy(game_data.move_category_indices()),
             move_target_flags=torch.from_numpy(game_data.move_target_flags()),

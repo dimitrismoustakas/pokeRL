@@ -394,13 +394,19 @@ class ShowdownCliValidator:
         if result.returncode == 0:
             return True, []
 
-        problem_text = result.stderr.strip() or result.stdout.strip() or "Unknown validator error"
+        problem_text = (
+            result.stderr.strip() or result.stdout.strip() or "Unknown validator error"
+        )
         return False, [line for line in problem_text.splitlines() if line.strip()]
 
     def pack_team(self, team_text: str) -> str:
         result = self._run(["pack-team"], team_text)
         if result.returncode != 0:
-            problem_text = result.stderr.strip() or result.stdout.strip() or "Unknown pack-team error"
+            problem_text = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "Unknown pack-team error"
+            )
             raise RuntimeError(problem_text)
         return result.stdout.strip()
 
@@ -431,7 +437,11 @@ def extract_victory_road_rows(page_html: str, source_page: str) -> list[SourceRo
 
         cells = [strip_tags(cell_html) for cell_html in CELL_RE.findall(row_html)]
         links = [urljoin(source_page, href) for href in HREF_RE.findall(row_html)]
-        export_links = [link for link in links if urlparse(link).netloc.lower() in KNOWN_EXPORT_HOSTS]
+        export_links = [
+            link
+            for link in links
+            if urlparse(link).netloc.lower() in KNOWN_EXPORT_HOSTS
+        ]
         if not export_links or len(cells) < 4:
             continue
         rows.append(
@@ -452,7 +462,9 @@ def extract_victory_road_rows(page_html: str, source_page: str) -> list[SourceRo
 def parse_pokepaste_team(page_html: str) -> tuple[str, str]:
     parser = PokepasteParser()
     parser.feed(page_html)
-    team_text = "\n\n".join(block.strip() for block in parser.pre_blocks if block.strip())
+    team_text = "\n\n".join(
+        block.strip() for block in parser.pre_blocks if block.strip()
+    )
     if not team_text:
         raise ValueError("Pokepaste page did not contain any exported team blocks.")
     return parser.title or "Pokepaste team", team_text + "\n"
@@ -495,7 +507,9 @@ def parse_liberty_moves(move_text: str) -> list[str]:
     for chunk in normalize_text(move_text).split():
         raw_moves.extend(part for part in chunk.split("/") if part)
     if len(raw_moves) != 4:
-        raise ValueError(f"Expected 4 moves in Liberty Note set, found {len(raw_moves)}: {move_text}")
+        raise ValueError(
+            f"Expected 4 moves in Liberty Note set, found {len(raw_moves)}: {move_text}"
+        )
     return [translate_exact(move, JP_MOVES_TO_EN, "move") for move in raw_moves]
 
 
@@ -535,7 +549,9 @@ def parse_liberty_note_team(page_html: str) -> tuple[str, str]:
             continue
 
         row_map: dict[str, str] = {
-            canonical_jp_key(cells[0]): cells[1] for cells in table_rows[1:] if len(cells) >= 2
+            canonical_jp_key(cells[0]): cells[1]
+            for cells in table_rows[1:]
+            if len(cells) >= 2
         }
         if not LIBERTY_REQUIRED_ROWS.issubset(row_map):
             continue
@@ -543,7 +559,9 @@ def parse_liberty_note_team(page_html: str) -> tuple[str, str]:
         species = translate_exact(species_heading, JP_SPECIES_TO_EN, "species")
         ability = translate_exact(first_row[1], JP_ABILITIES_TO_EN, "ability")
         item = translate_exact(row_map["持ち物"], JP_ITEMS_TO_EN, "item")
-        tera_type = translate_exact(row_map["テラスタイプ"], JP_TYPES_TO_EN, "tera type")
+        tera_type = translate_exact(
+            row_map["テラスタイプ"], JP_TYPES_TO_EN, "tera type"
+        )
         nature = translate_exact(row_map["性格"], JP_NATURES_TO_EN, "nature")
         evs = parse_evs_from_stat_line(row_map["実数値(努力値)"])
         moves = parse_liberty_moves(row_map["技"])
@@ -560,7 +578,9 @@ def parse_liberty_note_team(page_html: str) -> tuple[str, str]:
         translated_species.append(species)
 
     if len(team_blocks) != 6:
-        raise ValueError(f"Expected 6 Liberty Note team entries, found {len(team_blocks)}.")
+        raise ValueError(
+            f"Expected 6 Liberty Note team entries, found {len(team_blocks)}."
+        )
 
     species_title = " / ".join(translated_species[:3])
     title = f"Liberty Note - {species_title}"
@@ -683,12 +703,16 @@ def build_generated_teams(
 
     while len(generated) < count and attempts < max_attempts:
         attempts += 1
-        blocks, seeds = choose_candidate_blocks(curated_teams, team_blocks_by_packed, all_blocks, rng)
+        blocks, seeds = choose_candidate_blocks(
+            curated_teams, team_blocks_by_packed, all_blocks, rng
+        )
         if len(blocks) != 6:
             continue
 
         candidate_signature = tuple(
-            sorted(hashlib.sha1(block.text.encode("utf-8")).hexdigest() for block in blocks)
+            sorted(
+                hashlib.sha1(block.text.encode("utf-8")).hexdigest() for block in blocks
+            )
         )
         if candidate_signature in seen_candidate_signatures:
             continue
@@ -764,7 +788,9 @@ def build_curated_teams(
                 if packed_team and packed_team in curated_by_packed:
                     existing = curated_by_packed[packed_team]
                     existing.source_rows.append(row)
-                    existing.source_links = unique_preserve_order(existing.source_links + [export_link])
+                    existing.source_links = unique_preserve_order(
+                        existing.source_links + [export_link]
+                    )
                 continue
 
             host = urlparse(export_link).netloc.lower()
@@ -812,15 +838,23 @@ def build_curated_teams(
                 continue
 
             existing.source_rows.append(row)
-            existing.source_links = unique_preserve_order(existing.source_links + [export_link])
+            existing.source_links = unique_preserve_order(
+                existing.source_links + [export_link]
+            )
 
     curated = sorted(curated_by_packed.values(), key=lambda team: team.title.lower())
     return curated, unsupported, invalid
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a validated VGC team pool from online archives.")
-    parser.add_argument("--format", default=DEFAULT_FORMAT, help="Showdown format id to validate against.")
+    parser = argparse.ArgumentParser(
+        description="Build a validated VGC team pool from online archives."
+    )
+    parser.add_argument(
+        "--format",
+        default=DEFAULT_FORMAT,
+        help="Showdown format id to validate against.",
+    )
     parser.add_argument(
         "--source-page",
         default=None,
@@ -848,18 +882,26 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Desired total pool size including curated teams. If set, only enough remixes are generated to reach this total.",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for legal remix generation.")
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Random seed for legal remix generation."
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
-    out_dir = Path(args.out_dir) if args.out_dir else repo_root / "data" / "team_pools" / args.format
+    out_dir = (
+        Path(args.out_dir)
+        if args.out_dir
+        else repo_root / "data" / "team_pools" / args.format
+    )
     showdown_dir = Path(args.showdown_dir)
     source_page = args.source_page or default_source_page_for_format(args.format)
     if source_page is None:
-        raise SystemExit(f"No default source page is configured for format {args.format}; pass --source-page.")
+        raise SystemExit(
+            f"No default source page is configured for format {args.format}; pass --source-page."
+        )
 
     validator = ShowdownCliValidator(showdown_dir=showdown_dir, format_id=args.format)
 
@@ -902,6 +944,8 @@ def main() -> int:
     pool_manifest = write_team_records(curated + generated, out_dir / "pool", repo_root)
 
     manifest = {
+        "purpose": "training",
+        "allow_training": True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "format": args.format,
         "source_page": source_page,

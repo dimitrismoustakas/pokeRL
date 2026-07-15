@@ -119,12 +119,33 @@ class TrainingConfig:
     # The graph path is inference-only and falls back to eager execution on
     # non-CUDA devices or when graph capture is unavailable.
     league_cuda_graphs: bool = True
+    # Production batches usually contain far fewer rows than one full opponent
+    # group.  A smaller fixed graph avoids evaluating padded observations, while
+    # four resident entries cover the two current and two draining checkpoints
+    # that commonly coexist across an update boundary.
+    league_cuda_graph_batch_size: int = 16
+    league_cuda_graph_cache_size: int = 4
+    # ``action`` reuses the frozen battle-policy service/device for preview.
+    # This avoids competing CPU inference with local Showdown workers on CUDA
+    # trainers.  ``cpu`` remains available for explicit throughput A/B tests.
+    league_preview_device: str = "action"
 
     def __post_init__(self) -> None:
         if not 0 <= self.seed < 2**32:
             raise ValueError(f"seed must be in [0, 2**32) (got {self.seed}).")
         if self.league_size <= 0:
             raise ValueError(f"league_size must be positive (got {self.league_size}).")
+        for name, value in (
+            ("league_cuda_graph_batch_size", self.league_cuda_graph_batch_size),
+            ("league_cuda_graph_cache_size", self.league_cuda_graph_cache_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer (got {value}).")
+        if self.league_preview_device not in {"action", "cpu"}:
+            raise ValueError(
+                "league_preview_device must be 'action' or 'cpu' "
+                f"(got {self.league_preview_device!r})."
+            )
         if self.league_update_interval <= 0:
             raise ValueError(
                 "league_update_interval must be positive "

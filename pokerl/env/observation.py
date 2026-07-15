@@ -18,7 +18,7 @@ from poke_env.data import GenData
 from poke_env.data.normalize import to_id_str
 from poke_env.teambuilder.teambuilder import Teambuilder
 
-from ..data import GameData, UNKNOWN_IDX
+from ..data import GameData, NUM_MOVE_SCOPES, UNKNOWN_IDX
 from .actions import (
     INTENT_MOVE,
     INTENT_SWITCH,
@@ -161,6 +161,41 @@ POSITION_OPP_1 = 3
 POSITION_OPP_2 = 4
 POSITION_IMPLICIT = 5
 NUM_EVENT_POSITIONS = 6
+EVENT_FLAG_FAILED = 0
+EVENT_FLAG_MISSED = 1
+EVENT_FLAG_SPREAD = 2
+EVENT_FLAG_ACTION_FAILED = 3
+EVENT_FLAG_NO_TARGET = 4
+NUM_PUBLIC_EVENT_FLAGS = 5
+
+NUM_PUBLIC_TARGET_POSITIONS = 4
+TARGET_OUTCOME_PRESENT = 0
+TARGET_OUTCOME_MISSED = 1
+TARGET_OUTCOME_IMMUNE = 2
+TARGET_OUTCOME_BLOCKED = 3
+TARGET_OUTCOME_FAILED = 4
+TARGET_OUTCOME_PROTECTED = 5
+TARGET_OUTCOME_HIT_COUNT = 6
+TARGET_OUTCOME_DECLARED = 7
+NUM_TARGET_OUTCOME_FEATURES = 8
+
+_PROTECTION_ACTIVATION_IDS = frozenset(
+    {
+        "banefulbunker",
+        "burningbulwark",
+        "craftyshield",
+        "detect",
+        "kingsshield",
+        "matblock",
+        "maxguard",
+        "obstruct",
+        "protect",
+        "quickguard",
+        "silktrap",
+        "spikyshield",
+        "wideguard",
+    }
+)
 
 assert (
     1
@@ -185,6 +220,12 @@ class ObservationBuilder:
     def __init__(self, game_data: GameData, team_size: int = 6):
         self.gd = game_data
         self.team_size = team_size
+        self._move_target_scopes = game_data.move_target_scope_vector()
+        if np.any(
+            (self._move_target_scopes < 0)
+            | (self._move_target_scopes >= NUM_MOVE_SCOPES)
+        ):
+            raise ValueError("Move target scope metadata contains an invalid class.")
 
     def build(
         self,
@@ -236,9 +277,25 @@ class ObservationBuilder:
         event_actor = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
         event_target = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
         event_move = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_source_move = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_move_scope = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
         event_species = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
         event_tera_type = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
-        event_flags = np.zeros((MAX_RECENT_EVENTS, 3), dtype=np.float32)
+        event_flags = np.zeros(
+            (MAX_RECENT_EVENTS, NUM_PUBLIC_EVENT_FLAGS), dtype=np.float32
+        )
+        event_target_outcomes = np.zeros(
+            (
+                MAX_RECENT_EVENTS,
+                NUM_PUBLIC_TARGET_POSITIONS,
+                NUM_TARGET_OUTCOME_FEATURES,
+            ),
+            dtype=np.float32,
+        )
+        event_target_activation_move = np.zeros(
+            (MAX_RECENT_EVENTS, NUM_PUBLIC_TARGET_POSITIONS),
+            dtype=np.int64,
+        )
         event_mask = np.ones(MAX_RECENT_EVENTS, dtype=bool)
         event_meta = np.zeros(3, dtype=np.float32)
 
@@ -254,6 +311,15 @@ class ObservationBuilder:
                     event_move[index] = self.gd.move_to_idx.get(
                         to_id_str(event.move), UNKNOWN_IDX
                     )
+                    event_move_scope[index] = self._move_target_scopes[
+                        event_move[index]
+                    ]
+                source_effect = getattr(event, "source_effect", None)
+                if source_effect and str(source_effect).lower().startswith("move:"):
+                    event_source_move[index] = self.gd.move_to_idx.get(
+                        to_id_str(str(source_effect).split(":", 1)[1]),
+                        UNKNOWN_IDX,
+                    )
                 if (
                     event.kind
                     in {
@@ -268,7 +334,59 @@ class ObservationBuilder:
                     event_tera_type[index] = self.gd.type_to_idx.get(
                         to_id_str(event.details), UNKNOWN_IDX
                     )
-                event_flags[index] = (event.failed, event.missed, event.spread)
+                event_flags[index] = (
+                    event.failed,
+                    event.missed,
+                    event.spread,
+                    getattr(event, "action_failed", False),
+                    getattr(event, "no_target", False),
+                )
+                for outcome in getattr(event, "target_outcomes", ()):
+                    position = self._public_position(outcome.target, player_role)
+                    if not 1 <= position <= NUM_PUBLIC_TARGET_POSITIONS:
+                        continue
+                    features = event_target_outcomes[index, position - 1]
+                    features[TARGET_OUTCOME_PRESENT] = 1.0
+                    features[TARGET_OUTCOME_MISSED] = float(outcome.missed)
+                    features[TARGET_OUTCOME_IMMUNE] = float(outcome.immune)
+                    features[TARGET_OUTCOME_BLOCKED] = float(
+                        outcome.blocked_by is not None
+                    )
+                    features[TARGET_OUTCOME_FAILED] = float(
+                        getattr(outcome, "failed", False)
+                        or outcome.failed_action is not None
+                    )
+                    features[TARGET_OUTCOME_PROTECTED] = float(
+                        any(
+                            self._is_protection_activation(activation)
+                            for activation in outcome.activations
+                        )
+                    )
+                    features[TARGET_OUTCOME_DECLARED] = float(
+                        getattr(outcome, "declared_on_move_line", False)
+                    )
+                    for activation in outcome.activations:
+                        effect = str(activation)
+                        if ":" not in effect:
+                            continue
+                        source_kind, source_name = effect.split(":", 1)
+                        if to_id_str(source_kind) != "move":
+                            continue
+                        event_target_activation_move[index, position - 1] = (
+                            self.gd.move_to_idx.get(
+                                to_id_str(source_name),
+                                UNKNOWN_IDX,
+                            )
+                        )
+                        break
+                    if outcome.hit_count is not None:
+                        features[TARGET_OUTCOME_HIT_COUNT] = (
+                            min(
+                                max(int(outcome.hit_count), 0),
+                                10,
+                            )
+                            / 10.0
+                        )
                 event_mask[index] = False
             event_meta[:] = (
                 1.0,
@@ -302,9 +420,13 @@ class ObservationBuilder:
         obs["recent_event_actor"] = event_actor
         obs["recent_event_target"] = event_target
         obs["recent_event_move"] = event_move
+        obs["recent_event_source_move"] = event_source_move
+        obs["recent_event_move_scope"] = event_move_scope
         obs["recent_event_species"] = event_species
         obs["recent_event_tera_type"] = event_tera_type
         obs["recent_event_flags"] = event_flags
+        obs["recent_event_target_outcomes"] = event_target_outcomes
+        obs["recent_event_target_activation_move"] = event_target_activation_move
         obs["recent_event_mask"] = event_mask
         obs["recent_event_meta"] = event_meta
         obs["prev_own_kind"] = own_kind
@@ -328,6 +450,13 @@ class ObservationBuilder:
         if own:
             return POSITION_OWN_1 if slot == "a" else POSITION_OWN_2
         return POSITION_OPP_1 if slot == "a" else POSITION_OPP_2
+
+    @staticmethod
+    def _is_protection_activation(activation: str) -> bool:
+        effect = str(activation)
+        if ":" in effect:
+            effect = effect.split(":", 1)[1]
+        return to_id_str(effect) in _PROTECTION_ACTIVATION_IDS
 
     @staticmethod
     def _intent_target_position(target: int, actor_slot: int) -> int:

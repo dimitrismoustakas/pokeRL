@@ -1,0 +1,66 @@
+Roaring Moon @ Booster Energy
+Ability: Protosynthesis
+Level: 50
+Tera Type: Flying
+EVs: 148 HP / 164 Atk / 60 Def / 52 SpD / 84 Spe
+Adamant Nature
+- Knock Off
+- Acrobatics
+- Protect
+- Dragon Dance
+
+Incineroar @ Safety Goggles
+Ability: Intimidate
+Level: 50
+Tera Type: Ghost
+EVs: 252 HP / 4 Atk / 140 Def / 76 SpD / 36 Spe
+Careful Nature
+- Parting Shot
+- Flare Blitz
+- Fake Out
+- Will-O-Wisp
+
+Amoonguss @ Sitrus Berry
+Ability: Regenerator
+Level: 50
+Tera Type: Fairy
+EVs: 244 HP / 180 Def / 84 SpD
+Bold Nature
+IVs: 27 Spe
+- Spore
+- Rage Powder
+- Protect
+- Pollen Puff
+
+Flutter Mane @ Choice Specs
+Ability: Protosynthesis
+Level: 50
+Tera Type: Fairy
+EVs: 116 HP / 204 Def / 60 SpA / 4 SpD / 124 Spe
+Timid Nature
+- Dazzling Gleam
+- Shadow Ball
+- Moonblast
+- Perish Song
+
+Ogerpon-Wellspring @ Wellspring Mask
+Ability: Water Absorb
+Level: 50
+Tera Type: Water
+EVs: 228 HP / 76 Atk / 4 Def / 12 SpD / 188 Spe
+Adamant Nature
+- Ivy Cudgel
+- Horn Leech
+- Follow Me
+- Spiky Shield
+
+Raging Bolt @ Assault Vest
+Ability: Protosynthesis
+Level: 50
+Tera Type: Electric
+EVs: 244 HP / 108 Def / 100 SpA / 4 SpD / 52 Spe
+Modest Nature
+- Thunderbolt
+- Snarl
+- Thunderclap
+- Draco Meteor

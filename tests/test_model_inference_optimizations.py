@@ -172,7 +172,9 @@ def test_vectorized_effectiveness_preserves_gradient_enabled_head_gradients() ->
         strict=True,
     ):
         assert optimized_name == reference_name
-        if optimized_name.startswith("public_consequence_head."):
+        if optimized_name.startswith(
+            "public_consequence_"
+        ) and not optimized_name.startswith("public_consequence_policy_adapter."):
             # Actor gradients deliberately stop at the detached consequence
             # probabilities; this head is grounded only by its auxiliary loss.
             assert optimized_parameter.grad is None

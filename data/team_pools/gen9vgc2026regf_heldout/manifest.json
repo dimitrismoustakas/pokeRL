@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-15T00:00:00+03:00",
+  "retrieved_at": "2026-07-15",
+  "format": "gen9vgc2026regf",
+  "purpose": "evaluation_only",
+  "allow_training": false,
+  "stats": {
+    "curated_valid": 11,
+    "generated_valid": 0,
+    "pool_valid": 11
+  },
+  "curated": [
+    {
+      "title": "Glimmora Sun Hyper Offense",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/001_glimmora_sun_hyper_offense_39dc5181.txt",
+      "packed_sha1": "39dc5181242996462c97afeeb7a41fe42710fdc4",
+      "spread_provenance": "smogon_sample",
+      "result": "Based on Rayan Guezi's Utrecht Top 8 team",
+      "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-sample-teams.3738302/",
+      "export_link": "https://pokepast.es/ef67c92e7bcb646c"
+    },
+    {
+      "title": "Hatterene Urshifu-Dark Psyspam",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/002_hatterene_urshifu_dark_psyspam_5084dac0.txt",
+      "packed_sha1": "5084dac074ebc0d90d728f20cc873bc020379c45",
+      "spread_provenance": "smogon_sample",
+      "result": "Based on Brandon Davis's Portland Top 8 team",
+      "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-sample-teams.3738302/",
+      "export_link": "https://pokepast.es/0a790cea85520934"
+    },
+    {
+      "title": "Dragon Dance Roaring Moon Balance",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/003_roaring_moon_balance_18a8152f.txt",
+      "packed_sha1": "18a8152f7954507e8dde1b1302b10201293a6b8d",
+      "spread_provenance": "smogon_sample",
+      "result": "Based on Mattie Morgan's Dortmund Top 16 team",
+      "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-sample-teams.3738302/",
+      "export_link": "https://pokepast.es/6f9d2d044621aca4"
+    },
+    {
+      "title": "Farigiraf Bloodmoon Trick Room",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/004_farigiraf_bloodmoon_trick_room_70414cb4.txt",
+      "packed_sha1": "70414cb460fec5e16cc53079421079336392f629",
+      "spread_provenance": "smogon_sample",
+      "result": "Based on Florian Temme's Dortmund championship team",
+      "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-sample-teams.3738302/",
+      "export_link": "https://pokepast.es/169000ef737086a4"
+    },
+    {
+      "title": "Sleeping in the Sand / EUIC Call",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/005_sleeping_in_the_sand_99a7a9e6.txt",
+      "packed_sha1": "99a7a9e66e80cf09c7cf595093365b287b37707a",
+      "spread_provenance": "player_published_import",
+      "result": "Davide Leone EUIC Top 8 team report",
+      "source_page": "https://www.smogon.com/forums/threads/sleeping-in-the-sand-a-dondozo-ting-lu-regulation-f-team-report.3741846/",
+      "export_link": "https://pokepast.es/68b17c94c10b336e"
+    },
+    {
+      "title": "Teal-Pon V8",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/006_teal_pon_v8_43e03699.txt",
+      "packed_sha1": "43e03699418e7958b9bc3d732374aaf6ce768b87",
+      "spread_provenance": "player_published_import",
+      "result": "Daniel Marcelo Reyes Orlando Top 16",
+      "source_page": "https://devoncorp.press/long-form-content/how-the-ogerpon-that-nobody-wanted-to-use-made-orlando-top-16",
+      "export_link": "https://pokepast.es/4f780198b8fb3a3f"
+    },
+    {
+      "title": "ICE QUEEN",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/007_ice_queen_010295b9.txt",
+      "packed_sha1": "010295b9563c463a543340c167964b27cda47a6b",
+      "spread_provenance": "player_published_import",
+      "result": "Davide Leone 18th SpearPillar cart tournament champion",
+      "source_page": "https://devoncorp.press/team-reports-and-war-stories/rise-of-the-ice-queen-92pc5",
+      "export_link": "https://pokepast.es/3ad73a8c9a689dd9"
+    },
+    {
+      "title": "Paintspam",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/008_paintspam_6bb257f5.txt",
+      "packed_sha1": "6bb257f5caf17d43f79b32a6b1bd8407fd10269d",
+      "spread_provenance": "player_published_set_blocks",
+      "result": "Brian Collins EUIC Top 16 hard Trick Room variant",
+      "source_page": "https://devoncorp.press/team-reports-and-war-stories/the-best-hard-tr-team-of-reg-f-4w4nx",
+      "export_link": null
+    },
+    {
+      "title": "2026 Bulky Flutter Mane + Hisuian Arcanine Balance",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/009_2026_bulky_flutter_hisuian_arcanine_balance_e7ecc6d1.txt",
+      "packed_sha1": "e7ecc6d124d9fa4b71188e1e2fabc88302ba3aba",
+      "spread_provenance": "smogon_2026_sample_public_paste",
+      "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads; this entry is not marked RECREATION by the thread.",
+      "result": "Hiroto Hayasaki (arubega), 1st place at Victory Road December Challenge #3",
+      "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-2-0-sample-teams.3777032/",
+      "result_source_page": "https://victoryroad.pro/vr-dec25-3/",
+      "export_link": "https://pokepast.es/0fc22ed2f26ed6f9"
+    },
+    {
+      "title": "2026 Protosynthesis Sun Spam",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/010_2026_protosynthesis_sun_spam_39a67be3.txt",
+      "packed_sha1": "39a67be3d9d8597eea0a1fa397254bb3fe56d2a5",
+      "spread_provenance": "smogon_2026_sample_public_paste",
+      "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads; this entry is not marked RECREATION by the thread.",
+      "result": "Shunsuke Minami (Erizabeth), Top 4 at Victory Road December Challenge #3",
+      "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-2-0-sample-teams.3777032/",
+      "result_source_page": "https://victoryroad.pro/vr-dec25-3/",
+      "export_link": "https://pokepast.es/e9cf2f1190b4b630"
+    },
+    {
+      "title": "2026 Ting-Lu Setup + Sinistcha",
+      "subset": "curated",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/011_2026_ting_lu_setup_sinistcha_0fb6e9a4.txt",
+      "packed_sha1": "0fb6e9a463d8b1288681b11f6270569661e22aff",
+      "spread_provenance": "smogon_2026_sample_public_paste",
+      "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads; this entry is not marked RECREATION by the thread.",
+      "result": "Francesco Pio Pero (CICCIOTT), Top 8 at Victory Road December Challenge #2",
+      "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-2-0-sample-teams.3777032/",
+      "result_source_page": "https://victoryroad.pro/vr-dec25-2/",
+      "export_link": "https://pokepast.es/37194efd9132f787"
+    }
+  ],
+  "generated": [],
+  "pool": [
+    {
+      "title": "Glimmora Sun Hyper Offense",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/001_glimmora_sun_hyper_offense_39dc5181.txt"
+    },
+    {
+      "title": "Hatterene Urshifu-Dark Psyspam",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/002_hatterene_urshifu_dark_psyspam_5084dac0.txt"
+    },
+    {
+      "title": "Dragon Dance Roaring Moon Balance",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/003_roaring_moon_balance_18a8152f.txt"
+    },
+    {
+      "title": "Farigiraf Bloodmoon Trick Room",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/004_farigiraf_bloodmoon_trick_room_70414cb4.txt"
+    },
+    {
+      "title": "Sleeping in the Sand / EUIC Call",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/005_sleeping_in_the_sand_99a7a9e6.txt"
+    },
+    {
+      "title": "Teal-Pon V8",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/006_teal_pon_v8_43e03699.txt"
+    },
+    {
+      "title": "ICE QUEEN",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/007_ice_queen_010295b9.txt"
+    },
+    {
+      "title": "Paintspam",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/008_paintspam_6bb257f5.txt"
+    },
+    {
+      "title": "2026 Bulky Flutter Mane + Hisuian Arcanine Balance",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/009_2026_bulky_flutter_hisuian_arcanine_balance_e7ecc6d1.txt"
+    },
+    {
+      "title": "2026 Protosynthesis Sun Spam",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/010_2026_protosynthesis_sun_spam_39a67be3.txt"
+    },
+    {
+      "title": "2026 Ting-Lu Setup + Sinistcha",
+      "file": "data/team_pools/gen9vgc2026regf_heldout/curated/011_2026_ting_lu_setup_sinistcha_0fb6e9a4.txt"
+    }
+  ]
+}

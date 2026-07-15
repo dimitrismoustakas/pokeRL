@@ -76,7 +76,12 @@ class _CaptureAgent(nn.Module):
         }
 
 
-def _service(*, greedy: bool = False):
+def _service(
+    *,
+    greedy: bool = False,
+    cuda_graph_batch_size: int = 16,
+    cuda_graph_cache_size: int = 4,
+):
     agent = _CaptureAgent().cuda().eval().requires_grad_(False)
     service = _LeagueInferenceService(
         agent,
@@ -85,6 +90,8 @@ def _service(*, greedy: bool = False):
         max_models=4,
         greedy=greedy,
         enable_cuda_graphs=True,
+        cuda_graph_batch_size=cuda_graph_batch_size,
+        cuda_graph_cache_size=cuda_graph_cache_size,
     )
     with service._condition:
         service._models = OrderedDict(
@@ -156,12 +163,13 @@ def test_cuda_graph_handles_padded_split_batches_legality_and_hidden() -> None:
 
         info = service.cache_info()
         assert info["cuda_graph_captures"] == 1
-        assert info["cuda_graph_replays"] == 5
+        assert info["cuda_graph_batch_size"] == 16
+        assert info["cuda_graph_replays"] == 11
         assert info["cuda_graph_real_rows"] == 132
-        assert info["cuda_graph_padded_rows"] == 48
+        assert info["cuda_graph_padded_rows"] == 44
         assert info["resident_cuda_graphs"] == 1
-        # B=72 is split into two fixed B=36 replays.
-        assert info["cuda_graph_hits"] >= 4
+        # B=72 is split into five fixed B=16 replays.
+        assert info["cuda_graph_hits"] >= 10
     finally:
         service.close()
 
@@ -204,7 +212,7 @@ def test_cuda_graph_recapture_preserves_saved_rng_sequence() -> None:
 
 
 def test_cuda_graph_cache_is_lru_bounded_to_two_checkpoints() -> None:
-    service = _service(greedy=True)
+    service = _service(greedy=True, cuda_graph_cache_size=2)
     try:
         _run(service, _requests(1, checkpoint_path="a.pt"))
         _run(service, _requests(1, checkpoint_path="b.pt"))
@@ -388,8 +396,13 @@ def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() 
 
             np.testing.assert_array_equal(graph_actions, eager_actions)
             assert torch.equal(torch.cuda.get_rng_state(), eager_next_rng)
-            assert torch.allclose(graph_hidden[0], eager_hidden[0], atol=3e-7, rtol=0)
-            assert torch.allclose(graph_hidden[1], eager_hidden[1], atol=3e-7, rtol=0)
+            # Padded fixed-shape graph GEMMs and eager variable-shape GEMMs can
+            # differ by a few float32 ULPs while producing identical actions.
+            assert torch.allclose(graph_hidden[0], eager_hidden[0], atol=5e-7, rtol=0)
+            cell_max_abs_error = (graph_hidden[1] - eager_hidden[1]).abs().max()
+            assert torch.allclose(
+                graph_hidden[1], eager_hidden[1], atol=5e-7, rtol=0
+            ), f"cell-state max abs error: {cell_max_abs_error.item():.3g}"
         info = service.cache_info()
         assert info["cuda_graph_fallbacks"] == 0
         assert info["cuda_graph_last_error"] is None

@@ -99,6 +99,7 @@ def load_team_pool(
     *,
     subset: str = "pool",
     seed: int | None = None,
+    usage: str = "training",
 ) -> TeamPool:
     if subset not in VALID_TEAM_POOL_SUBSETS:
         raise ValueError(
@@ -107,16 +108,43 @@ def load_team_pool(
 
     manifest_path = Path(manifest_path).expanduser().resolve()
     manifest = _load_manifest_json(manifest_path)
+    if usage not in {"training", "evaluation"}:
+        raise ValueError(
+            f"Unsupported team-pool usage {usage!r}; expected 'training' or 'evaluation'."
+        )
+    purpose = manifest.get("purpose")
+    allow_training = manifest.get("allow_training")
+    if purpose not in {"training", "evaluation_only"}:
+        raise ValueError(
+            f"Manifest {manifest_path} must declare purpose as 'training' "
+            "or 'evaluation_only'."
+        )
+    if not isinstance(allow_training, bool):
+        raise ValueError(
+            f"Manifest {manifest_path} must declare boolean allow_training."
+        )
+    if (purpose == "training") != allow_training:
+        raise ValueError(
+            f"Manifest {manifest_path} has inconsistent purpose/allow_training metadata."
+        )
+    if usage == "training" and allow_training is not True:
+        raise ValueError(
+            f"Manifest {manifest_path} is evaluation-only and cannot be used for training."
+        )
     repo_root = _find_repo_root(manifest_path.parent)
     raw_entries = manifest.get(subset)
     if not isinstance(raw_entries, list):
-        raise ValueError(f"Manifest {manifest_path} is missing a list-valued {subset!r} section.")
+        raise ValueError(
+            f"Manifest {manifest_path} is missing a list-valued {subset!r} section."
+        )
 
     entries: list[TeamPoolEntry] = []
     for raw_entry in raw_entries:
         file_value = raw_entry.get("file")
         if not isinstance(file_value, str) or not file_value:
-            raise ValueError(f"Manifest entry is missing a valid file path: {raw_entry!r}")
+            raise ValueError(
+                f"Manifest entry is missing a valid file path: {raw_entry!r}"
+            )
 
         team_path = Path(file_value)
         if not team_path.is_absolute():
@@ -145,10 +173,14 @@ def _load_manifest_json(path: Path) -> dict:
             result[key] = value
         if duplicates:
             duplicate_list = ", ".join(sorted(set(duplicates)))
-            raise ValueError(f"Manifest {path} contains duplicate JSON key(s): {duplicate_list}")
+            raise ValueError(
+                f"Manifest {path} contains duplicate JSON key(s): {duplicate_list}"
+            )
         return result
 
-    loaded = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+    loaded = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys
+    )
     if not isinstance(loaded, dict):
         raise ValueError(f"Manifest {path} must contain a JSON object.")
     return loaded

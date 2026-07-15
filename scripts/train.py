@@ -14,6 +14,7 @@ import math
 import random
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from pokerl.env.actions import (
     NUM_SLOT_INTENT_COMPONENTS,
     NUM_TERA_INTENT_COMPONENTS,
 )
+from pokerl.env.observation import NUM_PUBLIC_TARGET_POSITIONS
 from pokerl.model.agent import PokeAgent
 from pokerl.public_consequence import (
     PUBLIC_CONSEQUENCE_FIELD_DIM,
@@ -54,6 +56,13 @@ from pokerl.training.preview import (
 )
 from pokerl.training.recurrent_history import RecurrentObservationHistory
 from pokerl.training.cuda_execution import cuda_model_execution
+from pokerl.training.phase import (
+    FrozenMixtureSampler,
+    PhaseKind,
+    PhaseRunState,
+    PhaseSpec,
+)
+from pokerl.training.population import PopulationRevision
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -174,6 +183,65 @@ def _sorted_assignment_paths(assignments: dict[int, str]) -> list[str]:
 class LeagueMaintenance:
     checkpoint_added: bool
     assignments_by_group: dict[int, str]
+
+
+CheckpointSampler = Callable[[int], list[str]]
+
+
+@dataclass(frozen=True)
+class FrozenPhaseOpponentSource:
+    """Map one pinned policy-id mixture to verified checkpoint paths."""
+
+    sampler: FrozenMixtureSampler
+    checkpoint_by_policy_id: dict[str, str]
+
+    def __post_init__(self) -> None:
+        target_ids = {item.policy_id for item in self.sampler.distribution}
+        if set(self.checkpoint_by_policy_id) != target_ids:
+            raise ValueError(
+                "Frozen checkpoint mapping must exactly match mixture support."
+            )
+        if len(set(self.checkpoint_by_policy_id.values())) != len(target_ids):
+            raise ValueError("Frozen mixture policies must use distinct checkpoints.")
+
+    def sample_checkpoint_paths(self, count: int) -> list[str]:
+        return [
+            self.checkpoint_by_policy_id[policy_id]
+            for policy_id in self.sampler.sample_policy_ids(count)
+        ]
+
+
+@dataclass(frozen=True)
+class BestResponsePhaseBundle:
+    spec_path: Path
+    spec: PhaseSpec
+    population_path: Path
+    population: PopulationRevision
+    checkpoint_by_policy_id: dict[str, str]
+
+
+def load_best_response_phase(path: str) -> BestResponsePhaseBundle:
+    spec_path = Path(path).expanduser().resolve()
+    spec = PhaseSpec.load(spec_path, verify_initializer=True)
+    if spec.kind is not PhaseKind.BEST_RESPONSE:
+        raise ValueError("--phase-spec currently supports only kind='best_response'.")
+    population_path = spec.resolve_target_population_path(spec_path.parent)
+    population = PopulationRevision.load(
+        population_path,
+        verify_checkpoints=True,
+    )
+    spec.validate_against_population(population)
+    checkpoint_by_policy_id = {
+        member.policy_id: str(member.checkpoint.resolve(population_path.parent))
+        for member in population.policies
+    }
+    return BestResponsePhaseBundle(
+        spec_path=spec_path,
+        spec=spec,
+        population_path=population_path,
+        population=population,
+        checkpoint_by_policy_id=checkpoint_by_policy_id,
+    )
 
 
 def _close_training_resources(*resources: tuple[str, object]) -> None:
@@ -420,6 +488,27 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--league-cuda-graph-batch-size",
+        type=int,
+        default=None,
+        help="Fixed row capacity of each frozen-opponent CUDA graph replay.",
+    )
+    parser.add_argument(
+        "--league-cuda-graph-cache-size",
+        type=int,
+        default=None,
+        help="Maximum frozen-checkpoint CUDA graphs resident at once.",
+    )
+    parser.add_argument(
+        "--league-preview-device",
+        choices=("action", "cpu"),
+        default=None,
+        help=(
+            "Run frozen team-preview inference on the shared action service/device "
+            "or on a separate CPU service."
+        ),
+    )
+    parser.add_argument(
         "--team-preview-max-samples",
         type=int,
         default=None,
@@ -505,6 +594,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
     )
     parser.add_argument(
+        "--phase-spec",
+        default=None,
+        help=(
+            "Immutable best-response PhaseSpec JSON. Without --resume it starts "
+            "a fresh weight-only learner; with --resume it must match the paired "
+            "phase state exactly."
+        ),
+    )
+    parser.add_argument(
         "--summary-path",
         default=None,
         help="Write a machine-readable JSON run summary to this path.",
@@ -570,6 +668,9 @@ def build_configs(
         "league_pfsp_exponent": args.league_pfsp_exponent,
         "league_pfsp_uniform_fraction": args.league_pfsp_uniform_fraction,
         "league_cuda_graphs": args.league_cuda_graphs,
+        "league_cuda_graph_batch_size": args.league_cuda_graph_batch_size,
+        "league_cuda_graph_cache_size": args.league_cuda_graph_cache_size,
+        "league_preview_device": args.league_preview_device,
         "team_preview_max_samples": args.team_preview_max_samples,
         "preview_update_minibatch_size": args.preview_update_minibatch_size,
         "tera_exploration_start": args.tera_exploration_start,
@@ -779,9 +880,12 @@ def make_team_pair_provider(team_pool: TeamPool | None):
 
 
 def _sample_checkpoints_by_group(
-    league: League, opponent_groups: int
+    league: League,
+    opponent_groups: int,
+    checkpoint_sampler: CheckpointSampler | None = None,
 ) -> dict[int, str]:
-    paths = league.sample_checkpoint_paths(opponent_groups)
+    sampler = checkpoint_sampler or league.sample_checkpoint_paths
+    paths = sampler(opponent_groups)
     if len(paths) != opponent_groups:
         raise RuntimeError(
             "League returned the wrong number of opponent assignments: "
@@ -800,10 +904,15 @@ def make_envs(
     team_pair_provider=None,
     collect_timing: bool = False,
     initial_checkpoint_by_group: dict[int, str] | None = None,
+    checkpoint_sampler: CheckpointSampler | None = None,
 ) -> ParallelBattleEnv:
     """Create parallel battle environments backed by league opponents."""
     if initial_checkpoint_by_group is None:
-        checkpoint_by_group = _sample_checkpoints_by_group(league, opponent_groups)
+        checkpoint_by_group = _sample_checkpoints_by_group(
+            league,
+            opponent_groups,
+            checkpoint_sampler,
+        )
     else:
         expected_groups = set(range(opponent_groups))
         if set(initial_checkpoint_by_group) != expected_groups:
@@ -880,10 +989,12 @@ def make_envs(
 def _sample_refresh_assignments(
     parallel_env: ParallelBattleEnv,
     league: League,
+    checkpoint_sampler: CheckpointSampler | None = None,
 ) -> list[tuple[BattleEnv, str]]:
     assignments: list[tuple[BattleEnv, str]] = []
     groups = sorted({int(env.config.opponent_group) for env in parallel_env.envs})
-    sampled_paths = league.sample_checkpoint_paths(len(groups))
+    sampler = checkpoint_sampler or league.sample_checkpoint_paths
+    sampled_paths = sampler(len(groups))
     checkpoint_by_group = dict(zip(groups, sampled_paths, strict=True))
     for env in parallel_env.envs:
         opponent_group = int(env.config.opponent_group)
@@ -895,6 +1006,7 @@ def _sample_refresh_assignments(
 def refresh_opponents(
     parallel_env: ParallelBattleEnv,
     league: League,
+    checkpoint_sampler: CheckpointSampler | None = None,
 ) -> dict[int, str]:
     """Swap out opponents in existing environments.
 
@@ -902,7 +1014,11 @@ def refresh_opponents(
     selves. Envs in the same opponent group share one sampled checkpoint, which
     keeps opponent inference batches large on local setups.
     """
-    assignments = _sample_refresh_assignments(parallel_env, league)
+    assignments = _sample_refresh_assignments(
+        parallel_env,
+        league,
+        checkpoint_sampler,
+    )
     checkpoint_by_group: dict[int, str] = {}
     for env, checkpoint_path in assignments:
         checkpoint_by_group[int(env.config.opponent_group)] = checkpoint_path
@@ -945,6 +1061,29 @@ def _maintain_league_after_update(
         assignments = refresh_opponents(parallel_env, league)
     return LeagueMaintenance(
         checkpoint_added=checkpoint_added,
+        assignments_by_group=assignments,
+    )
+
+
+def _maintain_best_response_after_update(
+    *,
+    update: int,
+    num_updates: int,
+    parallel_env: ParallelBattleEnv,
+    league: League,
+    config: TrainingConfig,
+    checkpoint_sampler: CheckpointSampler,
+) -> LeagueMaintenance:
+    """Refresh a frozen target without updating payoffs or adding the learner."""
+    assignments: dict[int, str] = {}
+    if update < num_updates and update % config.league_refresh_interval == 0:
+        assignments = refresh_opponents(
+            parallel_env,
+            league,
+            checkpoint_sampler,
+        )
+    return LeagueMaintenance(
+        checkpoint_added=False,
         assignments_by_group=assignments,
     )
 
@@ -1093,14 +1232,28 @@ def collect_synchronous_rollout(
         opponent_intent_tera_labels_np,
         dtype=bool,
     )
-    public_consequence_resolution_labels_np = np.empty(
-        (parallel_env.num_envs, 2),
-        dtype=np.int64,
+    consequence_slot_shape = (parallel_env.num_envs, 2)
+    consequence_target_shape = (
+        parallel_env.num_envs,
+        2,
+        NUM_PUBLIC_TARGET_POSITIONS,
     )
-    public_consequence_resolution_masks_np = np.empty_like(
-        public_consequence_resolution_labels_np,
-        dtype=bool,
-    )
+    public_consequence_np = {
+        "move_emitted_targets": np.empty(consequence_slot_shape, dtype=np.float32),
+        "move_emitted_masks": np.empty(consequence_slot_shape, dtype=bool),
+        "nonmove_reason_labels": np.empty(consequence_slot_shape, dtype=np.int64),
+        "nonmove_reason_masks": np.empty(consequence_slot_shape, dtype=bool),
+        "move_branch_labels": np.empty(consequence_slot_shape, dtype=np.int64),
+        "move_branch_masks": np.empty(consequence_slot_shape, dtype=bool),
+        "route_targets": np.empty(consequence_target_shape, dtype=np.float32),
+        "route_masks": np.empty(consequence_target_shape, dtype=bool),
+        "interaction_targets": np.empty(consequence_target_shape, dtype=np.float32),
+        "interaction_masks": np.empty(consequence_target_shape, dtype=bool),
+        "interaction_reason_labels": np.empty(consequence_target_shape, dtype=np.int64),
+        "interaction_reason_masks": np.empty(consequence_target_shape, dtype=bool),
+        "hit_count_labels": np.empty(consequence_target_shape, dtype=np.int64),
+        "hit_count_masks": np.empty(consequence_target_shape, dtype=bool),
+    }
     public_consequence_cant_targets_np = np.empty(
         (parallel_env.num_envs, 2, 2),
         dtype=np.float32,
@@ -1121,8 +1274,9 @@ def collect_synchronous_rollout(
     opponent_intent_slot_masks_device: torch.Tensor | None = None
     opponent_intent_tera_labels_device: torch.Tensor | None = None
     opponent_intent_tera_masks_device: torch.Tensor | None = None
-    public_consequence_resolution_labels_device: torch.Tensor | None = None
-    public_consequence_resolution_masks_device: torch.Tensor | None = None
+    public_consequence_device_buffers: dict[str, torch.Tensor | None] = {
+        key: None for key in public_consequence_np
+    }
     public_consequence_cant_targets_device: torch.Tensor | None = None
     public_consequence_cant_masks_device: torch.Tensor | None = None
     public_consequence_field_targets_device: torch.Tensor | None = None
@@ -1202,8 +1356,13 @@ def collect_synchronous_rollout(
         opponent_intent_slot_masks_np.fill(False)
         opponent_intent_tera_labels_np.fill(-1)
         opponent_intent_tera_masks_np.fill(False)
-        public_consequence_resolution_labels_np.fill(-1)
-        public_consequence_resolution_masks_np.fill(False)
+        for consequence_name, consequence_array in public_consequence_np.items():
+            if consequence_name.endswith("labels"):
+                consequence_array.fill(-1)
+            elif consequence_name.endswith("masks"):
+                consequence_array.fill(False)
+            else:
+                consequence_array.fill(0.0)
         public_consequence_cant_targets_np.fill(0.0)
         public_consequence_cant_masks_np.fill(False)
         public_consequence_field_targets_np.fill(0.0)
@@ -1223,12 +1382,8 @@ def collect_synchronous_rollout(
                     if key in next_obs
                 }
             consequence = encode_public_consequence(consequence_observation)
-            public_consequence_resolution_labels_np[env_index] = (
-                consequence.resolution_labels
-            )
-            public_consequence_resolution_masks_np[env_index] = (
-                consequence.resolution_masks
-            )
+            for consequence_name, consequence_array in public_consequence_np.items():
+                consequence_array[env_index] = getattr(consequence, consequence_name)
             public_consequence_cant_targets_np[env_index] = consequence.cant_targets
             public_consequence_cant_masks_np[env_index] = consequence.cant_masks
             public_consequence_field_targets_np[env_index] = consequence.field_targets
@@ -1288,18 +1443,24 @@ def collect_synchronous_rollout(
         opponent_intent_tera_labels_device = opponent_intent_tera_labels_t
         opponent_intent_tera_masks_device = opponent_intent_tera_masks_t
 
-        public_consequence_resolution_labels_t = array_to_device(
-            public_consequence_resolution_labels_np,
-            device,
-            dtype=torch.long,
-            buffer=public_consequence_resolution_labels_device,
-        )
-        public_consequence_resolution_masks_t = array_to_device(
-            public_consequence_resolution_masks_np,
-            device,
-            dtype=torch.bool,
-            buffer=public_consequence_resolution_masks_device,
-        )
+        public_consequence_t: dict[str, torch.Tensor] = {}
+        for consequence_name, consequence_array in public_consequence_np.items():
+            consequence_dtype = (
+                torch.long
+                if consequence_name.endswith("labels")
+                else (
+                    torch.bool if consequence_name.endswith("masks") else torch.float32
+                )
+            )
+            public_consequence_t[consequence_name] = array_to_device(
+                consequence_array,
+                device,
+                dtype=consequence_dtype,
+                buffer=public_consequence_device_buffers[consequence_name],
+            )
+            public_consequence_device_buffers[consequence_name] = public_consequence_t[
+                consequence_name
+            ]
         public_consequence_cant_targets_t = array_to_device(
             public_consequence_cant_targets_np,
             device,
@@ -1323,12 +1484,6 @@ def collect_synchronous_rollout(
             device,
             dtype=torch.bool,
             buffer=public_consequence_field_masks_device,
-        )
-        public_consequence_resolution_labels_device = (
-            public_consequence_resolution_labels_t
-        )
-        public_consequence_resolution_masks_device = (
-            public_consequence_resolution_masks_t
         )
         public_consequence_cant_targets_device = public_consequence_cant_targets_t
         public_consequence_cant_masks_device = public_consequence_cant_masks_t
@@ -1395,16 +1550,16 @@ def collect_synchronous_rollout(
             opponent_intent_slot_masks=opponent_intent_slot_masks_t,
             opponent_intent_tera_labels=opponent_intent_tera_labels_t,
             opponent_intent_tera_masks=opponent_intent_tera_masks_t,
-            public_consequence_resolution_labels=(
-                public_consequence_resolution_labels_t
-            ),
-            public_consequence_resolution_masks=(public_consequence_resolution_masks_t),
             public_consequence_cant_targets=public_consequence_cant_targets_t,
             public_consequence_cant_masks=public_consequence_cant_masks_t,
             public_consequence_field_targets=public_consequence_field_targets_t,
             public_consequence_field_masks=public_consequence_field_masks_t,
             aux_label_obs=aux_label_obs_t,
             done_env_indices=done_env_indices,
+            **{
+                f"public_consequence_{name}": value
+                for name, value in public_consequence_t.items()
+            },
         )
         if collect_timing:
             profile["buffer_add_sec"] += time.perf_counter() - started
@@ -1425,6 +1580,10 @@ def collect_synchronous_rollout(
 
 def _league_state_path_for_resume(resume_checkpoint: str) -> Path:
     return Path(resume_checkpoint).resolve().with_suffix(".league_state.json")
+
+
+def _phase_state_path_for_resume(resume_checkpoint: str) -> Path:
+    return Path(resume_checkpoint).resolve().with_suffix(".phase_state.json")
 
 
 def _serialize_opponent_assignments(
@@ -1496,6 +1655,37 @@ def _save_training_state(
             ),
         },
     )
+
+
+def _save_best_response_training_state(
+    *,
+    checkpoint_path: str,
+    phase: PhaseSpec,
+    sampler: FrozenMixtureSampler,
+    team_pool: TeamPool,
+    training_state_id: str,
+    completed_updates: int,
+    opponent_assignments: dict[int, str],
+    league: League,
+) -> None:
+    serialized_assignments = _serialize_opponent_assignments(
+        opponent_assignments,
+        league,
+    )
+    state = PhaseRunState(
+        phase_hash=phase.phase_hash,
+        target_population_revision_id=phase.target_population_revision_id,
+        training_state_id=training_state_id,
+        completed_updates=completed_updates,
+        sampler_state=sampler.state_dict(),
+        team_pool_signature=team_pool.signature(),
+        team_pool_rng_state=team_pool.rng_state(),
+        opponent_assignments=tuple(
+            (int(group), checkpoint_path)
+            for group, checkpoint_path in serialized_assignments.items()
+        ),
+    )
+    state.save(_phase_state_path_for_resume(checkpoint_path))
 
 
 def _json_ready_metrics(metrics: dict[str, float]) -> dict[str, float]:
@@ -1732,6 +1922,22 @@ def _maybe_write_run_summary(path: str | None, summary: dict) -> None:
 
 def train():
     args = parse_args()
+    phase_bundle = (
+        load_best_response_phase(args.phase_spec) if args.phase_spec else None
+    )
+    phase_spec = phase_bundle.spec if phase_bundle is not None else None
+    if phase_spec is not None:
+        if (
+            args.battle_format is not None
+            and args.battle_format != phase_spec.battle_format
+        ):
+            raise ValueError(
+                "--battle-format cannot override the immutable phase format: "
+                f"cli={args.battle_format!r}, phase={phase_spec.battle_format!r}."
+            )
+        args.battle_format = phase_spec.battle_format
+        if args.team_pool_manifest is None and args.team_pool_format is None:
+            args.team_pool_format = phase_spec.battle_format
     torch_runtime_config = apply_torch_runtime_config(args)
     device_name = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
@@ -1770,6 +1976,16 @@ def train():
         )
     opponent_groups = resolve_opponent_groups(args.opponent_groups, env_config.num_envs)
     team_pool = load_requested_team_pool(args, seed=seed_streams["team_pool"])
+    if phase_spec is not None:
+        if team_pool is None:
+            raise ValueError(
+                "A best-response phase requires the team pool identified by its "
+                "team_pool_signature."
+            )
+        if team_pool.signature() != phase_spec.team_pool_signature:
+            raise ValueError(
+                "Configured team pool does not match the immutable phase signature."
+            )
 
     steps_per_update = train_config.rollout_steps * env_config.num_envs
     if train_config.total_timesteps < steps_per_update:
@@ -1780,6 +1996,13 @@ def train():
 
     # Game data and model
     game_data = GameData(gen=9)
+    if (
+        phase_spec is not None
+        and game_data.vocab_signature() != phase_spec.model_signature
+    ):
+        raise ValueError(
+            "Runtime game-data vocabulary does not match the phase model signature."
+        )
     agent = PokeAgent(model_config, game_data)
     agent.to(device)
 
@@ -1800,9 +2023,83 @@ def train():
         rng=random.Random(seed_streams["league"]),
     )
 
+    frozen_sampler: FrozenMixtureSampler | None = None
+    phase_opponent_source: FrozenPhaseOpponentSource | None = None
+    checkpoint_sampler: CheckpointSampler | None = None
+    if phase_bundle is not None and phase_spec is not None:
+        frozen_sampler = FrozenMixtureSampler(
+            phase_spec.target_distribution,
+            seed=seed_streams["league"],
+        )
+        target_policy_ids = {item.policy_id for item in phase_spec.target_distribution}
+        target_checkpoints = {
+            policy_id: checkpoint_path
+            for policy_id, checkpoint_path in phase_bundle.checkpoint_by_policy_id.items()
+            if policy_id in target_policy_ids
+        }
+        phase_opponent_source = FrozenPhaseOpponentSource(
+            sampler=frozen_sampler,
+            checkpoint_by_policy_id=target_checkpoints,
+        )
+        checkpoint_sampler = phase_opponent_source.sample_checkpoint_paths
+        league.install_frozen_population(list(target_checkpoints.values()))
+
     # --- Resume from checkpoint ---
     restored_opponent_assignments: dict[int, str] | None = None
-    if args.resume:
+    if phase_spec is not None and phase_bundle is not None:
+        if team_pool is None or frozen_sampler is None:
+            raise RuntimeError("Best-response phase initialization was incomplete.")
+        if args.resume:
+            trainer.load(args.resume)
+            print(
+                f"Resumed best-response trainer from {args.resume!r} "
+                f"(phase update {trainer.completed_updates}, "
+                f"global step {trainer.global_step:,})"
+            )
+            phase_state_path = _phase_state_path_for_resume(args.resume)
+            if not phase_state_path.exists():
+                raise FileNotFoundError(
+                    "Strict best-response resume requires the checkpoint's paired "
+                    f"phase state: {phase_state_path!s}"
+                )
+            phase_state = PhaseRunState.load(phase_state_path)
+            phase_state.validate_resume(
+                phase=phase_spec,
+                training_state_id=trainer.loaded_training_state_id,
+                trainer_completed_updates=trainer.completed_updates,
+                sampler=frozen_sampler,
+            )
+            if phase_state.team_pool_signature != team_pool.signature():
+                raise ValueError(
+                    "Configured team pool does not match the paired phase state."
+                )
+            if phase_state.team_pool_rng_state is None:
+                raise ValueError("Paired phase state omitted the team-pool RNG state.")
+            team_pool.restore_rng_state(phase_state.team_pool_rng_state)
+            restored_opponent_assignments = _restore_opponent_assignments(
+                {
+                    str(group): checkpoint_path
+                    for group, checkpoint_path in phase_state.opponent_assignments
+                },
+                opponent_groups=opponent_groups,
+                league=league,
+            )
+            print(
+                "Restored frozen mixture sampler at "
+                f"draw {frozen_sampler.draw_count} from {phase_state_path!s}"
+            )
+        else:
+            initializer_path = Path(
+                phase_bundle.checkpoint_by_policy_id[
+                    phase_spec.initialization.source_policy_id
+                ]
+            )
+            trainer.initialize_from_trainer_weights(str(initializer_path))
+            print(
+                "Initialized fresh best-response learner from weights "
+                f"{initializer_path!s}; optimizer, counters, and RNG are fresh"
+            )
+    elif args.resume:
         trainer.load(args.resume)
         print(
             f"Resumed trainer from {args.resume!r} (global step {trainer.global_step:,})"
@@ -1851,7 +2148,7 @@ def train():
 
     # --- Seed league so self-play is available from update 1 ---
     # On a fresh start this ensures the agent never falls back to bots.
-    if not league.checkpoints:
+    if phase_spec is None and not league.checkpoints:
         with cuda_model_execution(device):
             league.add_checkpoint(agent, step=trainer.global_step)
         print(f"Seeded league with agent at step {trainer.global_step}")
@@ -1878,14 +2175,56 @@ def train():
         team_pair_provider=team_pair_provider,
         collect_timing=collect_timing,
         initial_checkpoint_by_group=restored_opponent_assignments,
+        checkpoint_sampler=checkpoint_sampler,
     )
     current_opponent_assignments = _current_opponent_assignments(parallel_env)
     run_assigned_opponents = set(current_opponent_assignments.values())
     run_observed_opponents: set[str] = set()
     run_opponent_outcomes: OpponentOutcomeCounts = {}
+    phase_summary = None
+    if (
+        phase_spec is not None
+        and phase_bundle is not None
+        and phase_opponent_source is not None
+        and frozen_sampler is not None
+    ):
+        phase_summary = {
+            "phase_id": phase_spec.phase_id,
+            "phase_hash": phase_spec.phase_hash,
+            "kind": phase_spec.kind.value,
+            "learner_policy_id": phase_spec.learner_policy_id,
+            "learner_role": phase_spec.learner_role.value,
+            "initialization_mode": phase_spec.initialization.mode.value,
+            "initializer_checkpoint": phase_bundle.checkpoint_by_policy_id[
+                phase_spec.initialization.source_policy_id
+            ],
+            "initialized_from_training_state_id": (
+                trainer.initialized_from_training_state_id
+            ),
+            "target_population_path": str(phase_bundle.population_path),
+            "target_population_revision_id": (phase_spec.target_population_revision_id),
+            "opponent_sampler": phase_spec.opponent_sampler.value,
+            "mixture_id": frozen_sampler.mixture_id,
+            "sampler_draw_count_at_start": frozen_sampler.draw_count,
+            "archive_policy": phase_spec.archive_policy.value,
+            "target_distribution": [
+                {
+                    "policy_id": item.policy_id,
+                    "probability": item.probability,
+                    "checkpoint_path": (
+                        phase_opponent_source.checkpoint_by_policy_id[item.policy_id]
+                    ),
+                }
+                for item in phase_spec.target_distribution
+            ],
+        }
     run_summary = {
         "status": "starting",
+        "phase": phase_summary,
         "config": {
+            "training_mode": (
+                "best_response" if phase_spec is not None else "main_self_play"
+            ),
             "device": str(device),
             "seed": train_config.seed,
             "seed_streams": seed_streams,
@@ -1921,6 +2260,9 @@ def train():
             "league_refresh_interval": train_config.league_refresh_interval,
             "league_coalesce_ms": train_config.league_coalesce_ms,
             "league_cuda_graphs": train_config.league_cuda_graphs,
+            "league_cuda_graph_batch_size": (train_config.league_cuda_graph_batch_size),
+            "league_cuda_graph_cache_size": (train_config.league_cuda_graph_cache_size),
+            "league_preview_device": train_config.league_preview_device,
             "league_payoff_half_life_updates": (
                 train_config.league_payoff_half_life_updates
             ),
@@ -1989,13 +2331,30 @@ def train():
         )
         print("Backend: local BattleStream")
         print(f"Opponent groups: {opponent_groups}")
+        if phase_spec is None:
+            print(
+                f"League: permanent archive, resident cache {train_config.league_size}; "
+                f"snapshot every {train_config.league_update_interval} update(s), "
+                f"refresh every {train_config.league_refresh_interval} update(s); "
+                f"payoff half-life {train_config.league_payoff_half_life_updates:g}; "
+                f"PFSP exponent {train_config.league_pfsp_exponent:g} with "
+                f"{train_config.league_pfsp_uniform_fraction:.0%} uniform coverage"
+            )
+        else:
+            assert frozen_sampler is not None
+            print(
+                "Best response: immutable target population "
+                f"{phase_spec.target_population_revision_id[:12]} with "
+                f"{len(phase_spec.target_distribution)} mixture member(s); "
+                f"refresh every {train_config.league_refresh_interval} update(s); "
+                "learner snapshots and payoff adaptation disabled"
+            )
         print(
-            f"League: permanent archive, resident cache {train_config.league_size}; "
-            f"snapshot every {train_config.league_update_interval} update(s), "
-            f"refresh every {train_config.league_refresh_interval} update(s); "
-            f"payoff half-life {train_config.league_payoff_half_life_updates:g}; "
-            f"PFSP exponent {train_config.league_pfsp_exponent:g} with "
-            f"{train_config.league_pfsp_uniform_fraction:.0%} uniform coverage"
+            "Frozen inference: "
+            f"action={league.inference_device}, preview={league.preview_inference_device}; "
+            f"CUDA graphs={'on' if train_config.league_cuda_graphs else 'off'} "
+            f"batch={train_config.league_cuda_graph_batch_size} "
+            f"cache={train_config.league_cuda_graph_cache_size}"
         )
         local_summary = battlestream_summary(env_config)
         print(
@@ -2230,22 +2589,38 @@ def train():
             hidden_refresh_sec = time.perf_counter() - hidden_refresh_started
             ppo_sec = time.perf_counter() - ppo_started
 
-            # The updated policy enters the league before opponent groups are
-            # resampled, making a newly created snapshot eligible immediately.
             league_maintenance_started = time.perf_counter()
-            # Outcomes came from the just-collected live policy. Update the
-            # discounted payoff row before drawing the next PFSP opponents.
-            league.record_outcomes(update_opponent_outcomes, update=update)
-            with cuda_model_execution(device):
-                league_maintenance = _maintain_league_after_update(
-                    update=update,
-                    num_updates=num_updates,
-                    global_step=trainer.global_step,
-                    agent=agent,
-                    parallel_env=parallel_env,
-                    league=league,
-                    config=train_config,
-                )
+            if phase_spec is None:
+                # The updated main policy enters the archive before opponent
+                # groups are resampled, making the new snapshot immediately
+                # eligible under the updated PFSP evidence.
+                league.record_outcomes(update_opponent_outcomes, update=update)
+                with cuda_model_execution(device):
+                    league_maintenance = _maintain_league_after_update(
+                        update=update,
+                        num_updates=num_updates,
+                        global_step=trainer.global_step,
+                        agent=agent,
+                        parallel_env=parallel_env,
+                        league=league,
+                        config=train_config,
+                    )
+            else:
+                if checkpoint_sampler is None:
+                    raise RuntimeError(
+                        "Best-response phase omitted its frozen checkpoint sampler."
+                    )
+                # Best responses report outcomes for diagnostics only.  Their
+                # target weights, population, and learner archive stay frozen.
+                with cuda_model_execution(device):
+                    league_maintenance = _maintain_best_response_after_update(
+                        update=update,
+                        num_updates=num_updates,
+                        parallel_env=parallel_env,
+                        league=league,
+                        config=train_config,
+                        checkpoint_sampler=checkpoint_sampler,
+                    )
             league_update_sec = time.perf_counter() - league_maintenance_started
             if league_maintenance.assignments_by_group:
                 current_opponent_assignments = dict(
@@ -2260,28 +2635,44 @@ def train():
                 )
                 print(f"League updated (pool: {len(league.checkpoints)}){refresh_note}")
 
-            if league.current_update != update:
+            if phase_spec is None and league.current_update != update:
                 raise RuntimeError(
                     "League maintenance did not finish at the current update: "
                     f"expected={update}, actual={league.current_update}."
                 )
             trainer.completed_updates = update
 
-            # Save league state after adding the current snapshot so a trainer
-            # checkpoint and its paired .league_state.json describe one point
-            # in training.
+            # Pair the trainer with the mutable state for its training regime:
+            # adaptive league state for main self-play, or exact frozen-sampler
+            # and team RNG state for a best response.
             checkpoint_sec = 0.0
             if update % train_config.save_interval == 0:
                 checkpoint_started = time.perf_counter()
                 path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
                 training_state_id = uuid.uuid4().hex
-                _save_training_state(
-                    league,
-                    path,
-                    team_pool,
-                    training_state_id,
-                    current_opponent_assignments,
-                )
+                if phase_spec is None:
+                    _save_training_state(
+                        league,
+                        path,
+                        team_pool,
+                        training_state_id,
+                        current_opponent_assignments,
+                    )
+                else:
+                    if team_pool is None or frozen_sampler is None:
+                        raise RuntimeError(
+                            "Best-response checkpoint state was not initialized."
+                        )
+                    _save_best_response_training_state(
+                        checkpoint_path=path,
+                        phase=phase_spec,
+                        sampler=frozen_sampler,
+                        team_pool=team_pool,
+                        training_state_id=training_state_id,
+                        completed_updates=trainer.completed_updates,
+                        opponent_assignments=current_opponent_assignments,
+                        league=league,
+                    )
                 with cuda_model_execution(device):
                     trainer.save(path, training_state_id=training_state_id)
                 checkpoint_sec = time.perf_counter() - checkpoint_started
@@ -2359,6 +2750,20 @@ def train():
             update_summary = {
                 "update": update,
                 "global_step": trainer.global_step,
+                "phase": (
+                    None
+                    if phase_spec is None or frozen_sampler is None
+                    else {
+                        "phase_hash": phase_spec.phase_hash,
+                        "target_population_revision_id": (
+                            phase_spec.target_population_revision_id
+                        ),
+                        "mixture_id": frozen_sampler.mixture_id,
+                        "sampler_draw_count": frozen_sampler.draw_count,
+                        "target_adapted": False,
+                        "learner_archived": False,
+                    }
+                ),
                 "completed_battles": len(update_episode_rewards),
                 "exact_aux_label_episodes": exact_aux_label_episodes,
                 "exact_aux_label_episode_coverage": _safe_div(
@@ -2467,6 +2872,8 @@ def train():
                 update=update,
                 include_members=True,
             )
+            if phase_summary is not None and frozen_sampler is not None:
+                phase_summary["sampler_draw_count"] = frozen_sampler.draw_count
             run_summary["updates"].append(update_summary)
             run_summary["status"] = "running"
             run_summary["update_count"] = update
@@ -2497,6 +2904,11 @@ def train():
                         f" | ObsQ wait {diagnostics.get('avg_player_obs_queue_get_wait_ms', 0.0):.1f}ms"
                         f" | OppQ {diagnostics.get('avg_opponent_infer_action_queue_wait_ms', 0.0):.1f}ms"
                     )
+                population_label = (
+                    f"League pool {len(league.checkpoints)}"
+                    if phase_spec is None
+                    else f"Frozen targets {len(league.checkpoints)}"
+                )
                 print(
                     f"Update {update}/{num_updates} | "
                     f"Step {trainer.global_step:,} | "
@@ -2526,20 +2938,34 @@ def train():
                     f"clip {metrics['pre_ppo_clip_fraction']:.1%} | "
                     f"Preview loss {metrics.get('team_preview_loss', float('nan')):.4f} | "
                     f"Preview value {metrics.get('team_preview_value_loss', float('nan')):.4f} | "
-                    f"League pool {len(league.checkpoints)}"
+                    f"{population_label}"
                     f"{diagnostics_text}"
                 )
 
         print("Training complete.")
         final_path = f"{train_config.checkpoint_dir}/final.pt"
         training_state_id = uuid.uuid4().hex
-        _save_training_state(
-            league,
-            final_path,
-            team_pool,
-            training_state_id,
-            current_opponent_assignments,
-        )
+        if phase_spec is None:
+            _save_training_state(
+                league,
+                final_path,
+                team_pool,
+                training_state_id,
+                current_opponent_assignments,
+            )
+        else:
+            if team_pool is None or frozen_sampler is None:
+                raise RuntimeError("Best-response final state was not initialized.")
+            _save_best_response_training_state(
+                checkpoint_path=final_path,
+                phase=phase_spec,
+                sampler=frozen_sampler,
+                team_pool=team_pool,
+                training_state_id=training_state_id,
+                completed_updates=trainer.completed_updates,
+                opponent_assignments=current_opponent_assignments,
+                league=league,
+            )
         with cuda_model_execution(device):
             trainer.save(final_path, training_state_id=training_state_id)
         print(f"Saved final checkpoint: {final_path}")
@@ -2553,7 +2979,14 @@ def train():
             if total_wall_sec > 0
             else 0.0,
             "final_checkpoint": final_path,
+            "phase_state": (
+                str(_phase_state_path_for_resume(final_path))
+                if phase_spec is not None
+                else None
+            ),
         }
+        if phase_summary is not None and frozen_sampler is not None:
+            phase_summary["sampler_draw_count"] = frozen_sampler.draw_count
         run_summary["status"] = "completed"
         _maybe_write_run_summary(args.summary_path, run_summary)
         return run_summary

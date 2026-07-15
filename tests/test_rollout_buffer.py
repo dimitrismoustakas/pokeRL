@@ -216,10 +216,19 @@ def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidd
     assert not batch.opponent_intent_tera_masks.any()
     assert torch.all(batch.opponent_intent_slot_labels == -1)
     assert torch.all(batch.opponent_intent_tera_labels == -1)
-    assert not batch.public_consequence_resolution_masks.any()
+    assert not batch.public_consequence_move_emitted_masks.any()
+    assert not batch.public_consequence_nonmove_reason_masks.any()
+    assert not batch.public_consequence_move_branch_masks.any()
+    assert not batch.public_consequence_route_masks.any()
+    assert not batch.public_consequence_interaction_masks.any()
+    assert not batch.public_consequence_interaction_reason_masks.any()
+    assert not batch.public_consequence_hit_count_masks.any()
     assert not batch.public_consequence_cant_masks.any()
     assert not batch.public_consequence_field_masks.any()
-    assert torch.all(batch.public_consequence_resolution_labels == -1)
+    assert torch.all(batch.public_consequence_nonmove_reason_labels == -1)
+    assert torch.all(batch.public_consequence_move_branch_labels == -1)
+    assert torch.all(batch.public_consequence_interaction_reason_labels == -1)
+    assert torch.all(batch.public_consequence_hit_count_labels == -1)
     assert not batch.public_consequence_cant_targets.any()
     assert not batch.public_consequence_field_targets.any()
 
@@ -241,8 +250,10 @@ def test_rollout_buffer_reset_clears_public_consequence_labels() -> None:
     buffer.reset()
     buffer.add(
         *common,
-        public_consequence_resolution_labels=torch.tensor([[2, 3]]),
-        public_consequence_resolution_masks=torch.ones((1, 2), dtype=torch.bool),
+        public_consequence_move_emitted_targets=torch.ones((1, 2)),
+        public_consequence_move_emitted_masks=torch.ones((1, 2), dtype=torch.bool),
+        public_consequence_move_branch_labels=torch.tensor([[2, 3]]),
+        public_consequence_move_branch_masks=torch.ones((1, 2), dtype=torch.bool),
         public_consequence_cant_targets=torch.ones((1, 2, 2)),
         public_consequence_cant_masks=torch.ones((1, 2, 2), dtype=torch.bool),
         public_consequence_field_targets=torch.ones((1, 2, 33)),
@@ -253,8 +264,10 @@ def test_rollout_buffer_reset_clears_public_consequence_labels() -> None:
     buffer.add(*common)
     batch = buffer.compute_gae(torch.zeros(1))
 
-    assert torch.all(batch.public_consequence_resolution_labels == -1)
-    assert not batch.public_consequence_resolution_masks.any()
+    assert not batch.public_consequence_move_emitted_targets.any()
+    assert not batch.public_consequence_move_emitted_masks.any()
+    assert torch.all(batch.public_consequence_move_branch_labels == -1)
+    assert not batch.public_consequence_move_branch_masks.any()
     assert not batch.public_consequence_cant_targets.any()
     assert not batch.public_consequence_cant_masks.any()
     assert not batch.public_consequence_field_targets.any()
@@ -630,7 +643,7 @@ def test_ppo_trainer_updates_public_consequence_model_from_rollout_labels() -> N
 
     agent = _DummyAgent().to(device)
     initial_consequence_weight = (
-        agent.action_head.public_consequence_head.weight.detach().clone()
+        agent.action_head.public_consequence_action_head.weight.detach().clone()
     )
     config = TrainingConfig(
         num_epochs=1,
@@ -664,11 +677,25 @@ def test_ppo_trainer_updates_public_consequence_model_from_rollout_labels() -> N
             out["value"],
             torch.tensor([1.0, -1.0]),
             torch.tensor([False, step == num_steps - 1]),
-            public_consequence_resolution_labels=torch.tensor(
+            public_consequence_move_emitted_targets=torch.ones(num_envs, 2),
+            public_consequence_move_emitted_masks=torch.ones(
+                num_envs, 2, dtype=torch.bool
+            ),
+            public_consequence_move_branch_labels=torch.tensor(
                 [[0, 1], [2, 3]], dtype=torch.long
             ),
-            public_consequence_resolution_masks=torch.ones(
+            public_consequence_move_branch_masks=torch.ones(
                 num_envs, 2, dtype=torch.bool
+            ),
+            public_consequence_route_targets=torch.randint(
+                0, 2, (num_envs, 2, 4), dtype=torch.int64
+            ).float(),
+            public_consequence_route_masks=torch.ones(num_envs, 2, 4, dtype=torch.bool),
+            public_consequence_interaction_targets=torch.randint(
+                0, 2, (num_envs, 2, 4), dtype=torch.int64
+            ).float(),
+            public_consequence_interaction_masks=torch.ones(
+                num_envs, 2, 4, dtype=torch.bool
             ),
             public_consequence_cant_targets=torch.tensor(
                 [[[0.0, 1.0], [1.0, 0.0]], [[1.0, 1.0], [0.0, 0.0]]]
@@ -683,14 +710,16 @@ def test_ppo_trainer_updates_public_consequence_model_from_rollout_labels() -> N
     metrics = trainer.update(buffer.compute_gae(torch.zeros(num_envs)))
 
     assert np.isfinite(metrics["aux_public_consequence_loss"])
-    assert metrics["aux_public_consequence_resolution_count"] == 8.0
+    assert metrics["aux_public_consequence_emitted_count"] == 8.0
+    assert metrics["aux_public_consequence_move_branch_count"] == 8.0
+    assert metrics["aux_public_consequence_route_count"] == 32.0
     assert metrics["aux_public_consequence_cant_count"] == 16.0
     assert metrics["aux_public_consequence_field_count"] == 8.0
     assert np.isfinite(metrics["aux_public_consequence_field_mse"])
     assert np.isfinite(metrics["aux_public_consequence_field_persistence_mse"])
     assert metrics["public_consequence_adapter_weight_norm"] >= 0.0
     assert not torch.equal(
-        agent.action_head.public_consequence_head.weight,
+        agent.action_head.public_consequence_action_head.weight,
         initial_consequence_weight,
     )
 
@@ -1066,6 +1095,10 @@ def test_action_head_matchup_features_distinguish_super_effective_and_resisted_t
         move_type_lookup=torch.tensor([0, 1], dtype=torch.long),
         move_base_power_lookup=torch.tensor([0.0, 1.0], dtype=torch.float32),
         move_accuracy_lookup=torch.tensor([0.0, 1.0], dtype=torch.float32),
+        move_bypasses_accuracy_lookup=torch.zeros(2, dtype=torch.float32),
+        move_ignores_evasion_lookup=torch.zeros(2, dtype=torch.float32),
+        move_target_scope_lookup=torch.tensor([0, 2], dtype=torch.long),
+        move_multihit_lookup=torch.zeros(2, dtype=torch.float32),
         move_priority_lookup=torch.tensor([0.0, 0.0], dtype=torch.float32),
         move_category_lookup=torch.tensor([0, 1], dtype=torch.long),
         move_target_flags=torch.zeros((2, 6), dtype=torch.float32),
@@ -1099,7 +1132,7 @@ def test_action_head_matchup_features_distinguish_super_effective_and_resisted_t
         device=torch.device("cpu"),
     )
 
-    target_eff_feature = 14
+    target_eff_feature = 19
     assert features[0, 0, target_eff_feature] > features[0, 1, target_eff_feature]
 
 

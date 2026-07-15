@@ -110,6 +110,11 @@ def _service_stub() -> _LeagueInferenceService:
     service._coalesce_window_sec = 0.0
     service._device = torch.device("cpu")
     service._cuda_stream = None
+    service._cuda_graph_batch_size = 16
+    service._cuda_graph_cache_size = 4
+    service._action_batch_size_histogram = (
+        league_module._empty_action_batch_size_histogram()
+    )
     return service
 
 
@@ -829,6 +834,17 @@ def test_action_batch_size_profile_accumulates_once_per_batch() -> None:
     assert timing.values["opponent_infer_action_requests"] == 4
     assert timing.values["opponent_infer_action_batches"] == pytest.approx(1.0)
     assert timing.values["opponent_infer_action_batch_size_sum"] == pytest.approx(4.0)
+    assert service.cache_info()["action_batch_size_histogram"] == {
+        "1": 0,
+        "2": 0,
+        "3-4": 1,
+        "5-8": 0,
+        "9-12": 0,
+        "13-16": 0,
+        "17-24": 0,
+        "25-36": 0,
+        ">36": 0,
+    }
 
 
 def test_league_inference_model_cache_is_lru_bounded() -> None:
@@ -855,8 +871,20 @@ def test_league_inference_model_cache_is_lru_bounded() -> None:
         "misses": 3,
         "loads": 3,
         "evictions": 1,
+        "action_batch_size_histogram": {
+            "1": 0,
+            "2": 0,
+            "3-4": 0,
+            "5-8": 0,
+            "9-12": 0,
+            "13-16": 0,
+            "17-24": 0,
+            "25-36": 0,
+            ">36": 0,
+        },
         "cuda_graphs_enabled": False,
-        "cuda_graph_capacity": 2,
+        "cuda_graph_batch_size": 16,
+        "cuda_graph_capacity": 4,
         "resident_cuda_graphs": 0,
         "cuda_graph_hits": 0,
         "cuda_graph_misses": 0,
@@ -949,6 +977,22 @@ def test_league_uses_same_process_cuda_inference(tmp_path) -> None:
         assert league.device.type == "cuda"
         assert league.inference_device.type == "cuda"
         assert isinstance(league._inference, _LeagueInferenceService)
+        assert league.preview_inference_device.type == "cuda"
+        assert league._preview_inference is league._inference
+    finally:
+        league.close()
+
+
+def test_league_can_use_separate_cpu_preview_inference(tmp_path) -> None:
+    game_data = GameData(gen=9)
+    agent = PokeAgent(ModelConfig(), game_data)
+    config = TrainingConfig(
+        checkpoint_dir=str(tmp_path),
+        league_preview_device="cpu",
+    )
+    league = League(config, EnvConfig(), game_data, agent, torch.device("cuda"))
+    try:
+        assert league.inference_device.type == "cuda"
         assert league.preview_inference_device.type == "cpu"
         assert league._preview_inference is not league._inference
     finally:

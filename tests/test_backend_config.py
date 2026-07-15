@@ -217,6 +217,58 @@ def test_frozen_opponent_cuda_graph_cli_can_disable_optimization(monkeypatch) ->
     assert config.league_cuda_graphs is False
 
 
+def test_frozen_opponent_inference_runtime_overrides(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--league-cuda-graph-batch-size",
+            "12",
+            "--league-cuda-graph-cache-size",
+            "6",
+            "--league-preview-device",
+            "cpu",
+        ],
+    )
+
+    _, _, config = build_configs(parse_args())
+
+    assert config.league_cuda_graph_batch_size == 12
+    assert config.league_cuda_graph_cache_size == 6
+    assert config.league_preview_device == "cpu"
+
+
+def test_frozen_opponent_inference_defaults_match_profiled_runtime() -> None:
+    config = TrainingConfig()
+
+    assert config.league_cuda_graph_batch_size == 16
+    assert config.league_cuda_graph_cache_size == 4
+    assert config.league_preview_device == "action"
+
+
+def test_best_response_phase_cli_is_explicit_and_composes_with_resume(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--phase-spec",
+            "plans/exploiter.json",
+            "--resume",
+            "checkpoints/exploiter.pt",
+            "--num-updates",
+            "7",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.phase_spec == "plans/exploiter.json"
+    assert args.resume == "checkpoints/exploiter.pt"
+    assert args.num_updates == 7
+
+
 def test_factorized_tera_cli_overrides(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
@@ -313,6 +365,24 @@ def test_league_intervals_must_be_positive(field_name: str) -> None:
 
     with pytest.raises(ValueError, match=field_name):
         TrainingConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["league_cuda_graph_batch_size", "league_cuda_graph_cache_size"],
+)
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_cuda_graph_geometry_must_be_positive_integer(
+    field_name: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        TrainingConfig(**{field_name: value})
+
+
+def test_preview_inference_device_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="league_preview_device"):
+        TrainingConfig(league_preview_device="cuda")
 
 
 @pytest.mark.parametrize(

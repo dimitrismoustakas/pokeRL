@@ -21,6 +21,8 @@ from pokerl.team_pool import (
     load_team_pool,
 )
 from pokerl.training.league import League
+from pokerl.training.population import CheckpointRef
+from pokerl.training.population_evidence import build_pairwise_evidence_block
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +36,17 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint", required=True, help="Candidate trainer or league checkpoint."
     )
     parser.add_argument(
+        "--checkpoint-policy-id",
+        required=True,
+        help="Stable population policy id for the candidate checkpoint.",
+    )
+    parser.add_argument(
         "--anchor", required=True, help="Frozen anchor trainer or league checkpoint."
+    )
+    parser.add_argument(
+        "--anchor-policy-id",
+        required=True,
+        help="Stable population policy id for the frozen anchor checkpoint.",
     )
     parser.add_argument("--device", default=None, help="cpu or cuda; defaults to auto")
     parser.add_argument(
@@ -132,8 +144,20 @@ def _write_json(path: str, payload: dict) -> Path:
     if not out_path.is_absolute():
         out_path = REPO_ROOT / out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return out_path
+    serialized = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    if out_path.exists():
+        if out_path.read_text(encoding="utf-8") == serialized:
+            return out_path.resolve()
+        raise FileExistsError(
+            f"Refusing to overwrite immutable evaluation summary: {out_path!s}"
+        )
+    temporary = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        temporary.write_text(serialized, encoding="utf-8")
+        temporary.replace(out_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return out_path.resolve()
 
 
 class _PlannedAnchorMatchups:
@@ -318,6 +342,13 @@ def _run_anchor_direction(
 def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
     if args.games <= 0:
         raise ValueError("--games must be positive.")
+    if args.checkpoint_policy_id == args.anchor_policy_id:
+        raise ValueError("Candidate and anchor policy ids must be distinct.")
+
+    checkpoint_ref = CheckpointRef.from_file(args.checkpoint)
+    anchor_ref = CheckpointRef.from_file(args.anchor)
+    if checkpoint_ref.sha256 == anchor_ref.sha256:
+        raise ValueError("Candidate and anchor checkpoints contain identical bytes.")
 
     showdown_dir = args.showdown_dir or default_showdown_dir()
     if showdown_dir is None:
@@ -353,6 +384,7 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
         manifest_path,
         subset=args.team_pool_subset,
         seed=args.seed,
+        usage="evaluation",
     )
     planned_pairs = [team_pool.sample_pair(distinct=True) for _ in range(args.games)]
 
@@ -362,8 +394,8 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
         model_config=model_config,
         game_data=game_data,
         device=device,
-        external_checkpoint=args.checkpoint,
-        opponent_checkpoint=args.anchor,
+        external_checkpoint=str(checkpoint_ref.resolve(REPO_ROOT)),
+        opponent_checkpoint=str(anchor_ref.resolve(REPO_ROOT)),
         planned_pairs=planned_pairs,
         swap_teams=False,
         label="candidate_external",
@@ -377,8 +409,8 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
                 model_config=model_config,
                 game_data=game_data,
                 device=device,
-                external_checkpoint=args.anchor,
-                opponent_checkpoint=args.checkpoint,
+                external_checkpoint=str(anchor_ref.resolve(REPO_ROOT)),
+                opponent_checkpoint=str(checkpoint_ref.resolve(REPO_ROOT)),
                 planned_pairs=planned_pairs,
                 swap_teams=True,
                 label="anchor_external_candidate_opponent",
@@ -402,10 +434,17 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             )
         }
     )
-    return {
+    # Reject a checkpoint that changed while games were being played.  The
+    # summary then always describes the exact bytes it names.
+    checkpoint_ref.verify(REPO_ROOT)
+    anchor_ref.verify(REPO_ROOT)
+    model_signature = game_data.vocab_signature()
+    summary: dict[str, object] = {
         "config": {
-            "checkpoint": args.checkpoint,
-            "anchor": args.anchor,
+            "checkpoint_policy_id": args.checkpoint_policy_id,
+            "anchor_policy_id": args.anchor_policy_id,
+            "checkpoint": checkpoint_ref.to_dict(),
+            "anchor": anchor_ref.to_dict(),
             "device": str(device),
             "battle_format": env_config.battle_format,
             "games_per_role": args.games,
@@ -420,12 +459,28 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             "team_pool_signature": team_pool.signature(),
             "league_coalesce_ms": args.league_coalesce_ms,
             "battlestream_startup_timeout": env_config.battlestream_startup_timeout,
+            "model_signature": model_signature,
         },
         "results": {
             "candidate_perspective": candidate_results,
             "directions": directions,
         },
     }
+    if args.mirrored:
+        summary["pairwise_evidence"] = build_pairwise_evidence_block(
+            checkpoint_policy_id=args.checkpoint_policy_id,
+            anchor_policy_id=args.anchor_policy_id,
+            checkpoint=checkpoint_ref,
+            anchor=anchor_ref,
+            battle_format=env_config.battle_format,
+            team_pool_signature=team_pool.signature(),
+            model_signature=model_signature,
+            action_mode=args.action_mode,
+            games_per_role=args.games,
+            directions=directions,
+            candidate_perspective=candidate_results,
+        )
+    return summary
 
 
 def main() -> None:

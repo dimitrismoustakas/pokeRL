@@ -25,13 +25,16 @@ from ..env.actions import (
 from ..env.observation import (
     ABILITY_KNOWN_OFFSET,
     ITEM_KNOWN_OFFSET,
+    NUM_PUBLIC_TARGET_POSITIONS,
     ROLE_BENCH,
     TERA_KNOWN_OFFSET,
 )
 from ..model.agent import PokeAgent
 from ..public_consequence import (
-    NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
-    PUBLIC_CONSEQUENCE_EXECUTED,
+    MAX_PUBLIC_HIT_COUNT,
+    NUM_MOVE_BRANCHES,
+    NUM_NONMOVE_REASONS,
+    NUM_TARGET_INTERACTION_REASONS,
     PUBLIC_CONSEQUENCE_FIELD_DIM,
 )
 from .aux_metrics import (
@@ -43,7 +46,20 @@ from .rollout import RolloutBatch
 
 
 # Increment when trainer-checkpoint semantics or same-shaped model inputs change.
-TRAINER_CHECKPOINT_FORMAT_VERSION = 5
+TRAINER_CHECKPOINT_FORMAT_VERSION = 6
+
+
+_PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
+    "move_emitted_logits",
+    "nonmove_reason_logits",
+    "move_branch_logits",
+    "route_logits",
+    "interaction_logits",
+    "interaction_reason_logits",
+    "hit_count_logits",
+    "cant_logits",
+    "field_logits",
+)
 
 
 def _qualified_type_name(value: object) -> str:
@@ -265,6 +281,7 @@ class PPOTrainer:
         self.global_step = 0
         self.completed_updates = 0
         self.loaded_training_state_id: str | None = None
+        self.initialized_from_training_state_id: str | None = None
 
     def _make_optimizer(self) -> torch.optim.Adam:
         return torch.optim.Adam(self.agent.parameters(), lr=self.config.lr, eps=1e-5)
@@ -370,12 +387,25 @@ class PPOTrainer:
         opponent_intent_slot_masks_all = batch.opponent_intent_slot_masks
         opponent_intent_tera_labels_all = batch.opponent_intent_tera_labels
         opponent_intent_tera_masks_all = batch.opponent_intent_tera_masks
-        public_consequence_resolution_labels_all = (
-            batch.public_consequence_resolution_labels
-        )
-        public_consequence_resolution_masks_all = (
-            batch.public_consequence_resolution_masks
-        )
+        public_consequence_structured_all = {
+            name: getattr(batch, f"public_consequence_{name}")
+            for name in (
+                "move_emitted_targets",
+                "move_emitted_masks",
+                "nonmove_reason_labels",
+                "nonmove_reason_masks",
+                "move_branch_labels",
+                "move_branch_masks",
+                "route_targets",
+                "route_masks",
+                "interaction_targets",
+                "interaction_masks",
+                "interaction_reason_labels",
+                "interaction_reason_masks",
+                "hit_count_labels",
+                "hit_count_masks",
+            )
+        }
         public_consequence_cant_targets_all = batch.public_consequence_cant_targets
         public_consequence_cant_masks_all = batch.public_consequence_cant_masks
         public_consequence_field_targets_all = batch.public_consequence_field_targets
@@ -398,10 +428,10 @@ class PPOTrainer:
             self.config.aux_public_consequence_coef != 0.0
             and hasattr(
                 getattr(self.agent, "action_head", None),
-                "public_consequence_head",
+                "public_consequence_action_head",
             )
             and bool(
-                public_consequence_resolution_masks_all.any().item()
+                public_consequence_structured_all["move_emitted_masks"].any().item()
                 or public_consequence_cant_masks_all.any().item()
                 or public_consequence_field_masks_all.any().item()
             )
@@ -511,9 +541,9 @@ class PPOTrainer:
                 all_base_tera_real_choices: list[torch.Tensor] = []
                 all_base_tera_slot_choices: list[torch.Tensor] = []
                 all_values: list[torch.Tensor] = []
-                all_public_consequence_resolution_logits: list[torch.Tensor] = []
-                all_public_consequence_cant_logits: list[torch.Tensor] = []
-                all_public_consequence_field_logits: list[torch.Tensor] = []
+                all_public_consequence_logits: dict[str, list[torch.Tensor]] = {
+                    name: [] for name in _PUBLIC_CONSEQUENCE_LOGIT_NAMES
+                }
                 head_chunk_steps = max(1, min(T, self._HEAD_BATCH_TARGET // E_mb))
                 for start in range(0, T, head_chunk_steps):
                     end = min(start + head_chunk_steps, T)
@@ -591,15 +621,8 @@ class PPOTrainer:
                         action_out["base_tera_has_slot_choice"]
                     )
                     if public_consequence_enabled:
-                        all_public_consequence_resolution_logits.append(
-                            action_out["public_consequence_resolution_logits"]
-                        )
-                        all_public_consequence_cant_logits.append(
-                            action_out["public_consequence_cant_logits"]
-                        )
-                        all_public_consequence_field_logits.append(
-                            action_out["public_consequence_field_logits"]
-                        )
+                        for name, chunks in all_public_consequence_logits.items():
+                            chunks.append(action_out[f"public_consequence_{name}"])
                     all_values.append(value_t)
 
                 log_probs_flat = torch.cat(all_log_probs)
@@ -616,25 +639,12 @@ class PPOTrainer:
                 public_consequence_out = None
                 if public_consequence_enabled:
                     public_consequence_out = {
-                        "public_consequence_resolution_logits": torch.cat(
-                            all_public_consequence_resolution_logits
-                        ).reshape(
+                        f"public_consequence_{name}": torch.cat(chunks).reshape(
                             T,
                             E_mb,
-                            2,
-                            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
-                        ),
-                        "public_consequence_cant_logits": torch.cat(
-                            all_public_consequence_cant_logits
-                        ).reshape(T, E_mb, 2, 2),
-                        "public_consequence_field_logits": torch.cat(
-                            all_public_consequence_field_logits
-                        ).reshape(
-                            T,
-                            E_mb,
-                            2,
-                            PUBLIC_CONSEQUENCE_FIELD_DIM,
-                        ),
+                            *chunks[0].shape[1:],
+                        )
+                        for name, chunks in all_public_consequence_logits.items()
                     }
 
                 # Policy loss (clipped surrogate objective).
@@ -799,12 +809,10 @@ class PPOTrainer:
                     )
 
                 if public_consequence_enabled:
-                    public_consequence_resolution_labels_mb = (
-                        public_consequence_resolution_labels_all[:, mb_envs]
-                    )
-                    public_consequence_resolution_masks_mb = (
-                        public_consequence_resolution_masks_all[:, mb_envs]
-                    )
+                    public_consequence_structured_mb = {
+                        name: value[:, mb_envs]
+                        for name, value in public_consequence_structured_all.items()
+                    }
                     public_consequence_cant_targets_mb = (
                         public_consequence_cant_targets_all[:, mb_envs]
                     )
@@ -824,8 +832,7 @@ class PPOTrainer:
                     )
                     public_consequence_loss = self._public_consequence_loss(
                         logits=public_consequence_out,
-                        resolution_labels=public_consequence_resolution_labels_mb,
-                        resolution_masks=public_consequence_resolution_masks_mb,
+                        **public_consequence_structured_mb,
                         cant_targets=public_consequence_cant_targets_mb,
                         cant_masks=public_consequence_cant_masks_mb,
                         field_targets=public_consequence_field_targets_mb,
@@ -865,14 +872,13 @@ class PPOTrainer:
                     if public_consequence_out is not None:
                         pending_aux_diagnostics.update(
                             public_consequence_additive_metrics(
-                                public_consequence_out,
-                                public_consequence_resolution_labels_mb,
-                                public_consequence_resolution_masks_mb,
-                                public_consequence_cant_targets_mb,
-                                public_consequence_cant_masks_mb,
-                                public_consequence_field_targets_mb,
-                                public_consequence_field_masks_mb,
-                                public_consequence_persistence_mb,
+                                logits=public_consequence_out,
+                                **public_consequence_structured_mb,
+                                cant_targets=public_consequence_cant_targets_mb,
+                                cant_masks=public_consequence_cant_masks_mb,
+                                field_targets=public_consequence_field_targets_mb,
+                                field_masks=public_consequence_field_masks_mb,
+                                persistence_fields=public_consequence_persistence_mb,
                             )
                         )
 
@@ -900,7 +906,11 @@ class PPOTrainer:
                             "memory_grad_public_consequence_valid_components"
                         )
                         support_tensors.append(
-                            public_consequence_resolution_masks_mb.sum()
+                            sum(
+                                value.sum()
+                                for name, value in public_consequence_structured_mb.items()
+                                if name.endswith("_masks")
+                            )
                             + public_consequence_cant_masks_mb.sum()
                             + public_consequence_field_masks_mb.sum()
                         )
@@ -1143,62 +1153,89 @@ class PPOTrainer:
                 numerator = sums.get(f"{prefix}_{source}", 0.0)
                 result[f"{prefix}_{target}"] = numerator / count if count > 0.0 else 0.0
 
-        resolution_prefix = "aux_public_consequence_resolution"
-        resolution_count = sums.get(f"{resolution_prefix}_count", 0.0)
-        result[f"{resolution_prefix}_count"] = resolution_count
-        result[f"{resolution_prefix}_accuracy"] = (
-            sums.get(f"{resolution_prefix}_top1_correct", 0.0) / resolution_count
-            if resolution_count > 0.0
-            else 0.0
-        )
-        for source, target in (("nll_sum", "nll"), ("brier_sum", "brier")):
-            result[f"{resolution_prefix}_{target}"] = (
-                sums.get(f"{resolution_prefix}_{source}", 0.0) / resolution_count
-                if resolution_count > 0.0
+        for task in ("emitted", "route", "interaction", "cant"):
+            prefix = f"aux_public_consequence_{task}"
+            count = sums.get(f"{prefix}_count", 0.0)
+            positive = sums.get(f"{prefix}_positive", 0.0)
+            negative = sums.get(f"{prefix}_negative", 0.0)
+            predicted_positive = sums.get(f"{prefix}_predicted_positive", 0.0)
+            result[f"{prefix}_count"] = count
+            for source, target in (
+                ("positive", "prevalence"),
+                ("predicted_positive", "predicted_positive_rate"),
+                ("correct", "accuracy"),
+                ("nll_sum", "nll"),
+                ("brier_sum", "brier"),
+            ):
+                result[f"{prefix}_{target}"] = (
+                    sums.get(f"{prefix}_{source}", 0.0) / count if count > 0.0 else 0.0
+                )
+            result[f"{prefix}_positive_recall"] = (
+                sums.get(f"{prefix}_true_positive", 0.0) / positive
+                if positive > 0.0
                 else 0.0
             )
-        for class_name in ("executed", "failed", "missed", "cant"):
-            class_prefix = f"{resolution_prefix}_{class_name}"
-            class_count = sums.get(f"{class_prefix}_count", 0.0)
-            result[f"{class_prefix}_count"] = class_count
-            result[f"{class_prefix}_recall"] = (
-                sums.get(f"{class_prefix}_correct", 0.0) / class_count
-                if class_count > 0.0
+            result[f"{prefix}_negative_specificity"] = (
+                sums.get(f"{prefix}_true_negative", 0.0) / negative
+                if negative > 0.0
                 else 0.0
             )
-            result[f"{class_prefix}_nll"] = (
-                sums.get(f"{class_prefix}_nll_sum", 0.0) / class_count
-                if class_count > 0.0
+            result[f"{prefix}_precision"] = (
+                sums.get(f"{prefix}_true_positive", 0.0) / predicted_positive
+                if predicted_positive > 0.0
                 else 0.0
             )
 
-        cant_prefix = "aux_public_consequence_cant"
-        cant_count = sums.get(f"{cant_prefix}_count", 0.0)
-        result[f"{cant_prefix}_count"] = cant_count
-        for source, target in (
-            ("positive", "prevalence"),
-            ("predicted_positive", "predicted_positive_rate"),
-            ("correct", "accuracy"),
-            ("nll_sum", "nll"),
-            ("brier_sum", "brier"),
-        ):
-            result[f"{cant_prefix}_{target}"] = (
-                sums.get(f"{cant_prefix}_{source}", 0.0) / cant_count
-                if cant_count > 0.0
-                else 0.0
-            )
-        cant_positive = sums.get(f"{cant_prefix}_positive", 0.0)
-        cant_negative = sums.get(f"{cant_prefix}_negative", 0.0)
-        result[f"{cant_prefix}_positive_recall"] = (
-            sums.get(f"{cant_prefix}_true_positive", 0.0) / cant_positive
-            if cant_positive > 0.0
-            else 0.0
-        )
-        result[f"{cant_prefix}_negative_specificity"] = (
-            sums.get(f"{cant_prefix}_true_negative", 0.0) / cant_negative
-            if cant_negative > 0.0
-            else 0.0
-        )
+        categorical_tasks = {
+            "nonmove_reason": ("cant", "fainted"),
+            "move_branch": (
+                "action_failed",
+                "no_target",
+                "scoped",
+                "target_phase",
+            ),
+            "interaction_reason": (
+                "miss",
+                "immune",
+                "protected",
+                "blocked",
+                "failed",
+            ),
+            "hit_count": tuple(f"hit_{count}" for count in range(1, 11)),
+        }
+        for task, classes in categorical_tasks.items():
+            prefix = f"aux_public_consequence_{task}"
+            count = sums.get(f"{prefix}_count", 0.0)
+            result[f"{prefix}_count"] = count
+            for source, target in (
+                ("top1_correct", "top1_accuracy"),
+                ("nll_sum", "nll"),
+                ("brier_sum", "brier"),
+            ):
+                result[f"{prefix}_{target}"] = (
+                    sums.get(f"{prefix}_{source}", 0.0) / count if count > 0.0 else 0.0
+                )
+            for class_name in classes:
+                class_prefix = f"{prefix}_{class_name}"
+                class_count = sums.get(f"{class_prefix}_count", 0.0)
+                predicted_count = sums.get(f"{class_prefix}_predicted_count", 0.0)
+                result[f"{class_prefix}_count"] = class_count
+                result[f"{class_prefix}_recall"] = (
+                    sums.get(f"{class_prefix}_correct", 0.0) / class_count
+                    if class_count > 0.0
+                    else 0.0
+                )
+                result[f"{class_prefix}_precision"] = (
+                    sums.get(f"{class_prefix}_correct", 0.0) / predicted_count
+                    if predicted_count > 0.0
+                    else 0.0
+                )
+                for source, target in (("nll_sum", "nll"), ("brier_sum", "brier")):
+                    result[f"{class_prefix}_{target}"] = (
+                        sums.get(f"{class_prefix}_{source}", 0.0) / class_count
+                        if class_count > 0.0
+                        else 0.0
+                    )
 
         field_prefix = "aux_public_consequence_field"
         field_count = sums.get(f"{field_prefix}_count", 0.0)
@@ -1214,6 +1251,16 @@ class PPOTrainer:
         )
         result[f"{field_prefix}_count"] = field_count
         result[f"{field_prefix}_mse"] = field_mse
+        result[f"{field_prefix}_nll"] = (
+            sums.get(f"{field_prefix}_nll_sum", 0.0) / field_count
+            if field_count > 0.0
+            else 0.0
+        )
+        result[f"{field_prefix}_brier"] = (
+            sums.get(f"{field_prefix}_brier_sum", 0.0) / field_count
+            if field_count > 0.0
+            else 0.0
+        )
         result[f"{field_prefix}_persistence_mse"] = persistence_mse
         result[f"{field_prefix}_mse_skill"] = (
             1.0 - field_mse / persistence_mse if persistence_mse > 0.0 else 0.0
@@ -1245,6 +1292,29 @@ class PPOTrainer:
                 if diagnostic_persistence_mse > 0.0
                 else 0.0
             )
+        feature_prefix = f"{field_prefix}_feature"
+        feature_count = sums.get(f"{feature_prefix}_count", 0.0)
+        feature_positive = sums.get(f"{feature_prefix}_positive", 0.0)
+        feature_negative = sums.get(f"{feature_prefix}_negative", 0.0)
+        result[f"{feature_prefix}_count"] = feature_count
+        result[f"{feature_prefix}_accuracy"] = (
+            sums.get(f"{feature_prefix}_correct", 0.0) / feature_count
+            if feature_count > 0.0
+            else 0.0
+        )
+        result[f"{feature_prefix}_prevalence"] = (
+            feature_positive / feature_count if feature_count > 0.0 else 0.0
+        )
+        result[f"{feature_prefix}_positive_recall"] = (
+            sums.get(f"{feature_prefix}_true_positive", 0.0) / feature_positive
+            if feature_positive > 0.0
+            else 0.0
+        )
+        result[f"{feature_prefix}_negative_specificity"] = (
+            sums.get(f"{feature_prefix}_true_negative", 0.0) / feature_negative
+            if feature_negative > 0.0
+            else 0.0
+        )
         return result
 
     @staticmethod
@@ -1545,48 +1615,109 @@ class PPOTrainer:
     @staticmethod
     def _public_consequence_loss(
         logits: Mapping[str, torch.Tensor],
-        resolution_labels: torch.Tensor,
-        resolution_masks: torch.Tensor,
+        move_emitted_targets: torch.Tensor,
+        move_emitted_masks: torch.Tensor,
+        nonmove_reason_labels: torch.Tensor,
+        nonmove_reason_masks: torch.Tensor,
+        move_branch_labels: torch.Tensor,
+        move_branch_masks: torch.Tensor,
+        route_targets: torch.Tensor,
+        route_masks: torch.Tensor,
+        interaction_targets: torch.Tensor,
+        interaction_masks: torch.Tensor,
+        interaction_reason_labels: torch.Tensor,
+        interaction_reason_masks: torch.Tensor,
+        hit_count_labels: torch.Tensor,
+        hit_count_masks: torch.Tensor,
         cant_targets: torch.Tensor,
         cant_masks: torch.Tensor,
         field_targets: torch.Tensor,
         field_masks: torch.Tensor,
         persistence_fields: torch.Tensor,
     ) -> torch.Tensor:
-        """Average normalized loss across available public-outcome tasks.
+        """Average conditional losses for the public consequence factorization.
 
-        Absolute public-field prediction is dominated by features that simply
-        persist from the current observation.  Within the field task, changed
-        and unchanged observed features therefore contribute one normalized
-        component each when both are present.  A minibatch containing only one
-        group falls back to that group's mean without changing the outer task
-        normalization.
+        Every subtype is supervised only where the protocol makes that question
+        meaningful.  This preserves the proper likelihood for each conditional
+        distribution without amplifying rare outcomes with class weights.
         """
         required = {
-            "public_consequence_resolution_logits",
+            "public_consequence_move_emitted_logits",
+            "public_consequence_nonmove_reason_logits",
+            "public_consequence_move_branch_logits",
+            "public_consequence_route_logits",
+            "public_consequence_interaction_logits",
+            "public_consequence_interaction_reason_logits",
+            "public_consequence_hit_count_logits",
             "public_consequence_cant_logits",
             "public_consequence_field_logits",
         }
         missing = sorted(required.difference(logits))
         if missing:
             raise ValueError(f"logits is missing key(s): {', '.join(missing)}.")
-        if resolution_labels.shape != resolution_masks.shape:
-            raise ValueError(
-                "Public consequence resolution labels/masks must share shape."
-            )
-        if resolution_labels.ndim < 1 or resolution_labels.shape[-1] != 2:
-            raise ValueError(
-                "Public consequence resolution labels must end with two action slots."
-            )
-        base_shape = tuple(resolution_labels.shape)
-        resolution_logits = logits["public_consequence_resolution_logits"]
-        if resolution_logits.shape != (
-            *base_shape,
-            NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+        if move_emitted_targets.shape != move_emitted_masks.shape:
+            raise ValueError("Move-emitted targets/masks must share shape.")
+        if move_emitted_targets.ndim < 1 or move_emitted_targets.shape[-1] != 2:
+            raise ValueError("Move-emitted targets must end with two action slots.")
+        base_shape = tuple(move_emitted_targets.shape)
+        target_shape = (*base_shape, NUM_PUBLIC_TARGET_POSITIONS)
+        paired_tensors = {
+            "nonmove reason": (nonmove_reason_labels, nonmove_reason_masks),
+            "move branch": (move_branch_labels, move_branch_masks),
+            "route": (route_targets, route_masks),
+            "interaction": (interaction_targets, interaction_masks),
+            "interaction reason": (
+                interaction_reason_labels,
+                interaction_reason_masks,
+            ),
+            "hit count": (hit_count_labels, hit_count_masks),
+        }
+        for name, (targets, masks) in paired_tensors.items():
+            if targets.shape != masks.shape:
+                raise ValueError(f"Public consequence {name} labels/masks differ.")
+        for name, tensor in (
+            ("nonmove reason", nonmove_reason_labels),
+            ("move branch", move_branch_labels),
         ):
-            raise ValueError(
-                "Public consequence resolution logits have incompatible shape."
-            )
+            if tensor.shape != base_shape:
+                raise ValueError(
+                    f"Public consequence {name} labels have incompatible shape."
+                )
+        for name, tensor in (
+            ("route", route_targets),
+            ("interaction", interaction_targets),
+            ("interaction reason", interaction_reason_labels),
+            ("hit count", hit_count_labels),
+        ):
+            if tensor.shape != target_shape:
+                raise ValueError(
+                    f"Public consequence {name} labels have incompatible shape."
+                )
+
+        expected_logit_shapes = {
+            "public_consequence_move_emitted_logits": base_shape,
+            "public_consequence_nonmove_reason_logits": (
+                *base_shape,
+                NUM_NONMOVE_REASONS,
+            ),
+            "public_consequence_move_branch_logits": (
+                *base_shape,
+                NUM_MOVE_BRANCHES,
+            ),
+            "public_consequence_route_logits": target_shape,
+            "public_consequence_interaction_logits": target_shape,
+            "public_consequence_interaction_reason_logits": (
+                *target_shape,
+                NUM_TARGET_INTERACTION_REASONS,
+            ),
+            "public_consequence_hit_count_logits": (
+                *target_shape,
+                MAX_PUBLIC_HIT_COUNT,
+            ),
+        }
+        for name, expected_shape in expected_logit_shapes.items():
+            if tuple(logits[name].shape) != expected_shape:
+                raise ValueError(f"{name} has incompatible shape.")
         if cant_targets.shape != (*base_shape, 2) or cant_masks.shape != (
             *base_shape,
             2,
@@ -1610,53 +1741,68 @@ class PPOTrainer:
             )
         if field_masks.shape != base_shape:
             raise ValueError(
-                "Public consequence field masks must match resolution-label shape."
+                "Public consequence field masks must match action-slot shape."
             )
         field_logits = logits["public_consequence_field_logits"]
         if field_logits.shape != expected_field_shape:
             raise ValueError("Public consequence field logits have incompatible shape.")
 
         component_losses: list[torch.Tensor] = []
-        resolution_selected = resolution_masks.reshape(-1).to(torch.bool)
-        if resolution_selected.any():
-            selected_resolution_logits = resolution_logits.reshape(
-                -1, NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES
-            )[resolution_selected]
-            selected_resolution_labels = resolution_labels.reshape(-1)[
-                resolution_selected
-            ]
-            nonexecuted = selected_resolution_labels != PUBLIC_CONSEQUENCE_EXECUTED
-            execution_logits = torch.stack(
-                (
-                    selected_resolution_logits[:, PUBLIC_CONSEQUENCE_EXECUTED],
-                    torch.logsumexp(selected_resolution_logits[:, 1:], dim=-1),
-                ),
-                dim=-1,
-            )
-            resolution_losses = [
-                F.cross_entropy(execution_logits, nonexecuted.to(torch.long))
-            ]
-            if nonexecuted.any():
-                resolution_losses.append(
-                    F.cross_entropy(
-                        selected_resolution_logits[nonexecuted, 1:],
-                        selected_resolution_labels[nonexecuted] - 1,
+
+        def add_binary(logit_name: str, targets: torch.Tensor, masks: torch.Tensor):
+            selected = masks.to(torch.bool)
+            if selected.any():
+                component_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        logits[logit_name][selected],
+                        targets.to(logits[logit_name].dtype)[selected],
                     )
                 )
-            # This proper hierarchical decomposition keeps the calibrated
-            # optimum of the original four-way likelihood.  Normalizing the
-            # conditional failure-type task independently prevents its
-            # gradients from being multiplied by the rarity of non-execution.
-            component_losses.append(torch.stack(resolution_losses).mean())
 
-        cant_selected = cant_masks.to(torch.bool)
-        if cant_selected.any():
-            component_losses.append(
-                F.binary_cross_entropy_with_logits(
-                    cant_logits[cant_selected],
-                    cant_targets.to(cant_logits.dtype)[cant_selected],
+        def add_categorical(
+            logit_name: str,
+            labels: torch.Tensor,
+            masks: torch.Tensor,
+        ):
+            selected = masks.to(torch.bool)
+            if selected.any():
+                component_losses.append(
+                    F.cross_entropy(logits[logit_name][selected], labels[selected])
                 )
-            )
+
+        add_binary(
+            "public_consequence_move_emitted_logits",
+            move_emitted_targets,
+            move_emitted_masks,
+        )
+        add_categorical(
+            "public_consequence_nonmove_reason_logits",
+            nonmove_reason_labels,
+            nonmove_reason_masks,
+        )
+        add_categorical(
+            "public_consequence_move_branch_logits",
+            move_branch_labels,
+            move_branch_masks,
+        )
+        add_binary("public_consequence_route_logits", route_targets, route_masks)
+        add_binary(
+            "public_consequence_interaction_logits",
+            interaction_targets,
+            interaction_masks,
+        )
+        add_categorical(
+            "public_consequence_interaction_reason_logits",
+            interaction_reason_labels,
+            interaction_reason_masks,
+        )
+        add_categorical(
+            "public_consequence_hit_count_logits",
+            hit_count_labels,
+            hit_count_masks,
+        )
+
+        add_binary("public_consequence_cant_logits", cant_targets, cant_masks)
 
         field_selected = field_masks.to(torch.bool)
         if field_selected.any():
@@ -1677,7 +1823,7 @@ class PPOTrainer:
             component_losses.append(torch.stack(field_group_losses).mean())
 
         if not component_losses:
-            return resolution_logits.sum() * 0.0
+            return logits["public_consequence_move_emitted_logits"].sum() * 0.0
         # Every available task contributes equally regardless of output width
         # or label frequency; the configured coefficient weights the complete
         # auxiliary objective rather than growing with added target fields.
@@ -1965,6 +2111,77 @@ class PPOTrainer:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def initialize_from_trainer_weights(self, path: str) -> None:
+        """Strictly initialize model weights without inheriting training state.
+
+        Best-response policies are new learners.  They may start from a
+        competent main policy, but must not silently inherit its Adam moments,
+        update counters, or RNG streams.  This method accepts only the current
+        versioned trainer format so architecture and vocabulary metadata can be
+        validated before loading exact weights.
+        """
+        fresh_rng_state = _capture_rng_state()
+        try:
+            checkpoint = torch.load(
+                path,
+                map_location=self.device,
+                weights_only=False,
+            )
+            if not isinstance(checkpoint, dict):
+                raise ValueError(
+                    "Weight initializer checkpoint must be a mapping, got "
+                    f"{type(checkpoint).__name__}."
+                )
+            if checkpoint.get("checkpoint_type") != "trainer":
+                raise ValueError(
+                    f"Weight initializer {path!r} must be a versioned trainer "
+                    "checkpoint; league and legacy checkpoints do not carry the "
+                    "strict model metadata required for a new learner."
+                )
+            if checkpoint.get("format_version") != TRAINER_CHECKPOINT_FORMAT_VERSION:
+                raise ValueError(
+                    f"Weight initializer {path!r} has unsupported format_version="
+                    f"{checkpoint.get('format_version')!r}; expected "
+                    f"{TRAINER_CHECKPOINT_FORMAT_VERSION}."
+                )
+            required = {"agent", "model_metadata", "training_state_id"}
+            missing = sorted(required.difference(checkpoint))
+            if missing:
+                raise ValueError(
+                    f"Weight initializer {path!r} is missing required key(s): "
+                    + ", ".join(missing)
+                )
+            checkpoint_state = _validate_model_checkpoint_metadata(
+                path=path,
+                checkpoint_state=checkpoint["agent"],
+                checkpoint_metadata=checkpoint["model_metadata"],
+                current_agent=self.agent,
+            )
+            source_state_id = checkpoint["training_state_id"]
+            if not isinstance(source_state_id, str) or not source_state_id:
+                raise ValueError(
+                    "Weight initializer training_state_id must be non-empty string."
+                )
+            try:
+                self.agent.load_state_dict(checkpoint_state, strict=True)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"Weight initializer {path!r} failed strict model loading: {exc}"
+                ) from exc
+
+            # Construct a new optimizer after loading.  No source optimizer
+            # tensors, rollout boundary, or random stream is adopted.
+            self.optimizer = self._make_optimizer()
+            self.global_step = 0
+            self.completed_updates = 0
+            self.loaded_training_state_id = None
+            self.initialized_from_training_state_id = source_state_id
+        finally:
+            # Loading checkpoint bytes and validating metadata must be RNG
+            # transparent.  The caller's freshly configured phase streams stay
+            # in force even if initialization fails.
+            _restore_rng_state(fresh_rng_state)
+
     def load(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         if not isinstance(checkpoint, dict):
@@ -2047,4 +2264,5 @@ class PPOTrainer:
         self.global_step = global_step
         self.completed_updates = completed_updates
         self.loaded_training_state_id = training_state_id
+        self.initialized_from_training_state_id = None
         _restore_rng_state(rng_state)

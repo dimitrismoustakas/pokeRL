@@ -232,9 +232,9 @@ Attention is **permutation-equivariant** with respect to team order — the mode
 
 ### 3.4 RecentEventEncoder and SpatialEncoder
 
-`RecentEventEncoder` encodes a bounded chronological sequence of public events from the most recent completed turn (or the causal partial segment at a forced replacement), plus the agent's own previous submitted intent. The public sequence covers executed moves and targets, switches/drags, inability to act, faints, and Terastallization. It is bounded to 12 events with explicit partial/overflow metadata. Opponent requested actions and trainer-private terminal labels are never policy inputs.
+`RecentEventEncoder` encodes a bounded chronological sequence of public events from the most recent completed turn (or the causal partial segment at a forced replacement), plus the agent's own previous submitted intent. The public sequence covers executed moves and actual targets, switches/drags, inability to act, faints, and Terastallization. Each move record also carries bounded per-target public facts (miss, immunity, explicit block, mechanic failure, Protect-like activation, and hit count) plus called-move source identity. This represents a spread move resolving against one target while failing against the other without adding an unbounded stream of minor protocol messages. The sequence remains bounded to 12 major events with explicit partial/overflow metadata. Opponent requested actions and trainer-private terminal labels are never policy inputs.
 
-The encoder combines event-kind, actor/target position, move, switch species, Tera type, and event-flag embeddings with a small GRU. A separate projection encodes both prior own slot intents using semantic move/target/switch/Tera features. The resulting 64-dimensional summary complements the across-turn LSTM: the LSTM retains longer strategic history, while this encoder makes the immediately preceding action and resolution order explicit.
+The encoder combines event-kind, actor/target position, actual and calling move, switch species, Tera type, event flags, and flattened per-target outcomes with a small GRU. A separate projection encodes both prior own slot intents using semantic move/target/switch/Tera features. The resulting 64-dimensional summary complements the across-turn LSTM: the LSTM retains longer strategic history, while this encoder makes the immediately preceding action and resolution order explicit.
 
 `SpatialEncoder` combines the team, field, and recent-event encoders and exposes five tensors:
 
@@ -707,15 +707,33 @@ Those losses update the shared encoder stack (and hence `opp_reps`) as well as t
 
 ### 5.5 Action-conditioned public consequences
 
-Each legal move candidate now predicts consequences visible in the next public
-observation: whether the submitted move executed, failed, missed, or could not
-act; whether either explicitly targeted opponent produced a public `CANT`
-event; and the next public field prefix through Trick Room. Labels are matched
-only from complete public event segments to the exact previously submitted
-actor and move. Ambiguous, transformed, truncated, and overflowing segments
-are masked instead of guessed. Implicit targets supervise opponent `CANT` only
-when the matched public move is marked as spread, so self/field moves such as
-Protect and Trick Room cannot receive an ally's flinch credit.
+Each legal move candidate predicts a structured immediate public transition:
+whether a move line was emitted; the exact public non-move reason (`CANT` or
+fainted before acting); the emitted move branch (actor-level failure, no
+target, scoped resolution, or per-target resolution); which public targets were
+declared; and, for each declared target, whether the protocol emitted an
+interaction marker (miss, immunity, Protect-like activation, block, or target
+failure) plus any public multi-hit count. It also predicts explicitly targeted
+opponent `CANT` events and the next public field prefix through Trick Room.
+Labels are matched only from complete public event segments to the exact
+previously submitted actor and move, including called moves identified by their
+public source tag. Ambiguous, transformed, truncated, and overflowing segments
+are masked instead of guessed. Declared routes are kept separate for every
+spread target rather than pretending the joint move has one universal result.
+A target `-block` or `-fail` is only an interaction marker: it can suppress a
+subeffect while the rest of a compound move succeeds (for example Clear Amulet
+blocks Parting Shot's stat drop while its self-switch still occurs). It is not
+assigned a negative value and is never collapsed into actor-level failure.
+Implicit targets supervise opponent `CANT`
+only when the matched public move is marked as spread, so self/field moves such
+as Protect and Trick Room cannot receive an ally's flinch credit.
+
+The target decoder receives target representations plus the move's numeric base
+accuracy, always-hit flag, ignore-evasion flag, the source accuracy stage, and
+the target evasion stage. Numeric 100% accuracy remains distinct from Showdown's
+boolean always-hit mechanic, and moves such as Sacred Sword can ignore evasion
+without being mislabeled as universally bypassing accuracy checks. These are
+mechanics inputs to a learned probabilistic model, not deterministic hit rules.
 
 At battle end, poke-env marks the final current public-event segment complete:
 Showdown does not emit another `|turn|` delimiter after a terminal event, but
@@ -738,20 +756,23 @@ Trick Room composition and harmful for a fast one.
 This is auxiliary representation learning, not reward shaping or a rule
 override. The only reward remains terminal win/loss, only selected actions
 receive consequence labels, and the model is not given counterfactual
-simulator outcomes. Resolution cross-entropy, opponent-CANT binary
-cross-entropy, and next-field mean-squared error are normalized as three equal
-components before multiplication by `aux_public_consequence_coef`. Resolution
-uses a proper hierarchical likelihood: executed versus non-executed, followed
-by failure/miss/CANT type conditional on non-execution. This gives the rare
-failure-type task a full gradient without changing the calibrated-probability
-optimum. Within the field component, changed and unchanged public features
+simulator outcomes. Every available binary or categorical component is trained
+with its proper normalized conditional likelihood: emitted, non-move reason,
+move branch, target route, interaction-marker presence, interaction-marker
+reason, public hit count, opponent CANT, and field transition. Conditional masks
+give rare subtypes a full task-level gradient without class weights or changing
+their calibrated optimum. Within the field component, changed and unchanged public features
 receive equal weight when both occur, preventing the persistence majority from
-drowning out real transitions. Logs report per-resolution-class support/recall,
-resolution/CANT calibration and CANT positive recall/negative specificity,
-generic changed-feature errors, and separate Trick Room scalar-age versus true
-presence-transition errors against a persistence baseline, plus policy-adapter
-weight norm. The transition-balanced field objective is deliberately judged by
-MSE/skill rather than interpreted as a calibrated conditional mean.
+drowning out real transitions. Logs report support, NLL, Brier score, accuracy,
+and per-class recall/precision for each conditional component, alongside field
+errors and separate Trick Room scalar-age versus true presence-transition errors
+against a persistence baseline, plus policy-adapter weight norm.
+
+The supervised scope ends with the immediate resolved public segment. Delayed
+effects whose later resolution cannot be exactly attributed from that segment
+(for example Future Sight) remain in recurrent public history and receive value
+through PPO's downstream return; the auxiliary labels do not invent a causal
+immediate outcome for them.
 
 Because doubles resolves a joint turn, the next field and CANT targets are
 on-policy marginal outcomes under the observed partner and opponent actions;
@@ -850,7 +871,7 @@ First-draw hard-PFSP priority is `(1 - p)^league_pfsp_exponent`, where `p` is th
 - Multiple parallel `LeaguePlayer` instances (one per concurrent battle) submit inference requests via `Future`.
 - Requests are buffered over the configured coalescing window, then grouped by `(checkpoint_path, kind)` — so all "checkpoint X, battle turn" requests across envs run in a single batched forward pass.
 - Frozen models use a bounded LRU cache. Selecting an evicted historical checkpoint reloads it lazily without removing it from the permanent archive.
-- On CUDA, battle-action batches use a bounded graph cache for the current frozen checkpoints. Inputs and recurrent state are staged into fixed buffers, stochastic sampling noise is generated outside the graph in the same logical order as eager inference, and outputs are cloned before reuse. Capture failure disables the optimization and falls back to eager inference with explicit diagnostics; preview inference stays eager on CPU.
+- On CUDA, battle-action batches use a bounded graph cache for the current frozen checkpoints. Inputs and recurrent state are staged into fixed buffers, stochastic sampling noise is generated outside the graph in the same logical order as eager inference, and outputs are cloned before reuse. Capture failure disables the optimization and falls back to eager inference with explicit diagnostics. Frozen team preview shares the action-device service by default so it reuses the same resident models without competing with Showdown workers for CPU time; `--league-preview-device cpu` keeps an explicit A/B fallback. The graph replay batch and cache sizes are runtime-configurable, and the service reports a fixed-cost logical batch-size histogram for retuning them from production runs.
 - Responses are dispatched back to the waiting `LeaguePlayer`s.
 
 Without this, each `LeaguePlayer` would drive a per-env forward pass — extremely slow given Showdown's per-battle latency.
@@ -1008,7 +1029,34 @@ Even with batching and multiple environments, Showdown battle latency dominates 
 
 ### 10.8 The league still follows one strategy-generating trajectory
 
-The permanent archive and payoff-aware PFSP prevent history eviction and resurface hard past policies, but every member is still a snapshot of the same main learner. Reweighting those opponents cannot invent a counter-strategy that never appeared on that trajectory. Separate learned exploiters remain deliberately deferred because they would consume substantial additional simulation compute on one machine and can overfit a single checkpoint.
+The permanent archive and payoff-aware PFSP prevent history eviction and resurface hard past policies, but every member is still a snapshot of the same main learner. Reweighting those opponents cannot invent a counter-strategy that never appeared on that trajectory.
+
+The repository now has a strict best-response worker rather than pretending the
+existing rolling archive is a complete exploiter league. Immutable population
+and phase artifacts pin exact checkpoint bytes; a main exploiter targets one
+declared main policy, while a league exploiter targets a certified mixture from
+a complete skew-symmetric frozen payoff matrix. Best-response phases start from
+weights only with fresh optimizer/counters/RNG, sample actions, never adapt the
+target distribution, and never archive the learner into its own target.
+
+Frozen admission evidence is now fail-closed. `evaluate_anchor.py` records exact
+checkpoint hashes, battle/team/model signatures, sampled action mode, both
+mirrored role schedules, W/L/D counts, and the retained per-game team pairing.
+`build_population_revision.py` verifies those source bytes and creates an
+immutable child only when inherited plus new evidence covers every unordered
+policy pair exactly once. It uses no arbitrary win-rate threshold: the empirical
+game records the oracle's measured row even when that row is weak.
+
+This is not yet an automatically closed PSRO loop. Once an external controller
+has verified a child population revision, `League.add_admitted_checkpoint`
+checks the selected member's exact SHA-256 and installs it as a permanent,
+neutral-prior member of the main learner's adaptive PFSP archive. Subsequent
+on-policy games update its difficulty estimate normally. The remaining gap is
+operational automation: generating member specifications and all required
+evaluation jobs, choosing when a fully evaluated oracle should be exposed to
+the main learner, invoking that update-boundary installation, and alternating
+main and oracle phases. No checkpoint is admitted merely because its
+best-response phase finished.
 
 Mirrored checkpoint evaluation remains necessary: online discounted payoffs estimate the changing main policy's current row against the archive, not the complete frozen-vs-frozen payoff matrix or a Nash mixture.
 
@@ -1016,7 +1064,11 @@ See [LEAGUE_IMPROVEMENTS.md](LEAGUE_IMPROVEMENTS.md) for the league design space
 
 ### 10.9 No explicit hazard / weather strategy
 
-The agent must discover hazard, weather, and terrain strategies entirely from scratch via sparse reward. It's learnable but slow. A curriculum — starting with simpler formats and increasing complexity — could accelerate this substantially, and would compose with the win-probability shaper idea from §10.3.
+The agent must discover hazard, weather, and terrain strategies from public
+state, recurrent history, self-play, and terminal outcomes. No hand-authored
+win-probability reward or strategy rule is used. Better population coverage and
+the learned public-consequence model can improve the learning signal without
+changing which strategies PPO ultimately values.
 
 ---
 

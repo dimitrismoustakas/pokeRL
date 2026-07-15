@@ -20,15 +20,26 @@ from ..env.observation import (
     ABILITY_KNOWN_OFFSET,
     FIELD_TRICK_ROOM_OFFSET,
     ITEM_KNOWN_OFFSET,
+    NUM_PUBLIC_TARGET_POSITIONS,
     TERA_KNOWN_OFFSET,
 )
 from ..public_consequence import (
-    NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+    MAX_PUBLIC_HIT_COUNT,
+    MOVE_BRANCH_ACTION_FAILED,
+    MOVE_BRANCH_NO_TARGET,
+    MOVE_BRANCH_SCOPED,
+    MOVE_BRANCH_TARGET_PHASE,
+    NONMOVE_REASON_CANT,
+    NONMOVE_REASON_FAINTED,
+    NUM_MOVE_BRANCHES,
+    NUM_NONMOVE_REASONS,
+    NUM_TARGET_INTERACTION_REASONS,
     PUBLIC_CONSEQUENCE_FIELD_DIM,
-    PUBLIC_CONSEQUENCE_CANT,
-    PUBLIC_CONSEQUENCE_EXECUTED,
-    PUBLIC_CONSEQUENCE_FAILED,
-    PUBLIC_CONSEQUENCE_MISSED,
+    TARGET_INTERACTION_BLOCKED,
+    TARGET_INTERACTION_FAILED,
+    TARGET_INTERACTION_IMMUNE,
+    TARGET_INTERACTION_MISS,
+    TARGET_INTERACTION_PROTECTED,
 )
 
 
@@ -37,11 +48,26 @@ _CLASSIFICATION_TASKS = (
     ("ability", "ability_logits", "opp_ability", ABILITY_KNOWN_OFFSET),
     ("tera", "tera_type_logits", None, TERA_KNOWN_OFFSET),
 )
-_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES = (
-    (PUBLIC_CONSEQUENCE_EXECUTED, "executed"),
-    (PUBLIC_CONSEQUENCE_FAILED, "failed"),
-    (PUBLIC_CONSEQUENCE_MISSED, "missed"),
-    (PUBLIC_CONSEQUENCE_CANT, "cant"),
+_PUBLIC_CONSEQUENCE_NONMOVE_REASON_CLASSES = (
+    (NONMOVE_REASON_CANT, "cant"),
+    (NONMOVE_REASON_FAINTED, "fainted"),
+)
+_PUBLIC_CONSEQUENCE_MOVE_BRANCH_CLASSES = (
+    (MOVE_BRANCH_ACTION_FAILED, "action_failed"),
+    (MOVE_BRANCH_NO_TARGET, "no_target"),
+    (MOVE_BRANCH_SCOPED, "scoped"),
+    (MOVE_BRANCH_TARGET_PHASE, "target_phase"),
+)
+_PUBLIC_CONSEQUENCE_INTERACTION_REASON_CLASSES = (
+    (TARGET_INTERACTION_MISS, "miss"),
+    (TARGET_INTERACTION_IMMUNE, "immune"),
+    (TARGET_INTERACTION_PROTECTED, "protected"),
+    (TARGET_INTERACTION_BLOCKED, "blocked"),
+    (TARGET_INTERACTION_FAILED, "failed"),
+)
+_PUBLIC_CONSEQUENCE_HIT_COUNT_CLASSES = tuple(
+    (hit_count - 1, f"hit_{hit_count}")
+    for hit_count in range(1, MAX_PUBLIC_HIT_COUNT + 1)
 )
 
 
@@ -84,6 +110,105 @@ def _classification_additive_tensors(
         },
         invalid_targets.any(),
     )
+
+
+def _binary_additive_tensors(
+    *,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    selected: torch.Tensor,
+    prefix: str,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Return additive diagnostics for one conditionally observed Bernoulli."""
+
+    flat_logits = logits.reshape(-1)
+    flat_targets = targets.reshape(-1).to(flat_logits.dtype)
+    flat_selected = selected.reshape(-1).to(torch.bool)
+    selected_logits = flat_logits[flat_selected]
+    selected_targets = flat_targets[flat_selected]
+    invalid_targets = (
+        ~torch.isfinite(selected_targets)
+        | (selected_targets < 0.0)
+        | (selected_targets > 1.0)
+    )
+    probs = selected_logits.sigmoid()
+    nll = torch.nn.functional.binary_cross_entropy_with_logits(
+        selected_logits,
+        selected_targets,
+        reduction="sum",
+    )
+    brier = (probs - selected_targets).square().sum()
+    predicted_positive = selected_logits >= 0.0
+    positive = selected_targets >= 0.5
+    negative = ~positive
+    return (
+        {
+            f"{prefix}_correct": (predicted_positive == positive).sum(),
+            f"{prefix}_count": flat_selected.sum(),
+            f"{prefix}_positive": positive.sum(),
+            f"{prefix}_negative": negative.sum(),
+            f"{prefix}_predicted_positive": predicted_positive.sum(),
+            f"{prefix}_true_positive": (predicted_positive & positive).sum(),
+            f"{prefix}_true_negative": ((~predicted_positive) & negative).sum(),
+            f"{prefix}_nll_sum": nll,
+            f"{prefix}_brier_sum": brier,
+        },
+        invalid_targets.any(),
+    )
+
+
+def _named_classification_additive_tensors(
+    *,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    selected: torch.Tensor,
+    prefix: str,
+    classes: tuple[tuple[int, str], ...],
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Return additive diagnostics for a conditional named categorical task."""
+
+    class_count = logits.shape[-1]
+    if tuple(class_index for class_index, _name in classes) != tuple(
+        range(class_count)
+    ):
+        raise ValueError(
+            f"{prefix} class names must cover indices 0..{class_count - 1}."
+        )
+    flat_logits = logits.reshape(-1, class_count)
+    flat_targets = targets.reshape(-1)
+    flat_selected = selected.reshape(-1).to(torch.bool)
+    selected_logits = flat_logits[flat_selected]
+    selected_targets = flat_targets[flat_selected]
+    invalid_targets = (selected_targets < 0) | (selected_targets >= class_count)
+    safe_targets = selected_targets.clamp(0, class_count - 1)
+
+    log_probs = torch.log_softmax(selected_logits, dim=-1)
+    probs = log_probs.exp()
+    target_probs = probs.gather(1, safe_targets.unsqueeze(1)).squeeze(1)
+    nll = -log_probs.gather(1, safe_targets.unsqueeze(1)).squeeze(1)
+    brier = probs.square().sum(dim=-1) - 2.0 * target_probs + 1.0
+    predictions = selected_logits.argmax(dim=-1)
+    metrics = {
+        f"{prefix}_top1_correct": (predictions == safe_targets).sum(),
+        f"{prefix}_count": flat_selected.sum(),
+        f"{prefix}_nll_sum": nll.sum(),
+        f"{prefix}_brier_sum": brier.sum(),
+    }
+    for class_index, class_name in classes:
+        class_selected = selected_targets == class_index
+        class_prefix = f"{prefix}_{class_name}"
+        metrics.update(
+            {
+                f"{class_prefix}_count": class_selected.sum(),
+                f"{class_prefix}_predicted_count": (predictions == class_index).sum(),
+                f"{class_prefix}_correct": (
+                    predictions[class_selected] == class_index
+                ).sum(),
+                f"{class_prefix}_nll_sum": nll[class_selected].sum(),
+                f"{class_prefix}_brier_sum": brier[class_selected].sum(),
+            }
+        )
+    return metrics, invalid_targets.any()
 
 
 def _pack_additive_metrics(
@@ -362,190 +487,219 @@ def opponent_intent_additive_metrics(
 @torch.no_grad()
 def public_consequence_additive_metrics(
     logits: Mapping[str, torch.Tensor],
-    resolution_labels: torch.Tensor,
-    resolution_masks: torch.Tensor,
+    move_emitted_targets: torch.Tensor,
+    move_emitted_masks: torch.Tensor,
+    nonmove_reason_labels: torch.Tensor,
+    nonmove_reason_masks: torch.Tensor,
+    move_branch_labels: torch.Tensor,
+    move_branch_masks: torch.Tensor,
+    route_targets: torch.Tensor,
+    route_masks: torch.Tensor,
+    interaction_targets: torch.Tensor,
+    interaction_masks: torch.Tensor,
+    interaction_reason_labels: torch.Tensor,
+    interaction_reason_masks: torch.Tensor,
+    hit_count_labels: torch.Tensor,
+    hit_count_masks: torch.Tensor,
     cant_targets: torch.Tensor,
     cant_masks: torch.Tensor,
     field_targets: torch.Tensor,
     field_masks: torch.Tensor,
     persistence_fields: torch.Tensor,
 ) -> dict[str, float]:
-    """Return additive diagnostics for selected actions' public outcomes.
+    """Return additive diagnostics for the conditional consequence factorization.
 
-    The two selected own-action slots form the final axis of ``resolution`` and
-    ``field_masks``.  Each action predicts two opponent CANT indicators and the
-    same 33-dimensional next-public-field view.  Field error is averaged over
-    dimensions before it is accumulated so one labeled action is one unit of
-    support, just as it is in the normalized training objective.
+    Every task is evaluated only where its corresponding exact protocol label is
+    available. Binary and categorical sums therefore remain meaningful when
+    the hierarchy exposes very different amounts of support at each stage.
+    Field errors retain the per-labeled-action normalization used by the loss,
+    while feature-level confusion counts expose the underlying support.
     """
+
     required = {
-        "public_consequence_resolution_logits",
+        "public_consequence_move_emitted_logits",
+        "public_consequence_nonmove_reason_logits",
+        "public_consequence_move_branch_logits",
+        "public_consequence_route_logits",
+        "public_consequence_interaction_logits",
+        "public_consequence_interaction_reason_logits",
+        "public_consequence_hit_count_logits",
         "public_consequence_cant_logits",
         "public_consequence_field_logits",
     }
     missing = sorted(required.difference(logits))
     if missing:
         raise ValueError(f"logits is missing key(s): {', '.join(missing)}.")
-    if resolution_labels.shape != resolution_masks.shape:
-        raise ValueError(
-            "public consequence resolution labels/masks must have the same shape."
-        )
-    if resolution_labels.ndim < 1 or resolution_labels.shape[-1] != 2:
-        raise ValueError(
-            "public consequence resolution labels must end with two own action slots."
-        )
-    base_shape = tuple(resolution_labels.shape)
-    if field_masks.shape != resolution_labels.shape:
-        raise ValueError(
-            "public consequence field masks must match resolution-label shape."
-        )
-    _require_shape(
-        "public consequence resolution logits",
-        logits["public_consequence_resolution_logits"],
-        (*base_shape, NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES),
-    )
-    _require_shape("public consequence CANT targets", cant_targets, (*base_shape, 2))
-    _require_shape("public consequence CANT masks", cant_masks, (*base_shape, 2))
-    _require_shape(
-        "public consequence CANT logits",
-        logits["public_consequence_cant_logits"],
-        (*base_shape, 2),
-    )
-    expected_field_shape = (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM)
-    _require_shape(
-        "public consequence field targets", field_targets, expected_field_shape
-    )
-    _require_shape(
-        "public consequence persistence fields",
-        persistence_fields,
-        expected_field_shape,
-    )
-    _require_shape(
-        "public consequence field logits",
-        logits["public_consequence_field_logits"],
-        expected_field_shape,
-    )
 
-    # Keep every additive diagnostic on-device until the end of this function.
-    # Calling ``.item()`` for each scalar serialized the CUDA stream dozens of
-    # times per PPO minibatch.  Packing the scalars (including validation flags)
-    # lets us preserve the Python-float API with one device-to-host transfer.
+    if move_emitted_targets.shape != move_emitted_masks.shape:
+        raise ValueError(
+            "public consequence move-emitted targets/masks must have the same shape."
+        )
+    if move_emitted_targets.ndim < 1 or move_emitted_targets.shape[-1] != 2:
+        raise ValueError(
+            "public consequence move-emitted targets must end with two own slots."
+        )
+    base_shape = tuple(move_emitted_targets.shape)
+    target_shape = (*base_shape, NUM_PUBLIC_TARGET_POSITIONS)
+    for name, tensor, expected_shape in (
+        (
+            "move-emitted logits",
+            logits["public_consequence_move_emitted_logits"],
+            base_shape,
+        ),
+        ("nonmove-reason labels", nonmove_reason_labels, base_shape),
+        ("nonmove-reason masks", nonmove_reason_masks, base_shape),
+        (
+            "nonmove-reason logits",
+            logits["public_consequence_nonmove_reason_logits"],
+            (*base_shape, NUM_NONMOVE_REASONS),
+        ),
+        ("move-branch labels", move_branch_labels, base_shape),
+        ("move-branch masks", move_branch_masks, base_shape),
+        (
+            "move-branch logits",
+            logits["public_consequence_move_branch_logits"],
+            (*base_shape, NUM_MOVE_BRANCHES),
+        ),
+        ("route targets", route_targets, target_shape),
+        ("route masks", route_masks, target_shape),
+        ("route logits", logits["public_consequence_route_logits"], target_shape),
+        ("interaction targets", interaction_targets, target_shape),
+        ("interaction masks", interaction_masks, target_shape),
+        (
+            "interaction logits",
+            logits["public_consequence_interaction_logits"],
+            target_shape,
+        ),
+        ("interaction-reason labels", interaction_reason_labels, target_shape),
+        ("interaction-reason masks", interaction_reason_masks, target_shape),
+        (
+            "interaction-reason logits",
+            logits["public_consequence_interaction_reason_logits"],
+            (*target_shape, NUM_TARGET_INTERACTION_REASONS),
+        ),
+        ("hit-count labels", hit_count_labels, target_shape),
+        ("hit-count masks", hit_count_masks, target_shape),
+        (
+            "hit-count logits",
+            logits["public_consequence_hit_count_logits"],
+            (*target_shape, MAX_PUBLIC_HIT_COUNT),
+        ),
+        ("CANT targets", cant_targets, (*base_shape, 2)),
+        ("CANT masks", cant_masks, (*base_shape, 2)),
+        (
+            "CANT logits",
+            logits["public_consequence_cant_logits"],
+            (*base_shape, 2),
+        ),
+        ("field masks", field_masks, base_shape),
+        (
+            "field targets",
+            field_targets,
+            (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM),
+        ),
+        (
+            "persistence fields",
+            persistence_fields,
+            (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM),
+        ),
+        (
+            "field logits",
+            logits["public_consequence_field_logits"],
+            (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM),
+        ),
+    ):
+        _require_shape(f"public consequence {name}", tensor, expected_shape)
+
     metric_tensors: dict[str, torch.Tensor] = {}
     validation_tensors: dict[str, torch.Tensor] = {}
 
-    flat_resolution_logits = logits["public_consequence_resolution_logits"].reshape(
-        -1,
-        NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES,
+    binary_tasks = (
+        (
+            "emitted",
+            logits["public_consequence_move_emitted_logits"],
+            move_emitted_targets,
+            move_emitted_masks,
+        ),
+        (
+            "route",
+            logits["public_consequence_route_logits"],
+            route_targets,
+            route_masks,
+        ),
+        (
+            "interaction",
+            logits["public_consequence_interaction_logits"],
+            interaction_targets,
+            interaction_masks,
+        ),
+        (
+            "cant",
+            logits["public_consequence_cant_logits"],
+            cant_targets,
+            cant_masks,
+        ),
     )
-    flat_resolution_targets = resolution_labels.reshape(-1)
-    flat_resolution_masks = resolution_masks.reshape(-1).to(torch.bool)
-    selected_resolution_logits = flat_resolution_logits[flat_resolution_masks]
-    selected_resolution_targets = flat_resolution_targets[flat_resolution_masks]
-    invalid_resolution_targets = (selected_resolution_targets < 0) | (
-        selected_resolution_targets >= NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES
-    )
-    validation_tensors["resolution"] = invalid_resolution_targets.any()
-    # Clamp only to make the packed validation non-synchronizing: invalid labels
-    # are still rejected after the single host transfer below.
-    safe_resolution_targets = selected_resolution_targets.clamp(
-        0,
-        NUM_PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES - 1,
-    )
-    selected_resolution_log_probs = torch.log_softmax(
-        selected_resolution_logits,
-        dim=-1,
-    )
-    selected_resolution_probs = selected_resolution_log_probs.exp()
-    selected_resolution_target_probs = selected_resolution_probs.gather(
-        1,
-        safe_resolution_targets.unsqueeze(1),
-    ).squeeze(1)
-    selected_resolution_nll = -selected_resolution_log_probs.gather(
-        1,
-        safe_resolution_targets.unsqueeze(1),
-    ).squeeze(1)
-    selected_resolution_brier = (
-        selected_resolution_probs.square().sum(dim=-1)
-        - 2.0 * selected_resolution_target_probs
-        + 1.0
-    )
-    selected_resolution_predictions = selected_resolution_logits.argmax(dim=-1)
-    resolution_prefix = "aux_public_consequence_resolution"
-    metric_tensors.update(
-        {
-            f"{resolution_prefix}_top1_correct": (
-                selected_resolution_predictions == safe_resolution_targets
-            ).sum(),
-            f"{resolution_prefix}_count": flat_resolution_masks.sum(),
-            f"{resolution_prefix}_nll_sum": selected_resolution_nll.sum(),
-            f"{resolution_prefix}_brier_sum": selected_resolution_brier.sum(),
-        }
-    )
-    for class_index, class_name in _PUBLIC_CONSEQUENCE_RESOLUTION_CLASSES:
-        class_selected = selected_resolution_targets == class_index
-        class_prefix = f"aux_public_consequence_resolution_{class_name}"
-        metric_tensors.update(
-            {
-                f"{class_prefix}_correct": (
-                    selected_resolution_predictions[class_selected] == class_index
-                ).sum(),
-                f"{class_prefix}_count": class_selected.sum(),
-                f"{class_prefix}_nll_sum": selected_resolution_nll[
-                    class_selected
-                ].sum(),
-            }
+    for name, task_logits, task_targets, task_masks in binary_tasks:
+        prefix_name = f"aux_public_consequence_{name}"
+        task_metrics, invalid_targets = _binary_additive_tensors(
+            logits=task_logits,
+            targets=task_targets,
+            selected=task_masks,
+            prefix=prefix_name,
         )
+        metric_tensors.update(task_metrics)
+        validation_tensors[name] = invalid_targets
 
-    flat_cant_logits = logits["public_consequence_cant_logits"].reshape(-1)
-    flat_cant_targets = cant_targets.reshape(-1).to(flat_cant_logits.dtype)
-    flat_cant_masks = cant_masks.reshape(-1).to(torch.bool)
-    selected_cant_logits = flat_cant_logits[flat_cant_masks]
-    selected_cant_targets = flat_cant_targets[flat_cant_masks]
-    validation_tensors["cant"] = (
-        ~torch.isfinite(selected_cant_targets)
-        | (selected_cant_targets < 0.0)
-        | (selected_cant_targets > 1.0)
-    ).any()
-    cant_probs = selected_cant_logits.sigmoid()
-    cant_nll = torch.nn.functional.binary_cross_entropy_with_logits(
-        selected_cant_logits,
-        selected_cant_targets,
-        reduction="sum",
+    categorical_tasks = (
+        (
+            "nonmove_reason",
+            logits["public_consequence_nonmove_reason_logits"],
+            nonmove_reason_labels,
+            nonmove_reason_masks,
+            _PUBLIC_CONSEQUENCE_NONMOVE_REASON_CLASSES,
+        ),
+        (
+            "move_branch",
+            logits["public_consequence_move_branch_logits"],
+            move_branch_labels,
+            move_branch_masks,
+            _PUBLIC_CONSEQUENCE_MOVE_BRANCH_CLASSES,
+        ),
+        (
+            "interaction_reason",
+            logits["public_consequence_interaction_reason_logits"],
+            interaction_reason_labels,
+            interaction_reason_masks,
+            _PUBLIC_CONSEQUENCE_INTERACTION_REASON_CLASSES,
+        ),
+        (
+            "hit_count",
+            logits["public_consequence_hit_count_logits"],
+            hit_count_labels,
+            hit_count_masks,
+            _PUBLIC_CONSEQUENCE_HIT_COUNT_CLASSES,
+        ),
     )
-    cant_brier = (cant_probs - selected_cant_targets).square().sum()
-    cant_predicted_positive = selected_cant_logits >= 0.0
-    cant_positive_mask = selected_cant_targets >= 0.5
-    cant_negative_mask = ~cant_positive_mask
-    metric_tensors.update(
-        {
-            "aux_public_consequence_cant_correct": (
-                cant_predicted_positive == cant_positive_mask
-            ).sum(),
-            "aux_public_consequence_cant_count": flat_cant_masks.sum(),
-            "aux_public_consequence_cant_positive": cant_positive_mask.sum(),
-            "aux_public_consequence_cant_negative": cant_negative_mask.sum(),
-            "aux_public_consequence_cant_predicted_positive": (
-                cant_predicted_positive.sum()
-            ),
-            "aux_public_consequence_cant_true_positive": (
-                cant_predicted_positive & cant_positive_mask
-            ).sum(),
-            "aux_public_consequence_cant_true_negative": (
-                (~cant_predicted_positive) & cant_negative_mask
-            ).sum(),
-            "aux_public_consequence_cant_nll_sum": cant_nll,
-            "aux_public_consequence_cant_brier_sum": cant_brier,
-        }
-    )
+    for name, task_logits, task_labels, task_masks, classes in categorical_tasks:
+        prefix_name = f"aux_public_consequence_{name}"
+        task_metrics, invalid_targets = _named_classification_additive_tensors(
+            logits=task_logits,
+            targets=task_labels,
+            selected=task_masks,
+            prefix=prefix_name,
+            classes=classes,
+        )
+        metric_tensors.update(task_metrics)
+        validation_tensors[name] = invalid_targets
 
     selected_fields = field_masks.reshape(-1).to(torch.bool)
+    flat_field_logits = logits["public_consequence_field_logits"].reshape(
+        -1, PUBLIC_CONSEQUENCE_FIELD_DIM
+    )
     flat_field_targets = field_targets.reshape(-1, PUBLIC_CONSEQUENCE_FIELD_DIM)
     flat_persistence = persistence_fields.reshape(-1, PUBLIC_CONSEQUENCE_FIELD_DIM)
-    field_probs = (
-        logits["public_consequence_field_logits"]
-        .sigmoid()
-        .reshape(-1, PUBLIC_CONSEQUENCE_FIELD_DIM)
-    )
+    selected_field_logits = flat_field_logits[selected_fields]
     selected_field_targets = flat_field_targets[selected_fields]
     selected_field_persistence = flat_persistence[selected_fields]
     validation_tensors["field_targets"] = (
@@ -558,11 +712,25 @@ def public_consequence_additive_metrics(
         | (selected_field_persistence < 0.0)
         | (selected_field_persistence > 1.0)
     ).any()
-    squared_field_errors = (field_probs - flat_field_targets).square()
-    squared_persistence_errors = (flat_persistence - flat_field_targets).square()
-    field_mse = squared_field_errors[selected_fields].mean(dim=-1).sum()
-    persistence_mse = squared_persistence_errors[selected_fields].mean(dim=-1).sum()
 
+    selected_field_probs = selected_field_logits.sigmoid()
+    selected_field_nll = torch.nn.functional.binary_cross_entropy_with_logits(
+        selected_field_logits,
+        selected_field_targets,
+        reduction="none",
+    )
+    selected_field_squared_errors = (
+        selected_field_probs - selected_field_targets
+    ).square()
+    field_nll = selected_field_nll.mean(dim=-1).sum()
+    field_brier = selected_field_squared_errors.mean(dim=-1).sum()
+    field_predictions = selected_field_logits >= 0.0
+    field_positive = selected_field_targets >= 0.5
+    field_negative = ~field_positive
+
+    squared_field_errors = (flat_field_logits.sigmoid() - flat_field_targets).square()
+    squared_persistence_errors = (flat_persistence - flat_field_targets).square()
+    persistence_mse = squared_persistence_errors[selected_fields].mean(dim=-1).sum()
     selected_feature_mask = selected_fields.unsqueeze(-1).expand_as(
         squared_field_errors
     )
@@ -601,11 +769,29 @@ def public_consequence_additive_metrics(
     trick_room_presence_changed_persistence_mse = trick_room_persistence_errors[
         trick_room_presence_changed
     ].sum()
+
     metric_tensors.update(
         {
             "aux_public_consequence_field_count": selected_fields.sum(),
-            "aux_public_consequence_field_mse_sum": field_mse,
+            "aux_public_consequence_field_nll_sum": field_nll,
+            "aux_public_consequence_field_brier_sum": field_brier,
+            "aux_public_consequence_field_mse_sum": field_brier,
             "aux_public_consequence_field_persistence_mse_sum": persistence_mse,
+            "aux_public_consequence_field_feature_count": selected_feature_mask.sum(),
+            "aux_public_consequence_field_feature_correct": (
+                field_predictions == field_positive
+            ).sum(),
+            "aux_public_consequence_field_feature_positive": field_positive.sum(),
+            "aux_public_consequence_field_feature_negative": field_negative.sum(),
+            "aux_public_consequence_field_feature_predicted_positive": (
+                field_predictions.sum()
+            ),
+            "aux_public_consequence_field_feature_true_positive": (
+                field_predictions & field_positive
+            ).sum(),
+            "aux_public_consequence_field_feature_true_negative": (
+                (~field_predictions) & field_negative
+            ).sum(),
             "aux_public_consequence_field_changed_count": changed_feature_mask.sum(),
             "aux_public_consequence_field_changed_mse_sum": changed_feature_mse,
             "aux_public_consequence_field_changed_persistence_mse_sum": (
@@ -638,13 +824,21 @@ def public_consequence_additive_metrics(
     )
 
     result, invalid = _pack_additive_metrics(metric_tensors, validation_tensors)
-    if invalid["resolution"]:
-        raise ValueError(
-            "aux_public_consequence_resolution labels contain an out-of-range "
-            "class index."
-        )
-    if invalid["cant"]:
-        raise ValueError("public consequence CANT targets must be within [0, 1].")
+    for name in ("emitted", "route", "interaction", "cant"):
+        if invalid[name]:
+            raise ValueError(
+                f"public consequence {name} targets must be finite and within [0, 1]."
+            )
+    for name in (
+        "nonmove_reason",
+        "move_branch",
+        "interaction_reason",
+        "hit_count",
+    ):
+        if invalid[name]:
+            raise ValueError(
+                f"public consequence {name} labels contain an out-of-range class index."
+            )
     if invalid["field_targets"]:
         raise ValueError("public consequence field targets must be within [0, 1].")
     if invalid["field_persistence"]:

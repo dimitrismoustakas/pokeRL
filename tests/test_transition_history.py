@@ -8,11 +8,12 @@ from poke_env.battle import (
     PublicBattleEvent,
     PublicBattleEventKind,
     PublicBattleEventSegment,
+    PublicMoveTargetOutcome,
 )
 from poke_env.player import SingleBattleOrder
 
 from pokerl.config import ModelConfig
-from pokerl.data import GameData
+from pokerl.data import MOVE_SCOPE_TARGETED, GameData
 from pokerl.env.actions import (
     INTENT_MOVE,
     INTENT_SWITCH,
@@ -24,10 +25,15 @@ from pokerl.env.actions import (
 )
 from pokerl.env.observation import (
     MAX_RECENT_EVENTS,
+    NUM_PUBLIC_EVENT_FLAGS,
     POSITION_IMPLICIT,
     POSITION_OPP_1,
     POSITION_OPP_2,
     POSITION_OWN_2,
+    TARGET_OUTCOME_HIT_COUNT,
+    TARGET_OUTCOME_MISSED,
+    TARGET_OUTCOME_PRESENT,
+    TARGET_OUTCOME_PROTECTED,
     ObservationBuilder,
     build_team_preview_observation,
 )
@@ -117,6 +123,52 @@ def test_team_preview_history_is_zero_and_fixed_shape() -> None:
     assert not obs["recent_event_meta"].any()
 
 
+def test_observation_encodes_called_move_and_per_target_resolution() -> None:
+    game_data = GameData(gen=9)
+    builder = ObservationBuilder(game_data, team_size=6)
+    segment = PublicBattleEventSegment(
+        events=(
+            PublicBattleEvent(
+                PublicBattleEventKind.MOVE,
+                actor="p2a: Opponent",
+                move="Rock Slide",
+                spread=True,
+                source_effect="move: Sleep Talk",
+                target_outcomes=(
+                    PublicMoveTargetOutcome(
+                        target="p1a: Lead",
+                        missed=True,
+                    ),
+                    PublicMoveTargetOutcome(
+                        target="p1b: Partner",
+                        hit_count=2,
+                        activations=("move: Protect",),
+                    ),
+                ),
+            ),
+        ),
+        turn=2,
+        partial=False,
+    )
+    battle = SimpleNamespace(player_role="p1", recent_public_events=segment)
+    obs: dict[str, np.ndarray] = {}
+
+    builder._encode_transition_history(battle, None, obs)
+
+    assert obs["recent_event_source_move"][0] == game_data.move_to_idx["sleeptalk"]
+    assert obs["recent_event_move_scope"][0] == MOVE_SCOPE_TARGETED
+    lead = obs["recent_event_target_outcomes"][0, 0]
+    partner = obs["recent_event_target_outcomes"][0, 1]
+    assert lead[TARGET_OUTCOME_PRESENT] == 1.0
+    assert lead[TARGET_OUTCOME_MISSED] == 1.0
+    assert partner[TARGET_OUTCOME_PROTECTED] == 1.0
+    assert partner[TARGET_OUTCOME_HIT_COUNT] == 0.2
+    assert (
+        obs["recent_event_target_activation_move"][0, 1]
+        == (game_data.move_to_idx["protect"])
+    )
+
+
 def test_semantic_intent_resolves_request_local_move_and_switch_slots() -> None:
     move = Move("fakeout", gen=9)
     switch = Pokemon(gen=9, species="rillaboom")
@@ -156,7 +208,7 @@ def test_recent_event_encoder_is_zero_without_history_and_receives_gradient() ->
         "recent_event_move": torch.zeros(2, 12, dtype=torch.long),
         "recent_event_species": torch.zeros(2, 12, dtype=torch.long),
         "recent_event_tera_type": torch.zeros(2, 12, dtype=torch.long),
-        "recent_event_flags": torch.zeros(2, 12, 3),
+        "recent_event_flags": torch.zeros(2, 12, NUM_PUBLIC_EVENT_FLAGS),
         "recent_event_mask": torch.ones(2, 12, dtype=torch.bool),
         "recent_event_meta": torch.zeros(2, 3),
         "prev_own_kind": torch.zeros(2, 2, dtype=torch.long),
