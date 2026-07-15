@@ -12,6 +12,7 @@ from pokerl.training.phase import FrozenMixtureSampler, MixtureWeight, PhaseRunS
 from scripts.train import (
     FrozenPhaseOpponentSource,
     _league_state_path_for_resume,
+    _main_run_identity,
     _maintain_best_response_after_update,
     _maintain_league_after_update,
     _phase_state_path_for_resume,
@@ -21,6 +22,7 @@ from scripts.train import (
     _sample_refresh_assignments,
     _serialize_opponent_assignments,
     _summarize_opponent_outcomes,
+    _validate_main_run_identity,
     make_league_opponent_factory,
     make_envs,
 )
@@ -631,6 +633,128 @@ def test_league_state_path_for_resume_is_paired_with_exact_checkpoint() -> None:
     assert _league_state_path_for_resume(resume_path) == Path(resume_path).with_suffix(
         ".league_state.json"
     )
+
+
+@pytest.mark.parametrize("population_revision_id", [None, "3" * 64])
+def test_main_run_identity_roundtrips_nullable_population_cursor(
+    population_revision_id,
+) -> None:
+    identity = _main_run_identity(
+        battle_format="gen9vgc2026regf",
+        team_pool_signature="1" * 64,
+        model_signature="2" * 64,
+        population_revision_id=population_revision_id,
+    )
+
+    assert identity == {
+        "format_version": 1,
+        "battle_format": "gen9vgc2026regf",
+        "team_pool_signature": "1" * 64,
+        "model_signature": "2" * 64,
+        "population_revision_id": population_revision_id,
+    }
+    assert (
+        _validate_main_run_identity(
+            identity,
+            battle_format="gen9vgc2026regf",
+            team_pool_signature="1" * 64,
+            model_signature="2" * 64,
+        )
+        == population_revision_id
+    )
+
+
+@pytest.mark.parametrize(
+    ("runtime_overrides", "match"),
+    [
+        ({"battle_format": "gen9vgc2026regg"}, "battle_format mismatch"),
+        ({"team_pool_signature": "4" * 64}, "team_pool_signature mismatch"),
+        ({"model_signature": "5" * 64}, "model_signature mismatch"),
+    ],
+)
+def test_main_run_identity_rejects_runtime_identity_mismatch(
+    runtime_overrides,
+    match,
+) -> None:
+    identity = _main_run_identity(
+        battle_format="gen9vgc2026regf",
+        team_pool_signature="1" * 64,
+        model_signature="2" * 64,
+        population_revision_id=None,
+    )
+    runtime = {
+        "battle_format": "gen9vgc2026regf",
+        "team_pool_signature": "1" * 64,
+        "model_signature": "2" * 64,
+        **runtime_overrides,
+    }
+
+    with pytest.raises(ValueError, match=match):
+        _validate_main_run_identity(identity, **runtime)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        [],
+        {
+            "format_version": 1,
+            "battle_format": "gen9vgc2026regf",
+            "team_pool_signature": "1" * 64,
+            "model_signature": "2" * 64,
+        },
+        {
+            "format_version": 1,
+            "battle_format": "gen9vgc2026regf",
+            "team_pool_signature": "1" * 64,
+            "model_signature": "2" * 64,
+            "population_revision_id": None,
+            "unexpected": True,
+        },
+        {
+            "format_version": True,
+            "battle_format": "gen9vgc2026regf",
+            "team_pool_signature": "1" * 64,
+            "model_signature": "2" * 64,
+            "population_revision_id": None,
+        },
+    ],
+)
+def test_main_run_identity_validation_rejects_malformed_envelope(value) -> None:
+    with pytest.raises(ValueError):
+        _validate_main_run_identity(
+            value,
+            battle_format="gen9vgc2026regf",
+            team_pool_signature="1" * 64,
+            model_signature="2" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"battle_format": ""},
+        {"battle_format": None},
+        {"team_pool_signature": 1},
+        {"team_pool_signature": "A" * 64},
+        {"model_signature": None},
+        {"model_signature": 2},
+        {"population_revision_id": 3},
+        {"population_revision_id": "3" * 63},
+    ],
+)
+def test_main_run_identity_creation_rejects_malformed_field_types(overrides) -> None:
+    values = {
+        "battle_format": "gen9vgc2026regf",
+        "team_pool_signature": "1" * 64,
+        "model_signature": "2" * 64,
+        "population_revision_id": None,
+        **overrides,
+    }
+
+    with pytest.raises(ValueError):
+        _main_run_identity(**values)
 
 
 def test_best_response_state_pairs_phase_hash_sampler_and_trainer_id(tmp_path) -> None:

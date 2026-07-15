@@ -1,8 +1,13 @@
+import hashlib
 import json
 import random
 
 import pytest
 
+from pokerl.training.exploiter import (
+    plan_league_exploiter_phase,
+    plan_main_exploiter_phase,
+)
 from pokerl.training.phase import (
     ArchivePolicy,
     FrozenMixtureSampler,
@@ -16,6 +21,7 @@ from pokerl.training.phase import (
 )
 from pokerl.training.population import (
     CheckpointRef,
+    PairwisePayoff,
     PolicyMember,
     PolicyRole,
     PopulationRevision,
@@ -28,6 +34,9 @@ MODEL_SIGNATURE = "2" * 64
 
 
 def _population(tmp_path) -> PopulationRevision:
+    evaluation_path = tmp_path / "main-a-v-main-b.json"
+    evaluation_path.write_bytes(b'{"frozen_cross_play": true}\n')
+    evaluation_sha256 = hashlib.sha256(evaluation_path.read_bytes()).hexdigest()
     checkpoints = []
     for policy_id in ("main-a", "main-b"):
         path = tmp_path / f"{policy_id}.pt"
@@ -56,6 +65,17 @@ def _population(tmp_path) -> PopulationRevision:
                 parent_policy_id="main-a",
                 generation=1,
             ),
+        ],
+        payoffs=[
+            PairwisePayoff(
+                "main-a",
+                "main-b",
+                100,
+                0,
+                0,
+                evaluation_sha256,
+                evaluation_path.name,
+            )
         ],
     )
 
@@ -92,6 +112,41 @@ def _best_response_phase(
         battle_format=population.battle_format,
         team_pool_signature=population.team_pool_signature,
         model_signature=population.model_signature,
+    )
+
+
+def _planned_league_phase(
+    population: PopulationRevision,
+    *,
+    target_population_path: str = "population.json",
+) -> PhaseSpec:
+    return plan_league_exploiter_phase(
+        population=population,
+        target_population_path=target_population_path,
+        phase_id="planned-league-exploiter",
+        learner_policy_id="planned-league-exploiter-final",
+        initializer_policy_id="main-b",
+    ).phase
+
+
+def _phase_with_distribution(
+    phase: PhaseSpec,
+    distribution: tuple[MixtureWeight, ...],
+) -> PhaseSpec:
+    return PhaseSpec.create(
+        phase_id=phase.phase_id,
+        learner_policy_id=phase.learner_policy_id,
+        kind=phase.kind,
+        learner_role=phase.learner_role,
+        initialization=phase.initialization,
+        target_population_path=phase.target_population_path,
+        target_population_revision_id=phase.target_population_revision_id,
+        target_distribution=distribution,
+        opponent_sampler=phase.opponent_sampler,
+        archive_policy=phase.archive_policy,
+        battle_format=phase.battle_format,
+        team_pool_signature=phase.team_pool_signature,
+        model_signature=phase.model_signature,
     )
 
 
@@ -139,7 +194,7 @@ def test_phase_target_population_path_is_resolved_from_phase_not_cwd(
     phase_dir.mkdir()
     population = _population(population_dir)
     population.save(population_dir / "population.json")
-    phase = _best_response_phase(
+    phase = _planned_league_phase(
         population,
         target_population_path="../population/population.json",
     )
@@ -167,7 +222,7 @@ def test_training_phase_loader_returns_verified_absolute_target_mapping(
 ) -> None:
     population = _population(tmp_path)
     population_path = population.save(tmp_path / "population.json")
-    phase_path = _best_response_phase(population).save(tmp_path / "phase.json")
+    phase_path = _planned_league_phase(population).save(tmp_path / "phase.json")
 
     bundle = load_best_response_phase(str(phase_path))
 
@@ -178,6 +233,70 @@ def test_training_phase_loader_returns_verified_absolute_target_mapping(
         "main-a": str((tmp_path / "main-a.pt").resolve()),
         "main-b": str((tmp_path / "main-b.pt").resolve()),
     }
+
+
+def test_training_phase_loader_accepts_both_planned_exploiter_roles(tmp_path) -> None:
+    population = _population(tmp_path)
+    population.save(tmp_path / "population.json")
+    phases = [
+        plan_main_exploiter_phase(
+            population=population,
+            target_population_path="population.json",
+            phase_id="planned-main-exploiter",
+            learner_policy_id="planned-main-exploiter-final",
+            initializer_policy_id="main-b",
+            target_main_policy_id="main-b",
+        ),
+        _planned_league_phase(population),
+    ]
+
+    for phase in phases:
+        phase_path = phase.save(tmp_path / f"{phase.phase_id}.json")
+        assert load_best_response_phase(str(phase_path)).spec == phase
+
+
+def test_training_phase_loader_rejects_hashed_main_exploiter_target_mixture(
+    tmp_path,
+) -> None:
+    population = _population(tmp_path)
+    population.save(tmp_path / "population.json")
+    planned = plan_main_exploiter_phase(
+        population=population,
+        target_population_path="population.json",
+        phase_id="forged-main-exploiter",
+        learner_policy_id="forged-main-exploiter-final",
+        initializer_policy_id="main-b",
+        target_main_policy_id="main-b",
+    )
+    forged = _phase_with_distribution(
+        planned,
+        (
+            MixtureWeight("main-a", 0.5),
+            MixtureWeight("main-b", 0.5),
+        ),
+    )
+    phase_path = forged.save(tmp_path / "forged-main-exploiter.json")
+
+    assert PhaseSpec.load(phase_path) == forged
+    with pytest.raises(ValueError, match="exactly one"):
+        load_best_response_phase(str(phase_path))
+
+
+def test_training_phase_loader_rejects_hashed_exploitable_league_mixture(
+    tmp_path,
+) -> None:
+    population = _population(tmp_path)
+    population.save(tmp_path / "population.json")
+    planned = _planned_league_phase(population)
+    forged = _phase_with_distribution(
+        planned,
+        (MixtureWeight("main-b", 1.0),),
+    )
+    phase_path = forged.save(tmp_path / "forged-league-exploiter.json")
+
+    assert PhaseSpec.load(phase_path) == forged
+    with pytest.raises(ValueError, match="exploitability"):
+        load_best_response_phase(str(phase_path))
 
 
 def test_phase_rejects_same_bytes_under_a_different_checkpoint_reference(

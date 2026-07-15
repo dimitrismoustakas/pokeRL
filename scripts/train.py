@@ -62,11 +62,13 @@ from pokerl.training.phase import (
     PhaseRunState,
     PhaseSpec,
 )
+from pokerl.training.exploiter import validate_exploiter_phase_semantics
 from pokerl.training.population import PopulationRevision
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SEED_MODULUS = 2**32
+_MAIN_RUN_IDENTITY_VERSION = 1
 
 
 def _derived_seed(seed: int, offset: int) -> int:
@@ -231,6 +233,7 @@ def load_best_response_phase(path: str) -> BestResponsePhaseBundle:
         verify_checkpoints=True,
     )
     spec.validate_against_population(population)
+    validate_exploiter_phase_semantics(spec, population)
     checkpoint_by_policy_id = {
         member.policy_id: str(member.checkpoint.resolve(population_path.parent))
         for member in population.policies
@@ -1586,6 +1589,107 @@ def _phase_state_path_for_resume(resume_checkpoint: str) -> Path:
     return Path(resume_checkpoint).resolve().with_suffix(".phase_state.json")
 
 
+def _main_run_identity(
+    *,
+    battle_format: str,
+    team_pool_signature: str | None,
+    model_signature: str,
+    population_revision_id: str | None,
+) -> dict[str, object]:
+    """Return the immutable scientific identity carried by main checkpoints."""
+
+    if (
+        not isinstance(model_signature, str)
+        or len(model_signature) != 64
+        or any(character not in "0123456789abcdef" for character in model_signature)
+    ):
+        raise ValueError(
+            "Main-run model_signature must be a lowercase SHA-256 digest."
+        )
+    if population_revision_id is not None and (
+        not isinstance(population_revision_id, str)
+        or len(population_revision_id) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in population_revision_id
+        )
+    ):
+        raise ValueError(
+            "Main-run population_revision_id must be a lowercase SHA-256 digest."
+        )
+    if team_pool_signature is not None and (
+        not isinstance(team_pool_signature, str)
+        or len(team_pool_signature) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in team_pool_signature
+        )
+    ):
+        raise ValueError(
+            "Main-run team_pool_signature must be a lowercase SHA-256 digest."
+        )
+    if not isinstance(battle_format, str) or not battle_format:
+        raise ValueError("Main-run battle_format must be a non-empty string.")
+    return {
+        "format_version": _MAIN_RUN_IDENTITY_VERSION,
+        "battle_format": battle_format,
+        "team_pool_signature": team_pool_signature,
+        "model_signature": model_signature,
+        "population_revision_id": population_revision_id,
+    }
+
+
+def _validate_main_run_identity(
+    value: object,
+    *,
+    battle_format: str,
+    team_pool_signature: str | None,
+    model_signature: str,
+) -> str | None:
+    if not isinstance(value, dict):
+        raise ValueError("Paired league state omitted the main-run identity.")
+    expected_keys = {
+        "format_version",
+        "battle_format",
+        "team_pool_signature",
+        "model_signature",
+        "population_revision_id",
+    }
+    if set(value) != expected_keys:
+        raise ValueError(
+            "Paired main-run identity has invalid fields: "
+            f"missing={sorted(expected_keys - set(value))}, "
+            f"unexpected={sorted(set(value) - expected_keys)}."
+        )
+    if (
+        type(value["format_version"]) is not int
+        or value["format_version"] != _MAIN_RUN_IDENTITY_VERSION
+    ):
+        raise ValueError("Unsupported main-run identity format version.")
+    declared = _main_run_identity(
+        battle_format=value["battle_format"],
+        team_pool_signature=value["team_pool_signature"],
+        model_signature=value["model_signature"],
+        population_revision_id=value["population_revision_id"],
+    )
+    for name, runtime in (
+        ("battle_format", battle_format),
+        ("team_pool_signature", team_pool_signature),
+        ("model_signature", model_signature),
+    ):
+        if declared[name] != runtime:
+            raise ValueError(
+                f"Resume main-run {name} mismatch: "
+                f"checkpoint={declared[name]!r}, runtime={runtime!r}."
+            )
+    population_revision_id = declared["population_revision_id"]
+    return (
+        None
+        if population_revision_id is None
+        else str(population_revision_id)
+    )
+
+
 def _serialize_opponent_assignments(
     assignments: dict[int, str],
     league: League,
@@ -1635,6 +1739,7 @@ def _save_training_state(
     team_pool: TeamPool | None,
     training_state_id: str,
     opponent_assignments: dict[int, str],
+    run_identity: dict[str, object],
 ) -> None:
     team_pool_state = (
         None
@@ -1648,6 +1753,7 @@ def _save_training_state(
         str(_league_state_path_for_resume(checkpoint_path)),
         extra_state={
             "training_state_id": training_state_id,
+            "run_identity": run_identity,
             "team_pool": team_pool_state,
             "opponent_assignments": _serialize_opponent_assignments(
                 opponent_assignments,
@@ -2003,6 +2109,18 @@ def train():
         raise ValueError(
             "Runtime game-data vocabulary does not match the phase model signature."
         )
+    main_run_identity = (
+        None
+        if phase_spec is not None
+        else _main_run_identity(
+            battle_format=env_config.battle_format,
+            team_pool_signature=(
+                None if team_pool is None else team_pool.signature()
+            ),
+            model_signature=game_data.vocab_signature(),
+            population_revision_id=None,
+        )
+    )
     agent = PokeAgent(model_config, game_data)
     agent.to(device)
 
@@ -2137,6 +2255,22 @@ def train():
             if not isinstance(team_pool_rng_state, tuple):
                 raise ValueError("Paired league state has invalid team-pool RNG state.")
             team_pool.restore_rng_state(team_pool_rng_state)
+        population_revision_id = _validate_main_run_identity(
+            extra_state.get("run_identity"),
+            battle_format=env_config.battle_format,
+            team_pool_signature=(
+                None if team_pool is None else team_pool.signature()
+            ),
+            model_signature=game_data.vocab_signature(),
+        )
+        main_run_identity = _main_run_identity(
+            battle_format=env_config.battle_format,
+            team_pool_signature=(
+                None if team_pool is None else team_pool.signature()
+            ),
+            model_signature=game_data.vocab_signature(),
+            population_revision_id=population_revision_id,
+        )
         restored_opponent_assignments = _restore_opponent_assignments(
             extra_state.get("opponent_assignments"),
             opponent_groups=opponent_groups,
@@ -2221,6 +2355,7 @@ def train():
     run_summary = {
         "status": "starting",
         "phase": phase_summary,
+        "run_identity": main_run_identity,
         "config": {
             "training_mode": (
                 "best_response" if phase_spec is not None else "main_self_play"
@@ -2651,12 +2786,15 @@ def train():
                 path = f"{train_config.checkpoint_dir}/step_{trainer.global_step}.pt"
                 training_state_id = uuid.uuid4().hex
                 if phase_spec is None:
+                    if main_run_identity is None:
+                        raise RuntimeError("Main training omitted its run identity.")
                     _save_training_state(
                         league,
                         path,
                         team_pool,
                         training_state_id,
                         current_opponent_assignments,
+                        main_run_identity,
                     )
                 else:
                     if team_pool is None or frozen_sampler is None:
@@ -2946,12 +3084,15 @@ def train():
         final_path = f"{train_config.checkpoint_dir}/final.pt"
         training_state_id = uuid.uuid4().hex
         if phase_spec is None:
+            if main_run_identity is None:
+                raise RuntimeError("Main training omitted its run identity.")
             _save_training_state(
                 league,
                 final_path,
                 team_pool,
                 training_state_id,
                 current_opponent_assignments,
+                main_run_identity,
             )
         else:
             if team_pool is None or frozen_sampler is None:

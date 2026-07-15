@@ -48,7 +48,7 @@ payoff coverage, and conditional emitted/branch/route/interaction/CANT/field
 calibration. Those consequence labels come only from exact public protocol
 transitions; they do not change the sparse terminal win/loss reward.
 
-`--resume` accepts only versioned trainer checkpoints produced by the exact same model class, configuration, categorical vocabulary, and tensor schema. Trainer checkpoints and their uniquely paired league-state files are atomically replaced and cross-checked; together they restore Adam, global step, the exact completed-update boundary, Python/NumPy/PyTorch RNG, league sampling, and team-pool sampling. Lightweight league snapshots are evaluation/opponent artifacts and cannot resume training.
+`--resume` accepts only versioned trainer checkpoints produced by the exact same model class, configuration, categorical vocabulary, and tensor schema. Trainer checkpoints and their uniquely paired league-state files are atomically replaced and cross-checked; together they restore Adam, global step, the exact completed-update boundary, Python/NumPy/PyTorch RNG, league sampling, and team-pool sampling. The paired state also pins the battle format, team-pool signature, vocabulary signature, and nullable evaluated-population cursor, so a later population workflow cannot silently reinterpret the run. Lightweight league snapshots are evaluation/opponent artifacts and cannot resume training.
 
 To train on a fixed Regulation F pool with team preview (bring 4 of 6):
 
@@ -88,6 +88,11 @@ every unordered policy pair. Greedy (`argmax`) diagnostics are rejected for
 training meta-games. There is deliberately no win-rate admission threshold or
 reward shaping: a trained oracle enters the finite game only after its complete
 frozen cross-play row exists.
+
+The training loader independently revalidates exploiter semantics even for a
+correctly hashed phase file. A main exploiter must target exactly one policy
+whose role is `main`; a league exploiter's declared mixture must have exact
+empirical-game exploitability at most `0.005` on a complete payoff matrix.
 
 After an external controller has verified that child revision and selected the
 member to expose to the adaptive main learner, `League.add_admitted_checkpoint`

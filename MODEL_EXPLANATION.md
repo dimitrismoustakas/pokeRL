@@ -667,7 +667,7 @@ With `gamma=0.99` and `gae_lambda=0.95`, this biases the advantage estimate towa
 
 **Diagnostic:** approximate KL divergence `((ratio - 1) - log_ratio).mean()` — useful for checking whether the policy is updating too aggressively.
 
-**Trainer checkpoints:** resume checkpoints use a strict versioned format and are written through an atomic temporary-file replacement. Each is cross-checked by a unique ID against its own `<checkpoint>.league_state.json` companion. Together they contain the exact agent state, model class/configuration, categorical-vocabulary fingerprint and tensor schema, Adam state, global step, completed-update boundary, Python/NumPy/PyTorch CPU and CUDA RNG states, league membership/RNG, and team-pool identity/RNG. The trainer and league completed-update counters must agree, so changing rollout geometry cannot silently reinterpret `global_step` as a different training schedule. Resume rejects legacy formats and any missing, unexpected, shape-, dtype-, layout-, class-, model-config, vocabulary, companion-ID, update-boundary, or team-pool mismatch; it never silently loads a compatible subset or resets Adam. League checkpoints remain lightweight agent snapshots and cannot be passed to `--resume`.
+**Trainer checkpoints:** resume checkpoints use a strict versioned format and are written through an atomic temporary-file replacement. Each is cross-checked by a unique ID against its own `<checkpoint>.league_state.json` companion. Together they contain the exact agent state, model class/configuration, categorical-vocabulary fingerprint and tensor schema, Adam state, global step, completed-update boundary, Python/NumPy/PyTorch CPU and CUDA RNG states, league membership/RNG, and team-pool identity/RNG. Main-run companions additionally pin battle format, team-pool signature, vocabulary signature, and a nullable evaluated-population revision cursor. The trainer and league completed-update counters must agree, so changing rollout geometry cannot silently reinterpret `global_step` as a different training schedule. Resume rejects legacy formats and any missing, unexpected, shape-, dtype-, layout-, class-, model-config, vocabulary, companion-ID, update-boundary, run-identity, or team-pool mismatch; it never silently loads a compatible subset or resets Adam. League checkpoints remain lightweight agent snapshots and cannot be passed to `--resume`.
 
 ### 5.4 Team Preview Update
 
@@ -1038,6 +1038,9 @@ declared main policy, while a league exploiter targets a certified mixture from
 a complete skew-symmetric frozen payoff matrix. Best-response phases start from
 weights only with fresh optimizer/counters/RNG, sample actions, never adapt the
 target distribution, and never archive the learner into its own target.
+The training loader does not trust a valid phase hash alone: it rechecks the
+main target's role and directly computes the declared league mixture's exact
+pure-best-response exploitability, which must be at most `0.005`.
 
 Frozen admission evidence is now fail-closed. `evaluate_anchor.py` records exact
 checkpoint hashes, battle/team/model signatures, sampled action mode, both

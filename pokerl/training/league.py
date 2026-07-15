@@ -2336,10 +2336,9 @@ class LeaguePlayer(Player):
         """Compact key for the request fields that determine a battle decision.
 
         poke-env assigns ``battle.last_request`` from the parsed Showdown request.
-        The previous implementation hashed the entire request JSON on every
-        opponent choice. For hidden-state commits we only need to distinguish
-        distinct decision requests, so keep the action-relevant fields instead
-        of serializing side/team payloads every time.
+        Hash only action-relevant fields, rather than serializing side/team
+        payloads, while still distinguishing request updates whose legal action
+        changed without advancing ``request_generation``.
         """
         if not isinstance(request, dict):
             return ()
