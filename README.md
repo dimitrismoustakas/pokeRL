@@ -167,8 +167,8 @@ roster, exactly enumerate all 180 legal bring/lead choices:
 & .\.venv\Scripts\python.exe .\scripts\evaluate_preview_policy.py --checkpoint checkpoints\current.pt --summary-path logs\preview_eval.json
 ```
 
-The default Regulation F manifest contains only teams used for training. An
-eleven-team tournament-derived panel is checked in separately at
+The default Regulation F manifest contains only teams used for training. A
+fifteen-team tournament-derived panel is checked in separately at
 `data/team_pools/gen9vgc2026regf_heldout/manifest.json`; it covers hyper
 offense, balance, control, and several forms of Trick Room. Pass that manifest
 with `--team-pool-manifest` to any evaluation command. Its metadata marks it
@@ -213,6 +213,23 @@ Use `--worker-counts`, `--battles-per-worker`, `--runtime-loop-count`,
 BattleStream knobs used by longer runs. Training also accepts
 `--reset-concurrency` to bound simultaneous environment resets when startup
 load needs to be limited.
+
+For the controlled production-efficiency experiment, run the restart-safe
+factorial harness from a quiet machine:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\benchmark_efficiency_factorial.py --output-dir .\benchmarks\efficiency_factorial_YYYYMMDD
+```
+
+It compares eager versus selected-only battle-order construction and
+deadline-only versus target-aware frozen-policy batching on the same committed
+code and the same bootstrap checkpoint. The default four-block Williams design
+runs 10 updates per cell, discards the first three invocation updates as
+warm-up, and keeps detailed timing disabled. Reusing the exact command and
+output directory after an interruption verifies completed artifacts and reruns
+only the interrupted cell from the common bootstrap boundary. Raw logs and
+summaries remain under each cell; `report.md`, `aggregate.json`, and
+`aggregate.csv` contain the live and final analysis.
 
 ## Building a VGC team pool
 

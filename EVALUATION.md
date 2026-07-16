@@ -36,8 +36,11 @@ scripted curriculum.
 
 Python, NumPy, Torch, bot, and team-schedule randomness is seeded. Pokemon
 Showdown's simulator RNG is not yet seed-controlled, so damage rolls and other
-in-battle randomness are not bitwise reproducible. The present team panel is
-also in-distribution: all 77 teams were used during training.
+in-battle randomness are not bitwise reproducible. All results recorded below
+through the completed matchup-belief run used the historical 77-team training
+panel and were therefore in-distribution. The current manifests contain 85
+training teams and a separate 15-team evaluation-only development panel; those
+later additions do not retroactively change the scope of the reported runs.
 
 ## What 150 updates learned
 
@@ -205,11 +208,16 @@ regularizers.
    history. Measure full-history versus reset-hidden inference before replacing
    memory.
 
-5. **Keep held-out teams in the backlog.** A legal archetype-stratified team
-   population remains necessary to distinguish general beliefs from memorized
-   roster identity, but it should not be approximated with randomly assembled
-   invalid or strategically incoherent teams. Until a sound source exists,
-   report the 77-team panel explicitly as in-distribution.
+5. **Historical decision: keep held-out teams in the backlog.** At this stage,
+   a legal archetype-stratified team population remains necessary to
+   distinguish general beliefs from memorized roster identity, but it should
+   not be approximated with randomly assembled invalid or strategically
+   incoherent teams. Until a sound source exists, report the 77-team panel
+   explicitly as in-distribution.
+
+That backlog item has since been completed with published, Showdown-validated
+teams: the current manifests contain 85 training teams and a disjoint 15-team
+evaluation-only development panel.
 
 ## Efficiency implications
 
@@ -501,15 +509,15 @@ was reported. Action entropy nevertheless fell from a mean 2.78 over updates
 1-50 to 0.92 over updates 351-400 while strength had already plateaued. The
 problem is learning coverage and sample use, not an unstable PPO implementation.
 
-The accepted next iteration has now been implemented as follows:
+The next iteration accepted after that historical run was implemented as
+follows:
 
 1. Every frozen checkpoint is kept in a permanent archive. The league maintains
    discounted current-policy payoff evidence per opponent and PFSP-samples
    opponents that remain difficult, with a uniform coverage component. It
    assigns distinct draws to the two inference groups whenever the archive
-   permits it. Do not add
-   dedicated exploiters yet; first determine whether this simpler population
-   fixes the plateau and exposes stable payoff cycles.
+   permits it. Dedicated exploiters were intentionally deferred for that run so
+   the simpler population could first be measured.
 2. Preview's one-use terminal update is now clipped on-policy PPO, so
    each current-policy sample receives bounded multi-epoch reuse and logs its
    own KL/clip behavior. Run this diagnostic before introducing a candidate-Q
@@ -523,12 +531,20 @@ The accepted next iteration has now been implemented as follows:
    terminal-reward learning;
    it does not add heuristics, shaped rewards, or simulator-private outcomes.
 4. Keep periodic frozen-anchor and small fixed-probe evaluation cheap and
-   separate from training. Keep dedicated exploiters and a legal held-out team
-   population in the backlog rather than substituting bots or randomly
-   assembled teams.
+   separate from training. At that point, dedicated exploiters and a legal
+   held-out team population remained backlog items rather than being
+   approximated with bots or randomly assembled teams.
 5. Frozen-opponent CUDA graphs are enabled for production rollout inference.
    A two-update same-seed A/B preserved action/RNG parity, used one capture and
    1,299 replays with zero fallbacks, reduced aggregate rollout time by 6.27%,
    and improved wall throughput by 6.13% without changing PPO work or reserved
    CUDA memory. This is an efficiency change only; terminal win/loss and the
    learned policy are unchanged.
+
+Current status: both deferred population items are now implemented. Main
+exploiters train ordinary PPO best responses against one immutable main
+checkpoint; league exploiters train against a solver-certified equilibrium
+mixture from a complete frozen payoff matrix. They use the same public
+observations, sparse terminal reward, and model as the main learner. The current
+85-team training manifest and disjoint 15-team development panel contain
+published, locally validated teams rather than generated substitutes.

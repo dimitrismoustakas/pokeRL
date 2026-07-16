@@ -107,7 +107,7 @@ Each side contributes up to 6 pokemon. For each pokemon the encoder receives two
 | `item` | `(6,)` | named-item vocab + hash-bucketed fallback |
 | `types` | `(6, 3)` | `[type_1, type_2, tera_type]` |
 
-#### Continuous features — 44 dimensions per pokemon
+#### Continuous features — 45 dimensions per pokemon
 
 Defined by `CONTINUOUS_DIM` in [observation.py:85](pokerl/env/observation.py#L85).
 
@@ -118,7 +118,7 @@ Defined by `CONTINUOUS_DIM` in [observation.py:85](pokerl/env/observation.py#L85
 | Stat boosts | 7 | `{atk, def, spa, spd, spe, accuracy, evasion}` divided by 6 |
 | Volatile effects | 16 | confusion, substitute, leech seed, taunt, encore, torment, disable, yawn, perish song, protect, endure, focus energy, attract, curse, nightmare, flash fire |
 | Move PP fractions | 4 | `current_pp / max_pp` per slot — **own side only**; opponent entries stay zero |
-| Extra | 9 | protect counter, status counter, first turn, revealed, known move count, ability known, item known, tera known, is terastallized |
+| Extra | 10 | protect counter, status counter, first turn, active-turn count, revealed, known move count, ability known, item known, tera known, is terastallized |
 
 **Important asymmetry:** PP is populated for own pokemon but zero for opponent pokemon. The model learns this as an implicit "is own" signal rather than having a separate flag. The cost is that it cannot track opponent PP depletion, such as whether a low-PP move is exhausted or an opponent is close to being forced into Struggle. Fake Out's first-active-turn restriction is different: the explicit `first_turn` feature makes that timing observable and learnable. See [§10.2](#102-opponent-pp-features-always-zero).
 
@@ -181,7 +181,7 @@ If `ModelConfig.init_embeddings_from_stats` is true (the default), `GameData` in
 
 Shared weights encode each individual pokemon into a fixed-size vector. The same encoder is applied to all 12 pokemon (own 6 + opponent 6).
 
-**Input per pokemon — 380 dims:**
+**Input per pokemon — 381 dims:**
 
 | Component | Source | Dims |
 |---|---|---|
@@ -191,13 +191,13 @@ Shared weights encode each individual pokemon into a fixed-size vector. The same
 | Ability embedding | `ability_to_idx` lookup | 32 |
 | Item embedding | named + hash bucket lookup | 32 |
 | Type embeddings (×3) | `type_to_idx` lookup, concatenated | 48 |
-| Continuous features | raw float vector | 44 |
-| **Total input** | | **380** |
+| Continuous features | raw float vector | 45 |
+| **Total input** | | **381** |
 
 **MLP:**
 
 ```
-380 → Linear(256) → ReLU → Linear(128) → ReLU   →   (batch, 128)
+381 → Linear(256) → ReLU → Linear(128) → ReLU   →   (batch, 128)
 ```
 
 ### 3.2 TeamEncoder
@@ -230,17 +230,26 @@ Attention is **permutation-equivariant** with respect to team order — the mode
 36 → Linear(64) → ReLU   →   (batch, 64)
 ```
 
-### 3.4 RecentEventEncoder and SpatialEncoder
+### 3.4 RecentEventEncoder, ActiveMechanicsEncoder, and SpatialEncoder
 
 `RecentEventEncoder` encodes a bounded chronological sequence of public events from the most recent completed turn (or the causal partial segment at a forced replacement), plus the agent's own previous submitted intent. The public sequence covers executed moves and actual targets, switches/drags, inability to act, faints, and Terastallization. Each move record also carries bounded per-target public facts (miss, immunity, explicit block, mechanic failure, Protect-like activation, and hit count) plus called-move source identity. This represents a spread move resolving against one target while failing against the other without adding an unbounded stream of minor protocol messages. The sequence remains bounded to 12 major events with explicit partial/overflow metadata. Opponent requested actions and trainer-private terminal labels are never policy inputs.
 
 The encoder combines event-kind, actor/target position, actual and calling move, switch species, Tera type, event flags, and flattened per-target outcomes with a small GRU. A separate projection encodes both prior own slot intents using semantic move/target/switch/Tera features. The resulting 64-dimensional summary complements the across-turn LSTM: the LSTM retains longer strategic history, while this encoder makes the immediately preceding action and resolution order explicit.
 
-`SpatialEncoder` combines the team, field, and recent-event encoders and exposes five tensors:
+`ActiveMechanicsEncoder` supplies a second 64-dimensional exact-public-state
+path aligned to the four active positions. It encodes live presence,
+`first_turn`, Protect-chain length, active-turn count, the last completed
+non-overflowed move resolution, switch/faint entry state, and public outcomes
+such as failure, miss, immunity, Protect, block, and hit. A partial or
+overflowed event segment contributes only live current mechanics rather than
+presenting stale resolution data as exact.
+
+`SpatialEncoder` combines the team, field, recent-event, and active-mechanics
+encoders and exposes five tensors:
 
 | Output | Shape | Description |
 |---|---|---|
-| `context` | `(batch, 384)` | `mean(own_reps) ∥ mean(opp_reps) ∥ field ∥ recent_events` |
+| `context` | `(batch, 448)` | `mean(own_reps) ∥ mean(opp_reps) ∥ field ∥ recent_events ∥ active_mechanics` |
 | `active_reps` | `(batch, 2, 128)` | own two active pokemon |
 | `own_reps` | `(batch, 6, 128)` | full own team after attention |
 | `opp_reps` | `(batch, 6, 128)` | full opponent team after attention |
@@ -258,13 +267,17 @@ Notes:
 
 Two interchangeable implementations selected by `ModelConfig.memory_type`:
 
-**`IdentityMemory`** — feedforward baseline for ablation. Single `Linear(384, 256)` projection, no hidden state beyond the explicit recent-event input.
+**`IdentityMemory`** — feedforward baseline for ablation. Single `Linear(448, 256)` projection, no hidden state beyond the explicit current-state inputs.
 
 **`LSTMMemory`** (default):
 
-- `nn.LSTM(input_dim=384, hidden_dim=256, batch_first=True)`.
-- Accepts either `(batch, 384)` single-step or `(batch, seq, 384)` sequence input.
-- Returns `(memory_out, (h, c))`.
+- `nn.LSTM(input_dim=448, hidden_dim=256, batch_first=True)`.
+- Accepts either `(batch, 448)` single-step or `(batch, seq, 448)` sequence input.
+- Fuses recurrence with an exact-current-state residual as
+  `RMSNorm(lstm_output + Linear(current_context))`, then returns
+  `(memory_out, (h, c))`. The recurrent path carries partial-observability
+  history while public mechanics do not need to survive an LSTM gate before
+  reaching the policy.
 - **Does not** reset hidden state on `done` and **does not** detach for BPTT by itself — both are handled by the rollout loop and PPO trainer. This keeps `LSTMMemory` a pure recurrent cell, with episode-boundary semantics owned by the caller that knows when episodes end.
 - During PPO, independent episode fragments are packed into one cuDNN LSTM call per minibatch (or explicit TBPTT window). Terminal resets and gradient boundaries are identical to stepwise unrolling, but avoid one recurrent launch per rollout timestep.
 
@@ -514,11 +527,12 @@ Battle turn ([agent.py:103-149](pokerl/model/agent.py#L103-L149)):
 obs dict
   → PokemonEncoder  (all 12 pokemon, shared weights)
   → TeamEncoder     (own team) + TeamEncoder (opponent team)
-  → FieldEncoder
+  → FieldEncoder + RecentEventEncoder + ActiveMechanicsEncoder
   → SpatialEncoder output:
-      { context (384), active_reps (2×128),
+      { context (448), active_reps (2×128),
         own_reps (6×128), opp_reps (6×128), opp_active_reps (2×128) }
-  → LSTMMemory:     context (384) → memory_out (256), (h, c)
+  → LSTMMemory:     RMSNorm(LSTM(context 448) + current residual)
+                    → memory_out (256), (h, c)
   → HiddenInfoHead.encode:
                      (opp_reps, opp_active_reps, memory_out)
                      → belief_opp_reps, belief_opp_active_reps
@@ -568,7 +582,14 @@ This structure enforces constraints that a per-slot mask cannot, such as:
 - If slot 1 picks an ally-target move, slot 2's ally-target space updates to reflect the new situation.
 - Pass-only states (e.g. single forced switch) are still representable.
 
-The joint table is built by feeding poke-env's `DoubleBattleOrder.join_orders` back through the action encoding — so legality is *delegated* to poke-env rather than re-derived, which avoids subtle bugs around disabled moves, trapped pokemon, and forced switches.
+poke-env remains the authority for each slot's available moves, targets,
+switches, trapping, and forced-switch state. From those request-derived slot
+masks, pokeRL builds the joint boolean table directly as their Cartesian
+product, excluding a duplicate switch into the same reserve and the invalid
+double-explicit-pass case. This is equivalent to joining the ordinary
+move/switch/pass orders represented by the action space, but avoids allocating
+every candidate `DoubleBattleOrder`; only the two selected orders are
+materialized.
 
 During inference, illegal actions are filled with `-1e8` before the softmax.
 
@@ -735,6 +756,16 @@ boolean always-hit mechanic, and moves such as Sacred Sword can ignore evasion
 without being mislabeled as universally bypassing accuracy checks. These are
 mechanics inputs to a learned probabilistic model, not deterministic hit rules.
 
+Field-state prediction is change-factorized rather than an independent absolute
+prediction of every next-state value. It begins with the deterministic
+no-event transition—unchanged public conditions persist and public timers
+advance—then predicts 21 component-level change gates. A changed component uses
+a typed alternative distribution (nine-way weather, five-way terrain, or a
+scalar alternative); the final probability mixes that alternative with the
+persistence baseline through the learned gate. This makes rare real changes
+compete against the correct persistence baseline without assuming that a
+selected move was emitted, connected, or caused the transition.
+
 At battle end, poke-env marks the final current public-event segment complete:
 Showdown does not emit another `|turn|` delimiter after a terminal event, but
 the finished battle itself proves no more events belong to that turn. Live
@@ -761,9 +792,9 @@ with its proper normalized conditional likelihood: emitted, non-move reason,
 move branch, target route, interaction-marker presence, interaction-marker
 reason, public hit count, opponent CANT, and field transition. Conditional masks
 give rare subtypes a full task-level gradient without class weights or changing
-their calibrated optimum. Within the field component, changed and unchanged public features
-receive equal weight when both occur, preventing the persistence majority from
-drowning out real transitions. Logs report support, NLL, Brier score, accuracy,
+their calibrated optimum. The field loss separately trains change gates and
+changed-only typed alternatives while scoring the final persistence mixture.
+Logs report support, NLL, Brier score, accuracy,
 and per-class recall/precision for each conditional component, alongside field
 errors and separate Trick Room scalar-age versus true presence-transition errors
 against a persistence baseline, plus policy-adapter weight norm.
