@@ -3,7 +3,6 @@
 import random
 import uuid
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +28,19 @@ from ..env.observation import (
     ROLE_BENCH,
     TERA_KNOWN_OFFSET,
 )
+from ..field_transition import (
+    FIELD_CHANGE_COMPONENT_DIM,
+    SCALAR_FIELD_INDICES,
+    TERRAIN_CLASS_SLICE,
+    WEATHER_CLASS_SLICE,
+    advanced_public_field_persistence,
+    public_field_change_targets,
+)
 from ..model.agent import PokeAgent
+from ..model.checkpoint import (
+    model_checkpoint_metadata,
+    validate_model_checkpoint_metadata,
+)
 from ..public_consequence import (
     MAX_PUBLIC_HIT_COUNT,
     NUM_MOVE_BRANCHES,
@@ -46,7 +57,7 @@ from .rollout import RolloutBatch
 
 
 # Increment when trainer-checkpoint semantics or same-shaped model inputs change.
-TRAINER_CHECKPOINT_FORMAT_VERSION = 6
+TRAINER_CHECKPOINT_FORMAT_VERSION = 7
 
 
 _PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
@@ -59,57 +70,9 @@ _PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
     "hit_count_logits",
     "cant_logits",
     "field_logits",
+    "field_change_logits",
+    "field_alternative_logits",
 )
-
-
-def _qualified_type_name(value: object) -> str:
-    value_type = type(value)
-    return f"{value_type.__module__}.{value_type.__qualname__}"
-
-
-def _state_dict_schema(
-    state_dict: Mapping[str, torch.Tensor],
-) -> dict[str, dict[str, object]]:
-    schema: dict[str, dict[str, object]] = {}
-    for key in sorted(state_dict):
-        value = state_dict[key]
-        if not isinstance(value, torch.Tensor):
-            raise ValueError(
-                f"Model state entry {key!r} must be a tensor, got "
-                f"{type(value).__name__}."
-            )
-        schema[key] = {
-            "shape": tuple(int(dimension) for dimension in value.shape),
-            "dtype": str(value.dtype),
-            "layout": str(value.layout),
-        }
-    return schema
-
-
-def _model_config_metadata(agent: nn.Module) -> dict[str, object] | None:
-    config = getattr(agent, "config", None)
-    if config is None:
-        return None
-    if is_dataclass(config) and not isinstance(config, type):
-        return {
-            "type": _qualified_type_name(config),
-            "values": asdict(config),
-        }
-    if isinstance(config, Mapping):
-        return {
-            "type": _qualified_type_name(config),
-            "values": dict(config),
-        }
-    return None
-
-
-def _model_checkpoint_metadata(agent: nn.Module) -> dict[str, object]:
-    return {
-        "model_type": _qualified_type_name(agent),
-        "model_config": _model_config_metadata(agent),
-        "game_data_signature": getattr(agent, "game_data_signature", None),
-        "state_schema": _state_dict_schema(agent.state_dict()),
-    }
 
 
 def _capture_rng_state() -> dict[str, object]:
@@ -168,80 +131,6 @@ def _validate_restorable_rng_state(rng_state: object) -> Mapping[str, object]:
     finally:
         _restore_rng_state(current_state)
     return rng_state
-
-
-def _validate_model_checkpoint_metadata(
-    *,
-    path: str,
-    checkpoint_state: object,
-    checkpoint_metadata: object,
-    current_agent: nn.Module,
-) -> Mapping[str, torch.Tensor]:
-    if not isinstance(checkpoint_state, Mapping):
-        raise ValueError("Trainer checkpoint agent state must be a mapping.")
-    if not isinstance(checkpoint_metadata, Mapping):
-        raise ValueError("Trainer checkpoint model metadata must be a mapping.")
-    required_metadata = {
-        "model_type",
-        "model_config",
-        "game_data_signature",
-        "state_schema",
-    }
-    missing_metadata = sorted(required_metadata.difference(checkpoint_metadata))
-    if missing_metadata:
-        raise ValueError(
-            "Trainer checkpoint model metadata is missing key(s): "
-            + ", ".join(missing_metadata)
-        )
-
-    declared_schema = checkpoint_metadata["state_schema"]
-    if not isinstance(declared_schema, Mapping):
-        raise ValueError("Trainer checkpoint model state schema must be a mapping.")
-    actual_checkpoint_schema = _state_dict_schema(checkpoint_state)
-    if actual_checkpoint_schema != dict(declared_schema):
-        raise ValueError(
-            f"Trainer checkpoint {path!r} agent state does not match its declared "
-            "model-state schema (missing, unexpected, shape, dtype, or layout mismatch)."
-        )
-
-    current_metadata = _model_checkpoint_metadata(current_agent)
-    if checkpoint_metadata["model_type"] != current_metadata["model_type"]:
-        raise ValueError(
-            f"Trainer checkpoint {path!r} model type mismatch: "
-            f"checkpoint={checkpoint_metadata['model_type']!r}, "
-            f"current={current_metadata['model_type']!r}."
-        )
-    if checkpoint_metadata["model_config"] != current_metadata["model_config"]:
-        raise ValueError(
-            f"Trainer checkpoint {path!r} model config mismatch; resume requires "
-            "the exact architecture configuration used to create the checkpoint."
-        )
-    if (
-        checkpoint_metadata["game_data_signature"]
-        != current_metadata["game_data_signature"]
-    ):
-        raise ValueError(
-            f"Trainer checkpoint {path!r} game-data vocabulary mismatch; resume "
-            "requires the exact categorical index mapping used by the checkpoint."
-        )
-
-    current_schema = current_metadata["state_schema"]
-    if declared_schema != current_schema:
-        checkpoint_keys = set(declared_schema)
-        current_keys = set(current_schema)
-        missing_keys = sorted(current_keys - checkpoint_keys)
-        unexpected_keys = sorted(checkpoint_keys - current_keys)
-        incompatible_keys = sorted(
-            key
-            for key in checkpoint_keys & current_keys
-            if declared_schema[key] != current_schema[key]
-        )
-        raise ValueError(
-            f"Trainer checkpoint {path!r} model-state schema mismatch: "
-            f"missing={missing_keys}, unexpected={unexpected_keys}, "
-            f"incompatible={incompatible_keys}."
-        )
-    return checkpoint_state
 
 
 class PPOTrainer:
@@ -590,6 +479,11 @@ class PPOTrainer:
                         },
                         tera_exploration_prob=batch.tera_exploration_prob,
                         validate_actions=False,
+                        move_embedding=getattr(
+                            getattr(self.agent.spatial, "pokemon_encoder", None),
+                            "move_emb",
+                            None,
+                        ),
                     )
                     value_t = self.agent.value_head(
                         ctx_flat,
@@ -826,7 +720,9 @@ class PPOTrainer:
                         public_consequence_field_masks_all[:, mb_envs]
                     )
                     public_consequence_persistence_mb = (
-                        mb_obs_seq["field"][..., :PUBLIC_CONSEQUENCE_FIELD_DIM]
+                        advanced_public_field_persistence(
+                            mb_obs_seq["field"][..., :PUBLIC_CONSEQUENCE_FIELD_DIM]
+                        )
                         .unsqueeze(-2)
                         .expand(*public_consequence_field_targets_mb.shape)
                     )
@@ -1153,7 +1049,14 @@ class PPOTrainer:
                 numerator = sums.get(f"{prefix}_{source}", 0.0)
                 result[f"{prefix}_{target}"] = numerator / count if count > 0.0 else 0.0
 
-        for task in ("emitted", "route", "interaction", "cant"):
+        for task in (
+            "emitted",
+            "route",
+            "interaction",
+            "cant",
+            "field_change",
+            "field_alternative_scalar",
+        ):
             prefix = f"aux_public_consequence_{task}"
             count = sums.get(f"{prefix}_count", 0.0)
             positive = sums.get(f"{prefix}_positive", 0.0)
@@ -1237,6 +1140,22 @@ class PPOTrainer:
                         else 0.0
                     )
 
+        for task in (
+            "field_alternative_weather",
+            "field_alternative_terrain",
+        ):
+            prefix = f"aux_public_consequence_{task}"
+            count = sums.get(f"{prefix}_count", 0.0)
+            result[f"{prefix}_count"] = count
+            for source, target in (
+                ("top1_correct", "top1_accuracy"),
+                ("nll_sum", "nll"),
+                ("brier_sum", "brier"),
+            ):
+                result[f"{prefix}_{target}"] = (
+                    sums.get(f"{prefix}_{source}", 0.0) / count if count > 0.0 else 0.0
+                )
+
         field_prefix = "aux_public_consequence_field"
         field_count = sums.get(f"{field_prefix}_count", 0.0)
         field_mse = (
@@ -1265,6 +1184,38 @@ class PPOTrainer:
         result[f"{field_prefix}_mse_skill"] = (
             1.0 - field_mse / persistence_mse if persistence_mse > 0.0 else 0.0
         )
+        for metric_name in ("typed_nll", "typed_brier"):
+            model_metric = (
+                sums.get(f"{field_prefix}_{metric_name}_sum", 0.0) / field_count
+                if field_count > 0.0
+                else 0.0
+            )
+            persistence_metric = (
+                sums.get(
+                    f"{field_prefix}_persistence_{metric_name}_sum",
+                    0.0,
+                )
+                / field_count
+                if field_count > 0.0
+                else 0.0
+            )
+            result[f"{field_prefix}_{metric_name}"] = model_metric
+            result[f"{field_prefix}_persistence_{metric_name}"] = persistence_metric
+            result[f"{field_prefix}_{metric_name}_skill"] = (
+                1.0 - model_metric / persistence_metric
+                if persistence_metric > 0.0
+                else 0.0
+            )
+        for group_name in ("weather", "terrain"):
+            result[f"{field_prefix}_{group_name}_probability_sum_error"] = (
+                sums.get(
+                    f"{field_prefix}_{group_name}_probability_sum_error_sum",
+                    0.0,
+                )
+                / field_count
+                if field_count > 0.0
+                else 0.0
+            )
         for suffix in (
             "changed",
             "trick_room",
@@ -1651,6 +1602,8 @@ class PPOTrainer:
             "public_consequence_hit_count_logits",
             "public_consequence_cant_logits",
             "public_consequence_field_logits",
+            "public_consequence_field_change_logits",
+            "public_consequence_field_alternative_logits",
         }
         missing = sorted(required.difference(logits))
         if missing:
@@ -1746,6 +1699,16 @@ class PPOTrainer:
         field_logits = logits["public_consequence_field_logits"]
         if field_logits.shape != expected_field_shape:
             raise ValueError("Public consequence field logits have incompatible shape.")
+        field_change_logits = logits["public_consequence_field_change_logits"]
+        if field_change_logits.shape != (*base_shape, FIELD_CHANGE_COMPONENT_DIM):
+            raise ValueError(
+                "Public consequence field-change logits have incompatible shape."
+            )
+        field_alternative_logits = logits["public_consequence_field_alternative_logits"]
+        if field_alternative_logits.shape != expected_field_shape:
+            raise ValueError(
+                "Public consequence field-alternative logits have incompatible shape."
+            )
 
         component_losses: list[torch.Tensor] = []
 
@@ -1808,19 +1771,84 @@ class PPOTrainer:
         if field_selected.any():
             typed_field_targets = field_targets.to(field_logits.dtype)
             typed_persistence = persistence_fields.to(field_logits.dtype)
-            field_errors = field_logits.sigmoid() - typed_field_targets
-            field_errors = field_errors.square()
-            selected_features = field_selected.unsqueeze(-1).expand_as(field_errors)
-            changed_features = selected_features & (
-                (typed_field_targets - typed_persistence).abs() > 1e-6
+            change_targets = public_field_change_targets(
+                typed_field_targets,
+                typed_persistence,
             )
-            unchanged_features = selected_features & ~changed_features
-            field_group_losses = []
-            if changed_features.any():
-                field_group_losses.append(field_errors[changed_features].mean())
-            if unchanged_features.any():
-                field_group_losses.append(field_errors[unchanged_features].mean())
-            component_losses.append(torch.stack(field_group_losses).mean())
+            field_component_losses: list[torch.Tensor] = []
+
+            # Final-state likelihood remains useful because it trains the
+            # mixture itself.  Categorical field classes use their proper
+            # grouped likelihood; ordinal/binary scalars retain BCE.
+            field_probs = field_logits.sigmoid()
+            typed_final_losses = []
+            for group in (WEATHER_CLASS_SLICE, TERRAIN_CLASS_SLICE):
+                group_probs = field_probs[..., group]
+                group_probs = group_probs / group_probs.sum(
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(1e-8)
+                group_labels = typed_field_targets[..., group].argmax(dim=-1)
+                selected_group_probs = group_probs[field_selected]
+                selected_group_labels = group_labels[field_selected]
+                typed_final_losses.append(
+                    -selected_group_probs.gather(1, selected_group_labels.unsqueeze(-1))
+                    .clamp_min(1e-8)
+                    .log()
+                    .mean()
+                )
+            scalar_logits = field_logits[..., SCALAR_FIELD_INDICES]
+            scalar_targets = typed_field_targets[..., SCALAR_FIELD_INDICES]
+            typed_final_losses.append(
+                F.binary_cross_entropy_with_logits(
+                    scalar_logits[field_selected],
+                    scalar_targets[field_selected],
+                )
+            )
+            field_component_losses.append(torch.stack(typed_final_losses).mean())
+
+            # A calibrated gate learns whether the deterministic transition is
+            # wrong.  No class balancing is used: the probability of change is
+            # itself part of the world model consumed by the policy.
+            field_component_losses.append(
+                F.binary_cross_entropy_with_logits(
+                    field_change_logits[field_selected],
+                    change_targets[field_selected],
+                )
+            )
+
+            # Alternative values are conditional distributions: only teach
+            # them on components whose next value differs from persistence.
+            conditional_losses = []
+            for component, group in enumerate(
+                (WEATHER_CLASS_SLICE, TERRAIN_CLASS_SLICE)
+            ):
+                changed = field_selected & change_targets[..., component].bool()
+                if changed.any():
+                    conditional_losses.append(
+                        F.cross_entropy(
+                            field_alternative_logits[..., group][changed],
+                            typed_field_targets[..., group].argmax(dim=-1)[changed],
+                        )
+                    )
+            scalar_changed = (
+                field_selected.unsqueeze(-1) & change_targets[..., 2:].bool()
+            )
+            if scalar_changed.any():
+                conditional_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        field_alternative_logits[..., SCALAR_FIELD_INDICES][
+                            scalar_changed
+                        ],
+                        scalar_targets[scalar_changed],
+                    )
+                )
+            if conditional_losses:
+                field_component_losses.append(torch.stack(conditional_losses).mean())
+
+            # The structured field transition remains one auxiliary task in
+            # the outer equal-task average, regardless of its internal factors.
+            component_losses.append(torch.stack(field_component_losses).mean())
 
         if not component_losses:
             return logits["public_consequence_move_emitted_logits"].sum() * 0.0
@@ -2097,7 +2125,7 @@ class PPOTrainer:
                 {
                     "checkpoint_type": "trainer",
                     "format_version": TRAINER_CHECKPOINT_FORMAT_VERSION,
-                    "model_metadata": _model_checkpoint_metadata(self.agent),
+                    "model_metadata": model_checkpoint_metadata(self.agent),
                     "agent": self.agent.state_dict(),
                     "optimizer": self.optimizer.state_dict(),
                     "global_step": self.global_step,
@@ -2151,7 +2179,7 @@ class PPOTrainer:
                     f"Weight initializer {path!r} is missing required key(s): "
                     + ", ".join(missing)
                 )
-            checkpoint_state = _validate_model_checkpoint_metadata(
+            checkpoint_state = validate_model_checkpoint_metadata(
                 path=path,
                 checkpoint_state=checkpoint["agent"],
                 checkpoint_metadata=checkpoint["model_metadata"],
@@ -2218,7 +2246,7 @@ class PPOTrainer:
                 f"Trainer checkpoint {path!r} is missing required key(s): {missing}."
             )
 
-        checkpoint_state = _validate_model_checkpoint_metadata(
+        checkpoint_state = validate_model_checkpoint_metadata(
             path=path,
             checkpoint_state=checkpoint["agent"],
             checkpoint_metadata=checkpoint["model_metadata"],

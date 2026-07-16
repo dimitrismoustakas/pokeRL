@@ -1390,7 +1390,14 @@ def collect_synchronous_rollout(
             public_consequence_cant_targets_np[env_index] = consequence.cant_targets
             public_consequence_cant_masks_np[env_index] = consequence.cant_masks
             public_consequence_field_targets_np[env_index] = consequence.field_targets
-            public_consequence_field_masks_np[env_index] = consequence.field_masks
+            # A terminal observation resolves the selected moves, but Showdown
+            # does not advance battle.turn after the battle-ending action. The
+            # field head's persistence baseline is explicitly a one-turn
+            # transition, so supervising that non-advanced terminal field would
+            # teach a systematic false deviation. Other exact consequences stay
+            # valid on the terminal segment.
+            if not dones[env_index]:
+                public_consequence_field_masks_np[env_index] = consequence.field_masks
 
             slot_labels = info.get("opponent_intent_slot_labels")
             if slot_labels is None:
@@ -2102,12 +2109,14 @@ def train():
 
     # Game data and model
     game_data = GameData(gen=9)
+    agent = PokeAgent(model_config, game_data)
+    agent.to(device)
     if (
         phase_spec is not None
-        and game_data.vocab_signature() != phase_spec.model_signature
+        and agent.model_signature != phase_spec.model_signature
     ):
         raise ValueError(
-            "Runtime game-data vocabulary does not match the phase model signature."
+            "Runtime architecture/vocabulary does not match the phase model signature."
         )
     main_run_identity = (
         None
@@ -2117,12 +2126,10 @@ def train():
             team_pool_signature=(
                 None if team_pool is None else team_pool.signature()
             ),
-            model_signature=game_data.vocab_signature(),
+            model_signature=agent.model_signature,
             population_revision_id=None,
         )
     )
-    agent = PokeAgent(model_config, game_data)
-    agent.to(device)
 
     print(f"Model parameters: {sum(p.numel() for p in agent.parameters()):,}")
     if team_pool is not None:
@@ -2261,14 +2268,14 @@ def train():
             team_pool_signature=(
                 None if team_pool is None else team_pool.signature()
             ),
-            model_signature=game_data.vocab_signature(),
+            model_signature=agent.model_signature,
         )
         main_run_identity = _main_run_identity(
             battle_format=env_config.battle_format,
             team_pool_signature=(
                 None if team_pool is None else team_pool.signature()
             ),
-            model_signature=game_data.vocab_signature(),
+            model_signature=agent.model_signature,
             population_revision_id=population_revision_id,
         )
         restored_opponent_assignments = _restore_opponent_assignments(

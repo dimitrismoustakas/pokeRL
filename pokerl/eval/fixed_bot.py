@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import random
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,11 @@ from ..env.showdown_env import (
     make_local_account_configuration,
 )
 from ..team_pool import TeamPool, TeamPoolEntry
+from ..model.checkpoint import (
+    LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION,
+    validate_model_checkpoint_metadata,
+)
+from ..training.ppo import TRAINER_CHECKPOINT_FORMAT_VERSION
 from .metrics import outcome_summary
 from .replay import save_replay, save_replay_json
 
@@ -122,6 +128,9 @@ class FixedTeamSpec:
         return {
             "title": self.title,
             "file": self.file,
+            "packed_team_sha256": hashlib.sha256(
+                self.packed_team.encode("utf-8")
+            ).hexdigest(),
             "species": list(self.species),
             "species_bst": list(self.species_bst),
             "team_total_bst": self.team_total_bst,
@@ -235,7 +244,9 @@ def plan_opponent_team_specs(
         return []
 
     candidate_entries = [
-        entry for entry in pool.entries if entry.file != model_team_spec.file
+        entry
+        for entry in pool.entries
+        if entry.packed_team != model_team_spec.packed_team
     ]
     if not candidate_entries:
         candidate_entries = list(pool.entries)
@@ -1476,30 +1487,35 @@ def load_agent_for_evaluation(
                 f"Evaluation checkpoint {checkpoint_path!r} must contain an agent state mapping."
             )
 
-        metadata = checkpoint.get("model_metadata")
-        if metadata is not None:
-            if not isinstance(metadata, Mapping):
-                raise ValueError(
-                    f"Evaluation checkpoint {checkpoint_path!r} has invalid model metadata."
-                )
-            checkpoint_config = metadata.get("model_config")
-            expected_config = {
-                "type": f"{type(model_config).__module__}.{type(model_config).__qualname__}",
-                "values": asdict(model_config),
-            }
-            if checkpoint_config != expected_config:
-                raise ValueError(
-                    f"Evaluation checkpoint {checkpoint_path!r} model config does not match "
-                    "the evaluator architecture."
-                )
-            if metadata.get("game_data_signature") != agent.game_data_signature:
-                raise ValueError(
-                    f"Evaluation checkpoint {checkpoint_path!r} game-data vocabulary does "
-                    "not match the evaluator."
-                )
+        checkpoint_type = checkpoint.get("checkpoint_type")
+        if checkpoint_type == "league":
+            expected_format = LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION
+        elif checkpoint_type == "trainer":
+            expected_format = TRAINER_CHECKPOINT_FORMAT_VERSION
+        else:
+            raise ValueError(
+                f"Evaluation checkpoint {checkpoint_path!r} has unsupported "
+                f"checkpoint_type={checkpoint_type!r}."
+            )
+        if checkpoint.get("format_version") != expected_format:
+            raise ValueError(
+                f"Evaluation checkpoint {checkpoint_path!r} has unsupported "
+                f"format_version={checkpoint.get('format_version')!r}; expected "
+                f"{expected_format}."
+            )
+        if "model_metadata" not in checkpoint:
+            raise ValueError(
+                f"Evaluation checkpoint {checkpoint_path!r} is missing model_metadata."
+            )
+        checkpoint_state = validate_model_checkpoint_metadata(
+            path=checkpoint_path,
+            checkpoint_state=checkpoint["agent"],
+            checkpoint_metadata=checkpoint["model_metadata"],
+            current_agent=agent,
+        )
 
         try:
-            agent.load_state_dict(checkpoint["agent"], strict=True)
+            agent.load_state_dict(checkpoint_state, strict=True)
         except RuntimeError as exc:
             raise ValueError(
                 f"Evaluation checkpoint {checkpoint_path!r} does not exactly match the "

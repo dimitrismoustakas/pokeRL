@@ -23,6 +23,13 @@ from ..env.observation import (
     NUM_PUBLIC_TARGET_POSITIONS,
     TERA_KNOWN_OFFSET,
 )
+from ..field_transition import (
+    FIELD_CHANGE_COMPONENT_DIM,
+    SCALAR_FIELD_INDICES,
+    TERRAIN_CLASS_SLICE,
+    WEATHER_CLASS_SLICE,
+    public_field_change_targets,
+)
 from ..public_consequence import (
     MAX_PUBLIC_HIT_COUNT,
     MOVE_BRANCH_ACTION_FAILED,
@@ -526,6 +533,8 @@ def public_consequence_additive_metrics(
         "public_consequence_hit_count_logits",
         "public_consequence_cant_logits",
         "public_consequence_field_logits",
+        "public_consequence_field_change_logits",
+        "public_consequence_field_alternative_logits",
     }
     missing = sorted(required.difference(logits))
     if missing:
@@ -606,6 +615,16 @@ def public_consequence_additive_metrics(
         (
             "field logits",
             logits["public_consequence_field_logits"],
+            (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM),
+        ),
+        (
+            "field-change logits",
+            logits["public_consequence_field_change_logits"],
+            (*base_shape, FIELD_CHANGE_COMPONENT_DIM),
+        ),
+        (
+            "field-alternative logits",
+            logits["public_consequence_field_alternative_logits"],
             (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM),
         ),
     ):
@@ -713,6 +732,72 @@ def public_consequence_additive_metrics(
         | (selected_field_persistence > 1.0)
     ).any()
 
+    typed_field_targets = field_targets.to(
+        logits["public_consequence_field_logits"].dtype
+    )
+    typed_persistence = persistence_fields.to(typed_field_targets.dtype)
+    field_change_targets = public_field_change_targets(
+        typed_field_targets,
+        typed_persistence,
+    )
+    field_component_mask = (
+        field_masks.to(torch.bool).unsqueeze(-1).expand_as(field_change_targets)
+    )
+    change_metrics, invalid_change_targets = _binary_additive_tensors(
+        logits=logits["public_consequence_field_change_logits"],
+        targets=field_change_targets,
+        selected=field_component_mask,
+        prefix="aux_public_consequence_field_change",
+    )
+    metric_tensors.update(change_metrics)
+    validation_tensors["field_change"] = invalid_change_targets
+
+    alternative_logits = logits["public_consequence_field_alternative_logits"]
+    for component, (name, group) in enumerate(
+        (
+            ("weather", WEATHER_CLASS_SLICE),
+            ("terrain", TERRAIN_CLASS_SLICE),
+        )
+    ):
+        alternative_metrics, invalid_alternative_targets = (
+            _classification_additive_tensors(
+                logits=alternative_logits[..., group],
+                targets=typed_field_targets[..., group].argmax(dim=-1),
+                selected=(
+                    field_masks.to(torch.bool)
+                    & field_change_targets[..., component].to(torch.bool)
+                ),
+                prefix=f"aux_public_consequence_field_alternative_{name}",
+            )
+        )
+        metric_tensors.update(alternative_metrics)
+        validation_tensors[f"field_alternative_{name}"] = invalid_alternative_targets
+
+    scalar_changed = field_masks.to(torch.bool).unsqueeze(-1) & (
+        field_change_targets[..., 2:].to(torch.bool)
+    )
+    scalar_alternative_metrics, invalid_scalar_alternative_targets = (
+        _binary_additive_tensors(
+            logits=alternative_logits[..., SCALAR_FIELD_INDICES],
+            targets=typed_field_targets[..., SCALAR_FIELD_INDICES],
+            selected=scalar_changed,
+            prefix="aux_public_consequence_field_alternative_scalar",
+        )
+    )
+    metric_tensors.update(scalar_alternative_metrics)
+    validation_tensors["field_alternative_scalar"] = invalid_scalar_alternative_targets
+
+    for name, group in (
+        ("weather", WEATHER_CLASS_SLICE),
+        ("terrain", TERRAIN_CLASS_SLICE),
+    ):
+        validation_tensors[f"field_{name}_target"] = (
+            (selected_field_targets[..., group].sum(dim=-1) - 1.0).abs() > 1e-4
+        ).any()
+        validation_tensors[f"field_{name}_persistence"] = (
+            (selected_field_persistence[..., group].sum(dim=-1) - 1.0).abs() > 1e-4
+        ).any()
+
     selected_field_probs = selected_field_logits.sigmoid()
     selected_field_nll = torch.nn.functional.binary_cross_entropy_with_logits(
         selected_field_logits,
@@ -727,6 +812,50 @@ def public_consequence_additive_metrics(
     field_predictions = selected_field_logits >= 0.0
     field_positive = selected_field_targets >= 0.5
     field_negative = ~field_positive
+
+    def typed_field_scores(
+        probabilities: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nll_parts = []
+        brier_parts = []
+        for group in (WEATHER_CLASS_SLICE, TERRAIN_CLASS_SLICE):
+            group_probs = probabilities[..., group].clamp_min(1e-8)
+            group_probs = group_probs / group_probs.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-8)
+            group_targets = selected_field_targets[..., group]
+            target_probs = (group_probs * group_targets).sum(dim=-1)
+            nll_parts.append(-target_probs.clamp_min(1e-8).log())
+            brier_parts.append((group_probs - group_targets).square().sum(dim=-1))
+        scalar_probs = probabilities[..., SCALAR_FIELD_INDICES].clamp(
+            1e-6,
+            1.0 - 1e-6,
+        )
+        scalar_targets = selected_field_targets[..., SCALAR_FIELD_INDICES]
+        nll_parts.append(
+            torch.nn.functional.binary_cross_entropy(
+                scalar_probs,
+                scalar_targets,
+                reduction="none",
+            ).mean(dim=-1)
+        )
+        brier_parts.append((scalar_probs - scalar_targets).square().mean(dim=-1))
+        return (
+            torch.stack(nll_parts, dim=-1).mean(dim=-1),
+            torch.stack(brier_parts, dim=-1).mean(dim=-1),
+        )
+
+    typed_field_nll, typed_field_brier = typed_field_scores(selected_field_probs)
+    typed_persistence_nll, typed_persistence_brier = typed_field_scores(
+        selected_field_persistence
+    )
+    weather_probability_sum_error = (
+        selected_field_probs[..., WEATHER_CLASS_SLICE].sum(dim=-1) - 1.0
+    ).abs()
+    terrain_probability_sum_error = (
+        selected_field_probs[..., TERRAIN_CLASS_SLICE].sum(dim=-1) - 1.0
+    ).abs()
 
     squared_field_errors = (flat_field_logits.sigmoid() - flat_field_targets).square()
     squared_persistence_errors = (flat_persistence - flat_field_targets).square()
@@ -777,6 +906,20 @@ def public_consequence_additive_metrics(
             "aux_public_consequence_field_brier_sum": field_brier,
             "aux_public_consequence_field_mse_sum": field_brier,
             "aux_public_consequence_field_persistence_mse_sum": persistence_mse,
+            "aux_public_consequence_field_typed_nll_sum": typed_field_nll.sum(),
+            "aux_public_consequence_field_typed_brier_sum": (typed_field_brier.sum()),
+            "aux_public_consequence_field_persistence_typed_nll_sum": (
+                typed_persistence_nll.sum()
+            ),
+            "aux_public_consequence_field_persistence_typed_brier_sum": (
+                typed_persistence_brier.sum()
+            ),
+            "aux_public_consequence_field_weather_probability_sum_error_sum": (
+                weather_probability_sum_error.sum()
+            ),
+            "aux_public_consequence_field_terrain_probability_sum_error_sum": (
+                terrain_probability_sum_error.sum()
+            ),
             "aux_public_consequence_field_feature_count": selected_feature_mask.sum(),
             "aux_public_consequence_field_feature_correct": (
                 field_predictions == field_positive
@@ -824,7 +967,14 @@ def public_consequence_additive_metrics(
     )
 
     result, invalid = _pack_additive_metrics(metric_tensors, validation_tensors)
-    for name in ("emitted", "route", "interaction", "cant"):
+    for name in (
+        "emitted",
+        "route",
+        "interaction",
+        "cant",
+        "field_change",
+        "field_alternative_scalar",
+    ):
         if invalid[name]:
             raise ValueError(
                 f"public consequence {name} targets must be finite and within [0, 1]."
@@ -834,6 +984,8 @@ def public_consequence_additive_metrics(
         "move_branch",
         "interaction_reason",
         "hit_count",
+        "field_alternative_weather",
+        "field_alternative_terrain",
     ):
         if invalid[name]:
             raise ValueError(
@@ -843,4 +995,11 @@ def public_consequence_additive_metrics(
         raise ValueError("public consequence field targets must be within [0, 1].")
     if invalid["field_persistence"]:
         raise ValueError("public consequence persistence fields must be within [0, 1].")
+    for source in ("target", "persistence"):
+        for group_name in ("weather", "terrain"):
+            if invalid[f"field_{group_name}_{source}"]:
+                raise ValueError(
+                    "public consequence field "
+                    f"{source} {group_name} classes must sum to one."
+                )
     return result

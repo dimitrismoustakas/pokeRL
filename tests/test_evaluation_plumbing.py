@@ -8,6 +8,10 @@ import torch.nn as nn
 from pokerl.config import ModelConfig
 from pokerl.eval.fixed_bot import ModelPolicyController, load_agent_for_evaluation
 from pokerl.model.agent import PokeAgent
+from pokerl.model.checkpoint import (
+    LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION,
+    model_checkpoint_metadata,
+)
 import pokerl.model.agent as agent_module
 
 
@@ -140,9 +144,11 @@ class _GameDataStub:
 class _TinyCheckpointAgent(nn.Module):
     def __init__(self, config, game_data) -> None:
         super().__init__()
-        del config
+        self.config = config
         self.projection = nn.Linear(2, 2)
         self.game_data_signature = game_data.vocab_signature()
+        self.architecture_signature = "evaluation-test-architecture"
+        self.model_signature = "evaluation-test-model"
 
 
 def _patch_tiny_checkpoint_agent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,7 +164,12 @@ def test_evaluation_loader_accepts_exact_league_snapshot(
     source = _TinyCheckpointAgent(ModelConfig(), game_data)
     checkpoint_path = tmp_path / "step_1382400.pt"
     torch.save(
-        {"checkpoint_type": "league", "agent": source.state_dict()},
+        {
+            "checkpoint_type": "league",
+            "format_version": LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION,
+            "model_metadata": model_checkpoint_metadata(source),
+            "agent": source.state_dict(),
+        },
         checkpoint_path,
     )
 
@@ -185,9 +196,43 @@ def test_evaluation_loader_rejects_missing_state_key(
     incomplete_state = dict(source.state_dict())
     incomplete_state.pop("projection.bias")
     checkpoint_path = tmp_path / "incomplete.pt"
-    torch.save({"agent": incomplete_state}, checkpoint_path)
+    torch.save(
+        {
+            "checkpoint_type": "league",
+            "format_version": LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION,
+            "model_metadata": model_checkpoint_metadata(source),
+            "agent": incomplete_state,
+        },
+        checkpoint_path,
+    )
 
-    with pytest.raises(ValueError, match="does not exactly match"):
+    with pytest.raises(ValueError, match="declared model-state schema"):
+        load_agent_for_evaluation(
+            checkpoint_path=str(checkpoint_path),
+            device=torch.device("cpu"),
+            model_config=ModelConfig(),
+            game_data=game_data,
+        )
+
+
+def test_evaluation_loader_rejects_metadata_less_league_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_tiny_checkpoint_agent(monkeypatch)
+    game_data = _GameDataStub()
+    source = _TinyCheckpointAgent(ModelConfig(), game_data)
+    checkpoint_path = tmp_path / "legacy-league.pt"
+    torch.save(
+        {
+            "checkpoint_type": "league",
+            "format_version": LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION,
+            "agent": source.state_dict(),
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(ValueError, match="missing model_metadata"):
         load_agent_for_evaluation(
             checkpoint_path=str(checkpoint_path),
             device=torch.device("cpu"),

@@ -22,7 +22,9 @@ from pokerl.eval.fixed_bot import (
     select_max_bst_team_spec,
     select_team_spec_by_title,
 )
+from pokerl.model.signature import model_signature as build_model_signature
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
+from pokerl.training.population import CheckpointRef
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -254,7 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--team-pool-manifest",
         default=None,
-        help="Optional explicit manifest path; overrides --team-pool-format.",
+        help="Shared manifest fallback for own and opponent rosters.",
     )
     parser.add_argument(
         "--team-pool-subset",
@@ -266,6 +268,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Reproducible ordering seed for opponent rosters.",
+    )
+    parser.add_argument(
+        "--model-team-pool-manifest",
+        default=None,
+        help="Independent manifest for the fixed own roster.",
+    )
+    parser.add_argument(
+        "--opponent-team-pool-manifest",
+        default=None,
+        help="Independent manifest for the opponent conditioning panel.",
+    )
+    parser.add_argument(
+        "--model-team-pool-subset",
+        choices=["curated", "generated", "pool"],
+        default=None,
+        help="Own-roster subset; defaults to --team-pool-subset.",
+    )
+    parser.add_argument(
+        "--opponent-team-pool-subset",
+        choices=["curated", "generated", "pool"],
+        default=None,
+        help="Opponent-panel subset; defaults to --team-pool-subset.",
     )
     parser.add_argument(
         "--model-team-title",
@@ -293,44 +317,67 @@ def main() -> None:
     pick_size = 4
     model_config = ModelConfig(pick_size=pick_size)
     species_bst_lookup = build_species_bst_lookup(gen=game_data.gen)
-    manifest_path = (
+    shared_manifest_path = (
         Path(args.team_pool_manifest)
         if args.team_pool_manifest
         else default_team_pool_manifest_path(REPO_ROOT, args.team_pool_format)
     )
-    team_pool = load_team_pool(
-        manifest_path,
-        subset=args.team_pool_subset,
+    model_manifest_path = (
+        Path(args.model_team_pool_manifest)
+        if args.model_team_pool_manifest
+        else shared_manifest_path
+    )
+    opponent_manifest_path = (
+        Path(args.opponent_team_pool_manifest)
+        if args.opponent_team_pool_manifest
+        else shared_manifest_path
+    )
+    model_subset = args.model_team_pool_subset or args.team_pool_subset
+    opponent_subset = args.opponent_team_pool_subset or args.team_pool_subset
+    model_team_pool = load_team_pool(
+        model_manifest_path,
+        subset=model_subset,
+        seed=args.team_pool_seed,
+        usage="evaluation",
+    )
+    opponent_team_pool = load_team_pool(
+        opponent_manifest_path,
+        subset=opponent_subset,
         seed=args.team_pool_seed,
         usage="evaluation",
     )
     if args.model_team_title:
         model_team_spec = select_team_spec_by_title(
-            team_pool,
+            model_team_pool,
             title=args.model_team_title,
             species_bst_lookup=species_bst_lookup,
             pick_size=pick_size,
         )
     else:
         model_team_spec = select_max_bst_team_spec(
-            team_pool,
+            model_team_pool,
             species_bst_lookup=species_bst_lookup,
             pick_size=pick_size,
         )
 
     opponent_count = len(
-        [entry for entry in team_pool.entries if entry.file != model_team_spec.file]
+        [
+            entry
+            for entry in opponent_team_pool.entries
+            if entry.packed_team != model_team_spec.packed_team
+        ]
     )
     opponent_specs = plan_opponent_team_specs(
-        team_pool,
+        opponent_team_pool,
         model_team_spec=model_team_spec,
         species_bst_lookup=species_bst_lookup,
         pick_size=pick_size,
         num_games=max(1, opponent_count),
         seed=args.team_pool_seed,
     )
+    checkpoint_ref = CheckpointRef.from_file(args.checkpoint)
     agent = load_agent_for_evaluation(
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=str(checkpoint_ref.resolve(REPO_ROOT)),
         device=device,
         model_config=model_config,
         game_data=game_data,
@@ -357,19 +404,27 @@ def main() -> None:
     distribution_summary.pop("greedy_action_indices")
     distribution_summary.pop("per_opponent_entropy_nats")
     distribution_summary.pop("per_opponent_max_probability")
+    checkpoint_ref.verify(REPO_ROOT)
 
-    checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     summary = {
         "config": {
-            "checkpoint": str(checkpoint_path),
+            "checkpoint": checkpoint_ref.to_dict(),
             "device": str(device),
             "batch_size": args.batch_size,
             "team_size": team_size,
             "pick_size": pick_size,
-            "team_pool_manifest": str(Path(manifest_path).expanduser().resolve()),
-            "team_pool_subset": args.team_pool_subset,
-            "team_pool_size": team_pool.size,
-            "team_pool_signature": team_pool.signature(),
+            "model_team_pool_manifest": str(model_manifest_path.resolve()),
+            "model_team_pool_subset": model_subset,
+            "model_team_pool_size": model_team_pool.size,
+            "model_team_pool_signature": model_team_pool.signature(),
+            "opponent_team_pool_manifest": str(opponent_manifest_path.resolve()),
+            "opponent_team_pool_subset": opponent_subset,
+            "opponent_team_pool_size": opponent_team_pool.size,
+            "opponent_team_pool_signature": opponent_team_pool.signature(),
+            "model_signature": build_model_signature(
+                model_config,
+                game_data.vocab_signature(),
+            ),
             "team_pool_seed": args.team_pool_seed,
         },
         "model_team": model_team_spec.to_summary(),
@@ -377,13 +432,25 @@ def main() -> None:
         "distribution": distribution_summary,
         "opponents": per_opponent,
     }
-    rendered = json.dumps(summary, indent=2)
+    rendered = json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n"
     if args.summary_path:
         summary_path = Path(args.summary_path).expanduser()
         if not summary_path.is_absolute():
             summary_path = REPO_ROOT / summary_path
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(rendered, encoding="utf-8")
+        if summary_path.exists():
+            if summary_path.read_text(encoding="utf-8") != rendered:
+                raise FileExistsError(
+                    "Refusing to overwrite immutable preview summary: "
+                    f"{summary_path!s}"
+                )
+        else:
+            temporary = summary_path.with_suffix(summary_path.suffix + ".tmp")
+            try:
+                temporary.write_text(rendered, encoding="utf-8")
+                temporary.replace(summary_path)
+            finally:
+                temporary.unlink(missing_ok=True)
         print(f"Wrote preview-policy summary to {summary_path.resolve()}")
     print(rendered)
 

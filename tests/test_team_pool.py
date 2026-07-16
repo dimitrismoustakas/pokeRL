@@ -32,7 +32,7 @@ def test_checked_in_team_pool_manifest_loads() -> None:
 
     pool = load_team_pool(manifest_path, subset="pool", seed=0)
 
-    assert pool.size == 77
+    assert pool.size == 85
 
 
 def test_heldout_team_pool_is_evaluation_only() -> None:
@@ -47,7 +47,7 @@ def test_heldout_team_pool_is_evaluation_only() -> None:
         seed=0,
         usage="evaluation",
     )
-    assert heldout.size == 11
+    assert heldout.size == 15
 
 
 def test_team_pool_training_metadata_fails_closed(tmp_path: Path) -> None:

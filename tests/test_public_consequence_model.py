@@ -4,8 +4,15 @@ import pytest
 import torch
 
 from pokerl.config import TrainingConfig
+from pokerl.data import MOVE_MECHANICS_DIM
 from pokerl.env.actions import ACTIONS_PER_SLOT, SWITCH_OFFSET, TERA_NONE
 from pokerl.env.observation import BOOSTS_OFFSET
+from pokerl.field_transition import (
+    FIELD_CHANGE_COMPONENT_DIM,
+    SCALAR_FIELD_INDICES,
+    TERRAIN_CLASS_SLICE,
+    WEATHER_CLASS_SLICE,
+)
 from pokerl.model.heads import ActionHead, _PublicConsequenceState
 from pokerl.public_consequence import (
     MAX_PUBLIC_HIT_COUNT,
@@ -71,9 +78,25 @@ def _consequence_tensors(
         "public_consequence_field_logits": torch.randn(
             *base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM
         ),
+        "public_consequence_field_change_logits": torch.randn(
+            *base_shape, FIELD_CHANGE_COMPONENT_DIM
+        ),
+        "public_consequence_field_alternative_logits": torch.randn(
+            *base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM
+        ),
     }
-    field_targets = torch.randint(
-        0, 2, (*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM)
+    persistence_fields = torch.zeros(*base_shape, PUBLIC_CONSEQUENCE_FIELD_DIM)
+    persistence_fields[..., WEATHER_CLASS_SLICE.start] = 1.0
+    persistence_fields[..., TERRAIN_CLASS_SLICE.start] = 1.0
+    field_targets = persistence_fields.clone()
+    field_targets[..., WEATHER_CLASS_SLICE] = 0.0
+    field_targets[..., WEATHER_CLASS_SLICE.start + 1] = 1.0
+    field_targets[..., TERRAIN_CLASS_SLICE] = 0.0
+    field_targets[..., TERRAIN_CLASS_SLICE.start + 2] = 1.0
+    field_targets[..., SCALAR_FIELD_INDICES] = torch.randint(
+        0,
+        2,
+        (*base_shape, len(SCALAR_FIELD_INDICES)),
     ).float()
     labels = {
         "move_emitted_targets": torch.randint(0, 2, base_shape).float(),
@@ -96,7 +119,7 @@ def _consequence_tensors(
         "cant_masks": torch.ones((*base_shape, 2), dtype=torch.bool),
         "field_targets": field_targets,
         "field_masks": torch.ones(base_shape, dtype=torch.bool),
-        "persistence_fields": 1.0 - field_targets,
+        "persistence_fields": persistence_fields,
     }
     return logits, labels
 
@@ -125,9 +148,42 @@ def test_actor_gradient_cannot_train_detached_world_predictions() -> None:
     (-head(**inputs)["log_prob"].sum()).backward()
 
     assert head.public_consequence_action_head.weight.grad is None
+    assert head.public_consequence_field_change_head.weight.grad is None
+    assert head.public_consequence_field_alternative_head.weight.grad is None
     assert head.public_consequence_target_head.weight.grad is None
     assert head.public_consequence_policy_adapter.weight.grad is not None
     assert head.public_consequence_policy_adapter.weight.grad.norm() > 0
+
+
+def test_untrained_field_transition_starts_at_advanced_persistence() -> None:
+    head, inputs = _head_and_inputs(batch_size=2)
+
+    output = head(**inputs)
+
+    torch.testing.assert_close(
+        output["public_consequence_field_probs"],
+        output["public_consequence_field_persistence"],
+        atol=7e-6,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        output["public_consequence_field_probs"][..., WEATHER_CLASS_SLICE].sum(dim=-1),
+        torch.ones(2, 2),
+    )
+    torch.testing.assert_close(
+        output["public_consequence_field_probs"][..., TERRAIN_CLASS_SLICE].sum(dim=-1),
+        torch.ones(2, 2),
+    )
+
+
+def test_missing_move_semantics_keeps_projection_in_gradient_graph() -> None:
+    head, inputs = _head_and_inputs()
+
+    (-head(**inputs)["log_prob"].sum()).backward()
+
+    projection_weight_grad = head.move_semantic_proj[0].weight.grad
+    assert projection_weight_grad is not None
+    assert projection_weight_grad.count_nonzero() == 0
 
 
 def test_selected_public_consequence_output_shapes() -> None:
@@ -148,6 +204,14 @@ def test_selected_public_consequence_output_shapes() -> None:
     )
     assert output["public_consequence_hit_count_logits"].shape == (2, 2, 4, 10)
     assert output["public_consequence_field_logits"].shape == (2, 2, 33)
+    assert output["public_consequence_field_change_logits"].shape == (
+        2,
+        2,
+        FIELD_CHANGE_COMPONENT_DIM,
+    )
+    assert output["public_consequence_field_alternative_logits"].shape == (2, 2, 33)
+    assert output["public_consequence_field_probs"].shape == (2, 2, 33)
+    assert output["public_consequence_field_persistence"].shape == (2, 2, 33)
 
 
 def test_target_decoder_sees_accuracy_evasion_and_ignore_evasion_exception() -> None:
@@ -204,6 +268,95 @@ def test_target_decoder_sees_accuracy_evasion_and_ignore_evasion_exception() -> 
     assert mechanics[0, 5, 2, 2] == 1.0
     assert mechanics[0, 0, 2, 3] == pytest.approx(-2.0 / 6.0)
     assert mechanics[0, 0, 2, 4] == pytest.approx(3.0 / 6.0)
+
+
+def test_candidate_score_receives_selected_global_move_identity() -> None:
+    hidden_dim = 8
+    num_moves = 3
+    head = ActionHead(
+        context_dim=3,
+        pokemon_dim=2,
+        hidden_dim=hidden_dim,
+        move_type_lookup=torch.zeros(num_moves, dtype=torch.long),
+        move_base_power_lookup=torch.zeros(num_moves),
+        move_accuracy_lookup=torch.ones(num_moves),
+        move_bypasses_accuracy_lookup=torch.zeros(num_moves),
+        move_ignores_evasion_lookup=torch.zeros(num_moves),
+        move_target_scope_lookup=torch.full((num_moves,), 2, dtype=torch.long),
+        move_multihit_lookup=torch.zeros(num_moves),
+        move_priority_lookup=torch.zeros(num_moves),
+        move_category_lookup=torch.zeros(num_moves, dtype=torch.long),
+        move_target_flags=torch.zeros((num_moves, 6)),
+        move_mechanics_lookup=torch.zeros((num_moves, MOVE_MECHANICS_DIM)),
+        move_embedding_dim=2,
+        type_effectiveness=torch.ones((1, 1)),
+    )
+    move_embedding = torch.nn.Embedding(num_moves, 2, padding_idx=0)
+    with torch.no_grad():
+        move_embedding.weight.zero_()
+        move_embedding.weight[1, 0] = 1.0
+        move_embedding.weight[2, 0] = 2.0
+        head.move_semantic_proj[0].weight.zero_()
+        head.move_semantic_proj[0].bias.zero_()
+        head.move_semantic_proj[0].weight[0, 0] = 1.0
+        head.score[0].weight.zero_()
+        head.score[0].bias.zero_()
+        head.score[0].weight[0, 4 * hidden_dim] = 1.0
+        head.score[2].weight.zero_()
+        head.score[2].bias.zero_()
+        head.score[2].weight[0, 0] = 1.0
+
+    def semantics_for(move_id: int) -> torch.Tensor:
+        own_moves = torch.zeros((1, 6, 4), dtype=torch.long)
+        own_moves[0, 0, 0] = move_id
+        battle_obs = {
+            "own_moves": own_moves,
+            "own_types": torch.zeros((1, 6, 3), dtype=torch.long),
+            "own_continuous": torch.zeros((1, 6, 44)),
+            "own_active_indices": torch.tensor([[0, 1]]),
+            "own_active_present": torch.tensor([[True, True]]),
+            "opp_types": torch.zeros((1, 6, 3), dtype=torch.long),
+            "opp_continuous": torch.zeros((1, 6, 44)),
+            "opp_active_indices": torch.tensor([[0, 1]]),
+            "opp_active_present": torch.tensor([[True, True]]),
+        }
+        context = head._matchup_context(battle_obs, 1, torch.device("cpu"))
+        return head._candidate_move_semantics(
+            context,
+            actor_slot=0,
+            move_embedding=move_embedding,
+            batch_size=1,
+            device=torch.device("cpu"),
+        )
+
+    common = {
+        "query": torch.zeros((1, hidden_dim)),
+        "actor_rep": torch.zeros((1, 2)),
+        "partner_rep": torch.zeros((1, 2)),
+        "own_team_reps": torch.zeros((1, 6, 2)),
+        "opp_active_reps": torch.zeros((1, 2, 2)),
+        "matchup_features": torch.zeros(
+            (1, ACTIONS_PER_SLOT, head._MATCHUP_FEATURE_DIM)
+        ),
+        "action_features": torch.zeros((ACTIONS_PER_SLOT, hidden_dim)),
+        "public_target_reps": torch.zeros((1, 4, 2)),
+        "target_mechanics": torch.zeros((1, SWITCH_OFFSET, 4, 6)),
+    }
+    with torch.no_grad():
+        first_logits, _ = head._score_actions(
+            **common,
+            move_semantics=semantics_for(1),
+        )
+        second_logits, _ = head._score_actions(
+            **common,
+            move_semantics=semantics_for(2),
+        )
+
+    assert second_logits[0, 0] > first_logits[0, 0]
+    torch.testing.assert_close(
+        second_logits[:, SWITCH_OFFSET:],
+        first_logits[:, SWITCH_OFFSET:],
+    )
 
 
 def test_amortized_target_decoder_matches_explicit_broadcast_reference() -> None:
@@ -288,6 +441,8 @@ def test_conditional_auxiliary_loss_trains_action_and_target_heads() -> None:
 
     assert torch.isfinite(loss)
     assert head.public_consequence_action_head.weight.grad is not None
+    assert head.public_consequence_field_change_head.weight.grad is not None
+    assert head.public_consequence_field_alternative_head.weight.grad is not None
     assert head.public_consequence_target_head.weight.grad is not None
     assert head.public_consequence_target_candidate_proj.weight.grad is not None
     assert head.public_consequence_target_entity_proj.weight.grad is not None
@@ -338,9 +493,16 @@ def test_additive_metrics_and_finalizer_report_conditional_support() -> None:
     assert metrics["aux_public_consequence_route_count"] == 48.0
     assert metrics["aux_public_consequence_interaction_reason_count"] == 48.0
     assert metrics["aux_public_consequence_field_count"] == 12.0
+    assert metrics["aux_public_consequence_field_change_count"] == (
+        12.0 * FIELD_CHANGE_COMPONENT_DIM
+    )
     assert 0.0 <= finalized["aux_public_consequence_emitted_brier"] <= 1.0
     assert 0.0 <= finalized["aux_public_consequence_move_branch_top1_accuracy"] <= 1.0
     assert finalized["aux_public_consequence_interaction_reason_failed_count"] >= 0
+    assert math.isfinite(finalized["aux_public_consequence_field_typed_nll_skill"])
+    assert (
+        finalized["aux_public_consequence_field_weather_probability_sum_error"] >= 0.0
+    )
 
 
 def test_public_consequence_coefficient_is_conservative_and_validated() -> None:

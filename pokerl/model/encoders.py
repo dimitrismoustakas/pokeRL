@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from ..data import NUM_MOVE_SCOPES
 from ..env.observation import (
+    ACTIVE_MECHANICS_FEATURE_DIM,
     NUM_PUBLIC_EVENT_FLAGS,
     NUM_PUBLIC_TARGET_POSITIONS,
     NUM_TARGET_OUTCOME_FEATURES,
@@ -276,6 +277,51 @@ class RecentEventEncoder(nn.Module):
         return encoded * valid.unsqueeze(-1)
 
 
+class ActiveMechanicsEncoder(nn.Module):
+    """Encode exact public mechanics aligned to the four active positions."""
+
+    NUM_PUBLIC_SLOTS = 4
+
+    def __init__(self, *, move_dim: int, out_dim: int = 64):
+        super().__init__()
+        self.out_dim = out_dim
+        self.position_emb = nn.Embedding(self.NUM_PUBLIC_SLOTS, 8)
+        self.slot_projection = nn.Sequential(
+            nn.Linear(move_dim + ACTIVE_MECHANICS_FEATURE_DIM + 8, 48),
+            nn.ReLU(),
+        )
+        self.output = nn.Sequential(
+            nn.Linear(self.NUM_PUBLIC_SLOTS * 48, out_dim),
+            nn.ReLU(),
+        )
+
+    def forward(
+        self,
+        obs: dict[str, torch.Tensor],
+        move_embedding: nn.Embedding,
+    ) -> torch.Tensor:
+        reference = obs["field"]
+        batch_size = reference.shape[0]
+        features = obs.get("active_mechanics")
+        moves = obs.get("active_mechanics_move")
+        if features is None or moves is None:
+            return reference.new_zeros((batch_size, self.out_dim))
+        positions = torch.arange(
+            self.NUM_PUBLIC_SLOTS,
+            device=reference.device,
+        ).view(1, self.NUM_PUBLIC_SLOTS)
+        positions = positions.expand(batch_size, -1)
+        slot_tokens = torch.cat(
+            [
+                move_embedding(moves),
+                features,
+                self.position_emb(positions),
+            ],
+            dim=-1,
+        )
+        return self.output(self.slot_projection(slot_tokens).flatten(start_dim=1))
+
+
 class SpatialEncoder(nn.Module):
     """Full spatial encoder: both teams + field -> battle representation.
 
@@ -294,6 +340,7 @@ class SpatialEncoder(nn.Module):
         team_encoder_opp: TeamEncoder,
         field_encoder: FieldEncoder,
         recent_event_encoder: RecentEventEncoder,
+        active_mechanics_encoder: ActiveMechanicsEncoder,
     ):
         super().__init__()
         self.pokemon_encoder = pokemon_encoder
@@ -301,11 +348,16 @@ class SpatialEncoder(nn.Module):
         self.team_opp = team_encoder_opp
         self.field_encoder = field_encoder
         self.recent_event_encoder = recent_event_encoder
+        self.active_mechanics_encoder = active_mechanics_encoder
 
         pokemon_dim = team_encoder_own.role_emb.embedding_dim
-        # context = mean(own_team) + mean(opp_team) + field
+        # context = mean(own_team) + mean(opp_team) + field + events +
+        # exact mechanics aligned to the four public active positions.
         self.context_dim = (
-            pokemon_dim * 2 + field_encoder.out_dim + recent_event_encoder.out_dim
+            pokemon_dim * 2
+            + field_encoder.out_dim
+            + recent_event_encoder.out_dim
+            + active_mechanics_encoder.out_dim
         )
 
     def forward(
@@ -348,12 +400,19 @@ class SpatialEncoder(nn.Module):
             recent_events = field.new_zeros(
                 (field.shape[0], self.recent_event_encoder.out_dim)
             )
+        active_mechanics = self.active_mechanics_encoder(
+            obs,
+            self.pokemon_encoder.move_emb,
+        )
 
         # Pool teams into summary vectors (mask-aware mean)
         own_summary = self._masked_mean(own_reps, obs.get("own_mask"))
         opp_summary = self._masked_mean(opp_reps, opp_mask)
 
-        context = torch.cat([own_summary, opp_summary, field, recent_events], dim=-1)
+        context = torch.cat(
+            [own_summary, opp_summary, field, recent_events, active_mechanics],
+            dim=-1,
+        )
 
         # Extract our active pokemon representations by index
         active_indices = obs["own_active_indices"]  # (batch, 2)

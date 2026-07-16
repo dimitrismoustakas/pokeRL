@@ -1,0 +1,66 @@
+Farigiraf @ Throat Spray  
+Ability: Armor Tail  
+Level: 50  
+Tera Type: Fairy  
+EVs: 108 HP / 44 Def / 156 SpA / 196 SpD / 4 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Psychic  
+- Hyper Voice  
+- Trick Room  
+- Protect  
+
+Tornadus @ Covert Cloak  
+Ability: Prankster  
+Level: 50  
+Tera Type: Steel  
+EVs: 212 HP / 164 Def / 36 SpA / 4 SpD / 92 Spe  
+Modest Nature  
+- Bleakwind Storm  
+- Sunny Day  
+- Tailwind  
+- Protect  
+
+Ogerpon-Hearthflame @ Hearthflame Mask  
+Ability: Mold Breaker  
+Level: 50  
+Tera Type: Fire  
+EVs: 4 HP / 252 Atk / 252 Spe  
+Jolly Nature  
+- Ivy Cudgel  
+- Wood Hammer  
+- Follow Me  
+- Spiky Shield  
+
+Incineroar @ Assault Vest  
+Ability: Intimidate  
+Level: 50  
+Tera Type: Grass  
+EVs: 228 HP / 36 Atk / 4 Def / 44 SpD / 196 Spe  
+Adamant Nature  
+- Knock Off  
+- Flare Blitz  
+- Fake Out  
+- U-turn  
+
+Flutter Mane @ Choice Specs  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Fairy  
+EVs: 116 HP / 204 Def / 52 SpA / 4 SpD / 132 Spe  
+Timid Nature  
+- Moonblast  
+- Dazzling Gleam  
+- Shadow Ball  
+- Power Gem  
+
+Ursaluna @ Flame Orb  
+Ability: Guts  
+Level: 50  
+Tera Type: Dragon  
+EVs: 140 HP / 172 Atk / 4 Def / 4 SpD / 188 Spe  
+Adamant Nature  
+- Facade  
+- Earthquake  
+- Headlong Rush  
+- Protect

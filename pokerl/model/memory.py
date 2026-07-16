@@ -101,12 +101,29 @@ class IdentityMemory(nn.Module):
 
 
 class LSTMMemory(nn.Module):
-    """LSTM memory: maintains hidden state across turns within a battle."""
+    """LSTM history fused with a short path from the exact current state.
+
+    The recurrent state carries partial-observability evidence, while the
+    residual projection prevents current public mechanics from having to
+    survive an LSTM gate before the policy can use them.
+    """
 
     def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.current_proj = nn.Linear(input_dim, hidden_dim)
+        # RMS normalization keeps scale controlled without forcing every
+        # context vector's feature sum to zero (which needlessly removes one
+        # direction from downstream linear heads).
+        self.fusion_norm = nn.RMSNorm(hidden_dim)
         self.hidden_dim = hidden_dim
+
+    def _fuse_current(
+        self,
+        recurrent: torch.Tensor,
+        current: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.fusion_norm(recurrent + self.current_proj(current))
 
     def forward(
         self,
@@ -119,6 +136,7 @@ class LSTMMemory(nn.Module):
             x = x.unsqueeze(1)
 
         output, hidden = self.lstm(x, hidden)
+        output = self._fuse_current(output, x)
 
         if was_2d:
             output = output.squeeze(1)
@@ -198,9 +216,10 @@ class LSTMMemory(nn.Module):
             flat_output = packed_output.data.new_zeros(
                 (window_x.shape[0] * num_envs, self.hidden_dim)
             ).index_copy(0, gather_indices, packed_output.data)
-            outputs.append(
-                flat_output.reshape(window_x.shape[0], num_envs, self.hidden_dim)
+            recurrent_output = flat_output.reshape(
+                window_x.shape[0], num_envs, self.hidden_dim
             )
+            outputs.append(self._fuse_current(recurrent_output, window_x))
 
             final_state_indices = plan.final_state_indices.to(device=x.device)
             next_hidden = tuple(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +14,24 @@ import torch
 from pokerl.config import EnvConfig, ModelConfig, TrainingConfig
 from pokerl.data import GameData
 from pokerl.env.showdown_env import BattleEnv, default_showdown_dir
-from pokerl.eval.fixed_bot import ModelPolicyController, load_agent_for_evaluation
+from pokerl.eval.fixed_bot import (
+    ModelPolicyController,
+    _classify_battle_mechanics,
+    _classify_joint_action,
+    _classify_protect_outcomes,
+    _classify_slot_action,
+    _describe_slot_action,
+    _protect_attempt_contexts,
+    _summarize_action_stats,
+    _summarize_battle_behavior,
+    load_agent_for_evaluation,
+)
 from pokerl.eval.metrics import mirrored_candidate_summary, outcome_summary
+from pokerl.eval.schedule import (
+    balanced_distinct_team_pairs,
+    team_pair_schedule_summary,
+)
+from pokerl.model.signature import model_signature as build_model_signature
 from pokerl.team_pool import (
     TeamPoolEntry,
     default_team_pool_manifest_path,
@@ -104,6 +121,14 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Repeat the same team pairs with checkpoints and player/team roles reversed.",
+    )
+    parser.add_argument(
+        "--same-policy-role-bias",
+        action="store_true",
+        help=(
+            "Require identical checkpoint bytes and report external-player role bias "
+            "instead of candidate strength. Requires mirrored evaluation."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -277,6 +302,8 @@ def _run_anchor_direction(
     rewards: list[float] = []
     battle_turns: list[int] = []
     decision_steps: list[int] = []
+    entropies: list[float] = []
+    action_stats: Counter[str] = Counter()
     game_results: list[dict[str, object]] = []
     try:
         for game_index in range(args.games):
@@ -291,6 +318,10 @@ def _run_anchor_direction(
             done = False
             reward = 0.0
             step_count = 0
+            battle_action_stats: Counter[str] = Counter()
+            first_tera_turn: int | None = None
+            first_tera_step: int | None = None
+            first_tera_slot: int | None = None
 
             while not done:
                 if args.max_turns > 0 and step_count >= args.max_turns:
@@ -298,16 +329,56 @@ def _run_anchor_direction(
                         f"Anchor evaluation exceeded max_turns={args.max_turns} "
                         f"on game {game_index + 1}."
                     )
+                battle = env.last_battle
+                if battle is None:
+                    raise RuntimeError(
+                        "BattleEnv returned no active battle during anchor evaluation."
+                    )
                 action_out = policy.choose_action(obs, masks)
-                obs, masks, reward, done, info = env.step(
-                    np.asarray(action_out["actions"], dtype=np.int64)
+                actions = np.asarray(action_out["actions"], dtype=np.int64)
+                tera_choice = int(actions[2])
+                entropies.append(float(action_out["entropy"]))
+                for slot, action_idx in enumerate(actions[:2]):
+                    slot_stats = _classify_slot_action(
+                        battle,
+                        slot,
+                        int(action_idx),
+                        tera_choice,
+                    )
+                    action_stats.update(slot_stats)
+                    battle_action_stats.update(slot_stats)
+                action_descriptions = [
+                    _describe_slot_action(battle, 0, int(actions[0]), tera_choice),
+                    _describe_slot_action(battle, 1, int(actions[1]), tera_choice),
+                ]
+                joint_stats = _classify_joint_action(action_descriptions)
+                action_stats.update(joint_stats)
+                battle_action_stats.update(joint_stats)
+                if first_tera_turn is None and any(
+                    description["tera"] for description in action_descriptions
+                ):
+                    first_tera_turn = int(getattr(battle, "turn", 0))
+                    first_tera_step = step_count + 1
+                    first_tera_slot = next(
+                        int(description["slot"])
+                        for description in action_descriptions
+                        if description["tera"]
+                    )
+                protect_contexts = _protect_attempt_contexts(
+                    battle,
+                    action_descriptions,
                 )
+                obs, masks, reward, done, info = env.step(actions)
+                protect_outcomes = _classify_protect_outcomes(protect_contexts)
+                action_stats.update(protect_outcomes)
+                battle_action_stats.update(protect_outcomes)
                 step_count += 1
 
             battle_turn = int(info.get("battle_turn", 0))
             rewards.append(float(reward))
             battle_turns.append(battle_turn)
             decision_steps.append(step_count)
+            action_stats.update(_classify_battle_mechanics(battle_action_stats))
             game_results.append(
                 {
                     "game": game_index + 1,
@@ -318,7 +389,15 @@ def _run_anchor_direction(
                     "battle_turn": battle_turn,
                     "decision_steps": step_count,
                     "battle_tag": info.get("battle_tag", ""),
+                    "won": bool(reward > 0),
                     "preview": preview,
+                    "tera_used": first_tera_turn is not None,
+                    "first_tera_turn": first_tera_turn,
+                    "first_tera_decision_step": first_tera_step,
+                    "first_tera_slot": first_tera_slot,
+                    "switch_actions": int(
+                        battle_action_stats.get("switch_actions", 0)
+                    ),
                     **matchup,
                 }
             )
@@ -335,6 +414,10 @@ def _run_anchor_direction(
         "avg_battle_turns": float(np.mean(battle_turns)) if battle_turns else 0.0,
         "median_battle_turns": float(np.median(battle_turns)) if battle_turns else 0.0,
         "avg_decision_steps": float(np.mean(decision_steps)) if decision_steps else 0.0,
+        "action_entropy_mean": float(np.mean(entropies)) if entropies else 0.0,
+        "action_entropy_std": float(np.std(entropies)) if entropies else 0.0,
+        "action_breakdown": _summarize_action_stats(action_stats),
+        "battle_behavior": _summarize_battle_behavior(game_results),
         "games_detail": game_results,
     }
 
@@ -342,13 +425,22 @@ def _run_anchor_direction(
 def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
     if args.games <= 0:
         raise ValueError("--games must be positive.")
-    if args.checkpoint_policy_id == args.anchor_policy_id:
-        raise ValueError("Candidate and anchor policy ids must be distinct.")
 
     checkpoint_ref = CheckpointRef.from_file(args.checkpoint)
     anchor_ref = CheckpointRef.from_file(args.anchor)
-    if checkpoint_ref.sha256 == anchor_ref.sha256:
-        raise ValueError("Candidate and anchor checkpoints contain identical bytes.")
+    identical_checkpoints = checkpoint_ref.sha256 == anchor_ref.sha256
+    if args.same_policy_role_bias:
+        if not args.mirrored:
+            raise ValueError("Same-policy role-bias evaluation requires --mirrored.")
+        if not identical_checkpoints:
+            raise ValueError(
+                "Same-policy role-bias evaluation requires identical checkpoint bytes."
+            )
+    else:
+        if args.checkpoint_policy_id == args.anchor_policy_id:
+            raise ValueError("Candidate and anchor policy ids must be distinct.")
+        if identical_checkpoints:
+            raise ValueError("Candidate and anchor checkpoints contain identical bytes.")
 
     showdown_dir = args.showdown_dir or default_showdown_dir()
     if showdown_dir is None:
@@ -386,7 +478,12 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
         seed=args.seed,
         usage="evaluation",
     )
-    planned_pairs = [team_pool.sample_pair(distinct=True) for _ in range(args.games)]
+    planned_pairs = balanced_distinct_team_pairs(
+        team_pool.entries,
+        games=args.games,
+        seed=args.seed,
+    )
+    schedule_summary = team_pair_schedule_summary(planned_pairs)
 
     forward = _run_anchor_direction(
         args=args,
@@ -417,28 +514,43 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             )
         )
 
-    candidate_results = (
-        mirrored_candidate_summary(forward, directions[1])
-        if args.mirrored
-        else {
-            key: forward[key]
-            for key in (
-                "games",
-                "wins",
-                "losses",
-                "draws",
-                "win_rate",
-                "score_rate",
-                "win_rate_ci95",
-                "score_rate_ci95",
-            )
-        }
-    )
+    candidate_results = None
+    role_bias_results = None
+    if args.same_policy_role_bias:
+        role_bias_results = outcome_summary(
+            wins=sum(int(direction["wins"]) for direction in directions),
+            losses=sum(int(direction["losses"]) for direction in directions),
+            draws=sum(int(direction["draws"]) for direction in directions),
+        )
+        role_bias_results["external_role_score_advantage"] = (
+            float(role_bias_results["score_rate"]) - 0.5
+        )
+    else:
+        candidate_results = (
+            mirrored_candidate_summary(forward, directions[1])
+            if args.mirrored
+            else {
+                key: forward[key]
+                for key in (
+                    "games",
+                    "wins",
+                    "losses",
+                    "draws",
+                    "win_rate",
+                    "score_rate",
+                    "win_rate_ci95",
+                    "score_rate_ci95",
+                )
+            }
+        )
     # Reject a checkpoint that changed while games were being played.  The
     # summary then always describes the exact bytes it names.
     checkpoint_ref.verify(REPO_ROOT)
     anchor_ref.verify(REPO_ROOT)
-    model_signature = game_data.vocab_signature()
+    model_signature = build_model_signature(
+        model_config,
+        game_data.vocab_signature(),
+    )
     summary: dict[str, object] = {
         "config": {
             "checkpoint_policy_id": args.checkpoint_policy_id,
@@ -449,6 +561,11 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             "battle_format": env_config.battle_format,
             "games_per_role": args.games,
             "mirrored": args.mirrored,
+            "evaluation_mode": (
+                "same_policy_role_bias"
+                if args.same_policy_role_bias
+                else "checkpoint_comparison"
+            ),
             "action_mode": args.action_mode,
             "seed": args.seed,
             "simulator_rng_seeded": False,
@@ -457,16 +574,24 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             "team_pool_subset": args.team_pool_subset,
             "team_pool_size": team_pool.size,
             "team_pool_signature": team_pool.signature(),
+            "team_pair_schedule": schedule_summary,
             "league_coalesce_ms": args.league_coalesce_ms,
             "battlestream_startup_timeout": env_config.battlestream_startup_timeout,
             "model_signature": model_signature,
         },
         "results": {
-            "candidate_perspective": candidate_results,
             "directions": directions,
         },
     }
-    if args.mirrored:
+    results = summary["results"]
+    assert isinstance(results, dict)
+    if role_bias_results is not None:
+        results["role_bias"] = role_bias_results
+    else:
+        assert candidate_results is not None
+        results["candidate_perspective"] = candidate_results
+    if args.mirrored and not args.same_policy_role_bias:
+        assert candidate_results is not None
         summary["pairwise_evidence"] = build_pairwise_evidence_block(
             checkpoint_policy_id=args.checkpoint_policy_id,
             anchor_policy_id=args.anchor_policy_id,

@@ -64,14 +64,58 @@ pair across the two player roles:
 & .\.venv\Scripts\python.exe .\scripts\evaluate_anchor.py --checkpoint checkpoints\current.pt --checkpoint-policy-id main-12 --anchor checkpoints\anchor.pt --anchor-policy-id main-11 --games 64 --action-mode sample --summary-path logs\main-12-v-main-11.json
 ```
 
-`--games` is the number per role, so this command runs 128 battles. Use
+`--games` is the number per role, so this command runs 128 battles. The planner
+uses deterministic cyclic blocks: every complete block places every roster
+exactly once on each side, and it exhausts directed pairings before repeating
+one. Use
 `--action-mode argmax` only as a separate deterministic diagnostic; the same
 mode is applied to both checkpoints. Results separate wins/losses/draws, include
-95% intervals, and retain per-game teams and preview choices. The summary also
+95% intervals, retain per-game teams and preview choices, and report Protect,
+Fake Out, Trick Room, switching, and Tera diagnostics independently for each
+external policy direction. The summary also
 pins both checkpoint SHA-256 digests, battle format, team-pool and categorical
 vocabulary signatures, and a hash of the mirrored role/team schedule. Summary
 files are immutable: choose a new path rather than overwriting completed
 evidence.
+
+To measure player-role bias without pretending a checkpoint played against
+itself is a strength comparison, pass the same checkpoint for both policies and
+add `--same-policy-role-bias`. This requires mirrored play, omits population
+evidence, swaps every team pair, and reports the external-player score advantage
+over 50%.
+
+For a multi-seed estimate, aggregate complete mirrored summaries by paired team
+matchup rather than treating their two role games as independent samples:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\aggregate_anchor_evaluations.py --summary logs\candidate-v-anchor-s0.json --summary logs\candidate-v-anchor-s1.json --summary logs\candidate-v-anchor-s2.json --output logs\candidate-v-anchor-aggregate.json
+```
+
+The aggregate validates checkpoint, model, pool, format, and action-mode
+identity and rejects duplicate evidence. Its hierarchical bootstrap resamples
+seed strata with replacement, then resamples whole mirrored matchup pairs
+within each selected seed, yielding an unconditional multi-seed interval while
+preserving the pairing and reporting between-seed variation. Python, NumPy,
+Torch, policy sampling, and team schedules are seeded. The current poke-env
+local BattleStream API does not expose Showdown's battle seed, so summaries
+explicitly retain
+`simulator_rng_seeded: false`; evaluator code does not monkey-patch that private
+session path.
+
+Start a population from a versioned main checkpoint, then plan a genuine
+best-response phase against either that frozen main or a solved population
+mixture:
+
+```powershell
+& .\.venv\Scripts\python.exe .\scripts\bootstrap_population.py --checkpoint checkpoints\main-0.pt --team-pool-manifest data\team_pools\gen9vgc2026regf\manifest.json --policy-id main-0 --lineage-id main --output populations\revision-0.json
+& .\.venv\Scripts\python.exe .\scripts\plan_exploiter_phase.py --population populations\revision-0.json --role main --phase-id main-exploiter-1 --learner-policy-id main-exploiter-1 --initializer-policy-id main-0 --target-main-policy-id main-0 --output phases\main-exploiter-1.json
+```
+
+Use `--role league` once the population contains a complete payoff matrix; the
+planner solves and certifies the target mixture instead of accepting a manually
+chosen opponent distribution. Both commands pin checkpoint bytes, model and
+team-pool signatures, and immutable lineage. The resulting phase is consumed
+by `train.py --phase-spec ...`.
 
 Sampled mirrored summaries can close an empirical population row. Write each
 new member as the exact JSON returned by `PolicyMember.to_dict()`, with its
@@ -108,6 +152,13 @@ telemetry:
 ```powershell
 & .\.venv\Scripts\python.exe .\scripts\evaluate_fixed_bot.py --checkpoint checkpoints\current.pt --opponent simple-heuristics --games 76 --action-mode sample --summary-path logs\fixed_bot_eval.json
 ```
+
+Fixed-bot and exact-preview evaluation can use independent own-roster and
+opponent-panel manifests through `--model-team-pool-manifest` and
+`--opponent-team-pool-manifest`. This is useful for holding the evaluated
+roster fixed while sweeping a larger or genuinely held-out opponent panel.
+Their summaries pin both pool signatures, the exact model-team hash, and the
+checkpoint hash, and refuse to overwrite a different existing artifact.
 
 To measure whether preview probabilities actually change with the opposing
 roster, exactly enumerate all 180 legal bring/lead choices:

@@ -24,12 +24,25 @@ from pokerl.env.actions import (
     semantic_action_intent,
 )
 from pokerl.env.observation import (
+    ACTIVE_MECHANICS_ENTERED,
+    ACTIVE_MECHANICS_FIRST_TURN,
+    ACTIVE_MECHANICS_ACTIVE_TURNS,
+    ACTIVE_MECHANICS_PROTECT_CHAIN,
+    ACTIVE_MECHANICS_RESOLUTION_OFFSET,
+    ACTIVE_MECHANICS_TERA_EVENT,
+    ACTIVE_RESOLUTION_MOVE,
+    ACTIVE_RESOLUTION_NONE,
+    ACTIVE_RESOLUTION_SWITCH,
+    CONTINUOUS_DIM,
+    ACTIVE_TURNS_OFFSET,
+    FIRST_TURN_OFFSET,
     MAX_RECENT_EVENTS,
     NUM_PUBLIC_EVENT_FLAGS,
     POSITION_IMPLICIT,
     POSITION_OPP_1,
     POSITION_OPP_2,
     POSITION_OWN_2,
+    PROTECT_COUNTER_OFFSET,
     TARGET_OUTCOME_HIT_COUNT,
     TARGET_OUTCOME_MISSED,
     TARGET_OUTCOME_PRESENT,
@@ -107,6 +120,158 @@ def test_observation_encodes_public_order_and_semantic_own_intent() -> None:
     assert obs["prev_own_target"][0] == POSITION_OPP_1
     assert obs["prev_own_tera"].tolist() == [True, False]
     assert obs["prev_own_switch_species"][1] == game_data.species_to_idx["rillaboom"]
+
+
+def test_active_mechanics_bind_public_events_to_current_slots() -> None:
+    game_data = GameData(gen=9)
+    builder = ObservationBuilder(game_data, team_size=6)
+    segment = PublicBattleEventSegment(
+        events=(
+            PublicBattleEvent(
+                PublicBattleEventKind.MOVE,
+                actor="p2a: Opponent",
+                move="Moonblast",
+            ),
+            PublicBattleEvent(
+                PublicBattleEventKind.SWITCH,
+                actor="p1b: Ally",
+                details="Incineroar, L50, M",
+            ),
+            PublicBattleEvent(
+                PublicBattleEventKind.TERA,
+                actor="p2b: Partner",
+                details="Grass",
+            ),
+        ),
+        turn=2,
+        partial=False,
+    )
+    obs: dict[str, np.ndarray] = {}
+    builder._encode_transition_history(
+        SimpleNamespace(player_role="p1", recent_public_events=segment),
+        None,
+        obs,
+    )
+    obs["own_active_indices"] = np.asarray([0, 1], dtype=np.int64)
+    obs["opp_active_indices"] = np.asarray([0, 1], dtype=np.int64)
+    obs["own_active_present"] = np.asarray([True, True])
+    obs["opp_active_present"] = np.asarray([True, True])
+    obs["own_continuous"] = np.zeros((6, CONTINUOUS_DIM), dtype=np.float32)
+    obs["opp_continuous"] = np.zeros((6, CONTINUOUS_DIM), dtype=np.float32)
+    obs["own_continuous"][0, FIRST_TURN_OFFSET] = 1.0
+    obs["own_continuous"][0, PROTECT_COUNTER_OFFSET] = 0.5
+    obs["own_continuous"][0, ACTIVE_TURNS_OFFSET] = 0.5
+
+    builder._encode_active_mechanics(obs)
+
+    mechanics = obs["active_mechanics"]
+    assert mechanics[0, ACTIVE_MECHANICS_FIRST_TURN] == 1.0
+    assert mechanics[0, ACTIVE_MECHANICS_PROTECT_CHAIN] == 0.5
+    assert mechanics[0, ACTIVE_MECHANICS_ACTIVE_TURNS] == 0.5
+    assert mechanics[1, ACTIVE_MECHANICS_ENTERED] == 1.0
+    assert (
+        mechanics[
+            1,
+            ACTIVE_MECHANICS_RESOLUTION_OFFSET + ACTIVE_RESOLUTION_SWITCH,
+        ]
+        == 1.0
+    )
+    assert (
+        mechanics[
+            2,
+            ACTIVE_MECHANICS_RESOLUTION_OFFSET + ACTIVE_RESOLUTION_MOVE,
+        ]
+        == 1.0
+    )
+    assert obs["active_mechanics_move"][2] == game_data.move_to_idx["moonblast"]
+    assert mechanics[3, ACTIVE_MECHANICS_TERA_EVENT] == 1.0
+
+
+def test_active_mechanics_do_not_claim_a_resolution_after_event_overflow() -> None:
+    game_data = GameData(gen=9)
+    builder = ObservationBuilder(game_data, team_size=6)
+    segment = PublicBattleEventSegment(
+        events=(
+            PublicBattleEvent(
+                PublicBattleEventKind.MOVE,
+                actor="p2a: Opponent",
+                move="Moonblast",
+            ),
+        ),
+        turn=3,
+        partial=False,
+        overflow_count=1,
+    )
+    obs: dict[str, np.ndarray] = {}
+    builder._encode_transition_history(
+        SimpleNamespace(player_role="p1", recent_public_events=segment),
+        None,
+        obs,
+    )
+    obs["own_active_indices"] = np.asarray([0, 1], dtype=np.int64)
+    obs["opp_active_indices"] = np.asarray([0, 1], dtype=np.int64)
+    obs["own_active_present"] = np.asarray([True, True])
+    obs["opp_active_present"] = np.asarray([True, True])
+    obs["own_continuous"] = np.zeros((6, CONTINUOUS_DIM), dtype=np.float32)
+    obs["opp_continuous"] = np.zeros((6, CONTINUOUS_DIM), dtype=np.float32)
+
+    builder._encode_active_mechanics(obs)
+
+    mechanics = obs["active_mechanics"]
+    assert (
+        mechanics[
+            2,
+            ACTIVE_MECHANICS_RESOLUTION_OFFSET + ACTIVE_RESOLUTION_NONE,
+        ]
+        == 1.0
+    )
+    assert obs["active_mechanics_move"][2] == 0
+
+
+def test_active_mechanics_do_not_bind_tera_event_to_switch_replacement() -> None:
+    game_data = GameData(gen=9)
+    builder = ObservationBuilder(game_data, team_size=6)
+    segment = PublicBattleEventSegment(
+        events=(
+            PublicBattleEvent(
+                PublicBattleEventKind.TERA,
+                actor="p2a: Outgoing",
+                details="Grass",
+            ),
+            PublicBattleEvent(
+                PublicBattleEventKind.SWITCH,
+                actor="p2a: Replacement",
+                details="Incineroar, L50, M",
+            ),
+        ),
+        turn=3,
+        partial=False,
+    )
+    obs: dict[str, np.ndarray] = {}
+    builder._encode_transition_history(
+        SimpleNamespace(player_role="p1", recent_public_events=segment),
+        None,
+        obs,
+    )
+    obs["own_active_indices"] = np.asarray([0, 1], dtype=np.int64)
+    obs["opp_active_indices"] = np.asarray([0, 1], dtype=np.int64)
+    obs["own_active_present"] = np.asarray([True, True])
+    obs["opp_active_present"] = np.asarray([True, True])
+    obs["own_continuous"] = np.zeros((6, CONTINUOUS_DIM), dtype=np.float32)
+    obs["opp_continuous"] = np.zeros((6, CONTINUOUS_DIM), dtype=np.float32)
+
+    builder._encode_active_mechanics(obs)
+
+    mechanics = obs["active_mechanics"]
+    assert mechanics[2, ACTIVE_MECHANICS_TERA_EVENT] == 0.0
+    assert mechanics[2, ACTIVE_MECHANICS_ENTERED] == 1.0
+    assert (
+        mechanics[
+            2,
+            ACTIVE_MECHANICS_RESOLUTION_OFFSET + ACTIVE_RESOLUTION_SWITCH,
+        ]
+        == 1.0
+    )
 
 
 def test_team_preview_history_is_zero_and_fixed_shape() -> None:

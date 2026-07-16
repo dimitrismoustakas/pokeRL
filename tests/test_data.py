@@ -39,3 +39,21 @@ def test_move_stats_encode_always_hit_accuracy_as_one() -> None:
     assert gd._moves["sacredsword"]["ignoreEvasion"] is True
     assert ignores_evasion[gd.move_to_idx["sacredsword"]] == 1.0
     assert ignores_evasion[gd.move_to_idx["tackle"]] == 0.0
+
+
+def test_move_mechanics_are_generic_dex_facts() -> None:
+    gd = GameData(gen=9)
+
+    mechanics = gd.move_mechanics_matrix()
+
+    assert mechanics[gd.move_to_idx["protect"], 0] == 1.0
+    assert mechanics[gd.move_to_idx["uturn"], 1] == 1.0
+    assert mechanics[gd.move_to_idx["whirlwind"], 2] == 1.0
+    assert mechanics[gd.move_to_idx["recover"], 3] == 1.0
+    assert mechanics[gd.move_to_idx["gigadrain"], 4] == pytest.approx(0.5)
+    assert mechanics[gd.move_to_idx["doubleedge"], 5] > 0.0
+    assert mechanics[gd.move_to_idx["trickroom"], 12] == 1.0
+    assert mechanics[gd.move_to_idx["electricterrain"], 14] == 1.0
+    assert mechanics[gd.move_to_idx["fakeout"], 15] == 1.0
+    assert mechanics[gd.move_to_idx["solarbeam"], 16] == 1.0
+    assert mechanics[gd.move_to_idx["hyperbeam"], 17] == 1.0

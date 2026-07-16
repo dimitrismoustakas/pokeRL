@@ -386,7 +386,9 @@ def test_public_consequences_align_next_and_terminal_observations_through_last_s
         10.0,
         20.0,
     ]
-    assert batch.public_consequence_field_masks[:, 0, 0].tolist() == [True, True]
+    # Terminal Showdown observations do not advance the turn counter, so their
+    # field state is not a valid target for the one-turn persistence baseline.
+    assert batch.public_consequence_field_masks[:, 0, 0].tolist() == [True, False]
 
 
 class _FailingParallelEnv:

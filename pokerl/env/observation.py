@@ -34,7 +34,7 @@ from .actions import (
 NUM_STATUS = 7
 NUM_BOOSTS = 7
 NUM_MOVE_SLOTS = 4
-NUM_EXTRA_POKEMON_FEATURES = 9
+NUM_EXTRA_POKEMON_FEATURES = 10
 
 WEATHER_TYPES = [
     Weather.SUNNYDAY,
@@ -63,6 +63,7 @@ FIELD_TIMER_CAPS = {
 
 PROTECT_COUNTER_CAP = 4
 STATUS_COUNTER_CAP = 8
+ACTIVE_TURNS_CAP = 6
 
 # Volatile effects to track as binary flags.
 # Each entry is either a single Effect or a frozenset of Effects (any match = True).
@@ -121,10 +122,11 @@ ABILITY_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 5
 ITEM_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 6
 TERA_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 7
 TERASTALLIZED_OFFSET = EXTRA_FEATURES_OFFSET + 8
+ACTIVE_TURNS_OFFSET = EXTRA_FEATURES_OFFSET + 9
 
 # Continuous features per pokemon:
 # hp(1) + status_one_hot(7) + stat_stages(7) + volatiles(16) + move_pp(4)
-# + explicit legal state/history features(9) = 44 total.
+# + explicit legal state/history features(10) = 45 total.
 # Must match PokemonEncoder continuous_dim.
 CONTINUOUS_DIM = EXTRA_FEATURES_OFFSET + NUM_EXTRA_POKEMON_FEATURES
 
@@ -178,6 +180,31 @@ TARGET_OUTCOME_PROTECTED = 5
 TARGET_OUTCOME_HIT_COUNT = 6
 TARGET_OUTCOME_DECLARED = 7
 NUM_TARGET_OUTCOME_FEATURES = 8
+
+# Slot-aligned public mechanic summary.  Public positions are always ordered as
+# own 1, own 2, opponent 1, opponent 2.  The full ordered event segment remains
+# available separately; this summary gives the current policy a direct binding
+# between the active entity and the last public resolution at its position.
+ACTIVE_MECHANICS_PRESENT = 0
+ACTIVE_MECHANICS_FIRST_TURN = 1
+ACTIVE_MECHANICS_PROTECT_CHAIN = 2
+ACTIVE_MECHANICS_ACTIVE_TURNS = 3
+ACTIVE_MECHANICS_ENTERED = 4
+ACTIVE_MECHANICS_TERA_EVENT = 5
+ACTIVE_MECHANICS_RESOLUTION_OFFSET = 6
+ACTIVE_RESOLUTION_NONE = 0
+ACTIVE_RESOLUTION_MOVE = 1
+ACTIVE_RESOLUTION_CANT = 2
+ACTIVE_RESOLUTION_SWITCH = 3
+ACTIVE_RESOLUTION_FAINT = 4
+NUM_ACTIVE_RESOLUTION_CLASSES = 5
+ACTIVE_MECHANICS_FAILED = 11
+ACTIVE_MECHANICS_MISSED = 12
+ACTIVE_MECHANICS_IMMUNE = 13
+ACTIVE_MECHANICS_PROTECTED = 14
+ACTIVE_MECHANICS_BLOCKED = 15
+ACTIVE_MECHANICS_HIT = 16
+ACTIVE_MECHANICS_FEATURE_DIM = 17
 
 _PROTECTION_ACTIVATION_IDS = frozenset(
     {
@@ -265,7 +292,140 @@ class ObservationBuilder:
         obs["opp_active_indices"] = opp_active_indices
         obs["opp_active_present"] = opp_active_present
         self._encode_transition_history(battle, previous_intent, obs)
+        self._encode_active_mechanics(obs)
         return obs
+
+    @staticmethod
+    def _encode_active_mechanics(obs: dict[str, np.ndarray]) -> None:
+        """Build an exact current-slot shortcut from public state and events."""
+
+        features = np.zeros(
+            (NUM_PUBLIC_TARGET_POSITIONS, ACTIVE_MECHANICS_FEATURE_DIM),
+            dtype=np.float32,
+        )
+        features[
+            :,
+            ACTIVE_MECHANICS_RESOLUTION_OFFSET + ACTIVE_RESOLUTION_NONE,
+        ] = 1.0
+        last_move = np.zeros(NUM_PUBLIC_TARGET_POSITIONS, dtype=np.int64)
+
+        for side_offset, prefix in ((0, "own"), (2, "opp")):
+            active_indices = obs[f"{prefix}_active_indices"]
+            active_present = obs[f"{prefix}_active_present"]
+            continuous = obs[f"{prefix}_continuous"]
+            for active_slot in range(2):
+                public_slot = side_offset + active_slot
+                present = bool(active_present[active_slot])
+                features[public_slot, ACTIVE_MECHANICS_PRESENT] = float(present)
+                if not present:
+                    continue
+                team_index = int(active_indices[active_slot])
+                if not 0 <= team_index < continuous.shape[0]:
+                    continue
+                current = continuous[team_index]
+                features[public_slot, ACTIVE_MECHANICS_FIRST_TURN] = current[
+                    FIRST_TURN_OFFSET
+                ]
+                features[public_slot, ACTIVE_MECHANICS_PROTECT_CHAIN] = current[
+                    PROTECT_COUNTER_OFFSET
+                ]
+                features[public_slot, ACTIVE_MECHANICS_ACTIVE_TURNS] = current[
+                    ACTIVE_TURNS_OFFSET
+                ]
+
+        # poke-env retains the first MAX_RECENT_EVENTS entries when a segment
+        # overflows, so the tail that determines the final slot resolution is
+        # unknown. Partial segments are likewise not exact. In either case the
+        # shortcut exposes only live public mechanics; the ordinary event
+        # encoder still receives the retained history and overflow metadata.
+        event_meta = obs["recent_event_meta"]
+        if (
+            event_meta[0] <= 0.0
+            or event_meta[1] > 0.0
+            or event_meta[2] > 0.0
+        ):
+            obs["active_mechanics"] = features
+            obs["active_mechanics_move"] = last_move
+            return
+
+        def set_resolution(public_slot: int, resolution: int) -> None:
+            start = ACTIVE_MECHANICS_RESOLUTION_OFFSET
+            features[public_slot, start : start + NUM_ACTIVE_RESOLUTION_CLASSES] = 0.0
+            features[public_slot, start + resolution] = 1.0
+
+        def clear_entity_events(public_slot: int) -> None:
+            last_move[public_slot] = UNKNOWN_IDX
+            features[public_slot, ACTIVE_MECHANICS_TERA_EVENT] = 0.0
+            features[
+                public_slot,
+                ACTIVE_MECHANICS_FAILED : ACTIVE_MECHANICS_HIT + 1,
+            ] = 0.0
+
+        for event_index in range(obs["recent_event_kind"].shape[0]):
+            if obs["recent_event_mask"][event_index]:
+                continue
+            public_position = int(obs["recent_event_actor"][event_index])
+            if not 1 <= public_position <= NUM_PUBLIC_TARGET_POSITIONS:
+                continue
+            public_slot = public_position - 1
+            kind = int(obs["recent_event_kind"][event_index])
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.TERA]:
+                features[public_slot, ACTIVE_MECHANICS_TERA_EVENT] = 1.0
+                continue
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.MOVE]:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_MOVE)
+                last_move[public_slot] = obs["recent_event_move"][event_index]
+                features[
+                    public_slot,
+                    ACTIVE_MECHANICS_FAILED : ACTIVE_MECHANICS_HIT + 1,
+                ] = 0.0
+                flags = obs["recent_event_flags"][event_index]
+                outcomes = obs["recent_event_target_outcomes"][event_index]
+                features[public_slot, ACTIVE_MECHANICS_FAILED] = float(
+                    bool(flags[EVENT_FLAG_FAILED])
+                    or bool(flags[EVENT_FLAG_ACTION_FAILED])
+                    or bool(flags[EVENT_FLAG_NO_TARGET])
+                    or bool(outcomes[:, TARGET_OUTCOME_FAILED].any())
+                )
+                features[public_slot, ACTIVE_MECHANICS_MISSED] = float(
+                    bool(flags[EVENT_FLAG_MISSED])
+                    or bool(outcomes[:, TARGET_OUTCOME_MISSED].any())
+                )
+                features[public_slot, ACTIVE_MECHANICS_IMMUNE] = float(
+                    outcomes[:, TARGET_OUTCOME_IMMUNE].any()
+                )
+                features[public_slot, ACTIVE_MECHANICS_PROTECTED] = float(
+                    outcomes[:, TARGET_OUTCOME_PROTECTED].any()
+                )
+                features[public_slot, ACTIVE_MECHANICS_BLOCKED] = float(
+                    outcomes[:, TARGET_OUTCOME_BLOCKED].any()
+                )
+                features[public_slot, ACTIVE_MECHANICS_HIT] = float(
+                    outcomes[:, TARGET_OUTCOME_PRESENT].any()
+                    and not features[
+                        public_slot,
+                        ACTIVE_MECHANICS_FAILED : ACTIVE_MECHANICS_BLOCKED + 1,
+                    ].any()
+                )
+                continue
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.CANT]:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_CANT)
+                continue
+            if kind in {
+                EVENT_KIND_TO_INDEX[PublicBattleEventKind.SWITCH],
+                EVENT_KIND_TO_INDEX[PublicBattleEventKind.DRAG],
+            }:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_SWITCH)
+                clear_entity_events(public_slot)
+                features[public_slot, ACTIVE_MECHANICS_ENTERED] = 1.0
+                continue
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.FAINT]:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_FAINT)
+                clear_entity_events(public_slot)
+                features[public_slot, ACTIVE_MECHANICS_ENTERED] = 0.0
+
+        obs["active_mechanics"] = features
+        obs["active_mechanics_move"] = last_move
 
     def _encode_transition_history(
         self,
@@ -679,6 +839,10 @@ class ObservationBuilder:
         feats[ITEM_KNOWN_OFFSET] = float(item not in (None, "", GenData.UNKNOWN_ITEM))
         feats[TERA_KNOWN_OFFSET] = float(pokemon.tera_type is not None)
         feats[TERASTALLIZED_OFFSET] = float(pokemon.is_terastallized)
+        feats[ACTIVE_TURNS_OFFSET] = self._normalized_counter(
+            getattr(pokemon, "active_turns", int(pokemon.first_turn)),
+            ACTIVE_TURNS_CAP,
+        )
 
     def _ordered_team_with_roles(
         self,

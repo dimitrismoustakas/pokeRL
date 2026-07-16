@@ -17,6 +17,7 @@ MOVE_SCOPE_UNKNOWN = 0
 MOVE_SCOPE_SCOPED = 1
 MOVE_SCOPE_TARGETED = 2
 NUM_MOVE_SCOPES = 3
+MOVE_MECHANICS_DIM = 18
 
 _SCOPED_MOVE_TARGETS = frozenset(
     {"self", "allyside", "allies", "allyteam", "foeside", "all", "scripted"}
@@ -219,6 +220,84 @@ class GameData:
             if idx == UNKNOWN_IDX:
                 continue
             values[idx] = float(bool(self._moves.get(move_id, {}).get("multihit")))
+        return values
+
+    def move_mechanics_matrix(self) -> np.ndarray:
+        """Return generic public move-effect metadata aligned with move ids.
+
+        These features describe simulator mechanics, not strategic value.  In
+        particular they let the action scorer distinguish effects such as a
+        protection/stalling move, field creation, switching, healing, and
+        secondary effects without asking a compressed four-move Pokemon vector
+        to preserve every bit.  Move identity remains available separately via
+        the shared learned move embedding.
+
+        Columns are:
+        stalling/protection move, self switch, forced target switch, healing,
+        drain fraction, recoil fraction, target boosts, self boosts, status,
+        volatile status, side condition, slot condition, pseudo-weather,
+        weather, terrain, secondary-effect probability, two-turn move, recharge.
+        """
+
+        values = np.zeros((self.num_moves, MOVE_MECHANICS_DIM), dtype=np.float32)
+
+        def fraction(raw: object) -> float:
+            if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+                return 0.0
+            numerator, denominator = raw
+            if not isinstance(numerator, (int, float)) or not isinstance(
+                denominator, (int, float)
+            ):
+                return 0.0
+            if denominator == 0:
+                return 0.0
+            return float(np.clip(float(numerator) / float(denominator), 0.0, 1.0))
+
+        for move_id, idx in self.move_to_idx.items():
+            if idx == UNKNOWN_IDX:
+                continue
+            move = self._moves.get(move_id, {})
+            secondary = move.get("secondary")
+            secondaries = move.get("secondaries")
+            secondary_chances: list[float] = []
+            if isinstance(secondary, dict):
+                secondary_chances.append(float(secondary.get("chance", 100) or 0))
+            if isinstance(secondaries, list):
+                secondary_chances.extend(
+                    float(effect.get("chance", 100) or 0)
+                    for effect in secondaries
+                    if isinstance(effect, dict)
+                )
+            self_effect = move.get("self")
+            values[idx] = np.asarray(
+                [
+                    bool(move.get("stallingMove")),
+                    bool(move.get("selfSwitch")),
+                    bool(move.get("forceSwitch")),
+                    bool(move.get("heal")),
+                    fraction(move.get("drain")),
+                    fraction(move.get("recoil")),
+                    bool(move.get("boosts")),
+                    bool(
+                        isinstance(self_effect, dict) and self_effect.get("boosts")
+                    ),
+                    bool(move.get("status")),
+                    bool(move.get("volatileStatus")),
+                    bool(move.get("sideCondition")),
+                    bool(move.get("slotCondition")),
+                    bool(move.get("pseudoWeather")),
+                    bool(move.get("weather")),
+                    bool(move.get("terrain")),
+                    max(secondary_chances, default=0.0) / 100.0,
+                    bool(move.get("flags", {}).get("charge")),
+                    bool(move.get("flags", {}).get("recharge"))
+                    or bool(
+                        isinstance(self_effect, dict)
+                        and self_effect.get("volatileStatus") == "mustrecharge"
+                    ),
+                ],
+                dtype=np.float32,
+            )
         return values
 
     def move_target_flags(self) -> np.ndarray:

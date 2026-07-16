@@ -9,7 +9,12 @@ import torch
 import torch.nn as nn
 
 from pokerl.config import TrainingConfig
-from pokerl.training.league import League, LeagueMember
+from pokerl.model.checkpoint import (
+    LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION,
+    MODEL_CHECKPOINT_METADATA_FIELDS,
+    model_checkpoint_metadata,
+)
+from pokerl.training.league import League, LeagueMember, _LeagueInferenceService
 from pokerl.training.ppo import (
     TRAINER_CHECKPOINT_FORMAT_VERSION,
     PPOTrainer,
@@ -304,6 +309,40 @@ def test_trainer_load_rejects_game_data_vocab_mismatch(tmp_path) -> None:
         target.load(str(checkpoint_path))
 
 
+def test_trainer_load_rejects_architecture_signature_mismatch(tmp_path) -> None:
+    source_agent = TinyAgent()
+    source_agent.architecture_signature = "architecture-a"
+    source_agent.model_signature = "model-a"
+    source = PPOTrainer(source_agent, TrainingConfig(), torch.device("cpu"))
+    checkpoint_path = tmp_path / "trainer.pt"
+    source.save(str(checkpoint_path))
+
+    target_agent = TinyAgent()
+    target_agent.architecture_signature = "architecture-b"
+    target_agent.model_signature = "model-b"
+    target = PPOTrainer(target_agent, TrainingConfig(), torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="architecture signature mismatch"):
+        target.load(str(checkpoint_path))
+
+
+def test_trainer_load_rejects_complete_model_signature_mismatch(tmp_path) -> None:
+    source_agent = TinyAgent()
+    source_agent.architecture_signature = "same-architecture"
+    source_agent.model_signature = "model-a"
+    source = PPOTrainer(source_agent, TrainingConfig(), torch.device("cpu"))
+    checkpoint_path = tmp_path / "trainer.pt"
+    source.save(str(checkpoint_path))
+
+    target_agent = TinyAgent()
+    target_agent.architecture_signature = "same-architecture"
+    target_agent.model_signature = "model-b"
+    target = PPOTrainer(target_agent, TrainingConfig(), torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="model signature mismatch"):
+        target.load(str(checkpoint_path))
+
+
 def test_league_checkpoint_is_marked_as_league(tmp_path) -> None:
     config = TrainingConfig(checkpoint_dir=str(tmp_path))
     league = object.__new__(League)
@@ -324,6 +363,33 @@ def test_league_checkpoint_is_marked_as_league(tmp_path) -> None:
         weights_only=False,
     )
     assert checkpoint["checkpoint_type"] == "league"
+    assert checkpoint["format_version"] == LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION
+    assert set(checkpoint["model_metadata"]) == MODEL_CHECKPOINT_METADATA_FIELDS
+
+
+def test_league_inference_rejects_model_signature_mismatch(tmp_path) -> None:
+    source = TinyAgent()
+    source.architecture_signature = "same-architecture"
+    source.model_signature = "source-model"
+    target = TinyAgent()
+    target.architecture_signature = "same-architecture"
+    target.model_signature = "target-model"
+    checkpoint_path = tmp_path / "league.pt"
+    torch.save(
+        {
+            "checkpoint_type": "league",
+            "format_version": LEAGUE_MODEL_CHECKPOINT_FORMAT_VERSION,
+            "model_metadata": model_checkpoint_metadata(source),
+            "agent": source.state_dict(),
+        },
+        checkpoint_path,
+    )
+    service = object.__new__(_LeagueInferenceService)
+    service._agent_template = target
+    service._device = torch.device("cpu")
+
+    with pytest.raises(ValueError, match="model signature mismatch"):
+        service._load_agent(str(checkpoint_path))
 
 
 def test_league_sampling_uses_its_own_reproducible_rng() -> None:

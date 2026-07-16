@@ -13,6 +13,7 @@ from ..env.observation import (
 )
 from ..env.actions import NUM_INTENT_KINDS
 from .encoders import (
+    ActiveMechanicsEncoder,
     FieldEncoder,
     PokemonEncoder,
     RecentEventEncoder,
@@ -20,6 +21,7 @@ from .encoders import (
     TeamEncoder,
 )
 from .memory import build_memory
+from .signature import architecture_signature, model_signature
 from .heads import (
     ActionHead,
     HiddenInfoHead,
@@ -42,6 +44,8 @@ class PokeAgent(nn.Module):
         super().__init__()
         self.config = config
         self.game_data_signature = game_data.vocab_signature()
+        self.architecture_signature = architecture_signature(config)
+        self.model_signature = model_signature(config, self.game_data_signature)
 
         # --- Spatial encoder ---
         pokemon_encoder = PokemonEncoder(
@@ -80,6 +84,10 @@ class PokeAgent(nn.Module):
             num_intent_kinds=NUM_INTENT_KINDS,
             out_dim=config.recent_event_out,
         )
+        active_mechanics_encoder = ActiveMechanicsEncoder(
+            move_dim=config.move_dim,
+            out_dim=config.field_out,
+        )
 
         self.spatial = SpatialEncoder(
             pokemon_encoder,
@@ -87,6 +95,7 @@ class PokeAgent(nn.Module):
             team_opp,
             field_encoder,
             recent_event_encoder,
+            active_mechanics_encoder,
         )
 
         # --- Memory ---
@@ -117,6 +126,8 @@ class PokeAgent(nn.Module):
             move_priority_lookup=torch.from_numpy(game_data.move_priority_vector()),
             move_category_lookup=torch.from_numpy(game_data.move_category_indices()),
             move_target_flags=torch.from_numpy(game_data.move_target_flags()),
+            move_mechanics_lookup=torch.from_numpy(game_data.move_mechanics_matrix()),
+            move_embedding_dim=config.move_dim,
             type_effectiveness=torch.from_numpy(game_data.type_effectiveness_matrix()),
         )
         self.team_preview_head = TeamPreviewHead(
@@ -217,6 +228,11 @@ class PokeAgent(nn.Module):
             tera_exploration_prob=tera_exploration_prob,
             validate_actions=validate_actions,
             include_policy_stats=include_policy_stats,
+            move_embedding=getattr(
+                getattr(self.spatial, "pokemon_encoder", None),
+                "move_emb",
+                None,
+            ),
             sampling_exponentials=sampling_exponentials,
         )
 

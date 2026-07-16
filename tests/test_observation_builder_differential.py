@@ -154,6 +154,10 @@ class _ReferenceObservationBuilder(ObservationBuilder):
             pokemon.tera_type is not None
         )
         feats[observation_module.TERASTALLIZED_OFFSET] = float(pokemon.is_terastallized)
+        feats[observation_module.ACTIVE_TURNS_OFFSET] = self._normalized_counter(
+            getattr(pokemon, "active_turns", int(pokemon.first_turn)),
+            observation_module.ACTIVE_TURNS_CAP,
+        )
 
 
 def _move(move_id: str, current_pp: int, max_pp: int) -> SimpleNamespace:
