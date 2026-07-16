@@ -331,8 +331,15 @@ def _semantic_slot_intent(
     return SemanticSlotIntent(kind=INTENT_PASS)
 
 
-def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
+def build_legal_action_state(
+    battle: DoubleBattle,
+    *,
+    lazy_action_orders: bool = True,
+) -> LegalActionState:
     """Build and index all legal orders for the current live request once."""
+    # Keep request indexing identical in both benchmark modes.  The runtime
+    # factor isolates eager versus selected-only poke-env order construction;
+    # it must not also measure rebuilding this map once per actionable slot.
     team_slot_by_identity = {
         id(pokemon): team_slot
         for team_slot, pokemon in enumerate(_ordered_own_team(battle))
@@ -350,6 +357,11 @@ def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
             team_slot_by_identity=team_slot_by_identity,
         ),
     )
+    if not lazy_action_orders:
+        slot_states = (
+            _materialize_slot_action_state(battle, slot=0, state=slot_states[0]),
+            _materialize_slot_action_state(battle, slot=1, state=slot_states[1]),
+        )
     joint_mask = _build_joint_mask(slot_states)
     return LegalActionState(
         slot_action_orders=(slot_states[0].action_orders, slot_states[1].action_orders),
@@ -357,6 +369,32 @@ def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
         joint_mask=joint_mask,
         can_tera=np.asarray(battle.can_tera, dtype=bool).copy(),
     )
+
+
+def _materialize_slot_action_state(
+    battle: DoubleBattle,
+    *,
+    slot: int,
+    state: _SlotActionState,
+) -> _SlotActionState:
+    """Construct every legal poke-env order for the eager A/B control."""
+    orders: dict[int, _OrderEntry] = {}
+    for action_idx, entry in state.action_orders.items():
+        kind, _, _ = decode_action(action_idx)
+        if isinstance(entry, Move):
+            orders[action_idx] = SingleBattleOrder(
+                entry,
+                move_target=_showdown_target_from_action(action_idx, slot, battle),
+            )
+        elif kind == "switch" and getattr(entry, "species", None) is not None:
+            orders[action_idx] = SingleBattleOrder(entry)
+        elif isinstance(entry, _PassOrderTemplate):
+            orders[action_idx] = (
+                PassBattleOrder() if entry.explicit else SkippedBattleOrder()
+            )
+        else:
+            orders[action_idx] = entry
+    return _SlotActionState(action_orders=orders, mask=state.mask)
 
 
 def build_action_mask(

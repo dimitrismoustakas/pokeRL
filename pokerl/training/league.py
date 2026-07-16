@@ -1992,6 +1992,7 @@ class LeaguePlayer(Player):
         inference_service: _LeagueInferenceService,
         obs_builder: ObservationBuilder,
         preview_inference_service: _LeagueInferenceService | None = None,
+        lazy_action_orders: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1999,6 +2000,7 @@ class LeaguePlayer(Player):
         self.inference_service = inference_service
         self.preview_inference_service = preview_inference_service or inference_service
         self.obs_builder = obs_builder
+        self.lazy_action_orders = lazy_action_orders
         self._hidden: tuple[torch.Tensor, torch.Tensor] | None = None
         self._pending_hidden: tuple[torch.Tensor, torch.Tensor] | None = None
         self._pending_decision_key: tuple[object, ...] | None = None
@@ -2115,7 +2117,11 @@ class LeaguePlayer(Player):
                     "opponent_hidden_commit_sec", time.perf_counter() - hidden_started
                 )
                 masks_started = time.perf_counter()
-            action_state = build_legal_action_state(battle)
+            action_state = (
+                build_legal_action_state(battle)
+                if getattr(self, "lazy_action_orders", True)
+                else build_legal_action_state(battle, lazy_action_orders=False)
+            )
             if is_default_only_action_state(action_state):
                 result = self.choose_default_move()
                 self._pending_decision_key = decision_key
@@ -2183,7 +2189,11 @@ class LeaguePlayer(Player):
         ):
             return self._pending_order
         if action_state is None:
-            action_state = build_legal_action_state(battle)
+            action_state = (
+                build_legal_action_state(battle)
+                if getattr(self, "lazy_action_orders", True)
+                else build_legal_action_state(battle, lazy_action_orders=False)
+            )
         if timing_enabled:
             self._add_timing(
                 "opponent_infer_action_wait_sec", time.perf_counter() - infer_started
@@ -2579,7 +2589,10 @@ class League:
             cuda_graph_cache_size=config.league_cuda_graph_cache_size,
             coalesce_target_batch_size=(
                 config.league_cuda_graph_batch_size
-                if config.league_cuda_graphs
+                if (
+                    config.league_cuda_graphs
+                    and config.league_target_aware_coalescing
+                )
                 else None
             ),
         )
@@ -2979,6 +2992,7 @@ class League:
             self._inference,
             obs_builder,
             preview_inference_service=self._preview_inference,
+            lazy_action_orders=self.env_config.lazy_action_orders,
             account_configuration=make_local_account_configuration("league"),
             battle_format=self.env_config.battle_format,
             server_configuration=battlestream_config,

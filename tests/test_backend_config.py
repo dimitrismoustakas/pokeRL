@@ -57,6 +57,7 @@ def test_battlestream_defaults_use_bounded_shared_workers(tmp_path: Path) -> Non
     assert summary["battle_loop_count"] == 4
     assert summary["startup_timeout"] == 30.0
     assert summary["reset_concurrency"] == 72
+    assert summary["lazy_action_orders"] is True
 
 
 def test_battlestream_explicit_shared_worker_count_defaults_to_required_capacity(
@@ -217,6 +218,25 @@ def test_frozen_opponent_cuda_graph_cli_can_disable_optimization(monkeypatch) ->
     assert config.league_cuda_graphs is False
 
 
+def test_lazy_action_order_cli_can_select_eager_control(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["train", "--no-lazy-action-orders"])
+
+    _, env_config, _ = build_configs(parse_args())
+
+    assert env_config.lazy_action_orders is False
+
+
+def test_target_aware_coalescing_cli_can_disable_optimization(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["train", "--no-league-target-aware-coalescing"],
+    )
+
+    _, _, config = build_configs(parse_args())
+
+    assert config.league_target_aware_coalescing is False
+
+
 def test_frozen_opponent_inference_runtime_overrides(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
@@ -244,6 +264,7 @@ def test_frozen_opponent_inference_defaults_match_profiled_runtime() -> None:
     assert config.league_cuda_graph_batch_size == 16
     assert config.league_cuda_graph_cache_size == 4
     assert config.league_preview_device == "action"
+    assert config.league_target_aware_coalescing is True
 
 
 def test_best_response_phase_cli_is_explicit_and_composes_with_resume(

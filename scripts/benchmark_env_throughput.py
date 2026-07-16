@@ -132,6 +132,12 @@ def parse_args() -> argparse.Namespace:
         help="Collect BattleEnv timing counters.",
     )
     parser.add_argument(
+        "--lazy-action-orders",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Toggle selected-only versus eager legal-order materialization.",
+    )
+    parser.add_argument(
         "--summary-path", default=None, help="Optional JSON summary path."
     )
     return parser.parse_args()
@@ -435,6 +441,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         runtime_loop_count=args.runtime_loop_count,
         battle_loop_count=args.battle_loop_count,
         battlestream_startup_timeout=args.battlestream_startup_timeout,
+        lazy_action_orders=args.lazy_action_orders,
     )
     game_data = GameData(gen=9)
     team_pool = load_team_pool(
@@ -507,6 +514,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "team_pool_subset": args.team_pool_subset,
             "team_pool_size": team_pool.size,
             "collect_timing": args.collect_timing,
+            "lazy_action_orders": env_config.lazy_action_orders,
             "battlestream": battlestream_summary(env_config),
         },
         "results": {

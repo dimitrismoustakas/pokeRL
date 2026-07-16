@@ -1070,6 +1070,22 @@ def test_league_can_use_separate_cpu_preview_inference(tmp_path) -> None:
         league.close()
 
 
+def test_league_can_retain_deadline_only_cuda_coalescing(tmp_path) -> None:
+    game_data = GameData(gen=9)
+    agent = PokeAgent(ModelConfig(), game_data)
+    config = TrainingConfig(
+        checkpoint_dir=str(tmp_path),
+        league_target_aware_coalescing=False,
+    )
+    league = League(config, EnvConfig(), game_data, agent, torch.device("cuda"))
+    try:
+        assert league._inference._cuda_graphs_enabled
+        assert league._inference._coalesce_window_sec == pytest.approx(0.005)
+        assert league._inference._coalesce_target_batch_size is None
+    finally:
+        league.close()
+
+
 def test_league_reuses_action_service_for_cpu_preview_inference(tmp_path) -> None:
     game_data = GameData(gen=9)
     agent = PokeAgent(ModelConfig(), game_data)
