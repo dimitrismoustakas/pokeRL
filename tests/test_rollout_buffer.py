@@ -29,6 +29,7 @@ from pokerl.env.actions import (
     build_joint_action_mask,
     build_tera_action_mask,
     is_default_only_action_state,
+    semantic_action_intent,
 )
 from pokerl.env.showdown_env import BattleEnv, ParallelBattleEnv, ShowdownPlayer
 from pokerl.env.observation import (
@@ -639,6 +640,10 @@ def test_ppo_trainer_updates_public_consequence_model_from_rollout_labels() -> N
     def consequence_obs(step: int) -> dict[str, np.ndarray]:
         obs = _ppo_obs(step, num_envs)
         obs["field"] = np.full((num_envs, 36), step / 10.0, dtype=np.float32)
+        obs["field"][:, :9] = 0.0
+        obs["field"][:, 0] = 1.0
+        obs["field"][:, 10:15] = 0.0
+        obs["field"][:, 10] = 1.0
         return obs
 
     agent = _DummyAgent().to(device)
@@ -663,6 +668,11 @@ def test_ppo_trainer_updates_public_consequence_model_from_rollout_labels() -> N
 
     for step in range(num_steps):
         obs_t = _obs_to_tensor(consequence_obs(step), device)
+        field_targets = torch.full((num_envs, 2, 33), 0.5 + step / 10.0)
+        field_targets[..., :9] = 0.0
+        field_targets[..., 0] = 1.0
+        field_targets[..., 10:15] = 0.0
+        field_targets[..., 10] = 1.0
         masks_t = {
             key: torch.from_numpy(value).to(device)
             for key, value in action_mask.items()
@@ -701,9 +711,7 @@ def test_ppo_trainer_updates_public_consequence_model_from_rollout_labels() -> N
                 [[[0.0, 1.0], [1.0, 0.0]], [[1.0, 1.0], [0.0, 0.0]]]
             ),
             public_consequence_cant_masks=torch.ones(num_envs, 2, 2, dtype=torch.bool),
-            public_consequence_field_targets=torch.full(
-                (num_envs, 2, 33), 0.5 + step / 10.0
-            ),
+            public_consequence_field_targets=field_targets,
             public_consequence_field_masks=torch.ones(num_envs, 2, dtype=torch.bool),
         )
 
@@ -1415,16 +1423,33 @@ def test_switch_actions_use_stable_team_slots() -> None:
 def test_legal_action_state_reuses_slot_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     battle = _FakeBattle()
     original = actions_module._build_slot_action_state
+    original_ordered_team = actions_module._ordered_own_team
     calls = 0
+    ordered_team_calls = 0
 
-    def counted_slot_action_state(current_battle, slot):
+    def counted_slot_action_state(
+        current_battle,
+        slot,
+        *,
+        team_slot_by_identity=None,
+    ):
         nonlocal calls
         calls += 1
-        return original(current_battle, slot)
+        return original(
+            current_battle,
+            slot,
+            team_slot_by_identity=team_slot_by_identity,
+        )
+
+    def counted_ordered_team(current_battle):
+        nonlocal ordered_team_calls
+        ordered_team_calls += 1
+        return original_ordered_team(current_battle)
 
     monkeypatch.setattr(
         actions_module, "_build_slot_action_state", counted_slot_action_state
     )
+    monkeypatch.setattr(actions_module, "_ordered_own_team", counted_ordered_team)
 
     action_state = build_legal_action_state(battle)
     expected_team_slot = 3
@@ -1439,12 +1464,102 @@ def test_legal_action_state_reuses_slot_orders(monkeypatch: pytest.MonkeyPatch) 
         is battle.available_switches[0][0]
     )
     assert calls == 2
+    assert ordered_team_calls == 1
+
+
+def test_legal_action_state_materializes_only_selected_orders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_order = actions_module.SingleBattleOrder
+    constructed = 0
+
+    class _CountingOrder(original_order):
+        def __init__(self, *args, **kwargs) -> None:
+            nonlocal constructed
+            constructed += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(actions_module, "SingleBattleOrder", _CountingOrder)
+    move = Move("icespinner", gen=9)
+    move.request_index = 1
+    battle = _FakeTargetBattle(move)
+    action_state = build_legal_action_state(battle)
+
+    assert constructed == 0
+    assert tuple(action_state.slot_action_orders[0]) == (0, 1)
+    intent = semantic_action_intent(
+        np.array([0, PASS_ACTION, TERA_NONE], dtype=np.int64),
+        action_state,
+    )
+    assert intent.slots[0].move_id == "icespinner"
+    assert constructed == 0
+
+    order = action_to_order(0, battle, slot=0, action_state=action_state)
+    assert order.message == "/choose move 1 1"
+    assert constructed == 1
+
+
+def test_lazy_action_orders_match_eager_showdown_messages() -> None:
+    move = Move("icespinner", gen=9)
+    move.request_index = 1
+    battle = _FakeTargetBattle(move)
+    battle.can_tera[0] = True
+    action_state = build_legal_action_state(battle)
+
+    expected = {
+        0: actions_module.SingleBattleOrder(move, move_target=1).message,
+        1: actions_module.SingleBattleOrder(move, move_target=2).message,
+    }
+    actual = {
+        action: action_to_order(
+            action,
+            battle,
+            slot=0,
+            action_state=action_state,
+        ).message
+        for action in action_state.slot_action_orders[0]
+    }
+    assert actual == expected
+
+    tera_order = action_to_order(
+        0,
+        battle,
+        slot=0,
+        terastallize=True,
+        action_state=action_state,
+    )
+    assert (
+        tera_order.message
+        == actions_module.SingleBattleOrder(
+            move,
+            terastallize=True,
+            move_target=1,
+        ).message
+    )
 
 
 def test_default_only_action_state_detects_pass_only_request() -> None:
     action_state = build_legal_action_state(_DefaultOnlyBattle())
 
     assert is_default_only_action_state(action_state)
+
+
+def test_single_replacement_request_preserves_explicit_pass_option() -> None:
+    battle = _FakeBattle()
+    battle.force_switch = [True, True]
+    action_state = build_legal_action_state(battle)
+
+    assert PASS_ACTION in action_state.slot_action_orders[0]
+    assert PASS_ACTION in action_state.slot_action_orders[1]
+    assert isinstance(
+        action_to_order(
+            PASS_ACTION,
+            battle,
+            slot=0,
+            action_state=action_state,
+        ),
+        PassBattleOrder,
+    )
 
 
 @pytest.mark.asyncio

@@ -215,12 +215,28 @@ def test_real_double_battle_request_fast_path_matches_forced_clone_fallback(
 
     np.testing.assert_array_equal(fast_state.joint_mask, fallback_state.joint_mask)
     np.testing.assert_array_equal(fast_state.can_tera, fallback_state.can_tera)
-    for fast_orders, fallback_orders in zip(
-        fast_state.slot_action_orders,
-        fallback_state.slot_action_orders,
-        strict=True,
+    for slot, (fast_orders, fallback_orders) in enumerate(
+        zip(
+            fast_state.slot_action_orders,
+            fallback_state.slot_action_orders,
+            strict=True,
+        )
     ):
         assert fast_orders.keys() == fallback_orders.keys()
-        assert [order.message for order in fast_orders.values()] == [
-            order.message for order in fallback_orders.values()
+        assert [
+            actions_module.action_to_order(
+                action,
+                battle,
+                slot,
+                action_state=fast_state,
+            ).message
+            for action in fast_orders
+        ] == [
+            actions_module.action_to_order(
+                action,
+                battle,
+                slot,
+                action_state=fallback_state,
+            ).message
+            for action in fallback_orders
         ]

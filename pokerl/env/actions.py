@@ -5,9 +5,10 @@ The model acts in a fixed discrete space. Single-slot move targets come from
 derived directly from the indexed slot orders.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from poke_env.battle import DoubleBattle, Move
+from poke_env.battle import DoubleBattle, Move, Pokemon
 from poke_env.player import PassBattleOrder, SingleBattleOrder, SkippedBattleOrder
 
 import numpy as np
@@ -49,13 +50,26 @@ TERA_SLOT_2 = 2
 FIRST_SLOT_MASK_ROW = 0
 
 
+_BattleOrder = SingleBattleOrder | PassBattleOrder | SkippedBattleOrder
+
+
+@dataclass(frozen=True, slots=True)
+class _PassOrderTemplate:
+    explicit: bool
+
+
+_EXPLICIT_PASS = _PassOrderTemplate(explicit=True)
+_SKIPPED_PASS = _PassOrderTemplate(explicit=False)
+_OrderEntry = Move | Pokemon | _PassOrderTemplate | _BattleOrder
+
+
 @dataclass(frozen=True)
 class LegalActionState:
     """Per-request legality tables derived from the live Showdown request."""
 
     slot_action_orders: tuple[
-        dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
-        dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
+        Mapping[int, _OrderEntry],
+        Mapping[int, _OrderEntry],
     ]
     slot_masks: tuple[np.ndarray, np.ndarray]
     joint_mask: np.ndarray
@@ -135,7 +149,7 @@ def semantic_action_request_key(battle: DoubleBattle) -> tuple[str, int]:
 
 @dataclass(frozen=True)
 class _SlotActionState:
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder]
+    action_orders: Mapping[int, _OrderEntry]
     mask: np.ndarray
 
 
@@ -283,26 +297,31 @@ def _semantic_slot_intent(
     *,
     terastallize: bool,
 ) -> SemanticSlotIntent:
+    action_orders = action_state.slot_action_orders[slot]
+    kind, _, target = decode_action(action_index)
     try:
-        order = action_state.slot_action_orders[slot][action_index]
+        entry = action_orders[action_index]
     except KeyError as exc:
         raise RuntimeError(
             f"Action {action_index} is not legal for slot {slot}."
         ) from exc
-    kind, _, target = decode_action(action_index)
     if kind == "move":
-        if not isinstance(order, SingleBattleOrder) or not isinstance(
-            order.order, Move
-        ):
+        move = (
+            entry.order
+            if isinstance(entry, SingleBattleOrder) and isinstance(entry.order, Move)
+            else entry
+        )
+        if not isinstance(move, Move):
             raise RuntimeError("A move action did not resolve to a Move order.")
         return SemanticSlotIntent(
             kind=INTENT_MOVE,
-            move_id=order.order.id,
+            move_id=move.id,
             target=target,
             terastallize=terastallize,
         )
     if kind == "switch":
-        species = getattr(getattr(order, "order", None), "species", None)
+        pokemon = entry.order if isinstance(entry, SingleBattleOrder) else entry
+        species = getattr(pokemon, "species", None)
         if species is None:
             raise RuntimeError("A switch action did not resolve to a Pokemon.")
         return SemanticSlotIntent(
@@ -314,9 +333,22 @@ def _semantic_slot_intent(
 
 def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
     """Build and index all legal orders for the current live request once."""
+    team_slot_by_identity = {
+        id(pokemon): team_slot
+        for team_slot, pokemon in enumerate(_ordered_own_team(battle))
+        if pokemon is not None
+    }
     slot_states = (
-        _build_slot_action_state(battle, slot=0),
-        _build_slot_action_state(battle, slot=1),
+        _build_slot_action_state(
+            battle,
+            slot=0,
+            team_slot_by_identity=team_slot_by_identity,
+        ),
+        _build_slot_action_state(
+            battle,
+            slot=1,
+            team_slot_by_identity=team_slot_by_identity,
+        ),
     )
     joint_mask = _build_joint_mask(slot_states)
     return LegalActionState(
@@ -424,10 +456,8 @@ def _build_joint_mask(
     legal_pairs = np.logical_and.outer(slot_states[0].mask, slot_states[1].mask)
     switch_actions = np.arange(SWITCH_OFFSET, PASS_ACTION)
     legal_pairs[switch_actions, switch_actions] = False
-    first_pass = slot_states[0].action_orders.get(PASS_ACTION)
-    second_pass = slot_states[1].action_orders.get(PASS_ACTION)
-    if isinstance(first_pass, PassBattleOrder) and isinstance(
-        second_pass, PassBattleOrder
+    if _has_explicit_pass(slot_states[0].action_orders) and _has_explicit_pass(
+        slot_states[1].action_orders
     ):
         legal_pairs[PASS_ACTION, PASS_ACTION] = False
 
@@ -479,87 +509,118 @@ def action_to_order(
     """Convert a flat action index to the exact current legal order."""
     if action_state is None:
         action_state = build_legal_action_state(battle)
-    try:
-        base_order = action_state.slot_action_orders[slot][action_idx]
-    except KeyError as exc:
+    action_orders = action_state.slot_action_orders[slot]
+    if action_idx not in action_orders:
         raise RuntimeError(
             f"Action {action_idx} is not legal for slot {slot} in the current request. "
             "The policy should only sample actions allowed by build_joint_action_mask()."
-        ) from exc
-
-    if not terastallize:
-        return base_order
+        )
 
     kind, _, _ = decode_action(action_idx)
-    if kind != "move":
-        raise RuntimeError(
-            f"Action {action_idx} for slot {slot} cannot terastallize because it is a {kind} action."
+    if terastallize:
+        if kind != "move":
+            raise RuntimeError(
+                f"Action {action_idx} for slot {slot} cannot terastallize because it is a {kind} action."
+            )
+        if not battle.can_tera[slot]:
+            raise RuntimeError(
+                f"Action {action_idx} for slot {slot} requested terastallization, but battle.can_tera[{slot}] is false."
+            )
+
+    entry = action_orders[action_idx]
+    if isinstance(entry, Move):
+        return SingleBattleOrder(
+            entry,
+            terastallize=terastallize,
+            move_target=_showdown_target_from_action(action_idx, slot, battle),
         )
-    if not battle.can_tera[slot]:
+    if kind == "switch" and getattr(entry, "species", None) is not None:
+        return SingleBattleOrder(entry)
+    if isinstance(entry, _PassOrderTemplate):
+        return PassBattleOrder() if entry.explicit else SkippedBattleOrder()
+    if not isinstance(
+        entry,
+        (SingleBattleOrder, PassBattleOrder, SkippedBattleOrder),
+    ):
         raise RuntimeError(
-            f"Action {action_idx} for slot {slot} requested terastallization, but battle.can_tera[{slot}] is false."
+            f"Action {action_idx} for slot {slot} has an unsupported order template."
         )
-    if isinstance(base_order, (PassBattleOrder, SkippedBattleOrder)):
+
+    if not terastallize:
+        return entry
+    if isinstance(entry, (PassBattleOrder, SkippedBattleOrder)):
         raise RuntimeError(f"Pass action {action_idx} cannot terastallize.")
     return SingleBattleOrder(
-        base_order.order,
+        entry.order,
         terastallize=True,
-        move_target=base_order.move_target,
+        move_target=entry.move_target,
     )
 
 
-def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionState:
+def _build_slot_action_state(
+    battle: DoubleBattle,
+    slot: int,
+    *,
+    team_slot_by_identity: dict[int, int] | None = None,
+) -> _SlotActionState:
     trapped = getattr(battle, "trapped", [False, False])
     force_switch = battle.force_switch
-    action_orders: dict[
-        int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder
-    ] = {}
+    action_orders: dict[int, _OrderEntry] = {}
     mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
 
     if any(force_switch) and not force_switch[slot]:
         return _build_pass_slot_state(mask, explicit=True)
 
     if not trapped[slot]:
-        ordered_team = _ordered_own_team(battle)
+        if team_slot_by_identity is None:
+            team_slot_by_identity = {
+                id(pokemon): team_slot
+                for team_slot, pokemon in enumerate(_ordered_own_team(battle))
+                if pokemon is not None
+            }
         for pokemon in battle.available_switches[slot]:
-            team_slot = _find_team_slot(ordered_team, pokemon)
+            team_slot = team_slot_by_identity.get(id(pokemon))
             if team_slot is None:
                 raise RuntimeError(
                     f"Available switch target {pokemon.species!r} was not found in the ordered team. "
                     "This indicates battle.team and available_switches are out of sync."
                 )
-            _add_order(
+            _add_switch_template(
                 action_orders=action_orders,
                 mask=mask,
                 action_idx=SWITCH_OFFSET + team_slot,
-                order=SingleBattleOrder(pokemon),
+                pokemon=pokemon,
                 slot=slot,
             )
 
     if all(force_switch) and len(battle.available_switches[0]) == 1:
-        _add_order(
-            action_orders=action_orders,
-            mask=mask,
-            action_idx=PASS_ACTION,
-            order=PassBattleOrder(),
-            slot=slot,
+        _add_pass_template(
+            action_orders,
+            mask,
+            explicit=True,
         )
         return _SlotActionState(action_orders=action_orders, mask=mask)
 
     active_pokemon = battle.active_pokemon[slot]
     if active_pokemon is not None and not force_switch[slot]:
         for move_idx, move in enumerate(battle.available_moves[slot]):
+            if move_idx >= NUM_MOVES:
+                raise RuntimeError(
+                    f"poke-env exposed more than {NUM_MOVES} moves for slot {slot}. "
+                    "Expand the action encoding to represent every request move."
+                )
             hydrated_move, target_locs = _request_aware_move_targets(
                 move, active_pokemon, battle, slot
             )
             for target_loc in target_locs:
                 target_idx = _showdown_target_to_index(target_loc, slot, battle)
                 action_idx = move_idx * NUM_TARGETS + target_idx
-                _add_order(
+                _add_move_template(
                     action_orders=action_orders,
                     mask=mask,
                     action_idx=action_idx,
-                    order=SingleBattleOrder(hydrated_move, move_target=target_loc),
+                    move=hydrated_move,
+                    target_loc=target_loc,
                     slot=slot,
                 )
 
@@ -569,35 +630,95 @@ def _build_slot_action_state(battle: DoubleBattle, slot: int) -> _SlotActionStat
 
 
 def _build_pass_slot_state(mask: np.ndarray, *, explicit: bool) -> _SlotActionState:
-    pass_order = PassBattleOrder() if explicit else SkippedBattleOrder()
-    action_orders = {PASS_ACTION: pass_order}
-    mask[PASS_ACTION] = True
+    action_orders: dict[int, _OrderEntry] = {}
+    _add_pass_template(action_orders, mask, explicit=explicit)
     return _SlotActionState(
         action_orders=action_orders,
         mask=mask,
     )
 
 
-def _add_order(
+def _add_move_template(
     *,
-    action_orders: dict[int, SingleBattleOrder | PassBattleOrder | SkippedBattleOrder],
+    action_orders: dict[int, _OrderEntry],
     mask: np.ndarray,
     action_idx: int,
-    order: SingleBattleOrder | PassBattleOrder | SkippedBattleOrder,
+    move: Move,
+    target_loc: int,
     slot: int,
 ) -> None:
     existing = action_orders.get(action_idx)
     if existing is not None:
-        if existing.message != order.message:
+        if not isinstance(existing, Move):
             raise RuntimeError(
-                f"Two different legal orders mapped to the same action id {action_idx} "
-                f"for slot {slot}: {existing.message!r} vs {order.message!r}. "
-                "Expand the action encoding so these orders are distinguishable."
+                f"Action template {action_idx} for slot {slot} has the wrong kind."
             )
+        _validate_same_action_message(
+            action_idx=action_idx,
+            slot=slot,
+            existing=SingleBattleOrder(existing, move_target=target_loc),
+            candidate=SingleBattleOrder(move, move_target=target_loc),
+        )
         return
 
-    action_orders[action_idx] = order
+    action_orders[action_idx] = move
     mask[action_idx] = True
+
+
+def _add_switch_template(
+    *,
+    action_orders: dict[int, _OrderEntry],
+    mask: np.ndarray,
+    action_idx: int,
+    pokemon,
+    slot: int,
+) -> None:
+    existing = action_orders.get(action_idx)
+    if existing is not None:
+        if getattr(existing, "species", None) is None:
+            raise RuntimeError(
+                f"Action template {action_idx} for slot {slot} has the wrong kind."
+            )
+        _validate_same_action_message(
+            action_idx=action_idx,
+            slot=slot,
+            existing=SingleBattleOrder(existing),
+            candidate=SingleBattleOrder(pokemon),
+        )
+        return
+
+    action_orders[action_idx] = pokemon
+    mask[action_idx] = True
+
+
+def _add_pass_template(
+    action_orders: dict[int, _OrderEntry],
+    mask: np.ndarray,
+    *,
+    explicit: bool,
+) -> None:
+    action_orders[PASS_ACTION] = _EXPLICIT_PASS if explicit else _SKIPPED_PASS
+    mask[PASS_ACTION] = True
+
+
+def _validate_same_action_message(
+    *,
+    action_idx: int,
+    slot: int,
+    existing: _BattleOrder,
+    candidate: _BattleOrder,
+) -> None:
+    if existing.message != candidate.message:
+        raise RuntimeError(
+            f"Two different legal orders mapped to the same action id {action_idx} "
+            f"for slot {slot}: {existing.message!r} vs {candidate.message!r}. "
+            "Expand the action encoding so these orders are distinguishable."
+        )
+
+
+def _has_explicit_pass(action_orders: Mapping[int, _OrderEntry]) -> bool:
+    pass_entry = action_orders.get(PASS_ACTION)
+    return pass_entry is _EXPLICIT_PASS or isinstance(pass_entry, PassBattleOrder)
 
 
 def _request_move_entry(move: Move, battle: DoubleBattle, slot: int) -> dict | None:
@@ -671,13 +792,6 @@ def _ordered_own_team(battle: DoubleBattle) -> list:
     return ordered[:MAX_TEAM_SLOTS]
 
 
-def _find_team_slot(team_list: list, pokemon) -> int | None:
-    for index, team_member in enumerate(team_list):
-        if team_member is pokemon:
-            return index
-    return None
-
-
 def _showdown_target_to_index(
     showdown_target: int,
     slot: int,
@@ -704,6 +818,28 @@ def _showdown_target_to_index(
             f"Unsupported showdown target {showdown_target} for slot {slot}. "
             "Expand the action encoding to represent this target."
         ) from exc
+
+
+def _showdown_target_from_action(
+    action_idx: int,
+    slot: int,
+    battle: DoubleBattle,
+) -> int:
+    """Recover the exact Showdown target for one lazy move template."""
+    target_idx = action_idx % NUM_TARGETS
+    if target_idx == TARGET_OPPONENT_1:
+        return battle.OPPONENT_1_POSITION
+    if target_idx == TARGET_OPPONENT_2:
+        return battle.OPPONENT_2_POSITION
+    if target_idx == TARGET_ALLY:
+        return battle.POKEMON_2_POSITION if slot == 0 else battle.POKEMON_1_POSITION
+    if target_idx == TARGET_SELF:
+        return battle.POKEMON_1_POSITION if slot == 0 else battle.POKEMON_2_POSITION
+    if target_idx == TARGET_NONE:
+        return battle.EMPTY_TARGET_POSITION
+    raise RuntimeError(
+        f"Unsupported action target {target_idx} for action {action_idx}."
+    )
 
 
 def _legal_target_locs(move: Move, active_pokemon, battle: DoubleBattle) -> list[int]:
