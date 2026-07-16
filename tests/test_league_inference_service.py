@@ -108,6 +108,8 @@ def _service_stub() -> _LeagueInferenceService:
     service._device_batch_buffers = {}
     service._prefetch_paths = set()
     service._coalesce_window_sec = 0.0
+    service._coalesce_target_batch_size = None
+    service._coalesce_target_wakeups = 0
     service._device = torch.device("cpu")
     service._cuda_stream = None
     service._cuda_graph_batch_size = 16
@@ -275,6 +277,70 @@ def test_league_inference_prioritizes_battle_requests() -> None:
     )
 
     assert [key[1] for key, _ in ordered] == ["battle", "preview", "load"]
+
+
+def test_league_inference_coalesce_target_is_checkpoint_and_kind_specific() -> None:
+    service = _service_stub()
+    service._coalesce_target_batch_size = 3
+    cancelled: Future = Future()
+    cancelled.cancel()
+
+    service._pending = [
+        _request(Future(), checkpoint_path="a.pt"),
+        _request(Future(), checkpoint_path="b.pt"),
+        _request(Future(), checkpoint_path="a.pt", kind="preview"),
+        _request(cancelled, checkpoint_path="a.pt"),
+    ]
+    assert not service._coalesce_target_reached_locked()
+
+    service._pending.extend(
+        [
+            _request(Future(), checkpoint_path="a.pt"),
+            _request(Future(), checkpoint_path="a.pt"),
+        ]
+    )
+    assert service._coalesce_target_reached_locked()
+
+
+def test_league_inference_coalesce_target_can_be_disabled() -> None:
+    service = _service_stub()
+    service._coalesce_target_batch_size = None
+    service._pending = [_request(Future()) for _ in range(32)]
+
+    assert not service._coalesce_target_reached_locked()
+
+
+def test_league_inference_target_wake_preserves_snapshot_membership() -> None:
+    service = _service_stub()
+    service._coalesce_window_sec = 60.0
+    service._coalesce_target_batch_size = 2
+    first = [_request(Future(), checkpoint_path="a.pt") for _ in range(2)]
+    late = _request(Future(), checkpoint_path="a.pt")
+    service._pending = list(first)
+    calls: list[list[_InferenceRequest]] = []
+
+    def run_battle_batch(
+        checkpoint_path: str,
+        requests: list[_InferenceRequest],
+    ) -> None:
+        assert checkpoint_path == "a.pt"
+        calls.append(list(requests))
+        for request in requests:
+            request.future.set_result(None)
+        with service._condition:
+            if len(calls) == 1:
+                service._pending.append(late)
+                # The second cycle is intentionally deadline-free: this test
+                # exercises target-triggered snapshot ownership, not waiting.
+                service._coalesce_window_sec = 0.0
+            else:
+                service._closed = True
+
+    service._run_battle_batch = run_battle_batch
+    service._run_loop()
+
+    assert calls == [first, [late]]
+    assert service._coalesce_target_wakeups == 1
 
 
 def test_league_inference_snapshot_does_not_late_merge_later_key() -> None:
@@ -884,6 +950,8 @@ def test_league_inference_model_cache_is_lru_bounded() -> None:
         },
         "cuda_graphs_enabled": False,
         "cuda_graph_batch_size": 16,
+        "coalesce_target_batch_size": None,
+        "coalesce_target_wakeups": 0,
         "cuda_graph_capacity": 4,
         "resident_cuda_graphs": 0,
         "cuda_graph_hits": 0,
@@ -977,6 +1045,7 @@ def test_league_uses_same_process_cuda_inference(tmp_path) -> None:
         assert league.device.type == "cuda"
         assert league.inference_device.type == "cuda"
         assert isinstance(league._inference, _LeagueInferenceService)
+        assert league._inference._coalesce_target_batch_size == 16
         assert league.preview_inference_device.type == "cuda"
         assert league._preview_inference is league._inference
     finally:
@@ -995,6 +1064,8 @@ def test_league_can_use_separate_cpu_preview_inference(tmp_path) -> None:
         assert league.inference_device.type == "cuda"
         assert league.preview_inference_device.type == "cpu"
         assert league._preview_inference is not league._inference
+        assert league._inference._coalesce_target_batch_size == 16
+        assert league._preview_inference._coalesce_target_batch_size is None
     finally:
         league.close()
 
@@ -1008,6 +1079,7 @@ def test_league_reuses_action_service_for_cpu_preview_inference(tmp_path) -> Non
         assert league.inference_device.type == "cpu"
         assert league.preview_inference_device.type == "cpu"
         assert league._preview_inference is league._inference
+        assert league._inference._coalesce_target_batch_size is None
     finally:
         league.close()
 
