@@ -102,9 +102,11 @@ be treated as precise intrinsic slowdowns. The defensible conclusion is that
 neither factor established a production benefit. In the final, relatively
 stable block both effects were close to neutral.
 
-Ignored raw artifacts remain locally, when available, under
-`benchmarks/efficiency_factorial_20260716/`, including `report.md`,
-`aggregate.json`, `aggregate.csv`, and `experiment.json`.
+The ignored raw artifacts were written under
+`benchmarks/efficiency_factorial_20260716/` (`report.md`, `aggregate.json`,
+`aggregate.csv`, and `experiment.json`) and were deleted during the subsequent
+workspace cleanup. The identities, protocol, effects, and uncertainty needed
+to reproduce or interpret the experiment are retained in this document.
 
 ## Historical rerun
 
