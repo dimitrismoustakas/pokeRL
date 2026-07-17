@@ -412,15 +412,6 @@ def parse_args() -> argparse.Namespace:
         help="Maximum concurrent BattleEnv resets. Defaults to all envs.",
     )
     parser.add_argument(
-        "--lazy-action-orders",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Construct only the two selected poke-env orders. Disable only for "
-            "the controlled eager-materialization throughput baseline."
-        ),
-    )
-    parser.add_argument(
         "--opponent-groups",
         type=int,
         default=None,
@@ -601,16 +592,6 @@ def parse_args() -> argparse.Namespace:
         help="Override the league-opponent inference coalescing window in milliseconds.",
     )
     parser.add_argument(
-        "--league-target-aware-coalescing",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "End the frozen-opponent coalescing window once one compatible "
-            "queue fills a CUDA-graph batch. Disable only for controlled "
-            "deadline-only throughput comparisons."
-        ),
-    )
-    parser.add_argument(
         "--resume",
         default=None,
         help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
@@ -671,9 +652,6 @@ def build_configs(
     if args.reset_concurrency is not None:
         resolve_reset_concurrency(args.reset_concurrency, env_config.num_envs)
         env_config.reset_concurrency = args.reset_concurrency
-    if args.lazy_action_orders is not None:
-        env_config.lazy_action_orders = args.lazy_action_orders
-
     overrides = {
         "seed": args.seed,
         "rollout_steps": args.rollout_steps,
@@ -688,9 +666,6 @@ def build_configs(
         "league_update_interval": args.league_update_interval,
         "league_refresh_interval": args.league_refresh_interval,
         "league_coalesce_ms": args.league_coalesce_ms,
-        "league_target_aware_coalescing": (
-            args.league_target_aware_coalescing
-        ),
         "league_payoff_half_life_updates": args.league_payoff_half_life_updates,
         "league_pfsp_exponent": args.league_pfsp_exponent,
         "league_pfsp_uniform_fraction": args.league_pfsp_uniform_fraction,
@@ -2425,9 +2400,6 @@ def train():
             "league_update_interval": train_config.league_update_interval,
             "league_refresh_interval": train_config.league_refresh_interval,
             "league_coalesce_ms": train_config.league_coalesce_ms,
-            "league_target_aware_coalescing": (
-                train_config.league_target_aware_coalescing
-            ),
             "league_cuda_graphs": train_config.league_cuda_graphs,
             "league_cuda_graph_batch_size": (train_config.league_cuda_graph_batch_size),
             "league_cuda_graph_cache_size": (train_config.league_cuda_graph_cache_size),
@@ -2444,7 +2416,6 @@ def train():
             "backend": "local_battlestream",
             "opponent_groups": opponent_groups,
             "battlestream": battlestream_summary(env_config),
-            "lazy_action_orders": env_config.lazy_action_orders,
             "team_pool": team_pool.describe() if team_pool is not None else None,
         },
         "opponents": {

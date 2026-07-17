@@ -535,7 +535,6 @@ def battlestream_summary(config: EnvConfig) -> dict[str, object]:
             config.reset_concurrency,
             config.num_envs,
         ),
-        "lazy_action_orders": config.lazy_action_orders,
     }
 
 
@@ -569,14 +568,11 @@ class ShowdownPlayer(Player):
         self,
         obs_builder: ObservationBuilder,
         timing: _TimingStats,
-        *,
-        lazy_action_orders: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.obs_builder = obs_builder
         self.timing = timing
-        self.lazy_action_orders = lazy_action_orders
         self.obs_queue: _AsyncQueue[_PlayerObservation] = _AsyncQueue(
             self.ps_client.loop,
             sync_get=True,
@@ -612,11 +608,7 @@ class ShowdownPlayer(Player):
         if self._closing:
             return ForfeitBattleOrder()
 
-        action_state = (
-            build_legal_action_state(battle)
-            if getattr(self, "lazy_action_orders", True)
-            else build_legal_action_state(battle, lazy_action_orders=False)
-        )
+        action_state = build_legal_action_state(battle)
         if is_default_only_action_state(action_state):
             return self.choose_default_move()
 
@@ -780,11 +772,7 @@ class ShowdownPlayer(Player):
         self._pending_action_battle = None
         self._pending_action_requested_at = None
         if action_state is None:
-            action_state = (
-                build_legal_action_state(battle)
-                if getattr(self, "lazy_action_orders", True)
-                else build_legal_action_state(battle, lazy_action_orders=False)
-            )
+            action_state = build_legal_action_state(battle)
         resolved_intent = semantic_action_intent(action, action_state)
         orders = []
         tera_slot_1, tera_slot_2 = decode_tera_choice(int(action[2]))
@@ -957,7 +945,6 @@ class BattleEnv:
             self.player = ShowdownPlayer(
                 obs_builder,
                 timing=self._timing,
-                lazy_action_orders=config.lazy_action_orders,
                 battle_format=config.battle_format,
                 server_configuration=make_battlestream_configuration(config),
                 loop=self._loop,

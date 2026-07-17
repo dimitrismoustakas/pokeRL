@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from poke_env.battle import Pokemon
+from poke_env.battle import Move, Pokemon
 from poke_env.player import (
     DoubleBattleOrder,
     PassBattleOrder,
@@ -13,12 +13,14 @@ from pokerl.env.actions import (
     FIRST_SLOT_MASK_ROW,
     PASS_ACTION,
     SWITCH_OFFSET,
+    _EXPLICIT_PASS,
+    _SKIPPED_PASS,
     _SlotActionState,
     _build_joint_mask,
 )
 
 
-def _slot_state(action_orders: dict[int, SingleBattleOrder]) -> _SlotActionState:
+def _slot_state(action_orders: dict[int, object]) -> _SlotActionState:
     mask = np.zeros(ACTIONS_PER_SLOT, dtype=bool)
     mask[list(action_orders)] = True
     return _SlotActionState(action_orders=action_orders, mask=mask)
@@ -29,17 +31,29 @@ def _join_orders_reference(
 ) -> np.ndarray:
     """Reproduce the former object-based mask builder as a test oracle."""
     joint_mask = np.zeros((ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=bool)
-    first_by_id = {id(order): action for action, order in states[0].action_orders.items()}
-    second_by_id = {id(order): action for action, order in states[1].action_orders.items()}
+    materialized = []
+    for state in states:
+        orders = {}
+        for action, entry in state.action_orders.items():
+            if isinstance(entry, (Move, Pokemon)):
+                orders[action] = SingleBattleOrder(entry)
+            elif entry is _EXPLICIT_PASS:
+                orders[action] = PassBattleOrder()
+            elif entry is _SKIPPED_PASS:
+                orders[action] = SkippedBattleOrder()
+            else:
+                raise AssertionError(f"Unsupported test order template: {entry!r}")
+        materialized.append(orders)
+    first_by_id = {id(order): action for action, order in materialized[0].items()}
+    second_by_id = {id(order): action for action, order in materialized[1].items()}
     joined = DoubleBattleOrder.join_orders(
-        list(states[0].action_orders.values()),
-        list(states[1].action_orders.values()),
+        list(materialized[0].values()),
+        list(materialized[1].values()),
     )
     if not joined:
-        if (
-            set(states[0].action_orders) == {PASS_ACTION}
-            and set(states[1].action_orders) == {PASS_ACTION}
-        ):
+        if set(states[0].action_orders) == {PASS_ACTION} and set(
+            states[1].action_orders
+        ) == {PASS_ACTION}:
             joint_mask[FIRST_SLOT_MASK_ROW, PASS_ACTION] = True
             joint_mask[PASS_ACTION + 1, PASS_ACTION] = True
             return joint_mask
@@ -59,39 +73,43 @@ def test_direct_joint_mask_matches_join_orders_for_moves_switches_and_passes() -
     states = (
         _slot_state(
             {
-                0: SingleBattleOrder("move 1"),
-                SWITCH_OFFSET: SingleBattleOrder(shared_switch),
-                SWITCH_OFFSET + 1: SingleBattleOrder(other_switch),
-                PASS_ACTION: PassBattleOrder(),
+                0: Move("protect", gen=9),
+                SWITCH_OFFSET: shared_switch,
+                SWITCH_OFFSET + 1: other_switch,
+                PASS_ACTION: _EXPLICIT_PASS,
             }
         ),
         _slot_state(
             {
-                1: SingleBattleOrder("move 2"),
-                SWITCH_OFFSET: SingleBattleOrder(shared_switch),
-                SWITCH_OFFSET + 1: SingleBattleOrder(other_switch),
-                PASS_ACTION: SkippedBattleOrder(),
+                1: Move("detect", gen=9),
+                SWITCH_OFFSET: shared_switch,
+                SWITCH_OFFSET + 1: other_switch,
+                PASS_ACTION: _SKIPPED_PASS,
             }
         ),
     )
 
-    np.testing.assert_array_equal(_build_joint_mask(states), _join_orders_reference(states))
+    np.testing.assert_array_equal(
+        _build_joint_mask(states), _join_orders_reference(states)
+    )
 
 
 def test_direct_joint_mask_preserves_pass_only_default_fallback() -> None:
     states = (
-        _slot_state({PASS_ACTION: PassBattleOrder()}),
-        _slot_state({PASS_ACTION: PassBattleOrder()}),
+        _slot_state({PASS_ACTION: _EXPLICIT_PASS}),
+        _slot_state({PASS_ACTION: _EXPLICIT_PASS}),
     )
 
-    np.testing.assert_array_equal(_build_joint_mask(states), _join_orders_reference(states))
+    np.testing.assert_array_equal(
+        _build_joint_mask(states), _join_orders_reference(states)
+    )
 
 
 def test_direct_joint_mask_rejects_an_only_duplicate_switch_pair() -> None:
     shared_switch = Pokemon(gen=9, species="Pikachu")
     states = (
-        _slot_state({SWITCH_OFFSET: SingleBattleOrder(shared_switch)}),
-        _slot_state({SWITCH_OFFSET: SingleBattleOrder(shared_switch)}),
+        _slot_state({SWITCH_OFFSET: shared_switch}),
+        _slot_state({SWITCH_OFFSET: shared_switch}),
     )
 
     with pytest.raises(RuntimeError, match="no legal joined doubles orders"):

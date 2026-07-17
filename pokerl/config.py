@@ -48,10 +48,6 @@ class EnvConfig:
     battlestream_startup_timeout: float = 30.0
     reset_concurrency: int | None = None
     opponent_group: int = 0
-    # Store request-local move/Pokemon templates and construct only the two
-    # selected poke-env orders. The false path is retained as an exact
-    # throughput control, not as a compatibility requirement.
-    lazy_action_orders: bool = True
 
 
 @dataclass
@@ -113,11 +109,6 @@ class TrainingConfig:
     league_update_interval: int = 10
     league_refresh_interval: int = 1
     league_coalesce_ms: float = 5.0
-    # End the coalescing window as soon as one checkpoint/action-kind queue can
-    # fill a CUDA-graph replay.  The switch exists primarily so throughput
-    # experiments can retain the same checkpoint and graph implementation
-    # while comparing the previous deadline-only behavior.
-    league_target_aware_coalescing: bool = True
     # Online current-policy results form an exponentially discounted payoff
     # estimate for each archived opponent. PFSP focuses on opponents the live
     # policy struggles against while retaining a uniform coverage component.

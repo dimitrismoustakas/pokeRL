@@ -60,7 +60,7 @@ class _PassOrderTemplate:
 
 _EXPLICIT_PASS = _PassOrderTemplate(explicit=True)
 _SKIPPED_PASS = _PassOrderTemplate(explicit=False)
-_OrderEntry = Move | Pokemon | _PassOrderTemplate | _BattleOrder
+_OrderEntry = Move | Pokemon | _PassOrderTemplate
 
 
 @dataclass(frozen=True)
@@ -306,22 +306,16 @@ def _semantic_slot_intent(
             f"Action {action_index} is not legal for slot {slot}."
         ) from exc
     if kind == "move":
-        move = (
-            entry.order
-            if isinstance(entry, SingleBattleOrder) and isinstance(entry.order, Move)
-            else entry
-        )
-        if not isinstance(move, Move):
+        if not isinstance(entry, Move):
             raise RuntimeError("A move action did not resolve to a Move order.")
         return SemanticSlotIntent(
             kind=INTENT_MOVE,
-            move_id=move.id,
+            move_id=entry.id,
             target=target,
             terastallize=terastallize,
         )
     if kind == "switch":
-        pokemon = entry.order if isinstance(entry, SingleBattleOrder) else entry
-        species = getattr(pokemon, "species", None)
+        species = getattr(entry, "species", None)
         if species is None:
             raise RuntimeError("A switch action did not resolve to a Pokemon.")
         return SemanticSlotIntent(
@@ -331,15 +325,8 @@ def _semantic_slot_intent(
     return SemanticSlotIntent(kind=INTENT_PASS)
 
 
-def build_legal_action_state(
-    battle: DoubleBattle,
-    *,
-    lazy_action_orders: bool = True,
-) -> LegalActionState:
-    """Build and index all legal orders for the current live request once."""
-    # Keep request indexing identical in both benchmark modes.  The runtime
-    # factor isolates eager versus selected-only poke-env order construction;
-    # it must not also measure rebuilding this map once per actionable slot.
+def build_legal_action_state(battle: DoubleBattle) -> LegalActionState:
+    """Build and index the legal action templates for one live request."""
     team_slot_by_identity = {
         id(pokemon): team_slot
         for team_slot, pokemon in enumerate(_ordered_own_team(battle))
@@ -357,11 +344,6 @@ def build_legal_action_state(
             team_slot_by_identity=team_slot_by_identity,
         ),
     )
-    if not lazy_action_orders:
-        slot_states = (
-            _materialize_slot_action_state(battle, slot=0, state=slot_states[0]),
-            _materialize_slot_action_state(battle, slot=1, state=slot_states[1]),
-        )
     joint_mask = _build_joint_mask(slot_states)
     return LegalActionState(
         slot_action_orders=(slot_states[0].action_orders, slot_states[1].action_orders),
@@ -369,32 +351,6 @@ def build_legal_action_state(
         joint_mask=joint_mask,
         can_tera=np.asarray(battle.can_tera, dtype=bool).copy(),
     )
-
-
-def _materialize_slot_action_state(
-    battle: DoubleBattle,
-    *,
-    slot: int,
-    state: _SlotActionState,
-) -> _SlotActionState:
-    """Construct every legal poke-env order for the eager A/B control."""
-    orders: dict[int, _OrderEntry] = {}
-    for action_idx, entry in state.action_orders.items():
-        kind, _, _ = decode_action(action_idx)
-        if isinstance(entry, Move):
-            orders[action_idx] = SingleBattleOrder(
-                entry,
-                move_target=_showdown_target_from_action(action_idx, slot, battle),
-            )
-        elif kind == "switch" and getattr(entry, "species", None) is not None:
-            orders[action_idx] = SingleBattleOrder(entry)
-        elif isinstance(entry, _PassOrderTemplate):
-            orders[action_idx] = (
-                PassBattleOrder() if entry.explicit else SkippedBattleOrder()
-            )
-        else:
-            orders[action_idx] = entry
-    return _SlotActionState(action_orders=orders, mask=state.mask)
 
 
 def build_action_mask(
@@ -576,22 +532,8 @@ def action_to_order(
         return SingleBattleOrder(entry)
     if isinstance(entry, _PassOrderTemplate):
         return PassBattleOrder() if entry.explicit else SkippedBattleOrder()
-    if not isinstance(
-        entry,
-        (SingleBattleOrder, PassBattleOrder, SkippedBattleOrder),
-    ):
-        raise RuntimeError(
-            f"Action {action_idx} for slot {slot} has an unsupported order template."
-        )
-
-    if not terastallize:
-        return entry
-    if isinstance(entry, (PassBattleOrder, SkippedBattleOrder)):
-        raise RuntimeError(f"Pass action {action_idx} cannot terastallize.")
-    return SingleBattleOrder(
-        entry.order,
-        terastallize=True,
-        move_target=entry.move_target,
+    raise RuntimeError(
+        f"Action {action_idx} for slot {slot} has an unsupported order template."
     )
 
 
@@ -755,8 +697,7 @@ def _validate_same_action_message(
 
 
 def _has_explicit_pass(action_orders: Mapping[int, _OrderEntry]) -> bool:
-    pass_entry = action_orders.get(PASS_ACTION)
-    return pass_entry is _EXPLICIT_PASS or isinstance(pass_entry, PassBattleOrder)
+    return action_orders.get(PASS_ACTION) is _EXPLICIT_PASS
 
 
 def _request_move_entry(move: Move, battle: DoubleBattle, slot: int) -> dict | None:
@@ -863,7 +804,7 @@ def _showdown_target_from_action(
     slot: int,
     battle: DoubleBattle,
 ) -> int:
-    """Recover the exact Showdown target for one lazy move template."""
+    """Recover the exact Showdown target for one selected move template."""
     target_idx = action_idx % NUM_TARGETS
     if target_idx == TARGET_OPPONENT_1:
         return battle.OPPONENT_1_POSITION

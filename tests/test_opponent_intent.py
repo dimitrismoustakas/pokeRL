@@ -5,8 +5,6 @@ import pytest
 import torch
 
 from poke_env.battle import Move, Pokemon
-from poke_env.player import PassBattleOrder, SingleBattleOrder
-
 from pokerl.env.actions import (
     ACTIONS_PER_SLOT,
     FIRST_SLOT_MASK_ROW,
@@ -32,6 +30,7 @@ from pokerl.env.actions import (
     TERA_NONE,
     TERA_SLOT_1,
     TERA_SLOT_2,
+    _EXPLICIT_PASS,
     semantic_action_supervision,
     semantic_action_request_key,
 )
@@ -44,17 +43,17 @@ def _semantic_state() -> LegalActionState:
     thunderbolt = Move("thunderbolt", gen=9)
     spore = Move("spore", gen=9)
     slot_zero_orders = {
-        TARGET_SELF: SingleBattleOrder(protect, move_target=0),
-        5 + TARGET_OPPONENT_1: SingleBattleOrder(thunderbolt, move_target=1),
-        5 + TARGET_OPPONENT_2: SingleBattleOrder(thunderbolt, move_target=2),
-        SWITCH_OFFSET: SingleBattleOrder(Pokemon(gen=9, species="incineroar")),
-        SWITCH_OFFSET + 1: SingleBattleOrder(Pokemon(gen=9, species="rillaboom")),
+        TARGET_SELF: protect,
+        5 + TARGET_OPPONENT_1: thunderbolt,
+        5 + TARGET_OPPONENT_2: thunderbolt,
+        SWITCH_OFFSET: Pokemon(gen=9, species="incineroar"),
+        SWITCH_OFFSET + 1: Pokemon(gen=9, species="rillaboom"),
     }
     slot_one_orders = {
-        TARGET_OPPONENT_1: SingleBattleOrder(spore, move_target=1),
-        TARGET_OPPONENT_2: SingleBattleOrder(spore, move_target=2),
-        SWITCH_OFFSET: SingleBattleOrder(Pokemon(gen=9, species="amoonguss")),
-        SWITCH_OFFSET + 1: SingleBattleOrder(Pokemon(gen=9, species="rillaboom")),
+        TARGET_OPPONENT_1: spore,
+        TARGET_OPPONENT_2: spore,
+        SWITCH_OFFSET: Pokemon(gen=9, species="amoonguss"),
+        SWITCH_OFFSET + 1: Pokemon(gen=9, species="rillaboom"),
     }
     slot_masks = []
     for orders in (slot_zero_orders, slot_one_orders):
@@ -135,8 +134,8 @@ def test_default_only_semantic_supervision_has_no_training_components() -> None:
     joint_mask[PASS_ACTION + 1, PASS_ACTION] = True
     state = LegalActionState(
         slot_action_orders=(
-            {PASS_ACTION: PassBattleOrder()},
-            {PASS_ACTION: PassBattleOrder()},
+            {PASS_ACTION: _EXPLICIT_PASS},
+            {PASS_ACTION: _EXPLICIT_PASS},
         ),
         slot_masks=(
             np.eye(1, ACTIONS_PER_SLOT, PASS_ACTION, dtype=bool).reshape(-1),

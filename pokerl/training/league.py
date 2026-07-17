@@ -304,7 +304,6 @@ class _LeagueInferenceService:
         enable_cuda_graphs: bool = False,
         cuda_graph_batch_size: int = _DEFAULT_CUDA_GRAPH_BATCH_SIZE,
         cuda_graph_cache_size: int = _DEFAULT_CUDA_GRAPH_CACHE_SIZE,
-        coalesce_target_batch_size: int | None = None,
     ):
         if max_models <= 0:
             raise ValueError(f"max_models must be positive (got {max_models}).")
@@ -314,15 +313,6 @@ class _LeagueInferenceService:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer (got {value}).")
-        if coalesce_target_batch_size is not None and (
-            isinstance(coalesce_target_batch_size, bool)
-            or not isinstance(coalesce_target_batch_size, int)
-            or coalesce_target_batch_size <= 0
-        ):
-            raise ValueError(
-                "coalesce_target_batch_size must be a positive integer or None "
-                f"(got {coalesce_target_batch_size})."
-            )
         self._agent_template = copy.deepcopy(agent_template).to(torch.device("cpu"))
         self._agent_template.eval()
         self._agent_template.requires_grad_(False)
@@ -345,15 +335,6 @@ class _LeagueInferenceService:
         )
         self._cuda_graph_batch_size = cuda_graph_batch_size
         self._cuda_graph_cache_size = cuda_graph_cache_size
-        # A graph replay has fixed cost up to this many real rows. Once one
-        # checkpoint-specific battle group fills that shape, waiting for the
-        # remainder of the coalescing window cannot make its first replay more
-        # efficient. ``None`` preserves deadline-only coalescing (used by the
-        # non-graph preview service and available to focused A/B tests).
-        self._coalesce_target_batch_size = (
-            coalesce_target_batch_size if self._cuda_graphs_enabled else None
-        )
-        self._coalesce_target_wakeups = 0
         self._cuda_graphs: OrderedDict[str, _CudaGraphExecutor] = OrderedDict()
         self._cuda_graph_hits = 0
         self._cuda_graph_misses = 0
@@ -431,10 +412,6 @@ class _LeagueInferenceService:
                 ),
                 "cuda_graphs_enabled": getattr(self, "_cuda_graphs_enabled", False),
                 "cuda_graph_batch_size": self._cuda_graph_batch_size,
-                "coalesce_target_batch_size": getattr(
-                    self, "_coalesce_target_batch_size", None
-                ),
-                "coalesce_target_wakeups": getattr(self, "_coalesce_target_wakeups", 0),
                 "cuda_graph_capacity": self._cuda_graph_cache_size,
                 "resident_cuda_graphs": len(getattr(self, "_cuda_graphs", {})),
                 "cuda_graph_hits": getattr(self, "_cuda_graph_hits", 0),
@@ -594,9 +571,6 @@ class _LeagueInferenceService:
                 if self._coalesce_window_sec > 0:
                     deadline = time.perf_counter() + self._coalesce_window_sec
                     while not self._closed:
-                        if self._coalesce_target_reached_locked():
-                            self._coalesce_target_wakeups += 1
-                            break
                         remaining = deadline - time.perf_counter()
                         if remaining <= 0:
                             break
@@ -663,34 +637,6 @@ class _LeagueInferenceService:
                     # active batch to remain discoverable for failure delivery.
                     if clear_active:
                         self._clear_active(key, requests)
-
-    def _coalesce_target_reached_locked(self) -> bool:
-        """Return whether one graph-compatible request group fills its target.
-
-        CUDA graphs are cached per frozen checkpoint, so rows belonging to
-        different checkpoints cannot share a replay. Preview/load/prune work
-        also follows different execution paths. Counting only uncancelled
-        battle requests therefore avoids an early wake that would still leave
-        every executable group below the configured target.
-
-        The caller owns ``self._condition``; keeping this scan under the same
-        lock as submission makes the stop decision and subsequent snapshot
-        atomic with respect to later arrivals.
-        """
-        target = getattr(self, "_coalesce_target_batch_size", None)
-        if target is None:
-            return False
-
-        group_sizes: dict[str, int] = {}
-        for request in self._pending:
-            if request.kind != "battle" or request.future.cancelled():
-                continue
-            checkpoint_path = request.checkpoint_path
-            size = group_sizes.get(checkpoint_path, 0) + 1
-            if size >= target:
-                return True
-            group_sizes[checkpoint_path] = size
-        return False
 
     def _activate_snapshot_group_locked(
         self,
@@ -1992,7 +1938,6 @@ class LeaguePlayer(Player):
         inference_service: _LeagueInferenceService,
         obs_builder: ObservationBuilder,
         preview_inference_service: _LeagueInferenceService | None = None,
-        lazy_action_orders: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -2000,7 +1945,6 @@ class LeaguePlayer(Player):
         self.inference_service = inference_service
         self.preview_inference_service = preview_inference_service or inference_service
         self.obs_builder = obs_builder
-        self.lazy_action_orders = lazy_action_orders
         self._hidden: tuple[torch.Tensor, torch.Tensor] | None = None
         self._pending_hidden: tuple[torch.Tensor, torch.Tensor] | None = None
         self._pending_decision_key: tuple[object, ...] | None = None
@@ -2117,11 +2061,7 @@ class LeaguePlayer(Player):
                     "opponent_hidden_commit_sec", time.perf_counter() - hidden_started
                 )
                 masks_started = time.perf_counter()
-            action_state = (
-                build_legal_action_state(battle)
-                if getattr(self, "lazy_action_orders", True)
-                else build_legal_action_state(battle, lazy_action_orders=False)
-            )
+            action_state = build_legal_action_state(battle)
             if is_default_only_action_state(action_state):
                 result = self.choose_default_move()
                 self._pending_decision_key = decision_key
@@ -2189,11 +2129,7 @@ class LeaguePlayer(Player):
         ):
             return self._pending_order
         if action_state is None:
-            action_state = (
-                build_legal_action_state(battle)
-                if getattr(self, "lazy_action_orders", True)
-                else build_legal_action_state(battle, lazy_action_orders=False)
-            )
+            action_state = build_legal_action_state(battle)
         if timing_enabled:
             self._add_timing(
                 "opponent_infer_action_wait_sec", time.perf_counter() - infer_started
@@ -2587,14 +2523,6 @@ class League:
             enable_cuda_graphs=config.league_cuda_graphs,
             cuda_graph_batch_size=config.league_cuda_graph_batch_size,
             cuda_graph_cache_size=config.league_cuda_graph_cache_size,
-            coalesce_target_batch_size=(
-                config.league_cuda_graph_batch_size
-                if (
-                    config.league_cuda_graphs
-                    and config.league_target_aware_coalescing
-                )
-                else None
-            ),
         )
         if self.preview_inference_device == self.inference_device:
             self._preview_inference = self._inference
@@ -2608,7 +2536,6 @@ class League:
                 enable_cuda_graphs=False,
                 cuda_graph_batch_size=config.league_cuda_graph_batch_size,
                 cuda_graph_cache_size=config.league_cuda_graph_cache_size,
-                coalesce_target_batch_size=None,
             )
 
     @property
@@ -2992,7 +2919,6 @@ class League:
             self._inference,
             obs_builder,
             preview_inference_service=self._preview_inference,
-            lazy_action_orders=self.env_config.lazy_action_orders,
             account_configuration=make_local_account_configuration("league"),
             battle_format=self.env_config.battle_format,
             server_configuration=battlestream_config,

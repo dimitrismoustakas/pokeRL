@@ -10,8 +10,6 @@ from poke_env.battle import (
     PublicBattleEventSegment,
     PublicMoveTargetOutcome,
 )
-from poke_env.player import SingleBattleOrder
-
 from pokerl.config import ModelConfig
 from pokerl.data import MOVE_SCOPE_TARGETED, GameData
 from pokerl.env.actions import (
@@ -339,8 +337,8 @@ def test_semantic_intent_resolves_request_local_move_and_switch_slots() -> None:
     switch = Pokemon(gen=9, species="rillaboom")
     state = LegalActionState(
         slot_action_orders=(
-            {1: SingleBattleOrder(move, move_target=2)},
-            {20: SingleBattleOrder(switch)},
+            {1: move},
+            {20: switch},
         ),
         slot_masks=(np.zeros(27, dtype=bool), np.zeros(27, dtype=bool)),
         joint_mask=np.zeros((28, 27), dtype=bool),

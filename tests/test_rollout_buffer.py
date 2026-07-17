@@ -1499,7 +1499,7 @@ def test_legal_action_state_materializes_only_selected_orders(
     assert constructed == 1
 
 
-def test_lazy_action_orders_match_eager_showdown_messages() -> None:
+def test_selected_order_construction_matches_poke_env_messages() -> None:
     move = Move("icespinner", gen=9)
     move.request_index = 1
     battle = _FakeTargetBattle(move)
@@ -1536,103 +1536,6 @@ def test_lazy_action_orders_match_eager_showdown_messages() -> None:
             move_target=1,
         ).message
     )
-
-
-def test_eager_action_order_control_matches_lazy_state() -> None:
-    move = Move("icespinner", gen=9)
-    move.request_index = 1
-    first_slot_move = _FakeTargetBattle(move)
-    first_slot_move.can_tera[0] = True
-
-    second_slot_move = _FakeTargetBattle(move)
-    second_slot_move.available_moves = [[], [move]]
-    second_slot_move.last_request["active"] = [
-        {"moves": []},
-        {
-            "moves": [
-                {
-                    "id": "icespinner",
-                    "target": "adjacentFoe",
-                    "disabled": False,
-                }
-            ]
-        },
-    ]
-    second_slot_move.can_tera[1] = True
-
-    forced_switch = _FakeBattle()
-    both_forced = _FakeBattle()
-    both_forced.force_switch = [True, True]
-    battles = [
-        first_slot_move,
-        second_slot_move,
-        forced_switch,
-        both_forced,
-        _DefaultOnlyBattle(),
-    ]
-
-    for battle in battles:
-        lazy = build_legal_action_state(battle)
-        eager = build_legal_action_state(battle, lazy_action_orders=False)
-
-        np.testing.assert_array_equal(lazy.joint_mask, eager.joint_mask)
-        np.testing.assert_array_equal(lazy.can_tera, eager.can_tera)
-        for slot in range(2):
-            assert set(lazy.slot_action_orders[slot]) == set(
-                eager.slot_action_orders[slot]
-            )
-            assert all(
-                isinstance(
-                    entry,
-                    (
-                        actions_module.SingleBattleOrder,
-                        actions_module.PassBattleOrder,
-                        actions_module.SkippedBattleOrder,
-                    ),
-                )
-                for entry in eager.slot_action_orders[slot].values()
-            )
-            for action_index in lazy.slot_action_orders[slot]:
-                lazy_order = action_to_order(
-                    action_index,
-                    battle,
-                    slot=slot,
-                    action_state=lazy,
-                )
-                eager_order = action_to_order(
-                    action_index,
-                    battle,
-                    slot=slot,
-                    action_state=eager,
-                )
-                assert type(lazy_order) is type(eager_order)
-                assert lazy_order.message == eager_order.message
-                if action_index < SWITCH_OFFSET and battle.can_tera[slot]:
-                    lazy_tera = action_to_order(
-                        action_index,
-                        battle,
-                        slot=slot,
-                        terastallize=True,
-                        action_state=lazy,
-                    )
-                    eager_tera = action_to_order(
-                        action_index,
-                        battle,
-                        slot=slot,
-                        terastallize=True,
-                        action_state=eager,
-                    )
-                    assert lazy_tera.message == eager_tera.message
-
-        for first_action in np.flatnonzero(lazy.joint_mask[FIRST_SLOT_MASK_ROW]):
-            for second_action in np.flatnonzero(lazy.joint_mask[first_action + 1]):
-                action = np.array(
-                    [first_action, second_action, TERA_NONE],
-                    dtype=np.int64,
-                )
-                assert semantic_action_intent(action, lazy) == semantic_action_intent(
-                    action, eager
-                )
 
 
 def test_default_only_action_state_detects_pass_only_request() -> None:

@@ -214,22 +214,11 @@ BattleStream knobs used by longer runs. Training also accepts
 `--reset-concurrency` to bound simultaneous environment resets when startup
 load needs to be limited.
 
-For the controlled production-efficiency experiment, run the restart-safe
-factorial harness from a quiet machine:
-
-```powershell
-& .\.venv\Scripts\python.exe .\scripts\benchmark_efficiency_factorial.py --output-dir .\benchmarks\efficiency_factorial_YYYYMMDD
-```
-
-It compares eager versus selected-only battle-order construction and
-deadline-only versus target-aware frozen-policy batching on the same committed
-code and the same bootstrap checkpoint. The default four-block Williams design
-runs 10 updates per cell, discards the first three invocation updates as
-warm-up, and keeps detailed timing disabled. Reusing the exact command and
-output directory after an interruption verifies completed artifacts and reruns
-only the interrupted cell from the common bootstrap boundary. Raw logs and
-summaries remain under each cell; `report.md`, `aggregate.json`, and
-`aggregate.csv` contain the live and final analysis.
+The retired eager-order and target-aware batching experiment is preserved in
+[the experiment archive](docs/experiments/2026-07-17-lazy-orders-target-coalescing.md).
+It records the design, pinned revisions, results, and a detached-worktree
+recipe for revisiting the ideas without leaving experimental gates in the
+training code.
 
 ## Building a VGC team pool
 
