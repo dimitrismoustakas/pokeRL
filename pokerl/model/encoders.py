@@ -108,7 +108,13 @@ class TeamEncoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.attention = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # PyTorch's nested-tensor path does not support pre-norm encoder layers
+        # and otherwise emits a warning before disabling itself.
+        self.attention = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
 
     def forward(
         self,
