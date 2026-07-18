@@ -489,7 +489,9 @@ def _contextual_move_group(
         protect_counter = int(getattr(active_pokemon, "protect_counter", 0))
         return "protect_like_repeat" if protect_counter > 0 else "protect_like_fresh"
     if move_id == "trickroom":
-        return "trick_room_cancel" if _trick_room_is_active(battle) else "trick_room_setup"
+        return (
+            "trick_room_cancel" if _trick_room_is_active(battle) else "trick_room_setup"
+        )
     if move_id == "fakeout":
         return (
             "fake_out_first_turn"
@@ -839,9 +841,7 @@ def _summarize_action_stats(action_stats: Counter[str]) -> dict[str, object]:
                     ),
                 ),
                 "success_rate_when_chosen": _safe_rate(
-                    counts.get(
-                        f"protect_like_prior_{prior_successes}_successes", 0
-                    ),
+                    counts.get(f"protect_like_prior_{prior_successes}_successes", 0),
                     counts.get(f"protect_like_prior_{prior_successes}_attempts", 0),
                 ),
             }
@@ -913,7 +913,8 @@ def _summarize_preview_results(
                 total_games,
             ),
             "note": (
-                "For learned greedy preview with a fixed own roster, changes are caused by "
+                "For the learned most-probable preview choice with a fixed own "
+                "roster, changes are caused by "
                 "the opposing roster. Learned sampled and random-preview changes also include "
                 "policy randomness; max-BST preview is opponent-independent by construction."
             ),
@@ -995,7 +996,9 @@ def _classify_protect_outcomes(
         stats["protect_like_attempts"] += 1
         stats[f"protect_like_prior_{bucket}_attempts"] += 1
         stats[
-            "protect_like_repeat_attempts" if repeated else "protect_like_fresh_attempts"
+            "protect_like_repeat_attempts"
+            if repeated
+            else "protect_like_fresh_attempts"
         ] += 1
         if succeeded:
             stats["protect_like_successes"] += 1

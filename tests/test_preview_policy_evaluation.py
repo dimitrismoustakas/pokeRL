@@ -47,9 +47,9 @@ def test_distribution_summary_reports_exact_opponent_information() -> None:
 
     assert summary["opponent_count"] == 2
     assert summary["legal_action_count"] == 3
-    assert summary["distinct_greedy_full_choices"] == 2
-    assert summary["distinct_greedy_bring_choices"] == 1
-    assert summary["distinct_greedy_lead_choices"] == 2
+    assert summary["distinct_most_probable_full_choices"] == 2
+    assert summary["distinct_most_probable_bring_choices"] == 1
+    assert summary["distinct_most_probable_lead_choices"] == 2
     assert summary["exact_policy_entropy_mean_nats"] == 0.0
     assert summary["max_probability_mean"] == 1.0
     assert summary["mutual_information_nats"] == pytest.approx(math.log(2.0))
@@ -63,7 +63,7 @@ def test_distribution_summary_identical_uniform_policies_have_no_information() -
 
     summary = summarize_preview_distributions(probabilities, actions)
 
-    assert summary["distinct_greedy_full_choices"] == 1
+    assert summary["distinct_most_probable_full_choices"] == 1
     assert summary["exact_policy_entropy_mean_nats"] == pytest.approx(
         math.log(len(actions))
     )

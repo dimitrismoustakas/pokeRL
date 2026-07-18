@@ -92,26 +92,28 @@ def summarize_preview_distributions(
     if abs(mutual_information) < 1e-12:
         mutual_information = 0.0
 
-    greedy_indices = normalized.argmax(axis=1)
-    greedy_actions = actions[greedy_indices]
-    full_choices = {tuple(int(slot) for slot in row) for row in greedy_actions}
-    bring_choices = {tuple(sorted(int(slot) for slot in row)) for row in greedy_actions}
-    lead_choices = {(int(row[0]), int(row[1])) for row in greedy_actions}
+    most_probable_indices = normalized.argmax(axis=1)
+    most_probable_actions = actions[most_probable_indices]
+    full_choices = {tuple(int(slot) for slot in row) for row in most_probable_actions}
+    bring_choices = {
+        tuple(sorted(int(slot) for slot in row)) for row in most_probable_actions
+    }
+    lead_choices = {(int(row[0]), int(row[1])) for row in most_probable_actions}
     total_variation = 0.5 * np.abs(normalized - mean_policy).sum(axis=1)
 
     return {
         "opponent_count": int(normalized.shape[0]),
         "legal_action_count": int(normalized.shape[1]),
-        "distinct_greedy_full_choices": len(full_choices),
-        "distinct_greedy_bring_choices": len(bring_choices),
-        "distinct_greedy_lead_choices": len(lead_choices),
+        "distinct_most_probable_full_choices": len(full_choices),
+        "distinct_most_probable_bring_choices": len(bring_choices),
+        "distinct_most_probable_lead_choices": len(lead_choices),
         "exact_policy_entropy_mean_nats": mean_conditional_entropy,
         "exact_policy_entropy_mean_bits": mean_conditional_entropy / math.log(2.0),
         "max_probability_mean": float(normalized.max(axis=1).mean()),
         "mutual_information_nats": mutual_information,
         "mutual_information_bits": mutual_information / math.log(2.0),
         "mean_total_variation_to_mean_policy": float(total_variation.mean()),
-        "greedy_action_indices": [int(index) for index in greedy_indices],
+        "most_probable_action_indices": [int(index) for index in most_probable_indices],
         "per_opponent_entropy_nats": [float(value) for value in entropies],
         "per_opponent_max_probability": [
             float(value) for value in normalized.max(axis=1)
@@ -401,7 +403,7 @@ def main() -> None:
         opponent_specs=opponent_specs,
         model_team_spec=model_team_spec,
     )
-    distribution_summary.pop("greedy_action_indices")
+    distribution_summary.pop("most_probable_action_indices")
     distribution_summary.pop("per_opponent_entropy_nats")
     distribution_summary.pop("per_opponent_max_probability")
     checkpoint_ref.verify(REPO_ROOT)
@@ -441,8 +443,7 @@ def main() -> None:
         if summary_path.exists():
             if summary_path.read_text(encoding="utf-8") != rendered:
                 raise FileExistsError(
-                    "Refusing to overwrite immutable preview summary: "
-                    f"{summary_path!s}"
+                    f"Refusing to overwrite immutable preview summary: {summary_path!s}"
                 )
         else:
             temporary = summary_path.with_suffix(summary_path.suffix + ".tmp")
