@@ -55,7 +55,9 @@ class EnvConfig:
 class TrainingConfig:
     # PPO
     lr: float = 2.5e-4
-    gamma: float = 0.99
+    # Optimize undiscounted win probability. GAE lambda still controls the
+    # battle critic's bias/variance tradeoff.
+    gamma: float = 1.0
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     entropy_coef: float = 0.01
@@ -69,11 +71,6 @@ class TrainingConfig:
     team_preview_value_coef: float = 0.5
     team_preview_bring_coef: float = 0.1
     team_preview_lead_coef: float = 0.05
-    # Use every current-policy preview sample by default. An explicit cap still
-    # provides deterministic uniform subsampling for constrained experiments.
-    team_preview_max_samples: int | None = None
-    # Maximum preview PPO minibatch size.
-    preview_update_minibatch_size: int = 512
     # Auxiliary prediction losses do not modify rewards, and every target is
     # trainer-only. Compact public-state beliefs and detached public-consequence
     # probabilities may still condition the deployed policy.
@@ -170,19 +167,6 @@ class TrainingConfig:
             raise ValueError(
                 "league_pfsp_uniform_fraction must be finite and within [0, 1] "
                 f"(got {self.league_pfsp_uniform_fraction})."
-            )
-        if (
-            self.team_preview_max_samples is not None
-            and self.team_preview_max_samples <= 0
-        ):
-            raise ValueError(
-                "team_preview_max_samples must be positive "
-                f"(got {self.team_preview_max_samples})."
-            )
-        if self.preview_update_minibatch_size <= 0:
-            raise ValueError(
-                "preview_update_minibatch_size must be positive "
-                f"(got {self.preview_update_minibatch_size})."
             )
         for name, value in (
             ("tera_gate_entropy_coef", self.tera_gate_entropy_coef),

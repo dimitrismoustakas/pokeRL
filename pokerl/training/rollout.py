@@ -11,6 +11,22 @@ from ..env.actions import (
 )
 from ..env.observation import NUM_PUBLIC_TARGET_POSITIONS
 from ..public_consequence import PUBLIC_CONSEQUENCE_FIELD_DIM
+from .preview import TeamPreviewEpisodeStart
+
+
+@dataclass
+class TeamPreviewRolloutBatch:
+    """Episode-start preview decisions aligned to one fixed battle rollout."""
+
+    obs: dict[str, torch.Tensor]
+    picks: torch.Tensor
+    log_probs: torch.Tensor
+    values: torch.Tensor
+    opponent_picks: torch.Tensor
+    advantages: torch.Tensor
+    returns: torch.Tensor
+    terminal: torch.Tensor
+    horizons: torch.Tensor
 
 
 @dataclass
@@ -32,8 +48,9 @@ class RolloutBatch:
     advantages: torch.Tensor  # (num_steps, num_envs)
     returns: torch.Tensor  # (num_steps, num_envs)
     # Trainer-private exact labels for the opponent's selected team are aligned
-    # to the same Pokemon at each earlier timestep. Unfinished episodes,
-    # unselected Pokemon, and ambiguous identities leave aux_label_valid=False.
+    # online to the same Pokemon at each timestep. Unselected Pokemon,
+    # unavailable packed teams, and ambiguous identities leave
+    # aux_label_valid=False.
     aux_labels: dict[str, torch.Tensor]
     aux_label_valid: torch.Tensor  # (num_steps, num_envs, team_size) bool
     # Trainer-only semantic opponent-intent targets. Component-specific masks
@@ -60,6 +77,7 @@ class RolloutBatch:
     public_consequence_cant_masks: torch.Tensor  # (steps, envs, 2, 2) bool
     public_consequence_field_targets: torch.Tensor  # (steps, envs, 2, 33) float
     public_consequence_field_masks: torch.Tensor  # (steps, envs, 2) bool
+    team_preview: TeamPreviewRolloutBatch | None
     num_steps: int
     num_envs: int
     initial_hidden_h: torch.Tensor | None = None  # (num_envs, hidden_dim)
@@ -78,7 +96,7 @@ class RolloutBuffer:
     the collected sequences without copying the full batch back to the device.
     """
 
-    # Obs keys whose end-of-episode value is stored as an aux label.
+    # Trainer-only selected-team fields supplied at episode start.
     AUX_LABEL_KEYS: tuple[str, ...] = (
         "opp_item",
         "opp_ability",
@@ -158,10 +176,24 @@ class RolloutBuffer:
                 )
                 for key in self.AUX_LABEL_KEYS
             }
+            self._active_aux_labels = {
+                key: torch.zeros(
+                    (num_envs, *obs_example[key].shape[1:]),
+                    dtype=torch.from_numpy(obs_example[key]).dtype,
+                    device=device,
+                )
+                for key in self.AUX_OBS_KEYS
+            }
             team_size = obs_example[self.AUX_IDENTITY_KEY].shape[-1]
         else:
             self._aux_labels = {}
+            self._active_aux_labels = {}
             team_size = 0
+        self._active_aux_episode = torch.zeros(
+            num_envs,
+            dtype=torch.bool,
+            device=device,
+        )
         self._aux_label_valid = torch.zeros(
             (num_steps, num_envs, team_size),
             dtype=torch.bool,
@@ -275,9 +307,108 @@ class RolloutBuffer:
             dtype=torch.bool,
             device=device,
         )
-        # Tracks the timestep within the current rollout at which each env's
-        # active episode began. Used to retroactively fill aux labels on done.
-        self._episode_start = [0] * num_envs
+        self._team_preview_starts: list[tuple[int, int, TeamPreviewEpisodeStart]] = []
+        self._team_preview_start_keys: set[tuple[int, int]] = set()
+
+    def register_team_preview_starts(
+        self,
+        starts: list[tuple[int, TeamPreviewEpisodeStart]],
+        *,
+        policy_version: int,
+    ) -> None:
+        """Register episode starts whose first battle state is ``self.step``."""
+        if (
+            isinstance(policy_version, bool)
+            or not isinstance(policy_version, int)
+            or policy_version < 0
+        ):
+            raise ValueError(
+                f"policy_version must be a non-negative integer, got {policy_version!r}."
+            )
+        if self.step > self.num_steps:
+            raise RuntimeError(
+                "Team-preview start cannot be registered beyond the rollout boundary."
+            )
+
+        accepted: list[tuple[int, TeamPreviewEpisodeStart]] = []
+        for env_index, start in starts:
+            if (
+                isinstance(env_index, bool)
+                or not isinstance(env_index, int)
+                or not 0 <= env_index < self.num_envs
+            ):
+                raise IndexError(
+                    f"Team-preview env index {env_index!r} is outside "
+                    f"[0, {self.num_envs})."
+                )
+            if start.policy_version != policy_version:
+                raise RuntimeError(
+                    "Team-preview episode start was produced by the wrong policy "
+                    f"version: expected={policy_version}, "
+                    f"actual={start.policy_version}."
+                )
+            start_key = (env_index, self.step)
+            if start_key in self._team_preview_start_keys:
+                raise RuntimeError(
+                    "An environment registered more than one team-preview start "
+                    f"at rollout step {self.step}: env={env_index}."
+                )
+            self._team_preview_start_keys.add(start_key)
+            self._team_preview_starts.append((env_index, self.step, start))
+            accepted.append((env_index, start))
+
+        if not accepted:
+            return
+        accepted_envs = torch.tensor(
+            [env_index for env_index, _ in accepted],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._active_aux_episode.index_fill_(0, accepted_envs, False)
+        for labels in self._active_aux_labels.values():
+            labels.index_fill_(0, accepted_envs, 0)
+        if not self._aux_enabled:
+            return
+
+        labeled = [
+            (env_index, start)
+            for env_index, start in accepted
+            if start.opponent_aux_labels is not None
+        ]
+        if not labeled:
+            return
+        labeled_envs = torch.tensor(
+            [env_index for env_index, _ in labeled],
+            dtype=torch.long,
+            device=self.device,
+        )
+        for _, start in labeled:
+            assert start.opponent_aux_labels is not None
+            missing = set(self.AUX_OBS_KEYS).difference(start.opponent_aux_labels)
+            if missing:
+                raise ValueError(
+                    "Team-preview episode start omitted trainer-only opponent "
+                    "label key(s): " + ", ".join(sorted(missing))
+                )
+        for key in self.AUX_OBS_KEYS:
+            destination = self._active_aux_labels[key]
+            source = torch.from_numpy(
+                np.stack(
+                    [
+                        start.opponent_aux_labels[key]
+                        for _, start in labeled
+                        if start.opponent_aux_labels is not None
+                    ]
+                )
+            ).to(device=self.device, dtype=destination.dtype)
+            expected_shape = (len(labeled), *destination.shape[1:])
+            if source.shape != expected_shape:
+                raise ValueError(
+                    f"Trainer-only opponent label {key!r} has batched shape "
+                    f"{tuple(source.shape)}; expected {expected_shape}."
+                )
+            destination.index_copy_(0, labeled_envs, source)
+        self._active_aux_episode.index_fill_(0, labeled_envs, True)
 
     def add(
         self,
@@ -310,8 +441,6 @@ class RolloutBuffer:
         public_consequence_cant_masks: torch.Tensor | None = None,
         public_consequence_field_targets: torch.Tensor | None = None,
         public_consequence_field_masks: torch.Tensor | None = None,
-        aux_label_obs: dict[str, torch.Tensor] | None = None,
-        done_env_indices: np.ndarray | list[int] | tuple[int, ...] | None = None,
     ) -> None:
         if self.step >= self.num_steps:
             raise IndexError(
@@ -405,105 +534,68 @@ class RolloutBuffer:
         else:
             self._public_consequence_field_masks[slot].fill_(False)
 
-        # Retroactively fill aux labels for completed episodes. Terminal slots
-        # are matched by their episode-local source index rather than output
-        # position because observation slots move when the active Pokemon
-        # switch. A unique match is required; untracked identities are skipped.
+        # Exact selected-team labels are known to the trainer at episode start.
+        # Align them to the current public slot order immediately so episodes
+        # spanning rollout boundaries receive the same supervision as shorter
+        # episodes. The labels never enter the policy observation.
         if self._aux_enabled:
-            if done_env_indices is None:
-                done_envs = dones.detach().nonzero(as_tuple=False).squeeze(-1).tolist()
-            else:
-                done_envs = done_env_indices
-            if len(done_envs) > 0:
-                label_obs = aux_label_obs if aux_label_obs is not None else obs
-                env_indices = [int(env_idx) for env_idx in done_envs]
-                self._fill_aligned_aux_labels(
-                    starts=[self._episode_start[env_idx] for env_idx in env_indices],
-                    end=slot + 1,
-                    env_indices=env_indices,
-                    label_obs=label_obs,
-                )
-                for env_idx in env_indices:
-                    self._episode_start[env_idx] = slot + 1
+            self._fill_current_aux_labels(slot)
+
+        # The terminal action still belongs to the old episode, so clear its
+        # trainer-only state only after filling this slot. Auto-reset starts are
+        # registered by the collector after add() and before the next action.
+        done_mask = dones.detach().to(device=self.device, dtype=torch.bool)
+        self._active_aux_episode.logical_and_(~done_mask)
+        for labels in self._active_aux_labels.values():
+            trailing_dims = labels.ndim - 1
+            labels.masked_fill_(
+                done_mask.reshape(
+                    self.num_envs,
+                    *((1,) * trailing_dims),
+                ),
+                0,
+            )
 
         self.step += 1
 
-    def _fill_aligned_aux_labels(
-        self,
-        *,
-        starts: list[int],
-        end: int,
-        env_indices: list[int],
-        label_obs: dict[str, torch.Tensor],
-    ) -> None:
-        lengths = [end - start for start in starts]
-        flat_times_cpu = torch.cat(
-            [torch.arange(start, end, dtype=torch.int64) for start in starts]
-        )
-        env_indices_cpu = torch.tensor(env_indices, dtype=torch.int64)
-        lengths_cpu = torch.tensor(lengths, dtype=torch.int64)
-        flat_envs_cpu = env_indices_cpu.repeat_interleave(lengths_cpu)
-        terminal_rows_cpu = torch.arange(
-            len(env_indices),
-            dtype=torch.int64,
-        ).repeat_interleave(lengths_cpu)
+    def _fill_current_aux_labels(self, slot: int) -> None:
+        current_identity = self._obs[self.AUX_IDENTITY_KEY][slot]
+        label_identity = self._active_aux_labels[self.AUX_IDENTITY_KEY]
+        current_present = ~self._obs["opp_mask"][slot]
+        label_present = ~self._active_aux_labels["opp_mask"]
 
-        flat_times = flat_times_cpu.to(device=self.device)
-        flat_envs = flat_envs_cpu.to(device=self.device)
-        terminal_rows = terminal_rows_cpu.to(device=self.device)
-        done_envs = env_indices_cpu.to(device=self.device)
-
-        current_identity = self._obs[self.AUX_IDENTITY_KEY][flat_times, flat_envs]
-        terminal_identity = (
-            label_obs[self.AUX_IDENTITY_KEY]
-            .index_select(
-                0,
-                done_envs,
-            )
-            .index_select(0, terminal_rows)
-        )
-        current_present = ~self._obs["opp_mask"][flat_times, flat_envs]
-        terminal_present = ~label_obs["opp_mask"].index_select(
-            0,
-            done_envs,
-        ).index_select(0, terminal_rows)
-
-        matches = current_identity.unsqueeze(-1).eq(terminal_identity.unsqueeze(-2))
+        matches = current_identity.unsqueeze(-1).eq(label_identity.unsqueeze(-2))
         matches &= current_present.unsqueeze(-1)
-        matches &= terminal_present.unsqueeze(-2)
+        matches &= label_present.unsqueeze(-2)
         matches &= current_identity.unsqueeze(-1).ge(0)
-        unique_match = matches.sum(dim=-1).eq(1)
-        terminal_indices = matches.to(torch.int64).argmax(dim=-1)
-        pair_indices = torch.arange(
-            terminal_indices.shape[0],
+        unique_match = matches.sum(dim=-1).eq(1) & self._active_aux_episode.unsqueeze(
+            -1
+        )
+        label_indices = matches.to(torch.int64).argmax(dim=-1)
+        env_indices = torch.arange(
+            self.num_envs,
             device=self.device,
         ).unsqueeze(-1)
 
         for key in self.AUX_LABEL_KEYS:
-            terminal_value = (
-                label_obs[key]
-                .index_select(
-                    0,
-                    done_envs,
-                )
-                .index_select(0, terminal_rows)
-            )
-            aligned_value = terminal_value[pair_indices, terminal_indices]
+            aligned_value = self._active_aux_labels[key][env_indices, label_indices]
             trailing_dims = aligned_value.ndim - unique_match.ndim
             valid_value = unique_match.reshape(
                 *unique_match.shape,
                 *((1,) * trailing_dims),
             ).expand_as(aligned_value)
-            self._aux_labels[key][flat_times, flat_envs] = aligned_value.masked_fill(
-                ~valid_value,
-                0,
+            self._aux_labels[key][slot].copy_(
+                aligned_value.masked_fill(
+                    ~valid_value,
+                    0,
+                )
             )
-        self._aux_label_valid[flat_times, flat_envs] = unique_match
+        self._aux_label_valid[slot].copy_(unique_match)
 
     def compute_gae(
         self,
         last_value: torch.Tensor,
-        gamma: float = 0.99,
+        gamma: float = 1.0,
         gae_lambda: float = 0.95,
     ) -> RolloutBatch:
         """Compute GAE advantages and returns for the collected rollout."""
@@ -529,6 +621,10 @@ class RolloutBuffer:
             self._advantages[t].copy_(last_gae)
 
         self._returns.copy_(self._advantages + self._values)
+        team_preview = self._build_team_preview_batch(
+            last_value=last_value,
+            gamma=gamma,
+        )
 
         return RolloutBatch(
             obs=self._obs,
@@ -588,11 +684,103 @@ class RolloutBuffer:
             public_consequence_cant_masks=self._public_consequence_cant_masks,
             public_consequence_field_targets=self._public_consequence_field_targets,
             public_consequence_field_masks=self._public_consequence_field_masks,
+            team_preview=team_preview,
             num_steps=self.num_steps,
             num_envs=self.num_envs,
             initial_hidden_h=self._initial_hidden_h,
             initial_hidden_c=self._initial_hidden_c,
             tera_exploration_prob=self._tera_exploration_prob,
+        )
+
+    def _build_team_preview_batch(
+        self,
+        *,
+        last_value: torch.Tensor,
+        gamma: float,
+    ) -> TeamPreviewRolloutBatch | None:
+        if not self._team_preview_starts:
+            return None
+
+        records = [record for _, _, record in self._team_preview_starts]
+        env_indices = torch.tensor(
+            [env_index for env_index, _, _ in self._team_preview_starts],
+            dtype=torch.long,
+            device=self.device,
+        )
+        first_battle_steps = torch.tensor(
+            [first_step for _, first_step, _ in self._team_preview_starts],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Return from every battle state to its own episode's first terminal or
+        # the rollout boundary. This is a direct lambda=1 truncated n-step
+        # target and therefore does not inherit battle GAE's lambda.
+        continuation_returns = torch.empty(
+            (self.num_steps + 1, self.num_envs),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        terminal = torch.empty(
+            (self.num_steps + 1, self.num_envs),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        horizons = torch.empty(
+            (self.num_steps + 1, self.num_envs),
+            dtype=torch.long,
+            device=self.device,
+        )
+        continuation_returns[-1].copy_(last_value)
+        terminal[-1].fill_(False)
+        horizons[-1].zero_()
+        for step in reversed(range(self.num_steps)):
+            non_terminal = ~self._dones[step]
+            continuation_returns[step].copy_(
+                self._rewards[step]
+                + gamma
+                * non_terminal.to(torch.float32)
+                * continuation_returns[step + 1]
+            )
+            terminal[step].copy_(
+                self._dones[step] | (non_terminal & terminal[step + 1])
+            )
+            horizons[step].copy_(1 + non_terminal.to(torch.long) * horizons[step + 1])
+
+        # Preview itself is a zero-reward transition into the first battle
+        # state, so it contributes one additional factor of gamma. Production
+        # uses gamma=1, while retaining the factor keeps discounted ablations
+        # correctly indexed.
+        returns = gamma * continuation_returns[first_battle_steps, env_indices]
+        values = torch.tensor(
+            [record.value for record in records],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        return TeamPreviewRolloutBatch(
+            obs={
+                key: torch.from_numpy(
+                    np.stack([record.obs[key] for record in records])
+                ).to(self.device)
+                for key in records[0].obs
+            },
+            picks=torch.from_numpy(np.stack([record.picks for record in records])).to(
+                device=self.device, dtype=torch.long
+            ),
+            log_probs=torch.tensor(
+                [record.log_prob for record in records],
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            values=values,
+            opponent_picks=torch.from_numpy(
+                np.stack([record.opponent_picks for record in records])
+            ).to(device=self.device, dtype=torch.long),
+            advantages=returns - values,
+            returns=returns,
+            terminal=terminal[first_battle_steps, env_indices],
+            horizons=horizons[first_battle_steps, env_indices],
         )
 
     def set_tera_behavior_policy(
@@ -642,8 +830,8 @@ class RolloutBuffer:
         self._public_consequence_cant_masks.fill_(False)
         self._public_consequence_field_targets.zero_()
         self._public_consequence_field_masks.fill_(False)
-        # New rollout starts a fresh episode-start tracker for every env.
-        self._episode_start = [0] * self.num_envs
+        self._team_preview_starts.clear()
+        self._team_preview_start_keys.clear()
 
         if initial_hidden is None:
             return

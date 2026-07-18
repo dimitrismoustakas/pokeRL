@@ -1056,7 +1056,7 @@ def test_league_player_submits_previews_to_preview_service(
     assert preview_service.calls[0] == ("checkpoint.pt", obs, None)
 
 
-def test_team_preview_batcher_requests_pick_only_inference() -> None:
+def test_team_preview_batcher_returns_action_time_behavior_snapshot() -> None:
     class _FakeAgent:
         def __init__(self) -> None:
             self.kwargs = None
@@ -1064,7 +1064,11 @@ def test_team_preview_batcher_requests_pick_only_inference() -> None:
         def team_preview(self, obs_batch, **kwargs):
             self.kwargs = kwargs
             batch_size = next(iter(obs_batch.values())).shape[0]
-            return {"picks": torch.zeros((batch_size, 4), dtype=torch.long)}
+            return {
+                "picks": torch.zeros((batch_size, 4), dtype=torch.long),
+                "log_prob": torch.full((batch_size,), -2.0),
+                "preview_value": torch.full((batch_size,), 0.25),
+            }
 
     agent = _FakeAgent()
     batcher = TeamPreviewBatcher(agent, torch.device("cpu"))
@@ -1075,8 +1079,10 @@ def test_team_preview_batcher_requests_pick_only_inference() -> None:
 
     np.testing.assert_array_equal(result.picks, np.zeros(4, dtype=np.int64))
     assert result.policy_version == 0
+    assert result.log_prob == -2.0
+    assert result.value == 0.25
     assert agent.kwargs == {
-        "include_value": False,
+        "include_value": True,
         "include_policy_stats": False,
         "include_opponent_preview": False,
     }
@@ -1089,7 +1095,11 @@ def test_team_preview_batcher_rejects_training_mode_without_dying() -> None:
         def team_preview(self, obs_batch, **kwargs):
             del kwargs
             batch_size = next(iter(obs_batch.values())).shape[0]
-            return {"picks": torch.zeros((batch_size, 4), dtype=torch.long)}
+            return {
+                "picks": torch.zeros((batch_size, 4), dtype=torch.long),
+                "log_prob": torch.zeros(batch_size),
+                "preview_value": torch.zeros(batch_size),
+            }
 
     agent = _FakeAgent()
     batcher = TeamPreviewBatcher(agent, torch.device("cpu"))
@@ -1113,7 +1123,11 @@ def test_team_preview_batcher_ignores_cancelled_request(monkeypatch) -> None:
         def team_preview(self, obs_batch, **kwargs):
             del kwargs
             batch_size = next(iter(obs_batch.values())).shape[0]
-            return {"picks": torch.zeros((batch_size, 4), dtype=torch.long)}
+            return {
+                "picks": torch.zeros((batch_size, 4), dtype=torch.long),
+                "log_prob": torch.zeros(batch_size),
+                "preview_value": torch.zeros(batch_size),
+            }
 
     monkeypatch.setattr(TeamPreviewBatcher, "_COALESCE_WINDOW_SEC", 0.05)
     batcher = TeamPreviewBatcher(_FakeAgent(), torch.device("cpu"))
@@ -1137,7 +1151,11 @@ def test_team_preview_batcher_tags_results_across_policy_versions() -> None:
         def team_preview(self, obs_batch, **kwargs):
             del kwargs
             batch_size = next(iter(obs_batch.values())).shape[0]
-            return {"picks": torch.zeros((batch_size, 4), dtype=torch.long)}
+            return {
+                "picks": torch.zeros((batch_size, 4), dtype=torch.long),
+                "log_prob": torch.zeros(batch_size),
+                "preview_value": torch.zeros(batch_size),
+            }
 
     batcher = TeamPreviewBatcher(
         _FakeAgent(),
@@ -1165,7 +1183,11 @@ def test_team_preview_batcher_refuses_version_advance_with_pending_work(
         def team_preview(self, obs_batch, **kwargs):
             del kwargs
             batch_size = next(iter(obs_batch.values())).shape[0]
-            return {"picks": torch.zeros((batch_size, 4), dtype=torch.long)}
+            return {
+                "picks": torch.zeros((batch_size, 4), dtype=torch.long),
+                "log_prob": torch.zeros(batch_size),
+                "preview_value": torch.zeros(batch_size),
+            }
 
     monkeypatch.setattr(TeamPreviewBatcher, "_COALESCE_WINDOW_SEC", 0.05)
     batcher = TeamPreviewBatcher(_FakeAgent(), torch.device("cpu"))

@@ -2561,6 +2561,7 @@ class TeamPreviewHead(nn.Module):
         bring_log_probs_all: torch.Tensor | None = None
         lead_log_probs_all: torch.Tensor | None = None
         joint_log_probs: torch.Tensor | None = None
+        sampled_log_prob: torch.Tensor | None = None
 
         if picks is not None:
             action_indices = self._external_action_indices(picks, valid_subsets)
@@ -2589,6 +2590,11 @@ class TeamPreviewHead(nn.Module):
             )
             lead_indices = _sample_categorical_logits(selected_lead_logits)
             action_indices = bring_indices * lead_count + lead_indices
+            sampled_log_prob = torch.log_softmax(bring_logits, dim=1).gather(
+                1, bring_indices.unsqueeze(1)
+            ).squeeze(1) + torch.log_softmax(selected_lead_logits, dim=1).gather(
+                1, lead_indices.unsqueeze(1)
+            ).squeeze(1)
         else:
             # Exact statistics and deterministic argmax selection need every
             # conditional lead distribution in the small joint action space.
@@ -2632,6 +2638,8 @@ class TeamPreviewHead(nn.Module):
             "picks": final_picks,
         }
         if not include_policy_stats:
+            if sampled_log_prob is not None:
+                result["log_prob"] = sampled_log_prob
             return result
 
         # ``picks`` may have taken the external-action branch, in which case the

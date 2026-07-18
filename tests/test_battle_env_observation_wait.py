@@ -122,7 +122,13 @@ def test_step_waits_for_terminal_battle_task_before_returning_done() -> None:
     env = _make_step_env(queue, task)
     preview_obs = {"context": np.asarray([1], dtype=np.int64)}
     preview_picks = np.asarray([0, 1, 2, 3], dtype=np.int64)
-    env._episode_team_preview = (preview_obs, preview_picks, 14)
+    env._episode_team_preview = (
+        preview_obs,
+        showdown_env_module.TeamPreviewResult(
+            picks=preview_picks,
+            policy_version=14,
+        ),
+    )
 
     _obs, _mask, reward, done, info = env.step(np.asarray([0, 0, 0], dtype=np.int64))
 
@@ -131,7 +137,7 @@ def test_step_waits_for_terminal_battle_task_before_returning_done() -> None:
     assert info["battle_tag"] == "battle-test"
     assert info["team_preview_obs"] is preview_obs
     np.testing.assert_array_equal(info["team_preview_picks"], preview_picks)
-    assert info["team_preview_policy_version"] == 14
+    assert "team_preview_policy_version" not in info
 
 
 def test_step_records_the_first_tera_decision_turn() -> None:

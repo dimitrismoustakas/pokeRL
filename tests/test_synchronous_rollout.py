@@ -21,6 +21,7 @@ from pokerl.public_consequence import (
     NONMOVE_REASON_CANT,
 )
 from pokerl.training.rollout import RolloutBuffer
+from pokerl.training.preview import TeamPreviewEpisodeStart
 from poke_env.battle import PublicBattleEventKind
 
 
@@ -70,6 +71,26 @@ def _batched_masks(num_envs: int) -> dict[str, np.ndarray]:
     return {"legal": np.ones((num_envs, 2), dtype=np.bool_)}
 
 
+def _preview_start(
+    env_index: int,
+    state: int,
+    *,
+    aux_value: int,
+) -> tuple[int, TeamPreviewEpisodeStart]:
+    return (
+        env_index,
+        TeamPreviewEpisodeStart(
+            obs=_single_obs(state, aux_value=state),
+            picks=np.asarray([0], dtype=np.int64),
+            log_prob=0.0,
+            value=0.0,
+            policy_version=0,
+            opponent_picks=np.asarray([0], dtype=np.int64),
+            opponent_aux_labels=_single_obs(state, aux_value=aux_value),
+        ),
+    )
+
+
 class _DeterministicAgent:
     def __init__(self) -> None:
         self.hidden_inputs: dict[tuple[int, ...], list[float] | None] = {}
@@ -114,6 +135,17 @@ class _ScriptedParallelEnv:
     def __init__(self) -> None:
         self.states = [0, 10, 20, 30]
         self.steps = [0] * self.num_envs
+        self.preview_starts = [
+            _preview_start(0, 0, aux_value=990),
+            _preview_start(1, 10, aux_value=910),
+            _preview_start(2, 20, aux_value=920),
+            _preview_start(3, 30, aux_value=933),
+        ]
+
+    def drain_team_preview_starts(self):
+        starts = self.preview_starts
+        self.preview_starts = []
+        return starts
 
     def step(self, actions):
         np.testing.assert_array_equal(
@@ -137,13 +169,15 @@ class _ScriptedParallelEnv:
                     current_state + 1,
                     aux_value=label,
                 )
-                if env_index == 0:
-                    info["opponent_aux_labels"] = _single_obs(
-                        current_state + 1,
-                        aux_value=990,
-                    )
                 info["episode_reward"] = float(label)
                 next_state = reset_state
+                self.preview_starts.append(
+                    _preview_start(
+                        env_index,
+                        reset_state,
+                        aux_value=reset_state + 1000,
+                    )
+                )
             else:
                 next_state = current_state + 1
 
@@ -194,6 +228,7 @@ def test_collect_synchronous_rollout_prefers_private_exact_labels_and_preserves_
             hidden=hidden,
             device=torch.device("cpu"),
             num_steps=2,
+            preview_policy_version=0,
             tera_exploration_prob=0.2,
             collect_timing=True,
         )
@@ -213,8 +248,9 @@ def test_collect_synchronous_rollout_prefers_private_exact_labels_and_preserves_
         [True, False, False, False],
         [False, False, False, True],
     ]
-    assert batch.aux_label_valid[:, 0].any(dim=-1).tolist() == [True, False]
+    assert batch.aux_label_valid[:, 0].any(dim=-1).tolist() == [True, True]
     assert batch.aux_labels["opp_item"][0, 0, 0].item() == 990
+    assert batch.aux_labels["opp_item"][1, 0, 0].item() == 1100
     assert batch.aux_label_valid[:, 3].any(dim=-1).tolist() == [True, True]
     assert batch.aux_labels["opp_item"][:, 3, 0].tolist() == [933, 933]
     assert batch.tera_exploration_prob == pytest.approx(0.2)
@@ -227,14 +263,17 @@ def test_collect_synchronous_rollout_prefers_private_exact_labels_and_preserves_
     assert final_obs["state"].reshape(-1).tolist() == [101.0, 12.0, 22.0, 300.0]
     assert len(infos) == 8
     assert all("final_observation" not in info for info in infos)
-    assert all("opponent_aux_labels" not in info for info in infos)
-    assert profile["exact_aux_label_episodes"] == 1.0
+    assert profile["team_preview_episode_starts"] == 6.0
     assert profile["env_step_sec"] >= 0.0
     assert guard_entries == 2
 
 
 class _MissingFinalObservationEnv:
     num_envs = 1
+
+    @staticmethod
+    def drain_team_preview_starts():
+        return []
 
     def step(self, actions):
         del actions
@@ -263,6 +302,7 @@ def test_collect_synchronous_rollout_requires_terminal_final_observation() -> No
             hidden=None,
             device=torch.device("cpu"),
             num_steps=1,
+            preview_policy_version=0,
             tera_exploration_prob=0.0,
             collect_timing=False,
         )
@@ -318,6 +358,10 @@ class _ConsequenceAlignmentEnv:
     def __init__(self) -> None:
         self.step_index = 0
 
+    @staticmethod
+    def drain_team_preview_starts():
+        return []
+
     def step(self, actions):
         del actions
         if self.step_index == 0:
@@ -365,6 +409,7 @@ def test_public_consequences_align_next_and_terminal_observations_through_last_s
         hidden=None,
         device=torch.device("cpu"),
         num_steps=2,
+        preview_policy_version=0,
         tera_exploration_prob=0.0,
         collect_timing=False,
     )
@@ -394,6 +439,10 @@ def test_public_consequences_align_next_and_terminal_observations_through_last_s
 class _FailingParallelEnv:
     num_envs = 1
 
+    @staticmethod
+    def drain_team_preview_starts():
+        return []
+
     def step(self, actions):
         del actions
         raise RuntimeError("environment step failed")
@@ -415,6 +464,7 @@ def test_collect_synchronous_rollout_propagates_step_failure() -> None:
             hidden=None,
             device=torch.device("cpu"),
             num_steps=1,
+            preview_policy_version=0,
             tera_exploration_prob=0.0,
             collect_timing=False,
         )

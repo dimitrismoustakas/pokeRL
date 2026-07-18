@@ -57,7 +57,7 @@ from .rollout import RolloutBatch
 
 
 # Increment when trainer-checkpoint semantics or same-shaped model inputs change.
-TRAINER_CHECKPOINT_FORMAT_VERSION = 7
+TRAINER_CHECKPOINT_FORMAT_VERSION = 8
 
 
 _PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
@@ -194,11 +194,14 @@ class PPOTrainer:
         return True
 
     def update(self, batch: RolloutBatch) -> dict[str, float]:
-        """Run PPO update epochs on a rollout batch.
+        """Run joint battle-and-preview PPO epochs on one rollout batch.
 
         Minibatches are slices of environments, not random timesteps, so that
         the LSTM can be unrolled through the full rollout sequence with correct
         gradient flow across episode boundaries (hidden state is zeroed on done).
+        Preview decisions are shuffled independently and evenly paired with
+        those recurrent minibatches. Each pair produces one summed loss, one
+        backward pass, one gradient clip, and one optimizer step.
 
         Returns a dict of loss metrics for logging.
         """
@@ -221,9 +224,75 @@ class PPOTrainer:
                 "Collect rollouts on the trainer device."
             )
 
-        # Normalize advantages over the full batch once, before the update loop.
-        adv = batch.advantages
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        preview = batch.team_preview
+        preview_count = 0 if preview is None else int(preview.picks.shape[0])
+        if preview is not None:
+            if preview.picks.device != batch_device:
+                raise ValueError(
+                    f"Team-preview rollout is on {preview.picks.device}, "
+                    f"but the battle rollout is on {batch_device}."
+                )
+
+        preview_behavior_joint_log_probs = None
+        initial_preview_policy_shift: dict[str, torch.Tensor] = {}
+        if preview_count:
+            # Live resets only score the sampled action. At the unchanged
+            # behavior parameters, evaluate the collected preview observations
+            # together once so exact KL remains available without putting the
+            # full 180-action calculation on the rollout critical path.
+            was_training = self.agent.training
+            self.agent.eval()
+            try:
+                with torch.no_grad():
+                    preview_behavior = self.agent.team_preview(
+                        preview.obs,
+                        picks=preview.picks,
+                        include_value=False,
+                        include_policy_stats=True,
+                        include_opponent_preview=False,
+                    )
+                    preview_behavior_joint_log_probs = preview_behavior[
+                        "joint_log_probs"
+                    ].detach()
+                    snapshot_log_ratio = (
+                        preview_behavior["log_prob"].detach() - preview.log_probs
+                    )
+            finally:
+                self.agent.train(was_training)
+
+            snapshot_bounded_log_ratio = snapshot_log_ratio.clamp(
+                min=-self._LOG_RATIO_CLAMP,
+                max=self._LOG_RATIO_CLAMP,
+            )
+            snapshot_ratio = snapshot_bounded_log_ratio.exp()
+            initial_preview_policy_shift = {
+                "team_preview_pre_ppo_approx_kl": (
+                    (snapshot_ratio - 1.0) - snapshot_bounded_log_ratio
+                ).mean(),
+                "team_preview_pre_ppo_mean_abs_log_ratio": (
+                    snapshot_log_ratio.abs().mean()
+                ),
+                "team_preview_pre_ppo_max_abs_log_ratio": (
+                    snapshot_log_ratio.abs().max()
+                ),
+            }
+
+        # Preview is the first action of the same episodic policy. Normalize
+        # battle and preview advantages together, once, before sample reuse.
+        raw_advantages = [batch.advantages.reshape(-1)]
+        if preview_count:
+            raw_advantages.append(preview.advantages)
+        all_advantages = torch.cat(raw_advantages)
+        if not torch.isfinite(all_advantages).all().item():
+            raise ValueError("PPO advantages must be finite.")
+        advantage_mean = all_advantages.mean()
+        advantage_std = all_advantages.std(unbiased=False)
+        adv = (batch.advantages - advantage_mean) / (advantage_std + 1e-8)
+        preview_advantages = (
+            (preview.advantages - advantage_mean) / (advantage_std + 1e-8)
+            if preview_count
+            else None
+        )
 
         obs_seq = batch.obs
         actions_seq = batch.actions  # (T, E, 3)
@@ -234,6 +303,14 @@ class PPOTrainer:
         values_old_seq = batch.values  # (T, E)
         dones_seq = batch.dones  # (T, E)
         dones_seq_cpu = dones_seq.detach().to(device="cpu")
+        total_decision_count = T * E + preview_count
+        # At fixed parameters, summing the M minibatch gradients then equals M
+        # times the full battle-plus-preview decision mean, even when shards
+        # differ by one sample.
+        decision_minibatch_scale = self.config.num_minibatches / total_decision_count
+        preview_valid_bring_slots = (
+            int((~preview.obs["opp_mask"]).sum().item()) if preview_count else 0
+        )
 
         # Per-env initial hidden states at the start of the rollout.
         if batch.initial_hidden_h is not None:
@@ -262,6 +339,22 @@ class PPOTrainer:
         base_tera_slot_choice_evaluations = torch.zeros((), device=self.device)
         num_updates = 0
         skipped_nonfinite = 0
+        preview_metric_sums = {
+            "policy": torch.zeros((), device=self.device),
+            "value": torch.zeros((), device=self.device),
+            "entropy": torch.zeros((), device=self.device),
+            "bring": torch.zeros((), device=self.device),
+            "lead": torch.zeros((), device=self.device),
+            "approx_kl": torch.zeros((), device=self.device),
+            "exact_kl": torch.zeros((), device=self.device),
+            "clip": torch.zeros((), device=self.device),
+            "value_clip": torch.zeros((), device=self.device),
+        }
+        preview_metric_samples = 0
+        preview_metric_bring_slots = 0
+        preview_optimizer_steps = 0
+        preview_max_approx_kl = torch.zeros((), device=self.device)
+        preview_max_exact_kl = torch.zeros((), device=self.device)
         memory_gradient_diagnostics: dict[str, float] = {}
         aux_diagnostic_sums: dict[str, float] = {}
         initial_policy_shift: dict[str, torch.Tensor] = {}
@@ -340,14 +433,25 @@ class PPOTrainer:
 
         for epoch in range(self.config.num_epochs):
             env_order_cpu = torch.randperm(E, device="cpu")
-
-            for mb_envs_cpu in torch.tensor_split(
+            env_minibatches = torch.tensor_split(
                 env_order_cpu,
                 self.config.num_minibatches,
+            )
+            preview_order_cpu = torch.randperm(preview_count, device="cpu")
+            preview_minibatches = torch.tensor_split(
+                preview_order_cpu,
+                self.config.num_minibatches,
+            )
+
+            for mb_envs_cpu, preview_indices_cpu in zip(
+                env_minibatches,
+                preview_minibatches,
+                strict=True,
             ):
                 if mb_envs_cpu.numel() == 0:
                     continue
                 mb_envs = mb_envs_cpu.to(device=self.device)
+                preview_indices = preview_indices_cpu.to(device=self.device)
                 E_mb = mb_envs.numel()
 
                 mb_obs_seq = {k: v[:, mb_envs] for k, v in obs_seq.items()}
@@ -580,7 +684,8 @@ class PPOTrainer:
                     )
                     * mb_adv
                 )
-                policy_loss = -torch.min(surr1, surr2).mean()
+                policy_loss_elements = -torch.min(surr1, surr2)
+                policy_loss = policy_loss_elements.mean()
 
                 # Value loss with clipping (prevents large value updates).
                 values_clipped = mb_values_old + torch.clamp(
@@ -588,13 +693,11 @@ class PPOTrainer:
                     -self.config.clip_eps,
                     self.config.clip_eps,
                 )
-                value_loss = (
-                    0.5
-                    * torch.max(
-                        (values_flat - mb_returns).pow(2),
-                        (values_clipped - mb_returns).pow(2),
-                    ).mean()
+                value_loss_elements = 0.5 * torch.max(
+                    (values_flat - mb_returns).pow(2),
+                    (values_clipped - mb_returns).pow(2),
                 )
+                value_loss = value_loss_elements.mean()
 
                 # Battle actions, the use-now gate, and the conditional slot
                 # choice have independent entropy coefficients. Conditional
@@ -626,14 +729,178 @@ class PPOTrainer:
                     / base_tera_slot_support
                 )
 
+                battle_decision_loss_sum = (
+                    policy_loss_elements.sum()
+                    + self.config.value_coef * value_loss_elements.sum()
+                    - self.config.entropy_coef * action_entropies_flat.sum()
+                )
                 loss = (
-                    policy_loss
-                    + self.config.value_coef * value_loss
-                    + self.config.entropy_coef * action_entropy_loss
-                    + self.config.tera_gate_entropy_coef * tera_gate_entropy_loss
-                    + self.config.tera_slot_entropy_coef * tera_slot_entropy_loss
+                    decision_minibatch_scale * battle_decision_loss_sum
+                    + decision_minibatch_scale
+                    * (T * E_mb)
+                    * (
+                        self.config.tera_gate_entropy_coef * tera_gate_entropy_loss
+                        + self.config.tera_slot_entropy_coef * tera_slot_entropy_loss
+                    )
                 )
 
+                preview_policy_loss = None
+                preview_value_loss = None
+                preview_entropy_mean = None
+                preview_bring_loss = None
+                preview_lead_loss = None
+                preview_log_ratio = None
+                preview_ratio = None
+                preview_value_delta = None
+                preview_exact_kl = None
+                preview_valid_slots = None
+                preview_policy_objective = None
+                preview_value_objective = None
+                preview_aux_objective = None
+                if preview_indices.numel() > 0:
+                    preview_obs = {
+                        key: value.index_select(0, preview_indices)
+                        for key, value in preview.obs.items()
+                    }
+                    preview_picks = preview.picks.index_select(0, preview_indices)
+                    preview_out = self.agent.team_preview(
+                        preview_obs,
+                        picks=preview_picks,
+                    )
+                    preview_log_prob = preview_out["log_prob"]
+                    preview_entropy = preview_out["entropy"]
+                    preview_current_value = preview_out["preview_value"]
+                    preview_old_log_prob = preview.log_probs.index_select(
+                        0,
+                        preview_indices,
+                    )
+                    preview_old_value = preview.values.index_select(
+                        0,
+                        preview_indices,
+                    )
+                    preview_returns = preview.returns.index_select(
+                        0,
+                        preview_indices,
+                    )
+                    preview_advantage = preview_advantages.index_select(
+                        0,
+                        preview_indices,
+                    )
+
+                    preview_log_ratio = preview_log_prob - preview_old_log_prob
+                    preview_bounded_log_ratio = preview_log_ratio.clamp(
+                        min=-self._LOG_RATIO_CLAMP,
+                        max=self._LOG_RATIO_CLAMP,
+                    )
+                    preview_ratio = preview_bounded_log_ratio.exp()
+                    preview_policy_unclipped = -preview_advantage * preview_ratio
+                    preview_policy_clipped = -preview_advantage * preview_ratio.clamp(
+                        1.0 - self.config.clip_eps,
+                        1.0 + self.config.clip_eps,
+                    )
+                    preview_policy_elements = torch.maximum(
+                        preview_policy_unclipped,
+                        preview_policy_clipped,
+                    )
+                    preview_policy_loss = preview_policy_elements.mean()
+                    preview_entropy_mean = preview_entropy.mean()
+
+                    preview_value_delta = preview_current_value - preview_old_value
+                    preview_clipped_value = preview_old_value + (
+                        preview_value_delta.clamp(
+                            -self.config.clip_eps,
+                            self.config.clip_eps,
+                        )
+                    )
+                    preview_value_loss_elements = 0.5 * torch.maximum(
+                        (preview_current_value - preview_returns).pow(2),
+                        (preview_clipped_value - preview_returns).pow(2),
+                    )
+                    preview_value_loss = preview_value_loss_elements.mean()
+
+                    preview_policy_objective = decision_minibatch_scale * (
+                        preview_policy_elements.sum()
+                        - self.config.entropy_coef * preview_entropy.sum()
+                    )
+                    preview_value_objective = (
+                        decision_minibatch_scale
+                        * self.config.team_preview_value_coef
+                        * preview_value_loss_elements.sum()
+                    )
+                    loss = loss + preview_policy_objective + preview_value_objective
+
+                    opponent_picks = preview.opponent_picks.index_select(
+                        0,
+                        preview_indices,
+                    )
+                    bring_logits = preview_out["opponent_bring_logits"]
+                    lead_pair_logits = preview_out["opponent_lead_pair_logits"]
+                    team_size = bring_logits.shape[1]
+                    bring_targets = torch.zeros_like(bring_logits)
+                    bring_targets.scatter_(1, opponent_picks, 1.0)
+                    preview_valid_slots = (~preview_obs["opp_mask"]).to(
+                        bring_logits.dtype
+                    )
+                    bring_loss_sum = (
+                        F.binary_cross_entropy_with_logits(
+                            bring_logits,
+                            bring_targets,
+                            reduction="none",
+                        )
+                        * preview_valid_slots
+                    ).sum()
+                    preview_bring_loss = bring_loss_sum / preview_valid_slots.sum()
+                    lead_targets = (
+                        opponent_picks[:, 0] * team_size + opponent_picks[:, 1]
+                    )
+                    lead_loss_sum = F.cross_entropy(
+                        lead_pair_logits,
+                        lead_targets,
+                        reduction="sum",
+                    )
+                    preview_lead_loss = lead_loss_sum / preview_indices.numel()
+                    # These are explicitly weighted auxiliary tasks rather than
+                    # policy decisions. Scale their sums against their own
+                    # complete-rollout support so uneven shards stay unbiased.
+                    preview_aux_objective = (
+                        self.config.team_preview_bring_coef
+                        * self.config.num_minibatches
+                        / preview_valid_bring_slots
+                        * bring_loss_sum
+                        + self.config.team_preview_lead_coef
+                        * self.config.num_minibatches
+                        / preview_count
+                        * lead_loss_sum
+                    )
+                    loss = loss + preview_aux_objective
+
+                    old_joint_log_probs = preview_behavior_joint_log_probs.index_select(
+                        0,
+                        preview_indices,
+                    )
+                    current_joint_log_probs = preview_out["joint_log_probs"].detach()
+                    old_joint_probs = old_joint_log_probs.exp()
+                    old_support = old_joint_probs > 0
+                    if (
+                        not torch.isfinite(current_joint_log_probs[old_support])
+                        .all()
+                        .item()
+                    ):
+                        raise RuntimeError(
+                            "Team-preview policy assigned zero probability to an "
+                            "action in the behavior-policy support."
+                        )
+                    finite_old_joint = old_joint_log_probs.masked_fill(
+                        ~old_support,
+                        0.0,
+                    )
+                    finite_current_joint = current_joint_log_probs.masked_fill(
+                        ~old_support,
+                        0.0,
+                    )
+                    preview_exact_kl = (
+                        old_joint_probs * (finite_old_joint - finite_current_joint)
+                    ).sum(dim=1)
                 # --- Aux losses ---
                 # Hidden info: predict exact selected-team item/ability/
                 # tera-type/move-set from spatial reps plus recurrent belief
@@ -818,15 +1085,29 @@ class PPOTrainer:
                     support = dict(zip(support_names, support_values, strict=True))
                     objectives = {
                         "actor": (
-                            policy_loss
-                            + self.config.entropy_coef * action_entropy_loss
-                            + self.config.tera_gate_entropy_coef
-                            * tera_gate_entropy_loss
-                            + self.config.tera_slot_entropy_coef
-                            * tera_slot_entropy_loss
+                            decision_minibatch_scale
+                            * (
+                                policy_loss_elements.sum()
+                                - self.config.entropy_coef * action_entropies_flat.sum()
+                                + (T * E_mb)
+                                * (
+                                    self.config.tera_gate_entropy_coef
+                                    * tera_gate_entropy_loss
+                                    + self.config.tera_slot_entropy_coef
+                                    * tera_slot_entropy_loss
+                                )
+                            )
                         ),
-                        "value": self.config.value_coef * value_loss,
+                        "value": (
+                            decision_minibatch_scale
+                            * self.config.value_coef
+                            * value_loss_elements.sum()
+                        ),
                     }
+                    if preview_policy_objective is not None:
+                        objectives["preview_actor"] = preview_policy_objective
+                        objectives["preview_value"] = preview_value_objective
+                        objectives["preview_aux"] = preview_aux_objective
                     if hidden_info_loss is not None:
                         objectives["hidden_info"] = (
                             self.config.aux_hidden_info_coef * hidden_info_loss
@@ -922,6 +1203,57 @@ class PPOTrainer:
                         .to(torch.float32)
                         .mean()
                     )
+                    if preview_policy_loss is not None:
+                        preview_batch_size = int(preview_indices.numel())
+                        preview_approx_kl = (
+                            preview_ratio - 1.0
+                        ) - preview_log_ratio.clamp(
+                            min=-self._LOG_RATIO_CLAMP,
+                            max=self._LOG_RATIO_CLAMP,
+                        )
+                        preview_metric_samples += preview_batch_size
+                        preview_slot_count = int(preview_valid_slots.sum().item())
+                        preview_metric_bring_slots += preview_slot_count
+                        preview_metric_sums["policy"].add_(
+                            preview_policy_loss.detach() * preview_batch_size
+                        )
+                        preview_metric_sums["value"].add_(
+                            preview_value_loss.detach() * preview_batch_size
+                        )
+                        preview_metric_sums["entropy"].add_(
+                            preview_entropy_mean.detach() * preview_batch_size
+                        )
+                        preview_metric_sums["bring"].add_(
+                            preview_bring_loss.detach() * preview_slot_count
+                        )
+                        preview_metric_sums["lead"].add_(
+                            preview_lead_loss.detach() * preview_batch_size
+                        )
+                        preview_metric_sums["approx_kl"].add_(
+                            preview_approx_kl.sum().detach()
+                        )
+                        preview_metric_sums["exact_kl"].add_(
+                            preview_exact_kl.sum().detach()
+                        )
+                        preview_metric_sums["clip"].add_(
+                            ((preview_ratio - 1.0).abs() > self.config.clip_eps)
+                            .to(torch.float32)
+                            .sum()
+                        )
+                        preview_metric_sums["value_clip"].add_(
+                            (preview_value_delta.abs() > self.config.clip_eps)
+                            .to(torch.float32)
+                            .sum()
+                        )
+                        preview_max_approx_kl = torch.maximum(
+                            preview_max_approx_kl,
+                            preview_approx_kl.max(),
+                        )
+                        preview_max_exact_kl = torch.maximum(
+                            preview_max_exact_kl,
+                            preview_exact_kl.max(),
+                        )
+                        preview_optimizer_steps += 1
                     if hidden_info_enabled:
                         metric_sums["aux_hidden_info_loss"].add_(
                             hidden_info_loss.detach()
@@ -947,6 +1279,9 @@ class PPOTrainer:
         }
         averaged.update(
             {key: value.item() for key, value in initial_policy_shift.items()}
+        )
+        averaged.update(
+            {key: value.item() for key, value in initial_preview_policy_shift.items()}
         )
         averaged["max_approx_kl"] = max_approx_kl.item()
         returns_variance = returns_seq.var(unbiased=False)
@@ -1002,6 +1337,78 @@ class PPOTrainer:
             .norm()
             .item()
         )
+        averaged["team_preview_samples"] = float(preview_count)
+        averaged["team_preview_terminal_samples"] = (
+            float(preview.terminal.sum().item()) if preview_count else 0.0
+        )
+        averaged["team_preview_boundary_samples"] = (
+            float((~preview.terminal).sum().item()) if preview_count else 0.0
+        )
+        averaged["team_preview_mean_horizon"] = (
+            float(preview.horizons.to(torch.float32).mean().item())
+            if preview_count
+            else 0.0
+        )
+        averaged["ppo_optimizer_steps"] = float(num_updates)
+        averaged["team_preview_joint_optimizer_steps"] = float(preview_optimizer_steps)
+        if preview_metric_samples > 0:
+            preview_denominator = float(preview_metric_samples)
+            preview_bring_denominator = float(max(preview_metric_bring_slots, 1))
+            preview_policy_metric = (
+                preview_metric_sums["policy"] / preview_denominator
+            ).item()
+            preview_value_metric = (
+                preview_metric_sums["value"] / preview_denominator
+            ).item()
+            preview_entropy_metric = (
+                preview_metric_sums["entropy"] / preview_denominator
+            ).item()
+            preview_bring_metric = (
+                preview_metric_sums["bring"] / preview_bring_denominator
+            ).item()
+            preview_lead_metric = (
+                preview_metric_sums["lead"] / preview_denominator
+            ).item()
+            averaged.update(
+                {
+                    "team_preview_policy_loss": preview_policy_metric,
+                    "team_preview_value_loss": preview_value_metric,
+                    "team_preview_entropy": preview_entropy_metric,
+                    "team_preview_bring_loss": preview_bring_metric,
+                    "team_preview_lead_loss": preview_lead_metric,
+                    "team_preview_approx_kl": (
+                        preview_metric_sums["approx_kl"] / preview_denominator
+                    ).item(),
+                    "team_preview_exact_kl": (
+                        preview_metric_sums["exact_kl"] / preview_denominator
+                    ).item(),
+                    "team_preview_max_approx_kl": preview_max_approx_kl.item(),
+                    "team_preview_max_exact_kl": preview_max_exact_kl.item(),
+                    "team_preview_clip_fraction": (
+                        preview_metric_sums["clip"] / preview_denominator
+                    ).item(),
+                    "team_preview_value_clip_fraction": (
+                        preview_metric_sums["value_clip"] / preview_denominator
+                    ).item(),
+                }
+            )
+            averaged["team_preview_loss"] = (
+                preview_policy_metric
+                - self.config.entropy_coef * preview_entropy_metric
+                + self.config.team_preview_value_coef * preview_value_metric
+                + self.config.team_preview_bring_coef * preview_bring_metric
+                + self.config.team_preview_lead_coef * preview_lead_metric
+            )
+            preview_returns_variance = preview.returns.var(unbiased=False)
+            averaged["team_preview_value_explained_variance"] = (
+                (
+                    1.0
+                    - (preview.returns - preview.values).var(unbiased=False)
+                    / preview_returns_variance.clamp_min(1e-8)
+                ).item()
+                if preview_returns_variance.item() > 0.0
+                else 0.0
+            )
         if skipped_nonfinite > 0:
             averaged["skipped_nonfinite_minibatches"] = float(skipped_nonfinite)
         return averaged
@@ -1856,262 +2263,6 @@ class PPOTrainer:
         # or label frequency; the configured coefficient weights the complete
         # auxiliary objective rather than growing with added target fields.
         return torch.stack(component_losses).mean()
-
-    def update_team_preview(
-        self,
-        data: list[tuple[dict, np.ndarray, float, np.ndarray]],
-    ) -> dict[str, float]:
-        """Update preview policy under the same eval semantics used for rollout."""
-        was_training = self.agent.training
-        memory = getattr(self.agent, "memory", None)
-        recurrent = getattr(memory, "lstm", None)
-        recurrent_was_training = (
-            recurrent.training if isinstance(recurrent, nn.LSTM) else None
-        )
-        self.agent.eval()
-        if isinstance(recurrent, nn.LSTM):
-            if recurrent.dropout != 0.0:
-                raise RuntimeError(
-                    "Exact deployment-semantic preview PPO requires a dropout-free "
-                    "LSTM when differentiating through cuDNN."
-                )
-            # cuDNN refuses LSTM backward after an eval-mode forward even when
-            # the module has no train/eval-dependent behavior.  This one-layer
-            # LSTM has zero dropout, so setting only the recurrent primitive's
-            # flag keeps its numerical semantics identical while enabling the
-            # differentiable preview pass.  Every other module remains in eval.
-            recurrent.train(True)
-        try:
-            return self._update_team_preview_eval(data)
-        finally:
-            self.agent.train(was_training)
-            if recurrent_was_training is not None:
-                recurrent.train(recurrent_was_training)
-
-    def _update_team_preview_eval(
-        self,
-        data: list[tuple[dict, np.ndarray, float, np.ndarray]],
-    ) -> dict[str, float]:
-        """Clipped on-policy update for terminal team-preview decisions.
-
-        The policy is unchanged while a rollout is collected, and callers
-        exclude preview decisions produced by an older policy version.  We can
-        therefore reconstruct the exact behavior log-probability and value
-        immediately before the first optimizer step instead of adding more
-        work to the latency-sensitive live preview path.  Those frozen
-        quantities support the same clipped sample reuse used by battle PPO.
-
-        Each entry is ``(obs_dict, picks_np, episode_reward,
-        opponent_picks_np)`` where the reward is the unshaped terminal outcome.
-        """
-        if not data:
-            raise ValueError("Team-preview update requires at least one sample.")
-
-        sample_count = len(data)
-        obs_all = {
-            key: torch.from_numpy(np.stack([sample[0][key] for sample in data])).to(
-                self.device
-            )
-            for key in data[0][0]
-        }
-        picks_all = torch.from_numpy(np.stack([sample[1] for sample in data])).to(
-            device=self.device,
-            dtype=torch.long,
-        )
-        rewards_all = torch.tensor(
-            [sample[2] for sample in data],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        opponent_picks_all = torch.from_numpy(
-            np.stack([sample[3] for sample in data])
-        ).to(device=self.device, dtype=torch.long)
-
-        requested_minibatches = min(self.config.num_minibatches, sample_count)
-        target_minibatch_size = max(
-            1,
-            (sample_count + requested_minibatches - 1) // requested_minibatches,
-        )
-        minibatch_size = min(
-            self.config.preview_update_minibatch_size,
-            target_minibatch_size,
-        )
-
-        # Snapshot the exact behavior policy before any shared parameter is
-        # updated.  Chunking bounds activations and avoids increasing live
-        # simulator/reset latency with behavior metadata collection.
-        old_log_prob_parts: list[torch.Tensor] = []
-        old_value_parts: list[torch.Tensor] = []
-        with torch.no_grad():
-            for start in range(0, sample_count, minibatch_size):
-                stop = min(start + minibatch_size, sample_count)
-                behavior = self.agent.team_preview(
-                    {key: value[start:stop] for key, value in obs_all.items()},
-                    picks=picks_all[start:stop],
-                    include_opponent_preview=False,
-                )
-                old_log_prob_parts.append(behavior["log_prob"].detach())
-                old_value_parts.append(behavior["preview_value"].detach())
-        old_log_prob_all = torch.cat(old_log_prob_parts)
-        old_value_all = torch.cat(old_value_parts)
-        advantages_all = rewards_all - old_value_all
-        if not all(
-            torch.isfinite(value).all().item()
-            for value in (
-                old_log_prob_all,
-                old_value_all,
-                advantages_all,
-            )
-        ):
-            return {"team_preview_skipped_nonfinite": 1.0}
-
-        metric_sums = {
-            "policy": 0.0,
-            "value": 0.0,
-            "entropy": 0.0,
-            "bring": 0.0,
-            "lead": 0.0,
-            "approx_kl": 0.0,
-            "clip": 0.0,
-            "value_clip": 0.0,
-        }
-        metric_samples = 0
-        metric_bring_slots = 0
-        optimizer_steps = 0
-        max_approx_kl = 0.0
-
-        for _epoch in range(self.config.num_epochs):
-            permutation = torch.randperm(sample_count, device=self.device)
-            for start in range(0, sample_count, minibatch_size):
-                indices = permutation[start : start + minibatch_size]
-                obs_batch = {
-                    key: value.index_select(0, indices)
-                    for key, value in obs_all.items()
-                }
-                picks_batch = picks_all.index_select(0, indices)
-                rewards_batch = rewards_all.index_select(0, indices)
-                opponent_picks_batch = opponent_picks_all.index_select(0, indices)
-                old_log_prob = old_log_prob_all.index_select(0, indices)
-                old_value = old_value_all.index_select(0, indices)
-                advantages = advantages_all.index_select(0, indices)
-
-                out = self.agent.team_preview(obs_batch, picks=picks_batch)
-                log_prob = out["log_prob"]
-                entropy = out["entropy"]
-                values = out["preview_value"]
-                bring_logits = out["opponent_bring_logits"]
-                lead_pair_logits = out["opponent_lead_pair_logits"]
-
-                log_ratio = log_prob - old_log_prob
-                bounded_log_ratio = log_ratio.clamp(
-                    min=-self._LOG_RATIO_CLAMP,
-                    max=self._LOG_RATIO_CLAMP,
-                )
-                ratio = bounded_log_ratio.exp()
-                unclipped_policy = -advantages * ratio
-                clipped_policy = -advantages * ratio.clamp(
-                    1.0 - self.config.clip_eps,
-                    1.0 + self.config.clip_eps,
-                )
-                policy_loss = torch.maximum(
-                    unclipped_policy,
-                    clipped_policy,
-                ).mean()
-                entropy_mean = entropy.mean()
-
-                value_delta = values - old_value
-                clipped_values = old_value + value_delta.clamp(
-                    -self.config.clip_eps,
-                    self.config.clip_eps,
-                )
-                value_loss = (
-                    0.5
-                    * torch.maximum(
-                        (values - rewards_batch).pow(2),
-                        (clipped_values - rewards_batch).pow(2),
-                    ).mean()
-                )
-
-                team_size = bring_logits.shape[1]
-                bring_targets = torch.zeros_like(bring_logits)
-                bring_targets.scatter_(1, opponent_picks_batch, 1.0)
-                valid_slots = (~obs_batch["opp_mask"]).to(bring_logits.dtype)
-                valid_bring_slots = int(valid_slots.sum().item())
-                bring_loss = (
-                    F.binary_cross_entropy_with_logits(
-                        bring_logits,
-                        bring_targets,
-                        reduction="none",
-                    )
-                    * valid_slots
-                ).sum() / max(valid_bring_slots, 1)
-
-                lead_targets = (
-                    opponent_picks_batch[:, 0] * team_size + opponent_picks_batch[:, 1]
-                )
-                lead_loss = F.cross_entropy(lead_pair_logits, lead_targets)
-
-                loss = (
-                    policy_loss
-                    - self.config.entropy_coef * entropy_mean
-                    + self.config.team_preview_value_coef * value_loss
-                    + self.config.team_preview_bring_coef * bring_loss
-                    + self.config.team_preview_lead_coef * lead_loss
-                )
-                if not self._apply_update_step(loss):
-                    return {"team_preview_skipped_nonfinite": 1.0}
-
-                with torch.no_grad():
-                    approx_kl = ((ratio - 1.0) - bounded_log_ratio).mean()
-                    clip_fraction = (
-                        ((ratio - 1.0).abs() > self.config.clip_eps).float().mean()
-                    )
-                    value_clip_fraction = (
-                        (value_delta.abs() > self.config.clip_eps).float().mean()
-                    )
-                    batch_size = int(indices.numel())
-                    metric_samples += batch_size
-                    metric_bring_slots += valid_bring_slots
-                    metric_sums["policy"] += policy_loss.item() * batch_size
-                    metric_sums["value"] += value_loss.item() * batch_size
-                    metric_sums["entropy"] += entropy_mean.item() * batch_size
-                    metric_sums["bring"] += bring_loss.item() * valid_bring_slots
-                    metric_sums["lead"] += lead_loss.item() * batch_size
-                    metric_sums["approx_kl"] += approx_kl.item() * batch_size
-                    metric_sums["clip"] += clip_fraction.item() * batch_size
-                    metric_sums["value_clip"] += value_clip_fraction.item() * batch_size
-                    max_approx_kl = max(max_approx_kl, approx_kl.item())
-                    optimizer_steps += 1
-
-        denominator = float(max(metric_samples, 1))
-        policy_loss = torch.tensor(metric_sums["policy"] / denominator)
-        value_loss = torch.tensor(metric_sums["value"] / denominator)
-        entropy_mean = torch.tensor(metric_sums["entropy"] / denominator)
-        bring_loss = torch.tensor(metric_sums["bring"] / max(metric_bring_slots, 1))
-        lead_loss = torch.tensor(metric_sums["lead"] / denominator)
-        loss = (
-            policy_loss
-            - self.config.entropy_coef * entropy_mean
-            + self.config.team_preview_value_coef * value_loss
-            + self.config.team_preview_bring_coef * bring_loss
-            + self.config.team_preview_lead_coef * lead_loss
-        )
-        return {
-            "team_preview_loss": loss.item(),
-            "team_preview_policy_loss": policy_loss.item(),
-            "team_preview_value_loss": value_loss.item(),
-            "team_preview_entropy": entropy_mean.item(),
-            "team_preview_bring_loss": bring_loss.item(),
-            "team_preview_lead_loss": lead_loss.item(),
-            "team_preview_approx_kl": metric_sums["approx_kl"] / denominator,
-            "team_preview_max_approx_kl": max_approx_kl,
-            "team_preview_clip_fraction": metric_sums["clip"] / denominator,
-            "team_preview_value_clip_fraction": (
-                metric_sums["value_clip"] / denominator
-            ),
-            "team_preview_optimizer_steps": float(optimizer_steps),
-            "team_preview_epochs": float(self.config.num_epochs),
-        }
 
     def save(self, path: str, *, training_state_id: str | None = None) -> None:
         target = Path(path)

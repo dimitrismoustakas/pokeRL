@@ -49,7 +49,7 @@ from pokerl.model.agent import PokeAgent
 from pokerl.model.memory import IdentityMemory
 from pokerl.training.league import LeaguePlayer
 from pokerl.training.ppo import PPOTrainer
-from pokerl.training.preview import TeamPreviewResult
+from pokerl.training.preview import TeamPreviewEpisodeStart, TeamPreviewResult
 from pokerl.training.rollout import RolloutBuffer
 from poke_env.battle import Move, Pokemon
 from poke_env.battle.move import SPECIAL_MOVES
@@ -147,6 +147,32 @@ def _aux_obs(num_envs: int, item_idx: int) -> dict[str, np.ndarray]:
         "opp_continuous": np.zeros((num_envs, 6, CONTINUOUS_DIM), dtype=np.float32),
         "opp_mask": np.zeros((num_envs, 6), dtype=bool),
     }
+
+
+def _unbatched_aux(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {
+        key: np.array(value[0], copy=True)
+        for key, value in obs.items()
+        if key in RolloutBuffer.AUX_OBS_KEYS
+    }
+
+
+def _preview_start(
+    *,
+    policy_version: int = 3,
+    value: float = 0.0,
+    marker: int = 0,
+    opponent_aux_labels: dict[str, np.ndarray] | None = None,
+) -> TeamPreviewEpisodeStart:
+    return TeamPreviewEpisodeStart(
+        obs={"preview": np.asarray([marker], dtype=np.int64)},
+        picks=np.asarray([0, 1, 2, 3], dtype=np.int64),
+        log_prob=-0.5,
+        value=value,
+        policy_version=policy_version,
+        opponent_picks=np.asarray([0, 1, 2, 3], dtype=np.int64),
+        opponent_aux_labels=opponent_aux_labels,
+    )
 
 
 def test_rollout_buffer_keeps_sequence_tensors_on_device_and_clones_initial_hidden() -> (
@@ -275,7 +301,7 @@ def test_rollout_buffer_reset_clears_public_consequence_labels() -> None:
     assert not batch.public_consequence_field_masks.any()
 
 
-def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> None:
+def test_rollout_buffer_uses_episode_start_aux_labels_online() -> None:
     device = torch.device("cpu")
     num_steps = 2
     num_envs = 1
@@ -283,6 +309,17 @@ def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> 
         num_steps, num_envs, _aux_obs(num_envs, 1), _mask(num_envs), device
     )
     buffer.reset()
+    buffer.register_team_preview_starts(
+        [
+            (
+                0,
+                _preview_start(
+                    opponent_aux_labels=_unbatched_aux(_aux_obs(num_envs, 9))
+                ),
+            )
+        ],
+        policy_version=3,
+    )
 
     actions_t = torch.zeros((num_envs, 3), dtype=torch.long, device=device)
     masks_t = {
@@ -301,7 +338,6 @@ def test_rollout_buffer_uses_terminal_aux_obs_for_completed_episode_labels() -> 
         values_t,
         rewards_t,
         torch.tensor([True], dtype=torch.bool, device=device),
-        aux_label_obs=_obs_to_tensor(_aux_obs(num_envs, 9), device),
     )
     buffer.add(
         _obs_to_tensor(_aux_obs(num_envs, 3), device),
@@ -330,6 +366,15 @@ def test_rollout_buffer_aligns_terminal_aux_labels_by_source_identity() -> None:
     masks = _obs_to_tensor(_mask(1), device)
     zeros = torch.zeros(1)
 
+    exact = _aux_obs(1, 1)
+    exact["opp_source_index"][0] = [0, 1, 2, -1, -1, -1]
+    exact["opp_item"][0] = [100, 200, 300, 0, 0, 0]
+    exact["opp_mask"][0] = [False, False, False, True, True, True]
+    buffer.register_team_preview_starts(
+        [(0, _preview_start(opponent_aux_labels=_unbatched_aux(exact)))],
+        policy_version=3,
+    )
+
     first = _aux_obs(1, 1)
     first["opp_source_index"][0] = [0, 1, -1, -1, -1, -1]
     first["opp_mask"][0] = [False, False, True, True, True, True]
@@ -346,10 +391,6 @@ def test_rollout_buffer_aligns_terminal_aux_labels_by_source_identity() -> None:
     switched = _aux_obs(1, 1)
     switched["opp_source_index"][0] = [1, 0, 2, -1, -1, -1]
     switched["opp_mask"][0] = [False, False, False, True, True, True]
-    terminal = _aux_obs(1, 1)
-    terminal["opp_source_index"][0] = [1, 0, 2, -1, -1, -1]
-    terminal["opp_item"][0] = [200, 100, 300, 0, 0, 0]
-    terminal["opp_mask"][0] = [False, False, False, True, True, True]
     buffer.add(
         _obs_to_tensor(switched, device),
         actions,
@@ -358,7 +399,6 @@ def test_rollout_buffer_aligns_terminal_aux_labels_by_source_identity() -> None:
         zeros,
         zeros,
         torch.tensor([True]),
-        aux_label_obs=_obs_to_tensor(terminal, device),
     )
 
     batch = buffer.compute_gae(torch.zeros(1))
@@ -383,9 +423,7 @@ def test_rollout_buffer_aligns_terminal_aux_labels_by_source_identity() -> None:
     ]
 
 
-def test_rollout_buffer_batches_aux_alignment_without_overwriting_prior_episode() -> (
-    None
-):
+def test_rollout_buffer_switches_online_aux_labels_at_episode_start() -> None:
     device = torch.device("cpu")
     buffer = RolloutBuffer(3, 2, _aux_obs(2, 1), _mask(2), device)
     buffer.reset()
@@ -393,8 +431,24 @@ def test_rollout_buffer_batches_aux_alignment_without_overwriting_prior_episode(
     masks = _obs_to_tensor(_mask(2), device)
     zeros = torch.zeros(2)
 
-    first_terminal = _aux_obs(2, 0)
-    first_terminal["opp_item"][0].fill(10)
+    first_env = _aux_obs(1, 10)
+    second_env = _aux_obs(1, 30)
+    buffer.register_team_preview_starts(
+        [
+            (
+                0,
+                _preview_start(marker=0, opponent_aux_labels=_unbatched_aux(first_env)),
+            ),
+            (
+                1,
+                _preview_start(
+                    marker=1,
+                    opponent_aux_labels=_unbatched_aux(second_env),
+                ),
+            ),
+        ],
+        policy_version=3,
+    )
     buffer.add(
         _obs_to_tensor(_aux_obs(2, 1), device),
         actions,
@@ -403,8 +457,19 @@ def test_rollout_buffer_batches_aux_alignment_without_overwriting_prior_episode(
         zeros,
         zeros,
         torch.tensor([True, False]),
-        aux_label_obs=_obs_to_tensor(first_terminal, device),
-        done_env_indices=[0],
+    )
+    next_first_env = _aux_obs(1, 20)
+    buffer.register_team_preview_starts(
+        [
+            (
+                0,
+                _preview_start(
+                    marker=2,
+                    opponent_aux_labels=_unbatched_aux(next_first_env),
+                ),
+            )
+        ],
+        policy_version=3,
     )
     buffer.add(
         _obs_to_tensor(_aux_obs(2, 2), device),
@@ -416,9 +481,6 @@ def test_rollout_buffer_batches_aux_alignment_without_overwriting_prior_episode(
         torch.tensor([False, False]),
     )
 
-    final_terminal = _aux_obs(2, 0)
-    final_terminal["opp_item"][0].fill(20)
-    final_terminal["opp_item"][1].fill(30)
     buffer.add(
         _obs_to_tensor(_aux_obs(2, 3), device),
         actions,
@@ -427,8 +489,6 @@ def test_rollout_buffer_batches_aux_alignment_without_overwriting_prior_episode(
         zeros,
         zeros,
         torch.tensor([True, True]),
-        aux_label_obs=_obs_to_tensor(final_terminal, device),
-        done_env_indices=[0, 1],
     )
 
     batch = buffer.compute_gae(torch.zeros(2))
@@ -437,6 +497,165 @@ def test_rollout_buffer_batches_aux_alignment_without_overwriting_prior_episode(
     assert batch.aux_labels["opp_item"][:, 1, 0].tolist() == [30, 30, 30]
     assert batch.aux_label_valid[:, 0, 0].tolist() == [True, True, True]
     assert batch.aux_label_valid[:, 1, 0].tolist() == [True, True, True]
+
+
+def test_rollout_buffer_preserves_active_aux_labels_across_rollout_reset() -> None:
+    device = torch.device("cpu")
+    buffer = RolloutBuffer(1, 1, _aux_obs(1, 1), _mask(1), device)
+    buffer.reset()
+    buffer.register_team_preview_starts(
+        [
+            (
+                0,
+                _preview_start(opponent_aux_labels=_unbatched_aux(_aux_obs(1, 77))),
+            )
+        ],
+        policy_version=3,
+    )
+    actions = torch.zeros((1, 3), dtype=torch.long)
+    masks = _obs_to_tensor(_mask(1), device)
+    zeros = torch.zeros(1)
+
+    buffer.add(
+        _obs_to_tensor(_aux_obs(1, 1), device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        zeros,
+        torch.tensor([False]),
+    )
+    first = buffer.compute_gae(torch.zeros(1))
+    assert first.aux_label_valid[0, 0, 0]
+    assert first.aux_labels["opp_item"][0, 0, 0].item() == 77
+
+    buffer.reset()
+    buffer.add(
+        _obs_to_tensor(_aux_obs(1, 2), device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        zeros,
+        torch.tensor([False]),
+    )
+    second = buffer.compute_gae(torch.zeros(1))
+    assert second.aux_label_valid[0, 0, 0]
+    assert second.aux_labels["opp_item"][0, 0, 0].item() == 77
+
+
+def test_rollout_buffer_preview_returns_stop_at_terminal_and_include_final_reset() -> (
+    None
+):
+    device = torch.device("cpu")
+    buffer = RolloutBuffer(4, 1, _obs(0, 1), _mask(1), device)
+    buffer.reset()
+    buffer.register_team_preview_starts(
+        [(0, _preview_start(value=0.25, marker=0))],
+        policy_version=3,
+    )
+    actions = torch.zeros((1, 3), dtype=torch.long)
+    masks = _obs_to_tensor(_mask(1), device)
+    zeros = torch.zeros(1)
+    rewards = [0.0, 1.0, 0.0, -1.0]
+    dones = [False, True, False, True]
+
+    for step, (reward, done) in enumerate(zip(rewards, dones, strict=True)):
+        buffer.add(
+            _obs_to_tensor(_obs(step, 1), device),
+            actions,
+            masks,
+            zeros,
+            zeros,
+            torch.tensor([reward]),
+            torch.tensor([done]),
+        )
+        if step == 1:
+            buffer.register_team_preview_starts(
+                [(0, _preview_start(value=-0.25, marker=1))],
+                policy_version=3,
+            )
+        if step == 3:
+            buffer.register_team_preview_starts(
+                [(0, _preview_start(value=0.1, marker=2))],
+                policy_version=3,
+            )
+
+    batch = buffer.compute_gae(torch.tensor([0.4]), gamma=1.0, gae_lambda=0.95)
+    preview = batch.team_preview
+    assert preview is not None
+    assert preview.returns.tolist() == pytest.approx([1.0, -1.0, 0.4])
+    assert preview.advantages.tolist() == pytest.approx([0.75, -0.75, 0.3])
+    assert preview.terminal.tolist() == [True, True, False]
+    assert preview.horizons.tolist() == [2, 2, 0]
+    assert preview.obs["preview"].reshape(-1).tolist() == [0, 1, 2]
+
+
+def test_rollout_buffer_preview_boundary_return_excludes_previous_episode_reward() -> (
+    None
+):
+    device = torch.device("cpu")
+    buffer = RolloutBuffer(3, 1, _obs(0, 1), _mask(1), device)
+    buffer.reset()
+    actions = torch.zeros((1, 3), dtype=torch.long)
+    masks = _obs_to_tensor(_mask(1), device)
+    zeros = torch.zeros(1)
+
+    buffer.add(
+        _obs_to_tensor(_obs(0, 1), device),
+        actions,
+        masks,
+        zeros,
+        zeros,
+        torch.tensor([5.0]),
+        torch.tensor([True]),
+    )
+    buffer.register_team_preview_starts(
+        [(0, _preview_start(value=0.125))],
+        policy_version=3,
+    )
+    for step, reward in ((1, 2.0), (2, 3.0)):
+        buffer.add(
+            _obs_to_tensor(_obs(step, 1), device),
+            actions,
+            masks,
+            zeros,
+            zeros,
+            torch.tensor([reward]),
+            torch.tensor([False]),
+        )
+
+    batch = buffer.compute_gae(torch.tensor([7.0]), gamma=0.5, gae_lambda=0.95)
+    preview = batch.team_preview
+    assert preview is not None
+    # Preview reward is zero, so the preview-to-first-battle transition adds
+    # one gamma: .5 * (2 + .5 * 3 + .5**2 * 7) = 2.625.
+    assert preview.returns.tolist() == pytest.approx([2.625])
+    assert preview.advantages.tolist() == pytest.approx([2.5])
+    assert preview.terminal.tolist() == [False]
+    assert preview.horizons.tolist() == [2]
+
+
+def test_rollout_buffer_rejects_preview_from_different_policy_version() -> None:
+    buffer = RolloutBuffer(1, 1, _obs(0, 1), _mask(1), torch.device("cpu"))
+    buffer.reset()
+
+    with pytest.raises(RuntimeError, match="wrong policy version"):
+        buffer.register_team_preview_starts(
+            [(0, _preview_start(policy_version=2))],
+            policy_version=3,
+        )
+
+    buffer.add(
+        _obs_to_tensor(_obs(0, 1), torch.device("cpu")),
+        torch.zeros((1, 3), dtype=torch.long),
+        _obs_to_tensor(_mask(1), torch.device("cpu")),
+        torch.zeros(1),
+        torch.zeros(1),
+        torch.zeros(1),
+        torch.zeros(1, dtype=torch.bool),
+    )
+    assert buffer.compute_gae(torch.zeros(1)).team_preview is None
 
 
 def test_rollout_buffer_requires_a_complete_rollout_before_gae() -> None:
@@ -1310,7 +1529,7 @@ def test_team_preview_head_validates_externally_supplied_picks() -> None:
         )
 
 
-def test_team_preview_head_can_return_picks_without_policy_stats() -> None:
+def test_team_preview_head_fast_sample_returns_selected_log_prob_only() -> None:
     torch.manual_seed(0)
     head = TeamPreviewHead(pokemon_dim=4, context_dim=6, pick_size=3)
     own_reps = torch.randn(2, 6, 4)
@@ -1322,7 +1541,9 @@ def test_team_preview_head_can_return_picks_without_policy_stats() -> None:
     assert out["picks"].shape == (2, 3)
     assert out["lead_pair"].shape == (2, 2)
     assert out["bring_picks"].shape == (2, 3)
-    assert "log_prob" not in out
+    assert out["log_prob"].shape == (2,)
+    assert torch.isfinite(out["log_prob"]).all()
+    assert "joint_log_probs" not in out
     assert "entropy" not in out
 
 
@@ -2010,6 +2231,8 @@ async def test_battle_env_async_team_preview_awaits_precomputed_future() -> None
     expected = TeamPreviewResult(
         picks=np.array([0, 1, 2, 3], dtype=np.int64),
         policy_version=12,
+        log_prob=-1.5,
+        value=0.25,
     )
     future.set_result(expected)
 
@@ -2024,6 +2247,8 @@ async def test_battle_env_team_preview_records_policy_version() -> None:
     expected = TeamPreviewResult(
         picks=np.array([0, 1, 2, 3], dtype=np.int64),
         policy_version=21,
+        log_prob=-1.5,
+        value=0.25,
     )
     fake_env = SimpleNamespace(
         _ext_team_preview_fn=object(),
@@ -2038,7 +2263,7 @@ async def test_battle_env_team_preview_records_policy_version() -> None:
     team_order = await BattleEnv._do_team_preview(fake_env, battle=object())
 
     assert team_order == "/team 1234"
-    assert fake_env._episode_team_preview == (obs, expected.picks, 21)
+    assert fake_env._episode_team_preview == (obs, expected)
 
 
 def test_finished_battle_update_skips_legality_rebuild(

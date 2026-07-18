@@ -71,6 +71,18 @@ The preview head shares the spatial encoder and recurrent module with the
 battle policy. It has its own value baseline and auxiliary opponent-preview
 heads.
 
+The live sampler records the chosen action, selected-action behavior log
+probability, value, and policy version at episode start. It does not enumerate
+all 180 actions on the reset path. After collection and before optimization,
+one batched no-gradient pass freezes the complete old preview distribution for
+exact KL diagnostics.
+
+Preview is the zero-reward first transition into the battle. Its direct
+truncated lambda-1 return stops at the first terminal result inside the rollout
+or bootstraps once from the battle value at the rollout boundary. Starts at the
+final boundary are valid. A long battle's preview is therefore trained once
+when it occurs rather than being discarded or replayed at terminal.
+
 ## Battle policy
 
 The battle action head is autoregressive:
@@ -132,14 +144,22 @@ clipped PPO with:
 Minibatches slice environments while retaining their full rollout sequences,
 so recurrent state and episode boundaries remain valid.
 
-One Adam optimizer owns the shared model. The update order is currently:
+One Adam optimizer owns the shared model. Preview and battle advantages are
+normalized together, and their policy/value/entropy sums are weighted by the
+complete rollout's number of decisions. Preview samples are independently
+shuffled and paired with the full-environment recurrent battle minibatches.
+Each pair produces one combined loss, one backward pass, one global gradient
+clip, and one optimizer step. Four epochs by four minibatches therefore means
+16 optimizer steps.
 
-1. team-preview PPO and preview auxiliaries;
-2. battle PPO and battle auxiliaries.
+The complete old preview distribution is frozen before those steps and used
+for exact `KL(old || current)`. The action-time selected log probability remains
+the PPO behavior reference. This preserves one behavior-policy version for
+both preview and battle data.
 
-Because these updates share parameters, preview optimization can move the
-battle policy before battle PPO consumes its rollout. Metrics named
-`pre_ppo_*` measure that preview-induced drift, not an untouched network.
+Production uses `gamma=1` for undiscounted win probability. Battle GAE retains
+lambda `0.95`; preview uses the direct truncated lambda-1 return described
+above.
 
 Tera has separate use-now and eligible-slot decisions. A temporary behavior
 epsilon is annealed over the configured opening fraction of a run; policy

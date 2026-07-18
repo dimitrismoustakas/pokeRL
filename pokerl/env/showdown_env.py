@@ -39,7 +39,11 @@ from poke_env.player import (
 
 from ..config import EnvConfig
 from ..data import GameData
-from ..training.preview import TeamPreviewBatcher, TeamPreviewResult
+from ..training.preview import (
+    TeamPreviewBatcher,
+    TeamPreviewEpisodeStart,
+    TeamPreviewResult,
+)
 from .observation import (
     ObservationBuilder,
     build_packed_team_aux_labels,
@@ -914,8 +918,8 @@ class BattleEnv:
         self._prepared_preview_future: Future | None = None
         self._active_preview_obs: dict[str, np.ndarray] | None = None
         self._active_preview_future: Future | None = None
-        # Set at team preview time, read when the episode ends to attach to info.
-        self._episode_team_preview: tuple[dict, np.ndarray, int | None] | None = None
+        self._episode_team_preview: tuple[dict, TeamPreviewResult] | None = None
+        self._pending_team_preview_start: TeamPreviewEpisodeStart | None = None
         self._episode_opponent_preview_picks: np.ndarray | None = None
         self._episode_opponent_packed_team: str | None = None
         self._episode_opponent_choice_calls = 0
@@ -981,6 +985,11 @@ class BattleEnv:
         if timing_enabled:
             reset_started = time.perf_counter()
         self._wait_for_battle_task_completion("before BattleEnv reset")
+        if self._pending_team_preview_start is not None:
+            raise RuntimeError(
+                "BattleEnv started another episode before its previous team-preview "
+                "start record was drained."
+            )
         self._pending_player_request_id = None
         self.player.reset_transition_history()
         self._episode_team_preview = None
@@ -1040,6 +1049,7 @@ class BattleEnv:
             max_wait_sec=self.config.battlestream_startup_timeout,
         )
         self._pending_player_request_id = player_observation.request_id
+        self._finalize_team_preview_start()
         if timing_enabled:
             self._timing.add(
                 "env_reset_wait_first_obs_sec", time.perf_counter() - wait_started
@@ -1164,26 +1174,9 @@ class BattleEnv:
             if self._battle_started_at is not None:
                 info["episode_sec"] = time.perf_counter() - self._battle_started_at
             if self._episode_team_preview is not None:
-                obs_tp, picks_tp, policy_version = self._episode_team_preview
+                obs_tp, preview_result = self._episode_team_preview
                 info["team_preview_obs"] = obs_tp
-                info["team_preview_picks"] = picks_tp
-                info["team_preview_policy_version"] = policy_version
-            if self._episode_opponent_preview_picks is not None:
-                info["opponent_team_preview_picks"] = (
-                    self._episode_opponent_preview_picks
-                )
-                opponent_packed_team = getattr(
-                    self,
-                    "_episode_opponent_packed_team",
-                    None,
-                )
-                if opponent_packed_team is not None:
-                    info["opponent_aux_labels"] = build_packed_team_aux_labels(
-                        self.game_data,
-                        self.config.team_size,
-                        opponent_packed_team,
-                        selected_indices=self._episode_opponent_preview_picks,
-                    )
+                info["team_preview_picks"] = preview_result.picks
             info["episode_opponent_choice_calls"] = self._episode_opponent_choice_calls
             info["episode_opponent_repeated_turn_requests"] = sum(
                 count - 1
@@ -1521,8 +1514,9 @@ class BattleEnv:
         """Build the team preview response using the agent callback.
 
         Called from ShowdownPlayer.teampreview() at the start of
-        each battle. Stores (obs, picks) so they can be returned in the info dict
-        when this episode ends, enabling the REINFORCE team preview gradient.
+        each battle. The trainer record is finalized by reset() only after both
+        players have submitted their orders and the first battle observation
+        has arrived.
         """
         if self._ext_team_preview_fn is None:
             raise RuntimeError(
@@ -1532,8 +1526,69 @@ class BattleEnv:
         result = await self._choose_team_preview_picks_async(obs)
         picks = result.picks
         team_str = "/team " + "".join(str(int(pick) + 1) for pick in picks)
-        self._episode_team_preview = (obs, picks, result.policy_version)
+        self._episode_team_preview = (obs, result)
         return team_str
+
+    def _finalize_team_preview_start(self) -> None:
+        episode_preview = self._episode_team_preview
+        if episode_preview is None:
+            return
+
+        obs, result = episode_preview
+        metadata = (
+            result.policy_version,
+            result.log_prob,
+            result.value,
+        )
+        if all(value is None for value in metadata):
+            # Evaluation and benchmarking callbacks may return only picks.
+            return
+        if any(value is None for value in metadata):
+            raise RuntimeError(
+                "Training team preview returned partial behavior metadata; "
+                "policy_version, log_prob, and value must all be present."
+            )
+        if self._pending_team_preview_start is not None:
+            raise RuntimeError(
+                "BattleEnv already has an undrained team-preview start record."
+            )
+        if self._episode_opponent_preview_picks is None:
+            raise RuntimeError(
+                "Training team preview completed without the opponent's submitted "
+                "team order."
+            )
+        policy_version = result.policy_version
+        log_prob = result.log_prob
+        value = result.value
+        assert policy_version is not None
+        assert log_prob is not None
+        assert value is not None
+        opponent_aux_labels = None
+        if self._episode_opponent_packed_team is not None:
+            opponent_aux_labels = build_packed_team_aux_labels(
+                self.game_data,
+                self.config.team_size,
+                self._episode_opponent_packed_team,
+                selected_indices=self._episode_opponent_preview_picks,
+            )
+        self._pending_team_preview_start = TeamPreviewEpisodeStart(
+            obs=obs,
+            picks=result.picks,
+            log_prob=log_prob,
+            value=value,
+            policy_version=policy_version,
+            opponent_picks=self._episode_opponent_preview_picks,
+            opponent_aux_labels=opponent_aux_labels,
+        )
+        # Training owns the copied episode-start record now. Terminal preview
+        # payloads are retained only for pick-only evaluation callbacks.
+        self._episode_team_preview = None
+
+    def take_team_preview_start(self) -> TeamPreviewEpisodeStart | None:
+        """Return and clear the episode-start record created by reset()."""
+        record = self._pending_team_preview_start
+        self._pending_team_preview_start = None
+        return record
 
     def _assign_teams_for_next_battle(self) -> None:
         if self._team_pair_provider is None:
@@ -2226,6 +2281,17 @@ class ParallelBattleEnv:
                 lambda env: env.refresh_prepared_team_preview(), self.envs
             )
         )
+
+    def drain_team_preview_starts(
+        self,
+    ) -> list[tuple[int, TeamPreviewEpisodeStart]]:
+        """Drain newly reset episode starts in stable environment order."""
+        starts: list[tuple[int, TeamPreviewEpisodeStart]] = []
+        for env_index, env in enumerate(self.envs):
+            record = env.take_team_preview_start()
+            if record is not None:
+                starts.append((env_index, record))
+        return starts
 
     def _collate(
         self,

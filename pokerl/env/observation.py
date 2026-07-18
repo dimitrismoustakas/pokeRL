@@ -1248,9 +1248,9 @@ def build_packed_team_aux_labels(
     """Return exact, trainer-only opponent labels in team-preview order.
 
     The packed team is already assigned to the simulator, but none of these
-    arrays are included in the policy observation.  They are attached only to
-    terminal training info so the hidden-information auxiliary head can learn
-    from complete item, ability, tera-type, and move-set targets.
+    arrays are included in the policy observation. They are registered with the
+    trainer at episode start so the hidden-information auxiliary head can learn
+    from complete item, ability, Tera-type, and move-set targets.
     """
     labels = {
         key: value.copy()

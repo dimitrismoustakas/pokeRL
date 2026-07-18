@@ -50,9 +50,6 @@ from pokerl.training.league import League
 from pokerl.training.preview import (
     TeamPreviewBatcher,
     TeamPreviewResult,
-    VersionedTeamPreviewTrainingSample,
-    filter_current_team_preview_training_samples,
-    update_preview_then_battle,
 )
 from pokerl.training.recurrent_history import RecurrentObservationHistory
 from pokerl.training.cuda_execution import cuda_model_execution
@@ -512,18 +509,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--team-preview-max-samples",
-        type=int,
-        default=None,
-        help="Optional uniform current-rollout preview sample cap; defaults to all.",
-    )
-    parser.add_argument(
-        "--preview-update-minibatch-size",
-        type=int,
-        default=None,
-        help="Maximum preview PPO minibatch size.",
-    )
-    parser.add_argument(
         "--tera-exploration-start",
         type=float,
         default=None,
@@ -674,8 +659,6 @@ def build_configs(
         "league_cuda_graph_batch_size": args.league_cuda_graph_batch_size,
         "league_cuda_graph_cache_size": args.league_cuda_graph_cache_size,
         "league_preview_device": args.league_preview_device,
-        "team_preview_max_samples": args.team_preview_max_samples,
-        "preview_update_minibatch_size": args.preview_update_minibatch_size,
         "tera_exploration_start": args.tera_exploration_start,
         "tera_exploration_end": args.tera_exploration_end,
         "tera_exploration_decay_fraction": args.tera_exploration_decay_fraction,
@@ -1185,6 +1168,7 @@ def collect_synchronous_rollout(
     hidden: tuple[torch.Tensor, torch.Tensor] | None,
     device: torch.device,
     num_steps: int,
+    preview_policy_version: int,
     tera_exploration_prob: float,
     collect_timing: bool,
 ) -> tuple[
@@ -1203,6 +1187,11 @@ def collect_synchronous_rollout(
     buffer.set_tera_behavior_policy(
         exploration_prob=tera_exploration_prob,
     )
+    initial_preview_starts = parallel_env.drain_team_preview_starts()
+    buffer.register_team_preview_starts(
+        initial_preview_starts,
+        policy_version=preview_policy_version,
+    )
     profile = {
         "obs_to_device_sec": 0.0,
         "mask_to_device_sec": 0.0,
@@ -1212,7 +1201,7 @@ def collect_synchronous_rollout(
         "feedback_to_device_sec": 0.0,
         "buffer_add_sec": 0.0,
         "hidden_reset_sec": 0.0,
-        "exact_aux_label_episodes": 0.0,
+        "team_preview_episode_starts": float(len(initial_preview_starts)),
     }
     rollout_infos: list[dict] = []
     obs_device_buffers: dict[str, torch.Tensor] | None = None
@@ -1284,8 +1273,6 @@ def collect_synchronous_rollout(
     public_consequence_cant_masks_device: torch.Tensor | None = None
     public_consequence_field_targets_device: torch.Tensor | None = None
     public_consequence_field_masks_device: torch.Tensor | None = None
-    aux_label_obs_device_buffers: dict[str, torch.Tensor] | None = None
-
     for _ in range(num_steps):
         with torch.no_grad(), cuda_model_execution(device):
             started = time.perf_counter() if collect_timing else 0.0
@@ -1372,7 +1359,7 @@ def collect_synchronous_rollout(
         public_consequence_field_masks_np.fill(False)
         for env_index, info in enumerate(infos):
             if dones[env_index]:
-                consequence_observation = info.get("final_observation")
+                consequence_observation = info.pop("final_observation", None)
                 if consequence_observation is None:
                     raise RuntimeError(
                         "Auto-reset transition omitted final_observation for "
@@ -1500,50 +1487,6 @@ def collect_synchronous_rollout(
         public_consequence_field_targets_device = public_consequence_field_targets_t
         public_consequence_field_masks_device = public_consequence_field_masks_t
 
-        done_env_indices = np.flatnonzero(dones)
-        aux_label_obs_t = None
-        if done_env_indices.size:
-            label_observations: dict[int, dict[str, np.ndarray]] = {}
-            for env_index in done_env_indices:
-                info = infos[int(env_index)]
-                final_observation = info.pop(
-                    "final_observation",
-                    None,
-                )
-                if final_observation is None:
-                    raise RuntimeError(
-                        "Auto-reset transition omitted final_observation for "
-                        "terminal auxiliary labels."
-                    )
-                private_labels = info.pop("opponent_aux_labels", None)
-                if private_labels is not None:
-                    missing_keys = set(RolloutBuffer.AUX_OBS_KEYS).difference(
-                        private_labels
-                    )
-                    if missing_keys:
-                        raise RuntimeError(
-                            "Trainer-private opponent labels omitted keys: "
-                            + ", ".join(sorted(missing_keys))
-                        )
-                    label_observations[int(env_index)] = private_labels
-                    profile["exact_aux_label_episodes"] += 1.0
-                else:
-                    label_observations[int(env_index)] = final_observation
-
-            if all(key in next_obs for key in RolloutBuffer.AUX_OBS_KEYS):
-                aux_label_obs_np = {
-                    key: np.empty_like(next_obs[key])
-                    for key in RolloutBuffer.AUX_OBS_KEYS
-                }
-                for env_index, label_observation in label_observations.items():
-                    for key in RolloutBuffer.AUX_OBS_KEYS:
-                        aux_label_obs_np[key][env_index] = label_observation[key]
-                aux_label_obs_t = obs_to_device(
-                    aux_label_obs_np,
-                    device,
-                    buffers=aux_label_obs_device_buffers,
-                )
-                aux_label_obs_device_buffers = aux_label_obs_t
         if collect_timing:
             profile["feedback_to_device_sec"] += time.perf_counter() - started
 
@@ -1564,13 +1507,17 @@ def collect_synchronous_rollout(
             public_consequence_cant_masks=public_consequence_cant_masks_t,
             public_consequence_field_targets=public_consequence_field_targets_t,
             public_consequence_field_masks=public_consequence_field_masks_t,
-            aux_label_obs=aux_label_obs_t,
-            done_env_indices=done_env_indices,
             **{
                 f"public_consequence_{name}": value
                 for name, value in public_consequence_t.items()
             },
         )
+        preview_starts = parallel_env.drain_team_preview_starts()
+        buffer.register_team_preview_starts(
+            preview_starts,
+            policy_version=preview_policy_version,
+        )
+        profile["team_preview_episode_starts"] += float(len(preview_starts))
         if collect_timing:
             profile["buffer_add_sec"] += time.perf_counter() - started
 
@@ -2378,13 +2325,11 @@ def train():
             "num_epochs": train_config.num_epochs,
             "num_minibatches": train_config.num_minibatches,
             "bptt_chunk_steps": train_config.bptt_chunk_steps,
+            "gamma": train_config.gamma,
+            "gae_lambda": train_config.gae_lambda,
             "team_preview_value_coef": train_config.team_preview_value_coef,
             "team_preview_bring_coef": train_config.team_preview_bring_coef,
             "team_preview_lead_coef": train_config.team_preview_lead_coef,
-            "team_preview_max_samples": train_config.team_preview_max_samples,
-            "preview_update_minibatch_size": (
-                train_config.preview_update_minibatch_size
-            ),
             "tera_exploration_start": train_config.tera_exploration_start,
             "tera_exploration_end": train_config.tera_exploration_end,
             "tera_exploration_decay_fraction": (
@@ -2546,7 +2491,6 @@ def train():
             update_episode_opponent_repeated_turn_requests: list[int] = []
             update_episode_opponent_max_calls_same_turn: list[int] = []
             update_pathological_episodes: list[dict[str, object]] = []
-            versioned_preview_data: list[VersionedTeamPreviewTrainingSample] = []
             update_opponent_outcomes: OpponentOutcomeCounts = {}
             update_observed_opponents: set[str] = set()
 
@@ -2561,12 +2505,13 @@ def train():
                     hidden=hidden,
                     device=device,
                     num_steps=train_config.rollout_steps,
+                    preview_policy_version=rollout_policy_version,
                     tera_exploration_prob=tera_eps,
                     collect_timing=collect_timing,
                 )
             )
 
-            # Track episode rewards and team preview decisions
+            # Track completed episodes.
             for info in rollout_infos:
                 if "episode_reward" in info:
                     reward = float(info["episode_reward"])
@@ -2585,28 +2530,6 @@ def train():
                     if opponent_path is not None:
                         update_observed_opponents.add(opponent_path)
                         run_observed_opponents.add(opponent_path)
-                    if "team_preview_obs" in info:
-                        if "opponent_team_preview_picks" not in info:
-                            raise RuntimeError(
-                                "Episode recorded a team preview decision without opponent preview labels."
-                            )
-                        preview_policy_version = info.get("team_preview_policy_version")
-                        if type(preview_policy_version) is not int:
-                            raise RuntimeError(
-                                "Training episode omitted its integer team-preview "
-                                "policy version."
-                            )
-                        versioned_preview_data.append(
-                            VersionedTeamPreviewTrainingSample(
-                                sample=(
-                                    info["team_preview_obs"],
-                                    info["team_preview_picks"],
-                                    reward,
-                                    info["opponent_team_preview_picks"],
-                                ),
-                                policy_version=preview_policy_version,
-                            )
-                        )
                 if "episode_sec" in info:
                     update_episode_secs.append(info["episode_sec"])
                 if "battle_turn" in info and info.get("episode_reward") is not None:
@@ -2649,23 +2572,14 @@ def train():
                             }
                         )
 
-            try:
-                preview_training_data = filter_current_team_preview_training_samples(
-                    versioned_preview_data,
-                    rollout_policy_version,
-                )
-            except ValueError as exc:
-                raise RuntimeError(
-                    "Invalid team-preview policy version in rollout data."
-                ) from exc
-            update_preview_data = list(preview_training_data.samples)
-            stale_preview_samples = preview_training_data.stale_excluded_count
-
+            # All behavior-policy preview work must be complete before the
+            # shared parameters change. Include any residual wait in rollout
+            # timing rather than leaving it as unaccounted update overhead.
+            parallel_env.wait_for_prepared_team_previews()
             rollout_sec = time.perf_counter() - rollout_started
             if collect_timing:
                 rollout_profile["rollout_sec"] = rollout_sec
             env_profile = parallel_env.snapshot_timing() if collect_timing else {}
-            parallel_env.wait_for_prepared_team_previews()
 
             # --- Compute advantages ---
             advantage_started = time.perf_counter()
@@ -2684,19 +2598,9 @@ def train():
             ppo_started = time.perf_counter()
             with cuda_model_execution(device):
                 agent.train()
-                metrics = update_preview_then_battle(
-                    trainer,
-                    batch,
-                    update_preview_data,
-                    train_config.team_preview_max_samples,
-                    seed=train_config.seed,
-                    update=update,
-                )
+                metrics = trainer.update(batch)
                 metrics["tera_exploration_prob"] = tera_eps
                 metrics.update(observation_history_metrics)
-                metrics["team_preview_samples_stale_excluded"] = float(
-                    stale_preview_samples
-                )
                 metrics["team_preview_policy_version"] = float(rollout_policy_version)
 
                 # TeamPreviewBatcher shares the live policy object.  Prepared
@@ -2886,7 +2790,9 @@ def train():
                 if update < num_updates
                 else []
             )
-            exact_aux_label_episodes = int(rollout_profile["exact_aux_label_episodes"])
+            team_preview_episode_starts = int(
+                rollout_profile["team_preview_episode_starts"]
+            )
             update_tera_summary = summarize_first_tera_turns(
                 update_first_tera_turns,
                 len(update_episode_rewards),
@@ -2909,11 +2815,7 @@ def train():
                     }
                 ),
                 "completed_battles": len(update_episode_rewards),
-                "exact_aux_label_episodes": exact_aux_label_episodes,
-                "exact_aux_label_episode_coverage": _safe_div(
-                    exact_aux_label_episodes,
-                    len(update_episode_rewards),
-                ),
+                "team_preview_episode_starts": team_preview_episode_starts,
                 "rollout_sec": rollout_sec,
                 "advantage_sec": advantage_sec,
                 "ppo_sec": ppo_sec,

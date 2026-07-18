@@ -305,6 +305,60 @@ def test_team_preview_fast_and_full_lead_scorers_are_equivalent() -> None:
     torch.testing.assert_close(fast_logits, full_logits, atol=1e-6, rtol=1e-6)
 
 
+def test_team_preview_fast_sample_log_prob_matches_exact_reevaluation() -> None:
+    torch.manual_seed(18)
+    head = TeamPreviewHead(
+        pokemon_dim=4,
+        context_dim=6,
+        pick_size=4,
+        team_size=6,
+    ).eval()
+    own_reps = torch.randn(4, 6, 4)
+    opponent_reps = torch.randn(4, 6, 4)
+    context = torch.randn(4, 6)
+    team_mask = torch.tensor(
+        [
+            [False, False, False, False, False, False],
+            [False, False, False, False, False, True],
+            [True, False, False, False, False, False],
+            [False, False, False, False, False, False],
+        ]
+    )
+    opponent_mask = torch.tensor(
+        [
+            [False, False, False, False, False, False],
+            [False, False, False, True, True, True],
+            [True, False, True, False, True, False],
+            [True, True, True, True, True, True],
+        ]
+    )
+
+    with torch.inference_mode():
+        sampled = head(
+            own_reps,
+            opponent_reps,
+            context,
+            team_mask=team_mask,
+            opponent_mask=opponent_mask,
+            include_policy_stats=False,
+        )
+        reevaluated = head(
+            own_reps,
+            opponent_reps,
+            context,
+            team_mask=team_mask,
+            opponent_mask=opponent_mask,
+            picks=sampled["picks"],
+        )
+
+    torch.testing.assert_close(
+        sampled["log_prob"],
+        reevaluated["log_prob"],
+        atol=2e-6,
+        rtol=2e-6,
+    )
+
+
 def test_uniform_migrated_preview_actor_learns_on_its_first_step() -> None:
     torch.manual_seed(18)
     head = TeamPreviewHead(

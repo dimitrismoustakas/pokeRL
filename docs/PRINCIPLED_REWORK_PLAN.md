@@ -5,9 +5,9 @@ This is the implementation plan following the independent review of the
 one. The corrected trainer will be trained from scratch; the earlier run is
 evidence for diagnosis and comparison, not a compatibility target.
 
-Current status: Step 1 is complete after implementation, real-checkpoint proof,
-performance measurement, adversarial review, and the full repository suite.
-Step 2 has not been implemented.
+Current status: Steps 1 and 2 are complete. Step 2 passed an integrated
+correctness review, the full repository suite, and a real 72-environment CUDA
+update on the 4 GiB reference GPU. No work on Step 3 has started.
 
 ## Step 1: exact team-preview policy
 
@@ -69,22 +69,70 @@ Measured Step 1 result:
 
 ## Step 2: one preview-and-battle PPO transaction
 
-The exact design will be presented before implementation. It must:
+Implemented semantics:
 
-- treat preview as an action-time transition with behavior log probability,
-  value, policy version, and recurrent boundary recorded when the action is
-  taken;
-- retain episodes that cross a rollout/update boundary instead of discarding
-  them when their terminal reward arrives;
-- optimize preview and battle objectives from the same behavior snapshot in one
-  explicitly weighted transaction;
-- prevent preview-only gradients from silently consuming the battle clipping
-  budget;
-- report exact preview KL, battle pre-update KL, per-objective shared-gradient
-  norms/cosines, clipping incidence, and optimizer-step exposure.
+- `gamma=1` is the production objective, matching undiscounted win
+  probability. Battle advantages retain GAE lambda `0.95`.
+- Preview is the zero-reward first transition of an episode. Its observation,
+  chosen action, selected-action behavior log probability, value, and policy
+  version are owned when the action is taken.
+- Every preview beginning in a rollout is trained once. A terminal inside the
+  rollout supplies the exact sparse outcome; otherwise a direct truncated
+  lambda-1 return bootstraps once from the battle value at the rollout
+  boundary. This includes starts at the final boundary `k=T`.
+- Long battles are no longer excluded or replayed at terminal. Their preview
+  action is trained in the rollout where it occurred, while exact
+  trainer-private selected-team labels persist across later rollout
+  boundaries.
+- Battle and preview advantages are normalized together. Their policy, value,
+  and entropy sums are weighted by the number of decisions in the complete
+  rollout.
+- Each paired recurrent-battle and independently shuffled preview minibatch
+  produces one loss, one backward pass, one global gradient clip, and one Adam
+  step. Four epochs by four minibatches therefore means 16 optimizer steps,
+  not 16 preview steps followed by 16 battle steps.
+- Live preview keeps the fast factorized sampler and computes only the sampled
+  action log probability and value. After collection and before the first
+  optimizer step, one batched no-gradient evaluation freezes the complete
+  180-action old distribution for exact `KL(old || current)`.
+- The terminal-only preview updater, stale-sample filter, optional sample cap,
+  separate preview minibatch setting, and update-order wrapper were removed.
+  There is one production update path and no checkpoint conversion path.
+- Exact preview KL, sampled approximate KL, clipping, value clipping,
+  boundary/terminal counts, return horizon, and joint optimizer-step exposure
+  are always logged. The existing expensive per-objective gradient diagnostic
+  remains opt-in for short diagnostic runs rather than burdening every update.
 
-Step 2 is not satisfied by merely moving the existing preview update after
-battle PPO or by suppressing stale-sample warnings.
+Correctness evidence:
+
+- focused lifecycle, return, joint-objective, policy-version, exact-KL, and
+  fast-sampler suites pass;
+- the fast sampled log probability equals exhaustive reevaluation exactly in a
+  direct masked-roster test;
+- the first real update trained 877 preview decisions: 805 terminal and 72
+  boundary-bootstrapped;
+- action-time versus pre-update preview log-probability disagreement was
+  `1.28e-7` mean and `9.54e-7` maximum, consistent with floating-point noise;
+- the update made exactly 16 joint optimizer steps and completed without a
+  non-finite skip.
+
+Feasibility and timing:
+
+- the full 72-environment, 128-step CUDA update completed on the 4 GiB Quadro
+  T2000: rollout 154.72 s, PPO 22.56 s, and update wall time 177.95 s;
+- CUDA allocator state after the update was 0.307 GB allocated and 3.618 GB
+  reserved, so the uncompromised combined graph fit without an out-of-memory
+  fallback;
+- a controlled run of the exact pre-Step-2 `HEAD` under the same command took
+  157.84 s rollout, 18.98 s PPO, and 177.22 s update wall time. The joint PPO
+  section was 3.58 s slower in this one comparison, while total update time
+  differed by 0.73 s (0.41%) and the joint run trained the 72 in-flight
+  previews that the terminal-only baseline omitted. This is a feasibility A/B,
+  not a statistically powered throughput claim.
+
+The chosen implementation remains the single combined-backward reference.
+There is no evidence from the end-to-end run that a memory-motivated
+two-backward accumulation path is necessary.
 
 ## Step 3: standalone exploiter proof
 
@@ -112,8 +160,10 @@ battle PPO or by suppressing stale-sample warnings.
 - serialize and validate the complete training/optimizer protocol first;
 - compare strict Adam continuation, fresh Adam, tuned AdamW, and later a named
   hybrid Muon/AdamW partition from identical weights and simulator budgets;
-- tune learning rate, decay, schedule, entropy, clipping/update epochs, and
-  `gamma` in controlled stages rather than changing them together;
+- tune learning rate, decay, schedule, entropy, clipping, and update epochs in
+  controlled stages rather than changing them together;
+- keep `gamma=1` fixed unless an explicit experiment changes the objective away
+  from undiscounted win probability;
 - confirm any final-seeded winner from an earlier checkpoint or initialization.
 
 ## Secondary correctness work
