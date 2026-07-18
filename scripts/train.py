@@ -591,19 +591,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the league-opponent inference coalescing window in milliseconds.",
     )
-    checkpoint_mode = parser.add_mutually_exclusive_group()
-    checkpoint_mode.add_argument(
+    parser.add_argument(
         "--resume",
         default=None,
         help="Path to a trainer checkpoint to resume training from (e.g. checkpoints/step_204800.pt).",
-    )
-    checkpoint_mode.add_argument(
-        "--initialize-from",
-        default=None,
-        help=(
-            "Path to a current trainer checkpoint whose model weights seed a "
-            "fresh main learner; optimizer, counters, RNG, and league are new."
-        ),
     )
     parser.add_argument(
         "--phase-spec",
@@ -620,30 +611,6 @@ def parse_args() -> argparse.Namespace:
         help="Write a machine-readable JSON run summary to this path.",
     )
     return parser.parse_args()
-
-
-def validate_fresh_main_checkpoint_target(args: argparse.Namespace) -> None:
-    """Reserve an explicit empty output namespace for weight initialization."""
-    if args.initialize_from is None:
-        return
-    if args.checkpoint_dir is None:
-        raise ValueError(
-            "--initialize-from requires an explicit new or empty "
-            "--checkpoint-dir so an existing run cannot be overwritten."
-        )
-    checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
-    if checkpoint_dir.exists():
-        if not checkpoint_dir.is_dir():
-            raise ValueError(
-                "--checkpoint-dir for --initialize-from must be a directory."
-            )
-        first_existing = next(checkpoint_dir.iterdir(), None)
-        if first_existing is not None:
-            raise FileExistsError(
-                "--checkpoint-dir for --initialize-from must be empty; found "
-                f"{first_existing!s}."
-            )
-    args.checkpoint_dir = str(checkpoint_dir)
 
 
 def build_configs(
@@ -2068,12 +2035,6 @@ def _maybe_write_run_summary(path: str | None, summary: dict) -> None:
 
 def train():
     args = parse_args()
-    if args.phase_spec is not None and args.initialize_from is not None:
-        raise ValueError(
-            "--initialize-from is only for a fresh main run; a best-response "
-            "phase declares its immutable initializer in the PhaseSpec."
-        )
-    validate_fresh_main_checkpoint_target(args)
     phase_bundle = (
         load_best_response_phase(args.phase_spec) if args.phase_spec else None
     )
@@ -2210,7 +2171,6 @@ def train():
 
     # --- Resume from checkpoint ---
     restored_opponent_assignments: dict[int, str] | None = None
-    initialization_summary: dict[str, object] | None = None
     if phase_spec is not None and phase_bundle is not None:
         if team_pool is None or frozen_sampler is None:
             raise RuntimeError("Best-response phase initialization was incomplete.")
@@ -2266,12 +2226,6 @@ def train():
             )
     elif args.resume:
         trainer.load(args.resume)
-        initialization_summary = {
-            "mode": "strict_resume",
-            "checkpoint": str(Path(args.resume).expanduser().resolve()),
-            "training_state_id": trainer.loaded_training_state_id,
-            "provenance": trainer.initialization_provenance,
-        }
         print(
             f"Resumed trainer from {args.resume!r} (global step {trainer.global_step:,})"
         )
@@ -2332,20 +2286,6 @@ def train():
         print(
             f"Restored league from {league_state!s}: {len(league.checkpoints)} checkpoint(s)"
         )
-    elif args.initialize_from:
-        initializer_path = Path(args.initialize_from).expanduser().resolve()
-        trainer.initialize_from_trainer_weights(str(initializer_path))
-        initialization_summary = {
-            "mode": "fresh_main_weights",
-            "checkpoint": str(initializer_path),
-            "training_state_id": trainer.initialized_from_training_state_id,
-            "provenance": trainer.initialization_provenance,
-        }
-        print(
-            "Initialized fresh main learner from weights "
-            f"{initializer_path!s}; optimizer, counters, RNG, and league are fresh"
-        )
-
     # --- Seed league so self-play is available from update 1 ---
     # On a fresh start this ensures the agent never falls back to bots.
     if phase_spec is None and not league.checkpoints:
@@ -2421,7 +2361,6 @@ def train():
     run_summary = {
         "status": "starting",
         "phase": phase_summary,
-        "initialization": initialization_summary,
         "run_identity": main_run_identity,
         "config": {
             "training_mode": (

@@ -209,9 +209,8 @@ verified child population to a resumable main league.
 ## Checkpoints and resume
 
 Trainer checkpoints contain model and Adam state, counters, schema metadata,
-RNG state, and retained initialization provenance when applicable. A paired
-league or phase-state file records the exact opponent sampler boundary and
-assignments.
+and RNG state. A paired league or phase-state file records the exact opponent
+sampler boundary and assignments.
 
 Resume fails if the model signature, tensor schema, vocabulary, team pool,
 battle format, completed update, or paired state disagrees. Frozen league
@@ -219,15 +218,6 @@ snapshots intentionally omit trainer state and cannot resume learning.
 
 Best-response initialization is different from resume: it loads compatible
 weights but creates a fresh optimizer, counters, and RNG streams.
-
-Architecture version 4 deliberately rejects version-3 preview checkpoints.
-The version-3 conversion tool can retain compatible battle and preview feature
-weights, zero the two preview policy output layers to obtain an exact uniform
-policy, and reset the now-stale preview value head. It does not convert or
-preserve the version-3 league population. The converted checkpoint starts a
-new main run through `--initialize-from` and requires an explicit empty
-`--checkpoint-dir`; it is never accepted as a silent resume of the 440-update
-run.
 
 ## Runtime architecture
 

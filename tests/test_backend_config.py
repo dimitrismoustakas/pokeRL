@@ -20,7 +20,6 @@ from scripts.train import (
     resolve_tera_exploration_decay_updates,
     resolve_update_bounds,
     tera_exploration_probability,
-    validate_fresh_main_checkpoint_target,
     validate_resume_update_state,
 )
 
@@ -268,58 +267,6 @@ def test_best_response_phase_cli_is_explicit_and_composes_with_resume(
     assert args.phase_spec == "plans/exploiter.json"
     assert args.resume == "checkpoints/exploiter.pt"
     assert args.num_updates == 7
-
-
-def test_fresh_main_weight_initializer_is_distinct_from_resume(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "train",
-            "--initialize-from",
-            "checkpoints/converted-v4.pt",
-        ],
-    )
-
-    args = parse_args()
-
-    assert args.initialize_from == "checkpoints/converted-v4.pt"
-    assert args.resume is None
-
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "train",
-            "--initialize-from",
-            "checkpoints/converted-v4.pt",
-            "--resume",
-            "checkpoints/resume.pt",
-        ],
-    )
-    with pytest.raises(SystemExit):
-        parse_args()
-
-
-def test_fresh_main_initializer_requires_an_explicit_empty_checkpoint_dir(
-    tmp_path,
-) -> None:
-    args = argparse.Namespace(
-        initialize_from="converted-v4.pt",
-        checkpoint_dir=None,
-    )
-    with pytest.raises(ValueError, match="requires an explicit"):
-        validate_fresh_main_checkpoint_target(args)
-
-    empty_dir = tmp_path / "new-run"
-    empty_dir.mkdir()
-    args.checkpoint_dir = str(empty_dir)
-    validate_fresh_main_checkpoint_target(args)
-    assert Path(args.checkpoint_dir) == empty_dir.resolve()
-
-    (empty_dir / "existing.pt").write_bytes(b"do not overwrite")
-    with pytest.raises(FileExistsError, match="must be empty"):
-        validate_fresh_main_checkpoint_target(args)
 
 
 def test_factorized_tera_cli_overrides(monkeypatch) -> None:

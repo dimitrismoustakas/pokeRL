@@ -2,8 +2,8 @@
 
 This is the implementation plan following the independent review of the
 440-update run. Each step must be reported before work proceeds to the next
-one. The original trainer checkpoint, paired league state, evaluation outputs,
-and archived league checkpoints remain immutable reference artifacts.
+one. The corrected trainer will be trained from scratch; the earlier run is
+evidence for diagnosis and comparison, not a compatibility target.
 
 Current status: Step 1 is complete after implementation, real-checkpoint proof,
 performance measurement, adversarial review, and the full repository suite.
@@ -19,9 +19,7 @@ Scope:
 - vectorize scoring and sampling, with a fast path for live sampled inference;
 - compute exact preview entropy and expose the exact joint distribution needed
   for later KL diagnostics;
-- preserve the useful parameterization where possible, but bump the model
-  architecture signature because policy semantics change;
-- add explicit migration tooling before any version-3 checkpoint is reused.
+- bump the model architecture signature because policy semantics change.
 
 Correctness checks:
 
@@ -32,7 +30,7 @@ Correctness checks:
   probabilities;
 - deterministic inference returns the global joint argmax;
 - masks and non-default team/pick sizes remain supported;
-- old checkpoints cannot silently resume under the new semantics.
+- incompatible checkpoints fail normal strict loading.
 
 Performance checks:
 
@@ -65,23 +63,9 @@ Measured Step 1 result:
   old-versus-new PPO comparison;
 - exact evaluation now obtains all 180 probabilities in one model forward per
   roster batch instead of repeating each observation 180 times;
-- architecture version 4 rejects version-3 checkpoints. The version-3
-  conversion preserves compatible battle, auxiliary, and preview feature
-  tensors; zeros only the two preview-policy output layers; resets the stale
-  preview value head; starts fresh optimizer/counters; and records compact
-  source provenance in the checkpoint;
-- the actual 440-update trainer was converted and strictly verified in a
-  temporary artifact: 229 tensors copied, 20 reset/zeroed, exact entropy
-  `ln(180)`, and maximum probability `1/180`. The original trainer and its
-  45-member version-3 league were not modified or converted;
-- a production `--initialize-from` path can seed a fresh main run from the
-  converted checkpoint. It requires an explicit empty checkpoint directory,
-  creates a new step-zero league, and refuses on-disk league checkpoint
-  collisions;
-- final validation: 574 tests pass and Ruff lint passes. The repository-wide
-  Ruff format check still reports 21 pre-existing files; files that were
-  formatted before this step remain formatted, and the new migration files
-  are formatted.
+- final validation after removing the now-unneeded migration path: 571 tests
+  pass and Ruff lint passes. The repository-wide Ruff format check still
+  reports 21 pre-existing files.
 
 ## Step 2: one preview-and-battle PPO transaction
 
