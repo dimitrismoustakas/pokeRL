@@ -1,5 +1,6 @@
 """Action head (autoregressive for doubles) and value head."""
 
+import itertools
 import math
 from typing import NamedTuple
 
@@ -129,23 +130,41 @@ class MaskedSetAttention(nn.Module):
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """Pool already-projected items for one or more structured queries."""
-        batch_size, _, _ = key_proj.shape
-        query_shape = query.shape
-        flat_query_proj = self.query_proj(query).reshape(
-            batch_size, -1, key_proj.shape[-1]
+        return self._pool_projected_queries(
+            self.query_proj(query),
+            key_proj,
+            values,
+            mask,
         )
+
+    def _pool_projected_queries(
+        self,
+        query_proj: torch.Tensor,
+        key_proj: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Pool items when callers can form query projections without concat."""
+        batch_size, _, _ = key_proj.shape
+        query_shape = query_proj.shape
+        flat_query_proj = query_proj.reshape(batch_size, -1, key_proj.shape[-1])
         scores = torch.bmm(flat_query_proj, key_proj.transpose(1, 2)) / self.scale
 
         if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(1), -1e8)
+            expanded_mask = mask.unsqueeze(1)
+            scores = scores.masked_fill(expanded_mask, -torch.inf)
+            # Avoid an all--infinity softmax. These rows represent an empty
+            # public opponent set and must pool to exactly zero.
+            all_items_masked = (mask.sum(dim=1) == mask.shape[1]).view(
+                batch_size,
+                1,
+                1,
+            )
+            scores = scores.masked_fill(all_items_masked, 0.0)
 
         weights = torch.softmax(scores, dim=-1)
         if mask is not None:
-            weights = weights.masked_fill(mask.unsqueeze(1), 0.0)
-        weights_sum = weights.sum(dim=-1, keepdim=True)
-        weights = torch.where(
-            weights_sum > 0, weights / weights_sum.clamp(min=1e-8), weights
-        )
+            weights = weights.masked_fill(expanded_mask, 0.0)
 
         summaries = torch.bmm(weights, values)
         return summaries.reshape(*query_shape[:-1], values.shape[-1])
@@ -2047,20 +2066,52 @@ class ActionHead(nn.Module):
 
 
 class TeamPreviewHead(nn.Module):
-    """Canonical bring-set selection plus ordered lead-pair choice.
+    """Exact bring-subset and ordered-lead distribution.
 
-    Every bring candidate and ordered lead pair cross-attends to the public
-    opponent representations with its own query. This lets preview decisions
-    express candidate-specific matchups instead of scoring every candidate
-    against one shared opponent summary.
+    A preview action is one unordered bring subset followed by one ordered lead
+    pair from that subset. All legal subsets and lead orders are represented
+    explicitly, so roster indices cannot create a prior through a
+    variable-branching sequential sampler. Subset scoring is symmetric over its
+    members, while every member and ordered lead pair retains
+    candidate-conditioned attention over the public opponent roster.
+
+    Live sampled inference scores every bring subset in one vectorized pass,
+    samples one, and scores only its lead orders. Policy-statistics and
+    deterministic argmax paths score the complete joint action space so entropy
+    and action selection are exact.
     """
 
-    def __init__(self, pokemon_dim: int, context_dim: int, pick_size: int = 4):
+    _MAX_EXACT_ACTIONS = 4096
+
+    def __init__(
+        self,
+        pokemon_dim: int,
+        context_dim: int,
+        pick_size: int = 4,
+        *,
+        team_size: int = 6,
+    ):
         super().__init__()
+        for name, value in (("team_size", team_size), ("pick_size", pick_size)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"TeamPreviewHead {name} must be an integer.")
         if pick_size < 2:
             raise ValueError(
                 "TeamPreviewHead requires pick_size >= 2 so it can choose a lead pair."
             )
+        if team_size < pick_size:
+            raise ValueError(
+                "TeamPreviewHead requires team_size >= pick_size "
+                f"(got team_size={team_size}, pick_size={pick_size})."
+            )
+        action_count = math.comb(team_size, pick_size) * pick_size * (pick_size - 1)
+        if action_count > self._MAX_EXACT_ACTIONS:
+            raise ValueError(
+                "TeamPreviewHead exact action space is too large: "
+                f"{action_count} actions exceeds the supported maximum of "
+                f"{self._MAX_EXACT_ACTIONS}."
+            )
+        self.team_size = team_size
         self.pick_size = pick_size
         self.bring_opponent_attention = MaskedSetAttention(
             context_dim + pokemon_dim, pokemon_dim, 128
@@ -2081,6 +2132,375 @@ class TeamPreviewHead(nn.Module):
             nn.Linear(128, 1),
         )
 
+        bring_subsets = tuple(itertools.combinations(range(team_size), pick_size))
+        lead_orders = tuple(itertools.permutations(range(pick_size), 2))
+        joint_picks: list[tuple[int, ...]] = []
+        for subset in bring_subsets:
+            for left_position, right_position in lead_orders:
+                lead_positions = {left_position, right_position}
+                bench_tail = tuple(
+                    slot
+                    for position, slot in enumerate(subset)
+                    if position not in lead_positions
+                )
+                joint_picks.append(
+                    (
+                        subset[left_position],
+                        subset[right_position],
+                        *bench_tail,
+                    )
+                )
+
+        # These are architecture constants, not learned state. Keeping them
+        # non-persistent preserves a compact state dict while .to(device)
+        # still moves them once with the module.
+        self.register_buffer(
+            "_bring_subsets",
+            torch.tensor(bring_subsets, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_lead_orders",
+            torch.tensor(lead_orders, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_joint_picks",
+            torch.tensor(joint_picks, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_joint_subset_indices",
+            torch.arange(len(joint_picks), dtype=torch.long) // len(lead_orders),
+            persistent=False,
+        )
+
+    @property
+    def legal_action_count(self) -> int:
+        return int(self._joint_picks.shape[0])
+
+    @property
+    def action_table(self) -> torch.Tensor:
+        """Canonical action rows in joint-log-probability column order."""
+        return self._joint_picks.detach().clone()
+
+    def _score_bring_subsets(
+        self,
+        pokemon_reps: torch.Tensor,
+        opponent_reps: torch.Tensor,
+        context: torch.Tensor,
+        opponent_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Score every subset symmetrically and project opponent items once."""
+        subset_members = pokemon_reps[:, self._bring_subsets]
+        subset_sum = subset_members.sum(dim=2)
+        bring_summary = subset_sum / float(self.pick_size)
+
+        # Score every member as a candidate conditioned on the other members in
+        # its proposed subset. Averaging the shared member score makes the subset
+        # logit invariant to the members' roster positions and ordering.
+        other_member_sum = subset_sum.unsqueeze(2) - subset_members
+        context_width = context.shape[-1]
+        pokemon_width = pokemon_reps.shape[-1]
+        context_projection = self.context_proj
+        member_context = F.linear(
+            context[:, None, None, :],
+            context_projection.weight[:, :context_width],
+            context_projection.bias,
+        ) + F.linear(
+            other_member_sum,
+            context_projection.weight[:, context_width:],
+            None,
+        )
+        opponent_keys, opponent_values = self.bring_opponent_attention._project_items(
+            opponent_reps
+        )
+        attention_query = self.bring_opponent_attention.query_proj
+        projected_queries = F.linear(
+            member_context,
+            attention_query.weight[:, :context_width],
+            attention_query.bias,
+        ) + F.linear(
+            subset_members,
+            attention_query.weight[:, context_width:],
+            None,
+        )
+        candidate_opponent_summaries = (
+            self.bring_opponent_attention._pool_projected_queries(
+                projected_queries,
+                opponent_keys,
+                opponent_values,
+                opponent_mask,
+            )
+        )
+        bring_hidden_layer = self.bring_score[0]
+        bring_hidden = F.linear(
+            subset_members,
+            bring_hidden_layer.weight[:, :pokemon_width],
+            bring_hidden_layer.bias,
+        )
+        bring_hidden = bring_hidden + F.linear(
+            member_context,
+            bring_hidden_layer.weight[
+                :,
+                pokemon_width : pokemon_width + context_width,
+            ],
+            None,
+        )
+        bring_hidden = bring_hidden + F.linear(
+            candidate_opponent_summaries,
+            bring_hidden_layer.weight[:, pokemon_width + context_width :],
+            None,
+        )
+        member_scores = F.linear(
+            F.relu(bring_hidden),
+            self.bring_score[2].weight,
+            self.bring_score[2].bias,
+        ).squeeze(-1)
+        subset_logits = member_scores.mean(dim=2)
+        return subset_logits, subset_members, bring_summary
+
+    def _score_lead_orders(
+        self,
+        subset_members: torch.Tensor,
+        bring_summary: torch.Tensor,
+        context: torch.Tensor,
+        opponent_keys: torch.Tensor,
+        opponent_values: torch.Tensor,
+        opponent_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Score every ordered lead pair for one or more bring subsets."""
+        left = subset_members.index_select(-2, self._lead_orders[:, 0])
+        right = subset_members.index_select(-2, self._lead_orders[:, 1])
+        context_width = context.shape[-1]
+        pokemon_width = subset_members.shape[-1]
+        lead_context_projection = self.lead_context_proj
+        lead_context = F.linear(
+            context,
+            lead_context_projection.weight[:, :context_width],
+            lead_context_projection.bias,
+        ) + F.linear(
+            bring_summary,
+            lead_context_projection.weight[:, context_width:],
+            None,
+        )
+        attention_query = self.lead_opponent_attention.query_proj
+        projected_queries = F.linear(
+            lead_context.unsqueeze(-2),
+            attention_query.weight[:, :context_width],
+            attention_query.bias,
+        )
+        projected_queries = projected_queries + F.linear(
+            left,
+            attention_query.weight[
+                :,
+                context_width : context_width + pokemon_width,
+            ],
+            None,
+        )
+        projected_queries = projected_queries + F.linear(
+            right,
+            attention_query.weight[:, context_width + pokemon_width :],
+            None,
+        )
+        lead_pair_opponent_summaries = (
+            self.lead_opponent_attention._pool_projected_queries(
+                projected_queries,
+                opponent_keys,
+                opponent_values,
+                opponent_mask,
+            )
+        )
+        lead_hidden_layer = self.lead_pair_score[0]
+        first = 0
+        second = first + pokemon_width
+        third = second + pokemon_width
+        fourth = third + pokemon_width
+        fifth = fourth + pokemon_width
+        lead_hidden = F.linear(
+            left,
+            lead_hidden_layer.weight[:, first:second],
+            lead_hidden_layer.bias,
+        )
+        lead_hidden = lead_hidden + F.linear(
+            right,
+            lead_hidden_layer.weight[:, second:third],
+            None,
+        )
+        lead_hidden = lead_hidden + F.linear(
+            bring_summary.unsqueeze(-2),
+            lead_hidden_layer.weight[:, third:fourth],
+            None,
+        )
+        lead_hidden = lead_hidden + F.linear(
+            lead_pair_opponent_summaries,
+            lead_hidden_layer.weight[:, fourth:fifth],
+            None,
+        )
+        lead_hidden = lead_hidden + F.linear(
+            lead_context.unsqueeze(-2),
+            lead_hidden_layer.weight[:, fifth:],
+            None,
+        )
+        return F.linear(
+            F.relu(lead_hidden),
+            self.lead_pair_score[2].weight,
+            self.lead_pair_score[2].bias,
+        ).squeeze(-1)
+
+    def _score_all_lead_orders(
+        self,
+        pokemon_reps: torch.Tensor,
+        bring_summaries: torch.Tensor,
+        context: torch.Tensor,
+        opponent_keys: torch.Tensor,
+        opponent_values: torch.Tensor,
+        opponent_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Score the full joint table without re-projecting repeated members."""
+        context_width = context.shape[-1]
+        pokemon_width = pokemon_reps.shape[-1]
+        left_slots = self._joint_picks[:, 0]
+        right_slots = self._joint_picks[:, 1]
+        subset_indices = self._joint_subset_indices
+
+        lead_context_projection = self.lead_context_proj
+        lead_contexts = F.linear(
+            context.unsqueeze(1),
+            lead_context_projection.weight[:, :context_width],
+            lead_context_projection.bias,
+        ) + F.linear(
+            bring_summaries,
+            lead_context_projection.weight[:, context_width:],
+            None,
+        )
+
+        attention_query = self.lead_opponent_attention.query_proj
+        projected_contexts = F.linear(
+            lead_contexts,
+            attention_query.weight[:, :context_width],
+            attention_query.bias,
+        )
+        projected_left = F.linear(
+            pokemon_reps,
+            attention_query.weight[
+                :,
+                context_width : context_width + pokemon_width,
+            ],
+            None,
+        )
+        projected_right = F.linear(
+            pokemon_reps,
+            attention_query.weight[:, context_width + pokemon_width :],
+            None,
+        )
+        projected_queries = (
+            projected_contexts[:, subset_indices]
+            + projected_left[:, left_slots]
+            + projected_right[:, right_slots]
+        )
+        opponent_summaries = self.lead_opponent_attention._pool_projected_queries(
+            projected_queries,
+            opponent_keys,
+            opponent_values,
+            opponent_mask,
+        )
+
+        lead_hidden_layer = self.lead_pair_score[0]
+        first = 0
+        second = first + pokemon_width
+        third = second + pokemon_width
+        fourth = third + pokemon_width
+        fifth = fourth + pokemon_width
+        projected_left_hidden = F.linear(
+            pokemon_reps,
+            lead_hidden_layer.weight[:, first:second],
+            lead_hidden_layer.bias,
+        )
+        projected_right_hidden = F.linear(
+            pokemon_reps,
+            lead_hidden_layer.weight[:, second:third],
+            None,
+        )
+        projected_bring_hidden = F.linear(
+            bring_summaries,
+            lead_hidden_layer.weight[:, third:fourth],
+            None,
+        )
+        projected_opponent_hidden = F.linear(
+            opponent_summaries,
+            lead_hidden_layer.weight[:, fourth:fifth],
+            None,
+        )
+        projected_context_hidden = F.linear(
+            lead_contexts,
+            lead_hidden_layer.weight[:, fifth:],
+            None,
+        )
+        lead_hidden = (
+            projected_left_hidden[:, left_slots]
+            + projected_right_hidden[:, right_slots]
+            + projected_bring_hidden[:, subset_indices]
+            + projected_opponent_hidden
+            + projected_context_hidden[:, subset_indices]
+        )
+        logits = F.linear(
+            F.relu(lead_hidden),
+            self.lead_pair_score[2].weight,
+            self.lead_pair_score[2].bias,
+        ).squeeze(-1)
+        return logits.reshape(
+            pokemon_reps.shape[0],
+            self._bring_subsets.shape[0],
+            self._lead_orders.shape[0],
+        )
+
+    def _external_action_indices(
+        self,
+        picks: torch.Tensor,
+        valid_subsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map externally supplied pick rows to exact joint-action indices."""
+        batch_size = valid_subsets.shape[0]
+        if picks.shape != (batch_size, self.pick_size):
+            raise ValueError(
+                "TeamPreviewHead expected picks shape "
+                f"{(batch_size, self.pick_size)}, got {tuple(picks.shape)}."
+            )
+        if picks.device != self._joint_picks.device:
+            raise ValueError("TeamPreviewHead picks must share the model device.")
+        if picks.dtype not in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            raise ValueError("TeamPreviewHead picks must contain integer indices.")
+
+        normalized = torch.cat(
+            [picks[:, :2], picks[:, 2:].sort(dim=1).values],
+            dim=1,
+        )
+        matches = (
+            normalized.unsqueeze(1).eq(self._joint_picks.unsqueeze(0)).sum(dim=-1)
+            == self.pick_size
+        )
+        action_indices = matches.to(torch.int64).argmax(dim=1)
+        valid_actions = (
+            valid_subsets.unsqueeze(2)
+            .expand(-1, -1, self._lead_orders.shape[0])
+            .reshape(batch_size, -1)
+        )
+        selected_is_valid = valid_actions.gather(
+            1, action_indices.unsqueeze(1)
+        ).squeeze(1)
+        if not ((matches.sum(dim=1) == 1) & selected_is_valid).all():
+            raise RuntimeError(
+                "TeamPreviewHead received an invalid canonical bring target."
+            )
+        return action_indices
+
     def forward(
         self,
         pokemon_reps: torch.Tensor,
@@ -2092,12 +2512,22 @@ class TeamPreviewHead(nn.Module):
         greedy: bool = False,
         include_policy_stats: bool = True,
     ) -> dict[str, torch.Tensor]:
-        batch, team_size, pdim = pokemon_reps.shape
+        batch, team_size, _ = pokemon_reps.shape
         opponent_batch, opponent_size, _ = opponent_reps.shape
+        if team_size != self.team_size:
+            raise ValueError(
+                "TeamPreviewHead input team size does not match its configured "
+                f"action space: input={team_size}, configured={self.team_size}."
+            )
         if opponent_batch != batch:
             raise ValueError(
                 "TeamPreviewHead expected batch-aligned own and opponent "
                 f"representations, got {batch} and {opponent_batch}."
+            )
+        if team_mask is not None and team_mask.shape != (batch, team_size):
+            raise ValueError(
+                "TeamPreviewHead expected team_mask shape "
+                f"{(batch, team_size)}, got {tuple(team_mask.shape)}."
             )
         if opponent_mask is not None and opponent_mask.shape != (
             batch,
@@ -2118,188 +2548,141 @@ class TeamPreviewHead(nn.Module):
                 f"TeamPreviewHead needs at least {self.pick_size} available pokemon per batch item."
             )
 
-        canonical_bring = None if picks is None else picks.sort(dim=1).values
-        team_positions = torch.arange(team_size, device=context.device).view(
-            1, team_size
+        bring_logits, subset_members, bring_summaries = self._score_bring_subsets(
+            pokemon_reps,
+            opponent_reps,
+            context,
+            opponent_mask,
         )
+        valid_subsets = available[:, self._bring_subsets].sum(dim=2) == self.pick_size
+        bring_logits = bring_logits.masked_fill(~valid_subsets, -torch.inf)
+        lead_count = self._lead_orders.shape[0]
+        batch_indices = torch.arange(batch, device=context.device)
+        bring_log_probs_all: torch.Tensor | None = None
+        lead_log_probs_all: torch.Tensor | None = None
+        joint_log_probs: torch.Tensor | None = None
 
-        bring_log_probs: list[torch.Tensor] = []
-        bring_entropies: list[torch.Tensor] = []
-        bring_picks: list[torch.Tensor] = []
-        picked_sum = torch.zeros(batch, pdim, device=context.device)
-        next_min_index = torch.zeros(batch, 1, dtype=torch.long, device=context.device)
-        remaining = available.clone()
-        bring_opponent_keys, bring_opponent_values = (
-            self.bring_opponent_attention._project_items(opponent_reps)
-        )
-
-        for step in range(self.pick_size):
-            ctx = self.context_proj(torch.cat([context, picked_sum], dim=-1))
-            ctx_expanded = ctx.unsqueeze(1).expand(-1, team_size, -1)
-            candidate_queries = torch.cat([ctx_expanded, pokemon_reps], dim=-1)
-            candidate_opponent_summaries = (
-                self.bring_opponent_attention._pool_projected(
-                    candidate_queries,
-                    bring_opponent_keys,
-                    bring_opponent_values,
-                    opponent_mask,
-                )
+        if picks is not None:
+            action_indices = self._external_action_indices(picks, valid_subsets)
+            bring_indices = torch.div(
+                action_indices,
+                lead_count,
+                rounding_mode="floor",
             )
-            bring_inputs = torch.cat(
-                [pokemon_reps, ctx_expanded, candidate_opponent_summaries], dim=-1
+            lead_indices = action_indices.remainder(lead_count)
+        elif not include_policy_stats and not greedy:
+            # Fast live path: enumerate 15 bring subsets, then only the 12 lead
+            # orders belonging to the sampled subset.
+            bring_indices = _sample_categorical_logits(bring_logits)
+            selected_members = subset_members[batch_indices, bring_indices]
+            selected_summaries = bring_summaries[batch_indices, bring_indices]
+            lead_opponent_keys, lead_opponent_values = (
+                self.lead_opponent_attention._project_items(opponent_reps)
             )
-            bring_scores = self.bring_score(bring_inputs).squeeze(-1)
-            picks_left = self.pick_size - step
-            suffix_available = torch.cumsum(
-                remaining.flip(1).to(dtype=torch.int64), dim=1
-            ).flip(1)
-            valid = (
-                remaining
-                & (team_positions >= next_min_index)
-                & (suffix_available >= picks_left)
+            selected_lead_logits = self._score_lead_orders(
+                selected_members,
+                selected_summaries,
+                context,
+                lead_opponent_keys,
+                lead_opponent_values,
+                opponent_mask,
             )
-            bring_scores = bring_scores.masked_fill(~valid, -1e8)
-            if include_policy_stats:
-                bring_log_probs_step = torch.log_softmax(bring_scores, dim=1)
-                bring_probs_step = bring_log_probs_step.exp()
-
-            if canonical_bring is None:
-                chosen = (
-                    bring_scores.argmax(dim=1)
-                    if greedy
-                    else _sample_categorical_logits(bring_scores)
-                )
-            else:
-                chosen = canonical_bring[:, step]
-
-            # Sampled picks come from the masked scores above. Only external
-            # training labels need a host-visible validity check.
-            if (
-                picks is not None
-                and not valid.gather(1, chosen.unsqueeze(1)).squeeze(1).all()
-            ):
-                raise RuntimeError(
-                    "TeamPreviewHead received an invalid canonical bring target."
-                )
-
-            bring_picks.append(chosen)
-            if include_policy_stats:
-                bring_log_probs.append(
-                    bring_log_probs_step.gather(1, chosen.unsqueeze(1)).squeeze(1)
-                )
-                bring_entropies.append(
-                    -(bring_probs_step * bring_log_probs_step).sum(dim=1)
-                )
-
-            remaining.scatter_(1, chosen.unsqueeze(1), False)
-            next_min_index = chosen.unsqueeze(1) + 1
-            chosen_rep = pokemon_reps.gather(
-                1,
-                chosen.unsqueeze(1).unsqueeze(2).expand(-1, -1, pdim),
-            ).squeeze(1)
-            picked_sum = picked_sum + chosen_rep
-
-        bring_picks_tensor = torch.stack(bring_picks, dim=1)
-
-        bring_mask = torch.zeros(
-            batch, team_size, dtype=torch.bool, device=context.device
-        )
-        bring_mask.scatter_(1, bring_picks_tensor, True)
-        bring_summary = picked_sum / float(self.pick_size)
-        lead_context = self.lead_context_proj(
-            torch.cat([context, bring_summary], dim=-1)
-        )
-        left = pokemon_reps.unsqueeze(2).expand(-1, team_size, team_size, -1)
-        right = pokemon_reps.unsqueeze(1).expand(-1, team_size, team_size, -1)
-        bring_expanded = (
-            bring_summary.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
-        )
-        lead_context_expanded = (
-            lead_context.unsqueeze(1).unsqueeze(2).expand(-1, team_size, team_size, -1)
-        )
-        lead_pair_queries = torch.cat([lead_context_expanded, left, right], dim=-1)
-        lead_pair_opponent_summaries = self.lead_opponent_attention(
-            lead_pair_queries, opponent_reps, opponent_mask
-        )
-        lead_pair_logits = self.lead_pair_score(
-            torch.cat(
-                [
-                    left,
-                    right,
-                    bring_expanded,
-                    lead_pair_opponent_summaries,
-                    lead_context_expanded,
-                ],
-                dim=-1,
-            )
-        ).squeeze(-1)
-
-        invalid_pairs = torch.eye(
-            team_size, dtype=torch.bool, device=context.device
-        ).unsqueeze(0)
-        invalid_pairs = (
-            invalid_pairs | (~bring_mask).unsqueeze(1) | (~bring_mask).unsqueeze(2)
-        )
-        if team_mask is not None:
-            invalid_pairs = (
-                invalid_pairs | team_mask.unsqueeze(1) | team_mask.unsqueeze(2)
-            )
-        lead_pair_logits = lead_pair_logits.masked_fill(invalid_pairs, -1e8).reshape(
-            batch, team_size * team_size
-        )
-
-        if picks is None:
-            chosen_pair = (
-                lead_pair_logits.argmax(dim=1)
-                if greedy
-                else _sample_categorical_logits(lead_pair_logits)
-            )
+            lead_indices = _sample_categorical_logits(selected_lead_logits)
+            action_indices = bring_indices * lead_count + lead_indices
         else:
-            chosen_pair = picks[:, 0] * team_size + picks[:, 1]
+            # Exact statistics and deterministic argmax selection need every
+            # conditional lead distribution in the small joint action space.
+            lead_opponent_keys, lead_opponent_values = (
+                self.lead_opponent_attention._project_items(opponent_reps)
+            )
+            all_lead_logits = self._score_all_lead_orders(
+                pokemon_reps,
+                bring_summaries,
+                context,
+                lead_opponent_keys,
+                lead_opponent_values,
+                opponent_mask,
+            )
+            bring_log_probs_all = torch.log_softmax(bring_logits, dim=1)
+            lead_log_probs_all = torch.log_softmax(all_lead_logits, dim=2)
+            joint_log_probs = bring_log_probs_all.unsqueeze(2) + lead_log_probs_all
+            if greedy:
+                action_indices = joint_log_probs.reshape(batch, -1).argmax(dim=1)
+                bring_indices = torch.div(
+                    action_indices,
+                    lead_count,
+                    rounding_mode="floor",
+                )
+                lead_indices = action_indices.remainder(lead_count)
+            else:
+                bring_indices = _sample_categorical_logits(bring_logits)
+                selected_lead_logits = all_lead_logits[
+                    batch_indices,
+                    bring_indices,
+                ]
+                lead_indices = _sample_categorical_logits(selected_lead_logits)
+                action_indices = bring_indices * lead_count + lead_indices
 
-        valid_pairs = (~invalid_pairs).reshape(batch, team_size * team_size)
-        if (
-            picks is not None
-            and not valid_pairs.gather(1, chosen_pair.unsqueeze(1)).squeeze(1).all()
-        ):
-            raise RuntimeError("TeamPreviewHead received an invalid lead pair target.")
-
-        lead_pair = torch.stack(
-            [chosen_pair // team_size, chosen_pair % team_size], dim=1
-        )
-
-        remaining_bring_mask = bring_mask.clone()
-        remaining_bring_mask.scatter_(1, lead_pair, False)
-        bench_tail = team_positions.expand(batch, -1).masked_fill(
-            ~remaining_bring_mask, team_size
-        )
-        bench_tail = bench_tail.sort(dim=1).values[:, : self.pick_size - 2]
-        final_picks = torch.cat([lead_pair, bench_tail], dim=1)
-
+        final_picks = self._joint_picks[action_indices]
+        bring_picks = self._bring_subsets[bring_indices]
+        lead_pair = final_picks[:, :2]
         result = {
-            "bring_picks": bring_picks_tensor,
+            "bring_picks": bring_picks,
             "lead_pair": lead_pair,
             "picks": final_picks,
         }
-        if include_policy_stats:
-            bring_log_prob = torch.stack(bring_log_probs, dim=1).sum(dim=1)
-            bring_entropy = torch.stack(bring_entropies, dim=1).sum(dim=1)
-            lead_log_probs = torch.log_softmax(lead_pair_logits, dim=1)
-            lead_probs = lead_log_probs.exp()
-            lead_log_prob = lead_log_probs.gather(1, chosen_pair.unsqueeze(1)).squeeze(
-                1
+        if not include_policy_stats:
+            return result
+
+        # ``picks`` may have taken the external-action branch, in which case the
+        # exact joint tensors have not been computed yet.
+        if joint_log_probs is None:
+            lead_opponent_keys, lead_opponent_values = (
+                self.lead_opponent_attention._project_items(opponent_reps)
             )
-            lead_entropy = -(lead_probs * lead_log_probs).sum(dim=1)
-            result.update(
-                {
-                    "bring_log_prob": bring_log_prob,
-                    "lead_log_prob": lead_log_prob,
-                    "log_prob": bring_log_prob + lead_log_prob,
-                    "bring_entropy": bring_entropy,
-                    "lead_entropy": lead_entropy,
-                    "entropy": bring_entropy + lead_entropy,
-                }
+            all_lead_logits = self._score_all_lead_orders(
+                pokemon_reps,
+                bring_summaries,
+                context,
+                lead_opponent_keys,
+                lead_opponent_values,
+                opponent_mask,
             )
+            bring_log_probs_all = torch.log_softmax(bring_logits, dim=1)
+            lead_log_probs_all = torch.log_softmax(all_lead_logits, dim=2)
+            joint_log_probs = bring_log_probs_all.unsqueeze(2) + lead_log_probs_all
+
+        assert bring_log_probs_all is not None
+        assert lead_log_probs_all is not None
+        bring_probs = bring_log_probs_all.exp()
+        lead_probs = lead_log_probs_all.exp()
+        finite_bring_log_probs = bring_log_probs_all.masked_fill(
+            ~valid_subsets,
+            0.0,
+        )
+        bring_entropy = -(bring_probs * finite_bring_log_probs).sum(dim=1)
+        conditional_lead_entropies = -(lead_probs * lead_log_probs_all).sum(dim=2)
+        lead_entropy = (bring_probs * conditional_lead_entropies).sum(dim=1)
+        bring_log_prob = bring_log_probs_all.gather(
+            1,
+            bring_indices.unsqueeze(1),
+        ).squeeze(1)
+        lead_log_prob = lead_log_probs_all[
+            batch_indices,
+            bring_indices,
+            lead_indices,
+        ]
+        result.update(
+            {
+                "bring_log_prob": bring_log_prob,
+                "lead_log_prob": lead_log_prob,
+                "log_prob": bring_log_prob + lead_log_prob,
+                "bring_entropy": bring_entropy,
+                "lead_entropy": lead_entropy,
+                "entropy": bring_entropy + lead_entropy,
+                "joint_log_probs": joint_log_probs.reshape(batch, -1),
+            }
+        )
         return result
 
 

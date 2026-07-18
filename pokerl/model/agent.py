@@ -131,7 +131,10 @@ class PokeAgent(nn.Module):
             type_effectiveness=torch.from_numpy(game_data.type_effectiveness_matrix()),
         )
         self.team_preview_head = TeamPreviewHead(
-            config.pokemon_out, memory_out, config.pick_size
+            config.pokemon_out,
+            memory_out,
+            config.pick_size,
+            team_size=config.team_size,
         )
         self.opponent_preview_head = OpponentPreviewHead(config.pokemon_out, memory_out)
         self.value_head = ValueHead(memory_out, config.pokemon_out, config.value_hidden)

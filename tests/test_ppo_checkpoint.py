@@ -367,6 +367,24 @@ def test_league_checkpoint_is_marked_as_league(tmp_path) -> None:
     assert set(checkpoint["model_metadata"]) == MODEL_CHECKPOINT_METADATA_FIELDS
 
 
+def test_league_checkpoint_refuses_to_overwrite_existing_archive_bytes(
+    tmp_path,
+) -> None:
+    target = tmp_path / "league" / "step_7.pt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"immutable prior run")
+    league = object.__new__(League)
+    league.config = TrainingConfig(checkpoint_dir=str(tmp_path))
+    league.checkpoints = []
+    league._members = {}
+    league._current_update = 0
+
+    with pytest.raises(FileExistsError, match="already exists on disk"):
+        league.add_checkpoint(TinyAgent(), step=7)
+
+    assert target.read_bytes() == b"immutable prior run"
+
+
 def test_league_inference_rejects_model_signature_mismatch(tmp_path) -> None:
     source = TinyAgent()
     source.architecture_signature = "same-architecture"

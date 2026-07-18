@@ -151,34 +151,45 @@ def evaluate_preview_distributions(
         for key in observations[0]
     }
     action_count = len(actions)
-    total_rows = len(observations) * action_count
-    log_probabilities = np.empty(total_rows, dtype=np.float64)
+    head_actions = agent.team_preview_head.action_table.detach().cpu().numpy()
+    if not np.array_equal(actions, head_actions):
+        raise RuntimeError(
+            "Evaluation action enumeration does not match the model's exact "
+            "team-preview action table."
+        )
+    log_probabilities = np.empty(
+        (len(observations), action_count),
+        dtype=np.float64,
+    )
 
     with torch.inference_mode():
-        for start in range(0, total_rows, batch_size):
-            stop = min(start + batch_size, total_rows)
-            flat_indices = np.arange(start, stop, dtype=np.int64)
-            opponent_indices = flat_indices // action_count
-            action_indices = flat_indices % action_count
+        for start in range(0, len(observations), batch_size):
+            stop = min(start + batch_size, len(observations))
             obs_batch = {
-                key: torch.from_numpy(values[opponent_indices]).to(device)
+                key: torch.from_numpy(values[start:stop]).to(device)
                 for key, values in stacked_observations.items()
             }
-            picks = torch.from_numpy(actions[action_indices]).to(device)
             output = agent.team_preview(
                 obs_batch,
-                picks=picks,
+                greedy=True,
                 include_value=False,
                 include_policy_stats=True,
                 include_opponent_preview=False,
             )
+            joint_log_probs = output.get("joint_log_probs")
+            if joint_log_probs is None or joint_log_probs.shape != (
+                stop - start,
+                action_count,
+            ):
+                raise RuntimeError(
+                    "Exact team-preview evaluation requires joint_log_probs "
+                    f"shape {(stop - start, action_count)}."
+                )
             log_probabilities[start:stop] = (
-                output["log_prob"].detach().cpu().numpy().astype(np.float64)
+                joint_log_probs.detach().cpu().numpy().astype(np.float64)
             )
 
-    raw_probabilities = np.exp(
-        log_probabilities.reshape(len(observations), action_count)
-    )
+    raw_probabilities = np.exp(log_probabilities)
     raw_sums = raw_probabilities.sum(axis=1)
     max_sum_error = float(np.max(np.abs(raw_sums - 1.0)))
     if not np.allclose(
@@ -317,7 +328,7 @@ def main() -> None:
     game_data = GameData(gen=9)
     team_size = 6
     pick_size = 4
-    model_config = ModelConfig(pick_size=pick_size)
+    model_config = ModelConfig(team_size=team_size, pick_size=pick_size)
     species_bst_lookup = build_species_bst_lookup(gen=game_data.gen)
     shared_manifest_path = (
         Path(args.team_pool_manifest)

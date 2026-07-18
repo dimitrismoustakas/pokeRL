@@ -222,7 +222,10 @@ def main() -> None:
         battles_per_worker=args.battles_per_worker,
         runtime_loop_count=args.runtime_loop_count,
     )
-    model_config = ModelConfig(pick_size=env_config.pick_size)
+    model_config = ModelConfig(
+        team_size=env_config.team_size,
+        pick_size=env_config.pick_size,
+    )
     game_data = GameData(gen=9)
     species_bst_lookup = build_species_bst_lookup(gen=game_data.gen)
 

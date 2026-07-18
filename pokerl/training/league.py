@@ -2599,7 +2599,12 @@ class League:
         path = f"{self.config.checkpoint_dir}/league/step_{step}.pt"
         if path in self._members:
             raise ValueError(f"League archive already contains {path!r}.")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        target = Path(path)
+        if target.exists():
+            raise FileExistsError(
+                f"League checkpoint path already exists on disk: {target!s}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "checkpoint_type": "league",
@@ -2607,7 +2612,7 @@ class League:
                 "model_metadata": model_checkpoint_metadata(agent),
                 "agent": agent.state_dict(),
             },
-            path,
+            target,
         )
         checkpoint_sha256 = _checkpoint_file_sha256(path)
         self.checkpoints.append(path)

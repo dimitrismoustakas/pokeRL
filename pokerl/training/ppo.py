@@ -1,5 +1,6 @@
 """PPO trainer with support for action masking and LSTM policies."""
 
+import copy
 import random
 import uuid
 from collections.abc import Mapping
@@ -73,6 +74,17 @@ _PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
     "field_change_logits",
     "field_alternative_logits",
 )
+
+
+def _copy_initialization_provenance(
+    checkpoint: Mapping[str, object],
+) -> dict[str, object] | None:
+    provenance = checkpoint.get("initialization_provenance")
+    if provenance is None:
+        return None
+    if not isinstance(provenance, Mapping):
+        raise ValueError("Checkpoint initialization_provenance must be a mapping.")
+    return copy.deepcopy(dict(provenance))
 
 
 def _capture_rng_state() -> dict[str, object]:
@@ -171,6 +183,7 @@ class PPOTrainer:
         self.completed_updates = 0
         self.loaded_training_state_id: str | None = None
         self.initialized_from_training_state_id: str | None = None
+        self.initialization_provenance: dict[str, object] | None = None
 
     def _make_optimizer(self) -> torch.optim.Adam:
         return torch.optim.Adam(self.agent.parameters(), lr=self.config.lr, eps=1e-5)
@@ -2121,20 +2134,22 @@ class PPOTrainer:
         if not isinstance(state_id, str) or not state_id:
             raise ValueError("training_state_id must be a non-empty string.")
         try:
-            torch.save(
-                {
-                    "checkpoint_type": "trainer",
-                    "format_version": TRAINER_CHECKPOINT_FORMAT_VERSION,
-                    "model_metadata": model_checkpoint_metadata(self.agent),
-                    "agent": self.agent.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "global_step": self.global_step,
-                    "completed_updates": self.completed_updates,
-                    "training_state_id": state_id,
-                    "rng_state": _capture_rng_state(),
-                },
-                temporary,
-            )
+            checkpoint: dict[str, object] = {
+                "checkpoint_type": "trainer",
+                "format_version": TRAINER_CHECKPOINT_FORMAT_VERSION,
+                "model_metadata": model_checkpoint_metadata(self.agent),
+                "agent": self.agent.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "global_step": self.global_step,
+                "completed_updates": self.completed_updates,
+                "training_state_id": state_id,
+                "rng_state": _capture_rng_state(),
+            }
+            if self.initialization_provenance is not None:
+                checkpoint["initialization_provenance"] = copy.deepcopy(
+                    self.initialization_provenance
+                )
+            torch.save(checkpoint, temporary)
             temporary.replace(target)
         finally:
             temporary.unlink(missing_ok=True)
@@ -2142,9 +2157,9 @@ class PPOTrainer:
     def initialize_from_trainer_weights(self, path: str) -> None:
         """Strictly initialize model weights without inheriting training state.
 
-        Best-response policies are new learners.  They may start from a
-        competent main policy, but must not silently inherit its Adam moments,
-        update counters, or RNG streams.  This method accepts only the current
+        A weight-initialized policy is a new learner. It may start from a
+        competent policy, but must not silently inherit its Adam moments,
+        update counters, or RNG streams. This method accepts only the current
         versioned trainer format so architecture and vocabulary metadata can be
         validated before loading exact weights.
         """
@@ -2190,6 +2205,7 @@ class PPOTrainer:
                 raise ValueError(
                     "Weight initializer training_state_id must be non-empty string."
                 )
+            initialization_provenance = _copy_initialization_provenance(checkpoint)
             try:
                 self.agent.load_state_dict(checkpoint_state, strict=True)
             except RuntimeError as exc:
@@ -2204,6 +2220,7 @@ class PPOTrainer:
             self.completed_updates = 0
             self.loaded_training_state_id = None
             self.initialized_from_training_state_id = source_state_id
+            self.initialization_provenance = initialization_provenance
         finally:
             # Loading checkpoint bytes and validating metadata must be RNG
             # transparent.  The caller's freshly configured phase streams stay
@@ -2273,6 +2290,7 @@ class PPOTrainer:
                 "Trainer checkpoint training_state_id must be a non-empty string."
             )
         rng_state = _validate_restorable_rng_state(checkpoint["rng_state"])
+        initialization_provenance = _copy_initialization_provenance(checkpoint)
 
         loaded_optimizer = self._make_optimizer()
         try:
@@ -2293,4 +2311,5 @@ class PPOTrainer:
         self.completed_updates = completed_updates
         self.loaded_training_state_id = training_state_id
         self.initialized_from_training_state_id = None
+        self.initialization_provenance = initialization_provenance
         _restore_rng_state(rng_state)

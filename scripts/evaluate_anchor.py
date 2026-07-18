@@ -465,7 +465,10 @@ def evaluate_anchor_matchup(args: argparse.Namespace) -> dict[str, object]:
             else EnvConfig.battlestream_startup_timeout
         ),
     )
-    model_config = ModelConfig(pick_size=env_config.pick_size)
+    model_config = ModelConfig(
+        team_size=env_config.team_size,
+        pick_size=env_config.pick_size,
+    )
     game_data = GameData(gen=9)
     manifest_path = (
         Path(args.team_pool_manifest)

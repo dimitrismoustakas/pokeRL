@@ -55,16 +55,17 @@ boundaries.
 ## Team preview
 
 At preview, the policy sees both complete public rosters and produces one
-distribution over legal ordered four-Pokémon choices. The head factorizes that
-decision into:
+exact distribution over the 180 legal ordered four-Pokémon choices. The head
+factorizes that decision into:
 
-1. a four-of-six bring set; then
-2. an ordered lead pair from the selected four.
+1. one of the 15 four-of-six bring subsets; then
+2. one of the 12 ordered lead pairs from that subset.
 
-Training and strength evaluation sample from this distribution. Exact preview
-diagnostics also report the **most-probable (`argmax`) choice** for each
-opposing roster. This is only the choice with the largest policy probability;
-it is not a heuristic or a claim of strategic optimality.
+Subset scoring is symmetric over the selected members, so permuting roster
+slots only permutes the semantic action probabilities. Live inference scores
+all subsets in one vectorized pass and only the selected subset's lead orders.
+Training, exact diagnostics, and deterministic argmax selection expose the
+complete joint distribution without repeating the observation 180 times.
 
 The preview head shares the spatial encoder and recurrent module with the
 battle policy. It has its own value baseline and auxiliary opponent-preview
@@ -95,9 +96,10 @@ and move-set targets. A compact belief residual is added to public opponent
 representations consumed by the action and value heads.
 
 The opponent-intent head predicts semantic action kind, global move identity,
-target, switch species, and factorized Tera intent. It supplies a dense
-trainer-only loss and a compact policy adapter; exact opponent decisions remain
-private labels.
+target, switch species, and factorized Tera intent. It currently supplies only
+a dense trainer-only auxiliary loss. Its predictions are not consumed by the
+deployed action or value heads, and exact opponent decisions remain private
+labels.
 
 The public-consequence model predicts what a selected action publicly resolves
 into. Field outcomes are decomposed into:
@@ -207,8 +209,9 @@ verified child population to a resumable main league.
 ## Checkpoints and resume
 
 Trainer checkpoints contain model and Adam state, counters, schema metadata,
-and RNG state. A paired league or phase-state file records the exact opponent
-sampler boundary and assignments.
+RNG state, and retained initialization provenance when applicable. A paired
+league or phase-state file records the exact opponent sampler boundary and
+assignments.
 
 Resume fails if the model signature, tensor schema, vocabulary, team pool,
 battle format, completed update, or paired state disagrees. Frozen league
@@ -216,6 +219,15 @@ snapshots intentionally omit trainer state and cannot resume learning.
 
 Best-response initialization is different from resume: it loads compatible
 weights but creates a fresh optimizer, counters, and RNG streams.
+
+Architecture version 4 deliberately rejects version-3 preview checkpoints.
+The version-3 conversion tool can retain compatible battle and preview feature
+weights, zero the two preview policy output layers to obtain an exact uniform
+policy, and reset the now-stale preview value head. It does not convert or
+preserve the version-3 league population. The converted checkpoint starts a
+new main run through `--initialize-from` and requires an explicit empty
+`--checkpoint-dir`; it is never accepted as a silent resume of the 440-update
+run.
 
 ## Runtime architecture
 
