@@ -7,12 +7,12 @@ poke-env BattleStream backend; no websocket server is required.
 ## Documentation
 
 - [Architecture and training semantics](docs/ARCHITECTURE.md)
-- [Current measured status](docs/STATUS.md)
+- [Independent review of current evidence and open decisions](docs/INDEPENDENT_REVIEW.md)
 - [Archived rollout-efficiency experiment](docs/experiments/2026-07-17-lazy-orders-target-coalescing.md)
 
-`docs/STATUS.md` describes only the latest accepted evidence. Historical run
-details belong in immutable JSON summaries and Git history, not an
-ever-growing Markdown diary.
+`docs/INDEPENDENT_REVIEW.md` is replaced as evidence and decisions change.
+Historical run details belong in immutable JSON summaries and Git history,
+not an ever-growing Markdown diary.
 
 ## Setup
 

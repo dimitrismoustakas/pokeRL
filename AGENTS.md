@@ -25,5 +25,5 @@ handoff.
 - Treat private simulator data as trainer-only labels. Inference receives only
   information legitimately available to a player.
 - Preserve user changes and unrelated worktree state.
-- Keep documentation current and compact. Replace `docs/STATUS.md`; do not
-  append a chronological project diary.
+- Keep documentation current and compact. Replace
+  `docs/INDEPENDENT_REVIEW.md`; do not append a chronological project diary.
