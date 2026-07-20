@@ -1,0 +1,66 @@
+Flutter Mane @ Booster Energy  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Fairy  
+EVs: 116 HP / 204 Def / 36 SpA / 4 SpD / 148 Spe  
+Timid Nature  
+- Moonblast  
+- Icy Wind  
+- Taunt  
+- Protect  
+
+Weezing-Galar @ Sitrus Berry  
+Ability: Neutralizing Gas  
+Level: 50  
+Tera Type: Flying  
+EVs: 252 HP / 4 Atk / 4 Def / 236 SpD / 12 Spe  
+Impish Nature  
+- Gunk Shot  
+- Poison Gas  
+- Toxic Spikes  
+- Protect  
+
+Dondozo @ Rocky Helmet  
+Ability: Oblivious  
+Level: 50  
+Tera Type: Grass  
+EVs: 4 HP / 148 Atk / 4 Def / 100 SpD / 252 Spe  
+Jolly Nature  
+- Wave Crash  
+- Order Up  
+- Earthquake  
+- Protect  
+
+Tatsugiri @ Safety Goggles  
+Ability: Commander  
+Level: 50  
+Tera Type: Steel  
+EVs: 236 HP / 100 Def / 36 SpA / 4 SpD / 132 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Draco Meteor  
+- Muddy Water  
+- Helping Hand  
+- Protect  
+
+Dragonite @ Choice Band  
+Ability: Multiscale  
+Level: 50  
+Tera Type: Normal  
+EVs: 252 HP / 252 Atk / 4 Spe  
+Adamant Nature  
+- Extreme Speed  
+- Iron Head  
+- Earthquake  
+- Outrage  
+
+Chi-Yu @ Focus Sash  
+Ability: Beads of Ruin  
+Level: 50  
+Tera Type: Ghost  
+EVs: 4 HP / 252 SpA / 252 Spe  
+Timid Nature  
+- Heat Wave  
+- Overheat  
+- Dark Pulse  
+- Protect

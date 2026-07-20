@@ -1,0 +1,70 @@
+Venusaur @ Covert Cloak  
+Ability: Chlorophyll  
+Level: 50  
+Tera Type: Stellar  
+EVs: 124 HP / 236 SpA / 148 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Sludge Bomb  
+- Leaf Storm  
+- Earth Power  
+- Sleep Powder
+
+Torkoal @ Eject Pack  
+Ability: Drought  
+Level: 50  
+Tera Type: Grass  
+EVs: 252 HP / 4 Def / 252 SpD  
+Relaxed Nature  
+IVs: 0 Atk / 0 Spe  
+- Overheat  
+- Body Press  
+- Helping Hand  
+- Protect
+
+Flutter Mane @ Choice Specs  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Fairy  
+EVs: 52 HP / 124 Def / 116 SpA / 4 SpD / 212 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Moonblast  
+- Dazzling Gleam  
+- Shadow Ball  
+- Power Gem
+
+Raging Bolt @ Magnet  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Electric  
+EVs: 188 HP / 4 Def / 180 SpA / 4 SpD / 132 Spe  
+Modest Nature  
+IVs: 20 Atk  
+- Thunderbolt  
+- Thunderclap  
+- Draco Meteor  
+- Protect
+
+Incineroar @ Assault Vest  
+Ability: Intimidate  
+Level: 50  
+Tera Type: Grass  
+EVs: 252 HP / 140 Def / 116 SpD  
+Careful Nature  
+- Flare Blitz  
+- Knock Off  
+- U-turn  
+- Fake Out
+
+Tornadus @ Focus Sash  
+Ability: Prankster  
+Level: 50  
+Tera Type: Ghost  
+EVs: 20 HP / 12 Def / 220 SpA / 4 SpD / 252 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Bleakwind Storm  
+- Tailwind  
+- Sunny Day  
+- Protect

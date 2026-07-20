@@ -1,0 +1,67 @@
+Raging Bolt @ Assault Vest
+Ability: Protosynthesis
+Level: 50
+Tera Type: Fairy
+EVs: 156 HP / 140 Def / 100 SpA / 36 SpD / 76 Spe
+Modest Nature
+IVs: 20 Atk
+- Thunderclap
+- Thunderbolt
+- Dragon Pulse
+- Snarl
+
+Incineroar (M) @ Safety Goggles
+Ability: Intimidate
+Level: 50
+Tera Type: Ghost
+EVs: 252 HP / 100 Def / 156 SpD
+Sassy Nature
+- Fake Out
+- Flare Blitz
+- Knock Off
+- Parting Shot
+
+Ogerpon @ Life Orb
+Ability: Defiant
+Level: 50
+Tera Type: Grass
+EVs: 28 HP / 252 Atk / 4 Def / 4 SpD / 220 Spe
+Adamant Nature
+- Ivy Cudgel
+- Stomping Tantrum
+- Follow Me
+- Spiky Shield
+
+Chien-Pao @ Focus Sash
+Ability: Sword of Ruin
+Level: 50
+Tera Type: Ghost
+EVs: 252 Atk / 4 Def / 252 Spe
+Adamant Nature
+- Ice Spinner
+- Sucker Punch
+- Sacred Sword
+- Protect
+
+Urshifu-Rapid-Strike @ Choice Scarf
+Ability: Unseen Fist
+Level: 50
+Tera Type: Water
+EVs: 252 Atk / 4 Def / 252 Spe
+Adamant Nature
+- Surging Strikes
+- Close Combat
+- Aqua Jet
+- U-turn
+
+Farigiraf @ Throat Spray
+Ability: Armor Tail
+Level: 50
+Tera Type: Fairy
+EVs: 108 HP / 44 Def / 156 SpA / 196 SpD / 4 Spe
+Modest Nature
+IVs: 0 Atk
+- Psychic
+- Hyper Voice
+- Trick Room
+- Helping Hand

@@ -1,0 +1,63 @@
+Primarina @ Throat Spray  
+Ability: Liquid Voice  
+Tera Type: Grass  
+EVs: 252 HP / 204 Def / 52 SpA  
+Quiet Nature  
+IVs: 0 Atk  
+- Hyper Voice  
+- Moonblast  
+- Calm Mind  
+- Protect
+
+Incineroar @ Sitrus Berry  
+Ability: Intimidate  
+Tera Type: Water  
+EVs: 244 HP / 4 Atk / 72 Def / 188 SpD  
+Careful Nature  
+- Parting Shot  
+- Darkest Lariat  
+- Fake Out  
+- Flare Blitz
+
+Farigiraf @ Rocky Helmet  
+Ability: Armor Tail  
+Tera Type: Fairy  
+EVs: 180 HP / 172 Def / 44 SpA / 108 SpD / 4 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Psychic  
+- Helping Hand  
+- Trick Room  
+- Dazzling Gleam
+
+Dusclops @ Eviolite  
+Ability: Frisk  
+Tera Type: Dark  
+EVs: 252 HP / 128 Def / 128 SpD  
+Calm Nature  
+- Trick Room  
+- Will-O-Wisp  
+- Brick Break  
+- Night Shade
+
+Rillaboom @ Assault Vest  
+Ability: Grassy Surge  
+Level: 50  
+Tera Type: Fire  
+EVs: 204 HP / 156 Atk / 84 Def / 4 SpD / 60 Spe  
+Adamant Nature  
+- Fake Out  
+- Wood Hammer  
+- Grassy Glide  
+- U-turn
+
+Ursaluna-Bloodmoon @ Weakness Policy  
+Ability: Mind's Eye  
+Tera Type: Ghost  
+EVs: 252 HP / 52 SpA / 204 SpD  
+Modest Nature  
+IVs: 0 Atk  
+- Hyper Voice  
+- Blood Moon  
+- Earth Power  
+- Protect

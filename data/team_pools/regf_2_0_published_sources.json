@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "format": "gen9vgc2026regf",
+  "source_page": "https://www.smogon.com/forums/threads/vgc-regulation-f-2-0-sample-teams.3777032/",
+  "source_description": "Smogon VGC Regulation F 2.0 sample teams published in January/March 2026",
+  "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
+  "split_policy": {
+    "training": "Published samples selected to expand archetype and mechanic coverage available to self-play.",
+    "heldout": "Four novel, mutually distinct archetypes are withheld from training to test transfer: setup balance, Regidrago psyspam, Neutralizing Gas Dondozo, and hard Trick Room. Existing heldout samples remain held out.",
+    "deduplication": "Exact Showdown packed-team bytes take precedence over the requested split. An existing team is never copied into the other split."
+  },
+  "entries": [
+    {
+      "source_order": 1,
+      "title": "Bulky Flutter Mane + Hisuian Arcanine Balance",
+      "result": "Hiroto Hayasaki (arubega), 1st place at Victory Road December Challenge #3",
+      "export_link": "https://pokepast.es/0fc22ed2f26ed6f9",
+      "recreation": false,
+      "split": "heldout"
+    },
+    {
+      "source_order": 2,
+      "title": "Calm Mind Raging Bolt + Swords Dance Ogerpon-Hearthflame",
+      "result": "Paul Chua, 1st place at EUIC 2026",
+      "export_link": "https://pokepast.es/be8e6ae1091627f6",
+      "recreation": false,
+      "split": "heldout"
+    },
+    {
+      "source_order": 3,
+      "title": "Calm Mind Raging Bolt + Icy Wind Chien-Pao",
+      "result": "Stefano Greppi, 1st place at Birmingham Regional 2026",
+      "export_link": "https://pokepast.es/e4bae7e3528760c5",
+      "recreation": true,
+      "split": "training"
+    },
+    {
+      "source_order": 4,
+      "title": "Roaring Moon + Gholdengo Tailwind",
+      "result": "Cary D'Ortona, 1st place at Toronto Regional 2026",
+      "export_link": "https://pokepast.es/4b5997d8b02ba8aa",
+      "recreation": false,
+      "split": "training"
+    },
+    {
+      "source_order": 5,
+      "title": "Regidrago + Gholdengo Tailwind",
+      "result": "Justin Tang, Top 4 at Toronto Regional 2026",
+      "export_link": "https://pokepast.es/1abe18672384e53b",
+      "recreation": false,
+      "split": "training"
+    },
+    {
+      "source_order": 6,
+      "title": "Glimmora Sun",
+      "result": "Rayan Guezi, Top 8 at Utrecht",
+      "export_link": "https://pokepast.es/2425a981c9534531",
+      "recreation": false,
+      "split": "heldout"
+    },
+    {
+      "source_order": 7,
+      "title": "Choice Band Landorus-Therian Tailwind",
+      "result": "Published Regulation F 2.0 sample marked RECREATION",
+      "export_link": "https://pokepast.es/0d0c8bf8831e0fc2",
+      "recreation": true,
+      "split": "training"
+    },
+    {
+      "source_order": 8,
+      "title": "Iron Crown Psyspam + Regidrago",
+      "result": "Hengyue Zhang, Top 4 at Birmingham Regional 2026",
+      "export_link": "https://pokepast.es/c2cbee064bf44b87",
+      "recreation": false,
+      "split": "heldout"
+    },
+    {
+      "source_order": 9,
+      "title": "Ursaluna + Porygon2 Tailroom",
+      "result": "Published Regulation F 2.0 sample archetype",
+      "export_link": "https://pokepast.es/7ad187c8c4a1f60a",
+      "recreation": false,
+      "split": "training"
+    },
+    {
+      "source_order": 10,
+      "title": "Ursaluna + Farigiraf Tailroom",
+      "result": "Eric Stuart, Top 8 at Toronto Regional 2026",
+      "export_link": "https://pokepast.es/cab084d6d1b4d1fe",
+      "recreation": true,
+      "split": "training"
+    },
+    {
+      "source_order": 11,
+      "title": "Articuno Snow",
+      "result": "Tyo, 1st place at Utrecht",
+      "export_link": "https://pokepast.es/262c301130a20afb",
+      "recreation": false,
+      "split": "training"
+    },
+    {
+      "source_order": 12,
+      "title": "Protosynthesis Sun",
+      "result": "Shunsuke Minami (Erizabeth), Top 4 at Victory Road December Challenge #3",
+      "export_link": "https://pokepast.es/e9cf2f1190b4b630",
+      "recreation": false,
+      "split": "heldout"
+    },
+    {
+      "source_order": 13,
+      "title": "Archaludon Rain",
+      "result": "Jeff Lehmann, Top 4 at a Victory Road tournament",
+      "export_link": "https://pokepast.es/7e5607a0b1ae90a1",
+      "recreation": false,
+      "split": "training"
+    },
+    {
+      "source_order": 14,
+      "title": "Dondozo + Ting-Lu",
+      "result": "Jong One Moon, Top 4 at a Victory Road tournament",
+      "export_link": "https://pokepast.es/81f976576149cb17",
+      "recreation": false,
+      "split": "training"
+    },
+    {
+      "source_order": 15,
+      "title": "Ting-Lu Setup + Sinistcha",
+      "result": "Francesco Pio Pero (CICCIOTT), Top 8 at Victory Road December Challenge #2",
+      "export_link": "https://pokepast.es/37194efd9132f787",
+      "recreation": false,
+      "split": "heldout"
+    },
+    {
+      "source_order": 16,
+      "title": "Dondozo + Galarian Weezing",
+      "result": "Marcus Koh, runner-up at Birmingham Regional 2026",
+      "export_link": "https://pokepast.es/ad281e3a0031a8c2",
+      "recreation": true,
+      "split": "heldout"
+    },
+    {
+      "source_order": 17,
+      "title": "Hard Trick Room",
+      "result": "Published Regulation F 2.0 sample archetype",
+      "export_link": "https://pokepast.es/a3b15eac0ebd3d26",
+      "recreation": false,
+      "split": "heldout"
+    }
+  ]
+}

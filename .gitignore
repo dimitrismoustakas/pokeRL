@@ -206,3 +206,8 @@ __marimo__/
 
 ## worktrees
 .claude/
+
+## benchmark results and checkpoints
+benchmarks/
+checkpoints/
+logs/

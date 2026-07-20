@@ -1,0 +1,69 @@
+Indeedee-F @ Psychic Seed  
+Ability: Psychic Surge  
+Level: 50  
+Tera Type: Dragon  
+EVs: 252 HP / 252 Def / 4 SpD  
+Relaxed Nature  
+IVs: 0 Atk / 0 Spe  
+- Dazzling Gleam  
+- Helping Hand  
+- Follow Me  
+- Trick Room
+
+Armarouge @ Power Herb  
+Ability: Flash Fire  
+Level: 50  
+Tera Type: Grass  
+EVs: 252 HP / 252 SpA / 4 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Expanding Force  
+- Heat Wave  
+- Meteor Beam  
+- Trick Room
+
+Enamorus-Therian @ Fairy Feather  
+Ability: Overcoat  
+Tera Type: Fairy  
+EVs: 252 HP / 4 Def / 252 SpA  
+Quiet Nature  
+IVs: 0 Atk / 0 Spe  
+- Moonblast  
+- Dazzling Gleam  
+- Earth Power  
+- Protect
+
+Araquanid @ Clear Amulet  
+Ability: Water Bubble  
+Level: 50  
+Tera Type: Water  
+EVs: 252 HP / 252 Atk / 4 Def  
+Brave Nature  
+IVs: 0 Spe  
+- Liquidation  
+- Lunge  
+- Wide Guard  
+- Protect
+
+Slowking @ Life Orb  
+Ability: Regenerator  
+Level: 50  
+Tera Type: Psychic  
+EVs: 228 HP / 28 Def / 252 SpA  
+Quiet Nature  
+IVs: 0 Atk / 0 Spe  
+- Expanding Force  
+- Scald  
+- Trick Room  
+- Protect
+
+Annihilape @ Choice Scarf  
+Ability: Defiant  
+Level: 50  
+Tera Type: Ghost  
+EVs: 252 HP / 4 Atk / 252 Spe  
+Jolly Nature  
+- Final Gambit  
+- Close Combat  
+- Shadow Claw  
+- U-turn

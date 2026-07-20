@@ -1,0 +1,65 @@
+Tornadus @ Rocky Helmet
+Ability: Prankster
+Level: 50
+Tera Type: Steel
+EVs: 252 HP / 92 Def / 4 SpA / 132 SpD / 28 Spe
+Calm Nature
+- Bleakwind Storm
+- Tailwind
+- Protect
+- Sunny Day
+
+Glimmora @ Power Herb
+Ability: Toxic Debris
+Level: 50
+Tera Type: Grass
+EVs: 244 HP / 4 Def / 76 SpA / 20 SpD / 164 Spe
+Modest Nature
+- Meteor Beam
+- Earth Power
+- Spiky Shield
+- Sludge Bomb
+
+Chi-Yu @ Choice Specs
+Ability: Beads of Ruin
+Level: 50
+Tera Type: Ghost
+EVs: 212 HP / 4 Def / 52 SpA / 4 SpD / 236 Spe
+Modest Nature
+- Heat Wave
+- Dark Pulse
+- Snarl
+- Overheat
+
+Flutter Mane @ Booster Energy
+Ability: Protosynthesis
+Level: 50
+Tera Type: Fairy
+EVs: 124 HP / 140 Def / 140 SpA / 12 SpD / 92 Spe
+Timid Nature
+- Dazzling Gleam
+- Protect
+- Moonblast
+- Icy Wind
+
+Ogerpon-Wellspring @ Wellspring Mask
+Ability: Water Absorb
+Level: 50
+Tera Type: Water
+EVs: 228 HP / 76 Atk / 4 Def / 12 SpD / 188 Spe
+Adamant Nature
+- Ivy Cudgel
+- Follow Me
+- Spiky Shield
+- Horn Leech
+
+Urshifu @ Focus Sash
+Ability: Unseen Fist
+Level: 50
+Tera Type: Dark
+EVs: 12 HP / 252 Atk / 4 Def / 20 SpD / 220 Spe
+Adamant Nature
+- Wicked Blow
+- Close Combat
+- Detect
+- Sucker Punch

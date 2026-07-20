@@ -1,0 +1,70 @@
+Indeedee-F @ Rocky Helmet
+Ability: Psychic Surge
+Level: 50
+Tera Type: Steel
+EVs: 252 HP / 252 Def / 4 SpD
+Relaxed Nature
+IVs: 0 Spe
+- Dazzling Gleam
+- Follow Me
+- Helping Hand
+- Trick Room
+
+Hatterene @ Life Orb
+Ability: Magic Bounce
+Level: 50
+Tera Type: Fire
+EVs: 212 HP / 100 Def / 196 SpA
+Quiet Nature
+IVs: 0 Spe
+- Dazzling Gleam
+- Expanding Force
+- Trick Room
+- Protect
+
+Torkoal @ Choice Specs
+Ability: Drought
+Level: 50
+Tera Type: Fire
+EVs: 252 HP / 252 SpA / 4 SpD
+Quiet Nature
+IVs: 0 Spe
+- Eruption
+- Earth Power
+- Heat Wave
+- Weather Ball
+
+Gallade @ Clear Amulet
+Ability: Sharpness
+Level: 50
+Tera Type: Grass
+EVs: 244 HP / 252 Atk / 12 SpD
+Brave Nature
+IVs: 0 Spe
+- Wide Guard
+- Sacred Sword
+- Psycho Cut
+- Trick Room
+
+Ursaluna @ Flame Orb
+Ability: Guts
+Level: 50
+Tera Type: Ghost
+EVs: 140 HP / 156 Atk / 76 Def / 132 SpD
+Brave Nature
+IVs: 0 Spe
+- Protect
+- Facade
+- Headlong Rush
+- Earthquake
+
+Urshifu @ Choice Scarf
+Ability: Unseen Fist
+Level: 50
+Tera Type: Stellar
+EVs: 156 Atk / 100 SpD / 252 Spe
+Adamant Nature
+- Wicked Blow
+- Close Combat
+- U-turn
+- Tera Blast
