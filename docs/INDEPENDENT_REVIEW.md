@@ -3,8 +3,9 @@
 Updated: 2026-07-21.
 
 This is the current decision brief for pokeRL training. It replaces earlier
-review state rather than recording a chronological diary. Code, run summaries,
-and evaluation artifacts remain the detailed evidence.
+review state rather than recording a chronological diary. The conclusions and
+key measurements are retained here; retired local run artifacts were removed
+after review.
 
 ## Current decision
 
@@ -27,9 +28,16 @@ shared this pokeRL adapter, so the defect was not specific to poke-env's local
 backend.
 
 AdamW with learning rate `2e-4` and weight decay `0.05` is the working optimizer
-for the first version-5 run. It is not declared optimal. The immediate run is a
-10-update correctness and gradient diagnostic; if it is clean, the same run is
-continued to update 80 and evaluated before spending a 450-update budget.
+for the first version-5 run. It is not declared optimal. The completed
+10-update correctness and gradient diagnostic was healthy, but it is a
+standalone run: its Tera exploration decay was derived from that run's horizon
+as three learner updates. Resuming it would change the intended schedule.
+
+Production now stores the complete Tera exploration schedule in the trainer
+checkpoint, including its explicit absolute decay length, so stopping and
+resuming cannot change it. The planned 450-update trajectory uses 113 decay
+updates, starts fresh, is first inspected at update 80, and then resumes to
+update 450 if the evidence is sound.
 
 ## Non-negotiable boundaries
 
@@ -104,8 +112,8 @@ fresh 10-update run verified the corrected preview lifecycle: every preview
 start was trained, boundary bootstraps were present, PPO used 16 joint steps,
 and behavior-policy disagreement stayed at floating-point noise.
 
-These artifacts remain useful for diagnosis, but their checkpoints are not
-inputs to version-5 training.
+These measurements remain useful for diagnosis, but the retired checkpoints
+are not inputs to version-5 training.
 
 ### Version-4 optimizer study
 
@@ -156,25 +164,22 @@ that actually supports the strategy while retaining terminal-only reward.
 
 ## Next evidence required
 
-1. Run 10 fresh version-5 updates with AdamW `2e-4`, weight decay `0.05`, and
-   the shared-gradient diagnostic enabled.
-2. Check request semantics, preview PPO/KL, gradient norms and cosines, clipping,
-   memory, and throughput before changing any training hyperparameter.
-3. If clean, resume the same run to update 80 and compare learned strength,
-   preview behavior, and mechanic-specific actions.
-4. If the update-80 evidence is sound, resume to update 450 and build a new
+1. Start a fresh version-5 AdamW trajectory intended to reach update 450, with
+   Tera exploration decaying over the first 113 learner updates. Do not resume
+   the standalone 10-update diagnostic.
+2. At update 80, compare learned strength, preview behavior, and
+   mechanic-specific actions against initialization and intermediate snapshots.
+3. If the update-80 evidence is sound, resume the same trajectory to update 450
+   without changing its checkpointed exploration schedule, then build a new
    league.
-5. Only then repeat the standalone main exploiter and test a league exploiter
+4. Only then repeat the standalone main exploiter and test a league exploiter
    against a complete frozen population.
-6. Continue optimizer work with Muon and later tune clipping, entropy, learning
+5. Continue optimizer work with Muon and later tune clipping, entropy, learning
    rate, decay, and update geometry in controlled experiments.
 
-## Evidence locations
+## Evidence retention
 
-- `logs/selfplay_public_state_adam_baseline_80_20260718.summary.json`
-- `logs/selfplay_public_state_adamw_lr2e4_wd5e2_80_20260719.summary.json`
-- `logs/selfplay_public_state_adamw_lr2e4_wd5e2_450_20260719.summary.json`
-- `logs/main_exploiter_u450_s1_80_20260720.summary.json`
-- `logs/evaluation/optimizer_adamw_lr2e4_vs_adam_80_20260719/`
-- `logs/evaluation/selfplay_public_state_adamw_lr2e4_wd5e2_450_20260719/`
-- `logs/evaluation/main_exploiter_u450_s1_80_20260720/`
+The retired checkpoints, raw summaries, console logs, and local evaluation
+artifacts were removed after their findings were consolidated above. The next
+production run should retain its summary and evaluation outputs until the
+optimizer, plateau, and exploiter decisions are complete.

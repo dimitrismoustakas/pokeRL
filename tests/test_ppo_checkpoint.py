@@ -189,7 +189,15 @@ def test_trainer_load_rejects_legacy_agent_only_checkpoint(tmp_path) -> None:
 
 
 def test_trainer_checkpoint_roundtrips(tmp_path) -> None:
-    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    trainer = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(
+            tera_exploration_start=0.3,
+            tera_exploration_end=0.05,
+            tera_exploration_decay_updates=113,
+        ),
+        torch.device("cpu"),
+    )
     loss = trainer.agent.linear(torch.tensor([[0.5, -1.0]])).square().sum()
     assert trainer._apply_update_step(loss)
     trainer.global_step = 123
@@ -209,6 +217,11 @@ def test_trainer_checkpoint_roundtrips(tmp_path) -> None:
     raw_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     assert raw_checkpoint["checkpoint_type"] == "trainer"
     assert raw_checkpoint["format_version"] == TRAINER_CHECKPOINT_FORMAT_VERSION
+    assert raw_checkpoint["tera_exploration_schedule"] == {
+        "start": 0.3,
+        "end": 0.05,
+        "decay_updates": 113,
+    }
     assert isinstance(raw_checkpoint["training_state_id"], str)
     assert raw_checkpoint["model_metadata"]["state_schema"]
     assert raw_checkpoint["rng_state"]["torch_cpu"].dtype == torch.uint8
@@ -231,6 +244,9 @@ def test_trainer_checkpoint_roundtrips(tmp_path) -> None:
 
     assert loaded.global_step == 123
     assert loaded.completed_updates == 7
+    assert loaded.config.tera_exploration_start == pytest.approx(0.3)
+    assert loaded.config.tera_exploration_end == pytest.approx(0.05)
+    assert loaded.config.tera_exploration_decay_updates == 113
     assert loaded.loaded_training_state_id == raw_checkpoint["training_state_id"]
     _assert_nested_equal(loaded.agent.state_dict(), expected_agent)
     _assert_nested_equal(loaded.optimizer.state_dict(), expected_optimizer)
@@ -246,10 +262,39 @@ def test_trainer_checkpoint_roundtrips(tmp_path) -> None:
         )
 
 
+def test_trainer_checkpoint_requires_resolved_tera_schedule(tmp_path) -> None:
+    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="tera_exploration_decay_updates"):
+        trainer.save(str(tmp_path / "trainer.pt"))
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5])
+def test_trainer_resume_rejects_invalid_tera_schedule(tmp_path, value) -> None:
+    source = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
+    checkpoint_path = tmp_path / "trainer.pt"
+    source.save(str(checkpoint_path))
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    checkpoint["tera_exploration_schedule"]["decay_updates"] = value
+    torch.save(checkpoint, checkpoint_path)
+
+    target = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    with pytest.raises(ValueError, match="tera_exploration_schedule"):
+        target.load(str(checkpoint_path))
+
+
 def test_weight_only_initializer_loads_exact_model_with_fresh_training_state(
     tmp_path,
 ) -> None:
-    source = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    source = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     loss = source.agent.linear(torch.tensor([[0.5, -1.0]])).square().sum()
     assert source._apply_update_step(loss)
     source.global_step = 1234
@@ -258,7 +303,15 @@ def test_weight_only_initializer_loads_exact_model_with_fresh_training_state(
     checkpoint_path = tmp_path / "source.pt"
     source.save(str(checkpoint_path), training_state_id="source-state")
 
-    target = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    target = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(
+            tera_exploration_start=0.2,
+            tera_exploration_end=0.01,
+            tera_exploration_decay_updates=40,
+        ),
+        torch.device("cpu"),
+    )
     random.seed(101)
     np.random.seed(202)
     torch.manual_seed(303)
@@ -277,6 +330,9 @@ def test_weight_only_initializer_loads_exact_model_with_fresh_training_state(
     assert target.optimizer.state_dict()["state"] == {}
     assert target.global_step == 0
     assert target.completed_updates == 0
+    assert target.config.tera_exploration_start == pytest.approx(0.2)
+    assert target.config.tera_exploration_end == pytest.approx(0.01)
+    assert target.config.tera_exploration_decay_updates == 40
     assert target.loaded_training_state_id is None
     assert target.initialized_from_training_state_id == "source-state"
 
@@ -313,7 +369,11 @@ def test_trainer_load_rejects_legacy_trainer_checkpoint_without_version(
 
 
 def test_trainer_load_rejects_wrong_checkpoint_format_version(tmp_path) -> None:
-    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    trainer = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / "trainer.pt"
     trainer.save(str(checkpoint_path))
     checkpoint = torch.load(checkpoint_path, weights_only=False)
@@ -325,7 +385,11 @@ def test_trainer_load_rejects_wrong_checkpoint_format_version(tmp_path) -> None:
 
 
 def test_trainer_load_rejects_previous_v4_checkpoint_schema(tmp_path) -> None:
-    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    trainer = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / "trainer_v4.pt"
     trainer.save(str(checkpoint_path))
     checkpoint = torch.load(checkpoint_path, weights_only=False)
@@ -342,7 +406,11 @@ def test_trainer_load_rejects_invalid_completed_updates(
     tmp_path,
     completed_updates,
 ) -> None:
-    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    trainer = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / "trainer.pt"
     trainer.save(str(checkpoint_path))
     checkpoint = torch.load(checkpoint_path, weights_only=False)
@@ -358,7 +426,11 @@ def test_trainer_load_rejects_model_state_that_disagrees_with_declared_schema(
     tmp_path,
     corruption: str,
 ) -> None:
-    trainer = PPOTrainer(TinyAgent(), TrainingConfig(), torch.device("cpu"))
+    trainer = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / f"trainer_{corruption}.pt"
     trainer.save(str(checkpoint_path))
     checkpoint = torch.load(checkpoint_path, weights_only=False)
@@ -375,7 +447,11 @@ def test_trainer_load_rejects_model_state_that_disagrees_with_declared_schema(
 
 
 def test_trainer_load_rejects_current_model_architecture_mismatch(tmp_path) -> None:
-    source = PPOTrainer(TinyAgent(width=2), TrainingConfig(), torch.device("cpu"))
+    source = PPOTrainer(
+        TinyAgent(width=2),
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / "trainer.pt"
     source.save(str(checkpoint_path))
     target = PPOTrainer(TinyAgent(width=3), TrainingConfig(), torch.device("cpu"))
@@ -389,7 +465,7 @@ def test_trainer_load_rejects_current_model_architecture_mismatch(tmp_path) -> N
 def test_trainer_load_rejects_model_config_mismatch(tmp_path) -> None:
     source = PPOTrainer(
         TinyAgent(config=TinyModelConfig(width=2)),
-        TrainingConfig(),
+        TrainingConfig(tera_exploration_decay_updates=113),
         torch.device("cpu"),
     )
     checkpoint_path = tmp_path / "trainer.pt"
@@ -407,7 +483,11 @@ def test_trainer_load_rejects_model_config_mismatch(tmp_path) -> None:
 def test_trainer_load_rejects_game_data_vocab_mismatch(tmp_path) -> None:
     source_agent = TinyAgent()
     source_agent.game_data_signature = "vocab-a"
-    source = PPOTrainer(source_agent, TrainingConfig(), torch.device("cpu"))
+    source = PPOTrainer(
+        source_agent,
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / "trainer.pt"
     source.save(str(checkpoint_path))
 
@@ -423,7 +503,11 @@ def test_trainer_load_rejects_architecture_signature_mismatch(tmp_path) -> None:
     source_agent = TinyAgent()
     source_agent.architecture_signature = "architecture-a"
     source_agent.model_signature = "model-a"
-    source = PPOTrainer(source_agent, TrainingConfig(), torch.device("cpu"))
+    source = PPOTrainer(
+        source_agent,
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / "trainer.pt"
     source.save(str(checkpoint_path))
 
@@ -440,7 +524,11 @@ def test_trainer_load_rejects_complete_model_signature_mismatch(tmp_path) -> Non
     source_agent = TinyAgent()
     source_agent.architecture_signature = "same-architecture"
     source_agent.model_signature = "model-a"
-    source = PPOTrainer(source_agent, TrainingConfig(), torch.device("cpu"))
+    source = PPOTrainer(
+        source_agent,
+        TrainingConfig(tera_exploration_decay_updates=113),
+        torch.device("cpu"),
+    )
     checkpoint_path = tmp_path / "trainer.pt"
     source.save(str(checkpoint_path))
 

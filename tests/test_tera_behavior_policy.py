@@ -663,7 +663,7 @@ def test_training_config_rejects_invalid_tera_entropy_coefficients(
         TrainingConfig(**{field: value})
 
 
-@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
-def test_training_config_rejects_invalid_exploration_decay_fraction(value) -> None:
-    with pytest.raises(ValueError, match="tera_exploration_decay_fraction"):
-        TrainingConfig(tera_exploration_decay_fraction=value)
+@pytest.mark.parametrize("value", [True, -1, 1.5])
+def test_training_config_rejects_invalid_exploration_decay_updates(value) -> None:
+    with pytest.raises(ValueError, match="tera_exploration_decay_updates"):
+        TrainingConfig(tera_exploration_decay_updates=value)

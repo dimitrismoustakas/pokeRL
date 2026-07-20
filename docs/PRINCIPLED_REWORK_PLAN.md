@@ -33,7 +33,15 @@ reference GPU.
 
 A real 72-environment CUDA update and a fresh 10-update run established that
 this path fits, trains boundary-crossing previews, and preserves one behavior
-policy version.
+policy version. The 10-update run is diagnostic evidence only and is not a
+checkpoint to resume.
+
+### Resume-invariant exploration
+
+Tera exploration decays over an explicit absolute number of learner updates.
+Its start, end, and decay length are stored in the trainer checkpoint and
+remain unchanged across resumes. The planned 450-update trajectory uses 113
+decay updates.
 
 ### Optimizer support and measurement
 
@@ -62,13 +70,15 @@ rejects all earlier checkpoints. No converter is planned.
 
 ## Immediate run sequence
 
-### 1. Ten-update diagnostic
+### 1. Completed ten-update diagnostic
 
-Start one fresh AdamW run with gradient diagnostics enabled. Keep the existing
-PPO coefficients and `max_grad_norm=0.5`; changing them now would confound the
-architecture check.
+The fresh AdamW diagnostic completed cleanly: all joint PPO updates were
+accounted for, preview behavior-policy likelihoods agreed, gradients were
+finite, and memory and throughput were practical. It used a horizon-derived
+Tera exploration decay of three updates, so it is a standalone diagnostic and
+must not be resumed.
 
-Inspect before continuing:
+Its measurements established that:
 
 - every update completes with 16 joint optimizer steps and no non-finite skip;
 - preview action-time and pre-update likelihoods agree;
@@ -78,19 +88,20 @@ Inspect before continuing:
 - pre-clip global norms explain how often and by how much the `0.5` cap binds;
 - rollout/PPO time, CUDA memory, and simulator throughput remain practical.
 
-### 2. Continue to update 80
+### 2. Start the 450-update trajectory and inspect at update 80
 
-If the diagnostic is clean, resume the same directory for 70 more updates.
-Evaluate the final checkpoint against initialization and intermediate snapshots
-with mirrored sampled schedules. Also inspect exact preview distributions and
-mechanic-specific action behavior. Do not treat training loss or self-play win
-rate as sufficient evidence.
+Start fresh with AdamW and an explicit 113-update Tera exploration decay. Stop
+first at update 80 and evaluate against initialization and intermediate
+snapshots with mirrored sampled schedules. Also inspect exact preview
+distributions and mechanic-specific action behavior. Do not treat training loss
+or self-play win rate as sufficient evidence.
 
 ### 3. Continue to update 450
 
-If update 80 learns normally, resume the same run for 370 more updates. Compare
-updates 100, 250, 350, and 450 on held-out teams to locate any plateau. Retain
-the resulting league for PFSP and exploiter work.
+If update 80 learns normally, resume the same run for 370 more updates. The
+checkpointed 113-update exploration schedule remains fixed. Compare updates
+100, 250, 350, and 450 on held-out teams to locate any plateau. Retain the
+resulting league for PFSP and exploiter work.
 
 ## Work after the corrected main run
 
@@ -128,7 +139,9 @@ a controlled policy-adapter comparison meaningful.
 
 ## Artifact policy
 
-Old logs and evaluation JSON remain useful evidence. Large version-4
-checkpoints can be removed after the version-5 ten-update run proves that a new
-checkpoint is written and loadable. Obsolete version-4 population and phase
-specifications are removed now so they cannot be mistaken for current inputs.
+The findings from retired runs are consolidated in `INDEPENDENT_REVIEW.md`.
+Their ignored checkpoints, summaries, console logs, and local evaluation
+artifacts have been removed. Keep the next production run's summary and
+evaluation outputs until the optimizer, plateau, and exploiter decisions are
+complete. Obsolete population and phase specifications remain removed so they
+cannot be mistaken for current inputs.

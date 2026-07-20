@@ -539,10 +539,13 @@ def parse_args() -> argparse.Namespace:
         help="Final tera-exploration epsilon after the decay window.",
     )
     parser.add_argument(
-        "--tera-exploration-decay-fraction",
-        type=float,
+        "--tera-exploration-decay-updates",
+        type=int,
         default=None,
-        help="Fraction of planned updates used to anneal Tera exploration.",
+        help=(
+            "Absolute number of learner updates used to anneal Tera exploration. "
+            "Required for a fresh learner and restored from its checkpoint on resume."
+        ),
     )
     parser.add_argument(
         "--tera-gate-entropy-coef",
@@ -682,7 +685,7 @@ def build_configs(
         "league_preview_device": args.league_preview_device,
         "tera_exploration_start": args.tera_exploration_start,
         "tera_exploration_end": args.tera_exploration_end,
-        "tera_exploration_decay_fraction": args.tera_exploration_decay_fraction,
+        "tera_exploration_decay_updates": args.tera_exploration_decay_updates,
         "tera_gate_entropy_coef": args.tera_gate_entropy_coef,
         "tera_slot_entropy_coef": args.tera_slot_entropy_coef,
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
@@ -769,20 +772,6 @@ def validate_resume_update_state(
             f"updates: trainer={trainer_completed_updates}, "
             f"league={league_current_update}."
         )
-
-
-def resolve_tera_exploration_decay_updates(
-    total_updates: int,
-    decay_fraction: float,
-) -> int:
-    """Convert a horizon fraction into an absolute exploration window."""
-    if total_updates <= 0:
-        raise ValueError("total_updates must be positive.")
-    if not 0.0 <= decay_fraction <= 1.0:
-        raise ValueError("decay_fraction must be within [0, 1].")
-    if decay_fraction == 0.0:
-        return 0
-    return max(1, math.ceil(total_updates * decay_fraction))
 
 
 def tera_exploration_probability(
@@ -1993,6 +1982,18 @@ def _maybe_write_run_summary(path: str | None, summary: dict) -> None:
 
 def train():
     args = parse_args()
+    if args.resume is not None and any(
+        value is not None
+        for value in (
+            args.tera_exploration_start,
+            args.tera_exploration_end,
+            args.tera_exploration_decay_updates,
+        )
+    ):
+        raise ValueError(
+            "Tera exploration schedule options cannot be used with --resume; "
+            "the complete schedule is restored from the trainer checkpoint."
+        )
     phase_bundle = (
         load_best_response_phase(args.phase_spec) if args.phase_spec else None
     )
@@ -2016,6 +2017,11 @@ def train():
     collect_timing = args.collect_timing
 
     model_config, env_config, train_config = build_configs(args)
+    if args.resume is None and train_config.tera_exploration_decay_updates is None:
+        raise ValueError(
+            "--tera-exploration-decay-updates is required when starting a fresh "
+            "learner. The value is restored automatically with --resume."
+        )
     seed_streams = configure_training_randomness(
         train_config.seed,
         team_pool_seed=args.team_pool_seed,
@@ -2349,8 +2355,8 @@ def train():
             "team_preview_lead_coef": train_config.team_preview_lead_coef,
             "tera_exploration_start": train_config.tera_exploration_start,
             "tera_exploration_end": train_config.tera_exploration_end,
-            "tera_exploration_decay_fraction": (
-                train_config.tera_exploration_decay_fraction
+            "tera_exploration_decay_updates": (
+                train_config.tera_exploration_decay_updates
             ),
             "tera_gate_entropy_coef": train_config.tera_gate_entropy_coef,
             "tera_slot_entropy_coef": train_config.tera_slot_entropy_coef,
@@ -2416,13 +2422,12 @@ def train():
             completed_updates=trainer.completed_updates,
             additional_updates=args.resume is not None and args.num_updates is not None,
         )
-        tera_exploration_decay_updates = resolve_tera_exploration_decay_updates(
-            num_updates,
-            train_config.tera_exploration_decay_fraction,
-        )
-        run_summary["config"]["tera_exploration_decay_updates"] = (
-            tera_exploration_decay_updates
-        )
+        tera_exploration_decay_updates = train_config.tera_exploration_decay_updates
+        if tera_exploration_decay_updates is None:
+            raise RuntimeError(
+                "Tera exploration decay was neither configured for fresh training "
+                "nor restored from the trainer checkpoint."
+            )
 
         print(f"Total updates: {num_updates}")
         print(f"Steps per update: {steps_per_update}")

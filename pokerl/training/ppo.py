@@ -58,7 +58,7 @@ from .rollout import RolloutBatch
 
 
 # Increment when trainer-checkpoint semantics or same-shaped model inputs change.
-TRAINER_CHECKPOINT_FORMAT_VERSION = 8
+TRAINER_CHECKPOINT_FORMAT_VERSION = 9
 
 _ADAM_BETAS = (0.9, 0.999)
 _ADAM_EPS = 1e-5
@@ -136,6 +136,47 @@ def _validate_restorable_rng_state(rng_state: object) -> Mapping[str, object]:
     finally:
         _restore_rng_state(current_state)
     return rng_state
+
+
+def _validate_checkpoint_tera_exploration_schedule(
+    value: object,
+) -> tuple[float, float, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "Trainer checkpoint tera_exploration_schedule must be a mapping."
+        )
+    required = {"start", "end", "decay_updates"}
+    missing = sorted(required.difference(value))
+    if missing:
+        raise ValueError(
+            "Trainer checkpoint tera_exploration_schedule is missing key(s): "
+            + ", ".join(missing)
+        )
+    probabilities: list[float] = []
+    for name in ("start", "end"):
+        probability = value[name]
+        if (
+            isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or not math.isfinite(probability)
+            or not 0.0 <= probability <= 1.0
+        ):
+            raise ValueError(
+                "Trainer checkpoint tera_exploration_schedule "
+                f"{name} must be finite and within [0, 1] (got {probability!r})."
+            )
+        probabilities.append(float(probability))
+    decay_updates = value["decay_updates"]
+    if (
+        isinstance(decay_updates, bool)
+        or not isinstance(decay_updates, int)
+        or decay_updates < 0
+    ):
+        raise ValueError(
+            "Trainer checkpoint tera_exploration_schedule decay_updates must be a "
+            f"non-negative integer (got {decay_updates!r})."
+        )
+    return probabilities[0], probabilities[1], decay_updates
 
 
 class PPOTrainer:
@@ -2352,6 +2393,17 @@ class PPOTrainer:
         state_id = training_state_id or uuid.uuid4().hex
         if not isinstance(state_id, str) or not state_id:
             raise ValueError("training_state_id must be a non-empty string.")
+        if self.config.tera_exploration_decay_updates is None:
+            raise ValueError(
+                "tera_exploration_decay_updates must be configured before saving "
+                "a trainer checkpoint."
+            )
+        tera_exploration_schedule = {
+            "start": self.config.tera_exploration_start,
+            "end": self.config.tera_exploration_end,
+            "decay_updates": self.config.tera_exploration_decay_updates,
+        }
+        _validate_checkpoint_tera_exploration_schedule(tera_exploration_schedule)
         try:
             torch.save(
                 {
@@ -2362,6 +2414,7 @@ class PPOTrainer:
                     "optimizer": self.optimizer.state_dict(),
                     "global_step": self.global_step,
                     "completed_updates": self.completed_updates,
+                    "tera_exploration_schedule": tera_exploration_schedule,
                     "training_state_id": state_id,
                     "rng_state": _capture_rng_state(),
                 },
@@ -2404,7 +2457,12 @@ class PPOTrainer:
                     f"{checkpoint.get('format_version')!r}; expected "
                     f"{TRAINER_CHECKPOINT_FORMAT_VERSION}."
                 )
-            required = {"agent", "model_metadata", "training_state_id"}
+            required = {
+                "agent",
+                "model_metadata",
+                "tera_exploration_schedule",
+                "training_state_id",
+            }
             missing = sorted(required.difference(checkpoint))
             if missing:
                 raise ValueError(
@@ -2422,6 +2480,9 @@ class PPOTrainer:
                 raise ValueError(
                     "Weight initializer training_state_id must be non-empty string."
                 )
+            _validate_checkpoint_tera_exploration_schedule(
+                checkpoint["tera_exploration_schedule"]
+            )
             try:
                 self.agent.load_state_dict(checkpoint_state, strict=True)
             except RuntimeError as exc:
@@ -2467,6 +2528,7 @@ class PPOTrainer:
             "optimizer",
             "global_step",
             "completed_updates",
+            "tera_exploration_schedule",
             "training_state_id",
             "model_metadata",
             "rng_state",
@@ -2499,6 +2561,11 @@ class PPOTrainer:
             raise ValueError(
                 "Trainer checkpoint completed_updates must be non-negative."
             )
+        tera_start, tera_end, tera_decay_updates = (
+            _validate_checkpoint_tera_exploration_schedule(
+                checkpoint["tera_exploration_schedule"]
+            )
+        )
         training_state_id = checkpoint["training_state_id"]
         if not isinstance(training_state_id, str) or not training_state_id:
             raise ValueError(
@@ -2523,6 +2590,9 @@ class PPOTrainer:
         self.optimizer = loaded_optimizer
         self.global_step = global_step
         self.completed_updates = completed_updates
+        self.config.tera_exploration_start = tera_start
+        self.config.tera_exploration_end = tera_end
+        self.config.tera_exploration_decay_updates = tera_decay_updates
         self.loaded_training_state_id = training_state_id
         self.initialized_from_training_state_id = None
         _restore_rng_state(rng_state)

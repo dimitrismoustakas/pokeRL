@@ -97,10 +97,11 @@ class TrainingConfig:
     # Factorized Tera exploration mixes the use-now gate toward Bernoulli(0.5)
     # and the conditional eligible-slot distribution toward uniform. PPO uses
     # the exact reconstructed three-choice behavior likelihood. Exploration
-    # reaches its end value after this fraction of the planned update horizon.
+    # reaches its end value at this learner update. Fresh training must choose
+    # the absolute window explicitly; strict resume restores it from checkpoint.
     tera_exploration_start: float = 0.15
     tera_exploration_end: float = 0.0
-    tera_exploration_decay_fraction: float = 0.25
+    tera_exploration_decay_updates: int | None = None
 
     # League. Every snapshot remains in the on-disk archive. ``league_size``
     # bounds only the number of frozen models resident in each inference
@@ -212,11 +213,12 @@ class TrainingConfig:
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be within [0, 1] (got {value}).")
-        if (
-            not math.isfinite(self.tera_exploration_decay_fraction)
-            or not 0.0 <= self.tera_exploration_decay_fraction <= 1.0
+        if self.tera_exploration_decay_updates is not None and (
+            isinstance(self.tera_exploration_decay_updates, bool)
+            or not isinstance(self.tera_exploration_decay_updates, int)
+            or self.tera_exploration_decay_updates < 0
         ):
             raise ValueError(
-                "tera_exploration_decay_fraction must be finite and within [0, 1] "
-                f"(got {self.tera_exploration_decay_fraction})."
+                "tera_exploration_decay_updates must be a non-negative integer "
+                f"or None (got {self.tera_exploration_decay_updates})."
             )

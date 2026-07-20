@@ -17,9 +17,9 @@ from scripts.train import (
     configure_training_randomness,
     parse_args,
     resolve_opponent_groups,
-    resolve_tera_exploration_decay_updates,
     resolve_update_bounds,
     tera_exploration_probability,
+    train,
     validate_resume_update_state,
 )
 
@@ -306,6 +306,22 @@ def test_best_response_phase_cli_is_explicit_and_composes_with_resume(
     assert args.num_updates == 7
 
 
+def test_resume_rejects_tera_schedule_overrides(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--resume",
+            "checkpoints/final.pt",
+            "--tera-exploration-start",
+            "0.3",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="complete schedule is restored"):
+        train()
+
+
 def test_factorized_tera_cli_overrides(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
@@ -313,8 +329,8 @@ def test_factorized_tera_cli_overrides(monkeypatch) -> None:
             "train",
             "--tera-exploration-end",
             "0.01",
-            "--tera-exploration-decay-fraction",
-            "0.4",
+            "--tera-exploration-decay-updates",
+            "113",
             "--tera-gate-entropy-coef",
             "0.02",
             "--tera-slot-entropy-coef",
@@ -325,17 +341,17 @@ def test_factorized_tera_cli_overrides(monkeypatch) -> None:
     _, _, config = build_configs(parse_args())
 
     assert config.tera_exploration_end == pytest.approx(0.01)
-    assert config.tera_exploration_decay_fraction == pytest.approx(0.4)
+    assert config.tera_exploration_decay_updates == 113
     assert config.tera_gate_entropy_coef == pytest.approx(0.02)
     assert config.tera_slot_entropy_coef == pytest.approx(0.03)
 
 
-def test_factorized_tera_defaults_leave_unmodified_training_tail() -> None:
+def test_factorized_tera_defaults_leave_decay_window_unresolved() -> None:
     config = TrainingConfig()
 
     assert config.tera_exploration_start == pytest.approx(0.15)
     assert config.tera_exploration_end == 0.0
-    assert config.tera_exploration_decay_fraction == pytest.approx(0.25)
+    assert config.tera_exploration_decay_updates is None
 
 
 def test_public_consequence_cli_override(monkeypatch) -> None:
@@ -349,10 +365,8 @@ def test_public_consequence_cli_override(monkeypatch) -> None:
     assert config.aux_public_consequence_coef == pytest.approx(0.075)
 
 
-def test_tera_exploration_decay_uses_planned_update_horizon() -> None:
-    decay_updates = resolve_tera_exploration_decay_updates(100, 0.25)
-
-    assert decay_updates == 25
+def test_tera_exploration_uses_absolute_update_window() -> None:
+    decay_updates = 113
     assert tera_exploration_probability(
         start=0.15,
         end=0.0,
@@ -362,33 +376,30 @@ def test_tera_exploration_decay_uses_planned_update_horizon() -> None:
     assert tera_exploration_probability(
         start=0.15,
         end=0.0,
-        update=13,
+        update=57,
         decay_updates=decay_updates,
     ) == pytest.approx(0.075)
     assert tera_exploration_probability(
         start=0.15,
         end=0.0,
-        update=25,
+        update=113,
         decay_updates=decay_updates,
     ) == pytest.approx(0.0)
     assert tera_exploration_probability(
         start=0.15,
         end=0.0,
-        update=90,
+        update=114,
         decay_updates=decay_updates,
     ) == pytest.approx(0.0)
 
 
-def test_zero_tera_decay_fraction_applies_end_immediately() -> None:
-    decay_updates = resolve_tera_exploration_decay_updates(100, 0.0)
-
-    assert decay_updates == 0
+def test_zero_tera_decay_updates_applies_end_immediately() -> None:
     assert (
         tera_exploration_probability(
             start=0.15,
             end=0.0,
             update=1,
-            decay_updates=decay_updates,
+            decay_updates=0,
         )
         == 0.0
     )
