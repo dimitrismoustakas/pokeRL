@@ -54,7 +54,9 @@ class EnvConfig:
 @dataclass
 class TrainingConfig:
     # PPO
+    optimizer_name: str = "adam"
     lr: float = 2.5e-4
+    weight_decay: float = 0.0
     # Optimize undiscounted win probability. GAE lambda still controls the
     # battle critic's bias/variance tradeoff.
     gamma: float = 1.0
@@ -129,6 +131,23 @@ class TrainingConfig:
     league_preview_device: str = "action"
 
     def __post_init__(self) -> None:
+        if self.optimizer_name not in {"adam", "adamw"}:
+            raise ValueError(
+                "optimizer_name must be 'adam' or 'adamw' "
+                f"(got {self.optimizer_name!r})."
+            )
+        if not math.isfinite(self.lr) or self.lr <= 0.0:
+            raise ValueError(f"lr must be finite and positive (got {self.lr}).")
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0.0:
+            raise ValueError(
+                "weight_decay must be finite and non-negative "
+                f"(got {self.weight_decay})."
+            )
+        if self.optimizer_name == "adam" and self.weight_decay != 0.0:
+            raise ValueError(
+                "weight_decay must be zero for the Adam baseline; use "
+                "optimizer_name='adamw' for decoupled weight decay."
+            )
         if not 0 <= self.seed < 2**32:
             raise ValueError(f"seed must be in [0, 2**32) (got {self.seed}).")
         if self.league_size <= 0:

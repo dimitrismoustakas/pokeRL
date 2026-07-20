@@ -147,6 +147,43 @@ def test_float32_matmul_precision_defaults_to_highest(monkeypatch) -> None:
     assert parse_args().float32_matmul_precision == "highest"
 
 
+def test_optimizer_cli_overrides(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--optimizer",
+            "adamw",
+            "--lr",
+            "0.0003",
+            "--weight-decay",
+            "0.02",
+        ],
+    )
+
+    _, _, train_config = build_configs(parse_args())
+
+    assert train_config.optimizer_name == "adamw"
+    assert train_config.lr == pytest.approx(3e-4)
+    assert train_config.weight_decay == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"optimizer_name": "sgd"},
+        {"lr": 0.0},
+        {"lr": -0.01},
+        {"lr": float("nan")},
+        {"weight_decay": -0.01},
+        {"optimizer_name": "adam", "weight_decay": 0.01},
+    ],
+)
+def test_optimizer_config_rejects_invalid_settings(config) -> None:
+    with pytest.raises(ValueError):
+        TrainingConfig(**config)
+
+
 def test_memory_gradient_diagnostics_are_opt_in(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["train", "--diagnose-memory-gradients"])
 

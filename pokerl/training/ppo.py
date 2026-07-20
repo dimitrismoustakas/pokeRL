@@ -1,5 +1,6 @@
 """PPO trainer with support for action masking and LSTM policies."""
 
+import math
 import random
 import uuid
 from collections.abc import Mapping
@@ -58,6 +59,10 @@ from .rollout import RolloutBatch
 
 # Increment when trainer-checkpoint semantics or same-shaped model inputs change.
 TRAINER_CHECKPOINT_FORMAT_VERSION = 8
+
+_ADAM_BETAS = (0.9, 0.999)
+_ADAM_EPS = 1e-5
+_ADAMW_DECAY_GROUPING = "non_embedding_matrices_v1"
 
 
 _PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
@@ -172,13 +177,70 @@ class PPOTrainer:
         self.loaded_training_state_id: str | None = None
         self.initialized_from_training_state_id: str | None = None
 
-    def _make_optimizer(self) -> torch.optim.Adam:
-        return torch.optim.Adam(self.agent.parameters(), lr=self.config.lr, eps=1e-5)
+    def optimizer_settings(self) -> dict[str, object]:
+        """Return the optimizer settings recorded with the run."""
+        return {
+            "name": self.config.optimizer_name,
+            "lr": float(self.config.lr),
+            "betas": _ADAM_BETAS,
+            "eps": _ADAM_EPS,
+            "weight_decay": float(self.config.weight_decay),
+            "decay_grouping": (
+                _ADAMW_DECAY_GROUPING
+                if self.config.optimizer_name == "adamw"
+                else "none"
+            ),
+        }
 
-    def _apply_update_step(self, loss: torch.Tensor) -> bool:
+    def _make_optimizer(self) -> torch.optim.Optimizer:
+        if self.config.optimizer_name == "adam":
+            return torch.optim.Adam(
+                self.agent.parameters(),
+                lr=self.config.lr,
+                betas=_ADAM_BETAS,
+                eps=_ADAM_EPS,
+                weight_decay=0.0,
+            )
+
+        modules = dict(self.agent.named_modules())
+        decay_params: list[nn.Parameter] = []
+        no_decay_params: list[nn.Parameter] = []
+        for name, param in self.agent.named_parameters():
+            if not param.requires_grad:
+                continue
+            module_name, _, _ = name.rpartition(".")
+            module = modules[module_name]
+            if param.ndim == 2 and not isinstance(module, nn.Embedding):
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+
+        param_groups: list[dict[str, object]] = []
+        if decay_params:
+            param_groups.append(
+                {
+                    "params": decay_params,
+                    "weight_decay": self.config.weight_decay,
+                }
+            )
+        if no_decay_params:
+            param_groups.append(
+                {
+                    "params": no_decay_params,
+                    "weight_decay": 0.0,
+                }
+            )
+        return torch.optim.AdamW(
+            param_groups,
+            lr=self.config.lr,
+            betas=_ADAM_BETAS,
+            eps=_ADAM_EPS,
+        )
+
+    def _apply_update_step(self, loss: torch.Tensor) -> float | None:
         if not torch.isfinite(loss).item():
             self.optimizer.zero_grad(set_to_none=True)
-            return False
+            return None
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -186,12 +248,13 @@ class PPOTrainer:
         total_norm = nn.utils.clip_grad_norm_(
             self._trainable_params, self.config.max_grad_norm
         )
-        if not torch.isfinite(total_norm).item():
+        total_norm_value = float(total_norm.item())
+        if not math.isfinite(total_norm_value):
             self.optimizer.zero_grad(set_to_none=True)
-            return False
+            return None
 
         self.optimizer.step()
-        return True
+        return total_norm_value
 
     def update(self, batch: RolloutBatch) -> dict[str, float]:
         """Run joint battle-and-preview PPO epochs on one rollout batch.
@@ -355,6 +418,9 @@ class PPOTrainer:
         preview_optimizer_steps = 0
         preview_max_approx_kl = torch.zeros((), device=self.device)
         preview_max_exact_kl = torch.zeros((), device=self.device)
+        pre_clip_global_grad_norm_sum = 0.0
+        pre_clip_global_grad_norm_max = 0.0
+        global_grad_clip_count = 0
         memory_gradient_diagnostics: dict[str, float] = {}
         aux_diagnostic_sums: dict[str, float] = {}
         initial_policy_shift: dict[str, torch.Tensor] = {}
@@ -1140,9 +1206,19 @@ class PPOTrainer:
                             float(E_mb)
                         )
 
-                if not self._apply_update_step(loss):
+                global_grad_norm = self._apply_update_step(loss)
+                if global_grad_norm is None:
                     skipped_nonfinite += 1
                     continue
+                global_grad_norm = float(global_grad_norm)
+                pre_clip_global_grad_norm_sum += global_grad_norm
+                pre_clip_global_grad_norm_max = max(
+                    pre_clip_global_grad_norm_max,
+                    global_grad_norm,
+                )
+                global_grad_clip_count += int(
+                    global_grad_norm > self.config.max_grad_norm
+                )
                 if pending_memory_diagnostics is not None:
                     memory_gradient_diagnostics = pending_memory_diagnostics
                 for key, value in pending_aux_diagnostics.items():
@@ -1350,6 +1426,11 @@ class PPOTrainer:
             else 0.0
         )
         averaged["ppo_optimizer_steps"] = float(num_updates)
+        averaged["global_grad_norm_pre_clip_mean"] = (
+            pre_clip_global_grad_norm_sum / num_updates
+        )
+        averaged["global_grad_norm_pre_clip_max"] = pre_clip_global_grad_norm_max
+        averaged["global_grad_clip_fraction"] = global_grad_clip_count / num_updates
         averaged["team_preview_joint_optimizer_steps"] = float(preview_optimizer_steps)
         if preview_metric_samples > 0:
             preview_denominator = float(preview_metric_samples)

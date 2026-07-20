@@ -39,6 +39,18 @@ class TinyAgent(nn.Module):
             self.config = config
 
 
+class OptimizerGroupingAgent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.root_matrix = nn.Parameter(torch.ones(2, 2))
+        self.frozen_matrix = nn.Parameter(torch.ones(2, 2), requires_grad=False)
+        self.embedding = nn.Embedding(8, 3)
+        self.norm = nn.LayerNorm(3)
+        self.hidden = nn.Linear(3, 4)
+        self.memory = nn.LSTM(4, 4)
+        self.output = nn.Linear(4, 1)
+
+
 def _assert_nested_equal(actual, expected) -> None:
     if isinstance(expected, torch.Tensor):
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
@@ -55,6 +67,104 @@ def _assert_nested_equal(actual, expected) -> None:
             _assert_nested_equal(actual_value, expected_value)
         return
     assert actual == expected
+
+
+def test_adam_settings_preserve_current_optimizer_defaults() -> None:
+    trainer = PPOTrainer(
+        TinyAgent(),
+        TrainingConfig(optimizer_name="adam", lr=2.5e-4),
+        torch.device("cpu"),
+    )
+
+    assert type(trainer.optimizer) is torch.optim.Adam
+    assert len(trainer.optimizer.param_groups) == 1
+    assert trainer.optimizer_settings() == {
+        "name": "adam",
+        "lr": 2.5e-4,
+        "betas": (0.9, 0.999),
+        "eps": 1e-5,
+        "weight_decay": 0.0,
+        "decay_grouping": "none",
+    }
+
+
+def test_adamw_groups_every_trainable_parameter_exactly_once() -> None:
+    agent = OptimizerGroupingAgent()
+    trainer = PPOTrainer(
+        agent,
+        TrainingConfig(
+            optimizer_name="adamw",
+            lr=3e-4,
+            weight_decay=0.02,
+        ),
+        torch.device("cpu"),
+    )
+
+    assert type(trainer.optimizer) is torch.optim.AdamW
+    assert len(trainer.optimizer.param_groups) == 2
+    decay_group, no_decay_group = trainer.optimizer.param_groups
+    assert decay_group["weight_decay"] == pytest.approx(0.02)
+    assert no_decay_group["weight_decay"] == 0.0
+
+    decay_ids = {id(param) for param in decay_group["params"]}
+    no_decay_ids = {id(param) for param in no_decay_group["params"]}
+    assert decay_ids == {
+        id(agent.root_matrix),
+        id(agent.hidden.weight),
+        id(agent.memory.weight_ih_l0),
+        id(agent.memory.weight_hh_l0),
+        id(agent.output.weight),
+    }
+    assert no_decay_ids == {
+        id(agent.embedding.weight),
+        id(agent.norm.weight),
+        id(agent.norm.bias),
+        id(agent.hidden.bias),
+        id(agent.memory.bias_ih_l0),
+        id(agent.memory.bias_hh_l0),
+        id(agent.output.bias),
+    }
+    assert decay_ids.isdisjoint(no_decay_ids)
+    assert decay_ids | no_decay_ids == {
+        id(param) for param in agent.parameters() if param.requires_grad
+    }
+    assert id(agent.frozen_matrix) not in decay_ids | no_decay_ids
+
+
+def test_zero_decay_adamw_matches_one_adam_step_exactly_on_cpu() -> None:
+    torch.manual_seed(47)
+    adam_agent = TinyAgent()
+    adamw_agent = copy.deepcopy(adam_agent)
+    adam = PPOTrainer(
+        adam_agent,
+        TrainingConfig(optimizer_name="adam", lr=2.5e-4),
+        torch.device("cpu"),
+    )
+    adamw = PPOTrainer(
+        adamw_agent,
+        TrainingConfig(
+            optimizer_name="adamw",
+            lr=2.5e-4,
+            weight_decay=0.0,
+        ),
+        torch.device("cpu"),
+    )
+    features = torch.tensor([[0.5, -1.0], [1.25, 0.75]])
+
+    assert (
+        adam._apply_update_step(adam.agent.linear(features).square().sum()) is not None
+    )
+    assert (
+        adamw._apply_update_step(adamw.agent.linear(features).square().sum())
+        is not None
+    )
+
+    for adam_param, adamw_param in zip(
+        adam.agent.parameters(),
+        adamw.agent.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(adam_param, adamw_param, rtol=0.0, atol=0.0)
 
 
 def test_trainer_load_rejects_league_only_checkpoint(tmp_path) -> None:

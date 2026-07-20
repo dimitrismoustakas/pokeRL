@@ -163,6 +163,12 @@ def test_joint_update_pairs_preview_shards_with_battle_optimizer_steps() -> None
     assert all(training for _size, training, _kwargs in agent.preview_calls[1:])
     assert metrics["ppo_optimizer_steps"] == 4.0
     assert metrics["team_preview_joint_optimizer_steps"] == 4.0
+    assert np.isfinite(metrics["global_grad_norm_pre_clip_mean"])
+    assert (
+        metrics["global_grad_norm_pre_clip_max"]
+        >= metrics["global_grad_norm_pre_clip_mean"]
+    )
+    assert 0.0 <= metrics["global_grad_clip_fraction"] <= 1.0
     assert metrics["team_preview_samples"] == 5.0
     assert metrics["team_preview_pre_ppo_approx_kl"] == pytest.approx(
         0.0,

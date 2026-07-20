@@ -487,7 +487,7 @@ def test_ppo_initial_ratio_is_one_under_rollout_behavior_policy() -> None:
     trainer = PPOTrainer(
         agent,
         TrainingConfig(
-            lr=0.0,
+            lr=1e-12,
             num_epochs=1,
             num_minibatches=1,
             aux_hidden_info_coef=0.0,

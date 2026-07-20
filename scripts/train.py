@@ -341,6 +341,24 @@ def parse_args() -> argparse.Namespace:
         "--num-epochs", type=int, default=None, help="Override PPO epochs per update."
     )
     parser.add_argument(
+        "--optimizer",
+        choices=("adam", "adamw"),
+        default=None,
+        help="Optimizer family. AdamW uses explicit decay/no-decay parameter groups.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Optimizer learning rate.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="AdamW decoupled weight decay for non-embedding matrix parameters.",
+    )
+    parser.add_argument(
         "--num-minibatches",
         type=int,
         default=None,
@@ -640,6 +658,9 @@ def build_configs(
         env_config.reset_concurrency = args.reset_concurrency
     overrides = {
         "seed": args.seed,
+        "optimizer_name": args.optimizer,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
         "rollout_steps": args.rollout_steps,
         "total_timesteps": args.total_timesteps,
         "num_epochs": args.num_epochs,
@@ -1557,15 +1578,12 @@ def _main_run_identity(
         or len(model_signature) != 64
         or any(character not in "0123456789abcdef" for character in model_signature)
     ):
-        raise ValueError(
-            "Main-run model_signature must be a lowercase SHA-256 digest."
-        )
+        raise ValueError("Main-run model_signature must be a lowercase SHA-256 digest.")
     if population_revision_id is not None and (
         not isinstance(population_revision_id, str)
         or len(population_revision_id) != 64
         or any(
-            character not in "0123456789abcdef"
-            for character in population_revision_id
+            character not in "0123456789abcdef" for character in population_revision_id
         )
     ):
         raise ValueError(
@@ -1574,10 +1592,7 @@ def _main_run_identity(
     if team_pool_signature is not None and (
         not isinstance(team_pool_signature, str)
         or len(team_pool_signature) != 64
-        or any(
-            character not in "0123456789abcdef"
-            for character in team_pool_signature
-        )
+        or any(character not in "0123456789abcdef" for character in team_pool_signature)
     ):
         raise ValueError(
             "Main-run team_pool_signature must be a lowercase SHA-256 digest."
@@ -1637,11 +1652,7 @@ def _validate_main_run_identity(
                 f"checkpoint={declared[name]!r}, runtime={runtime!r}."
             )
     population_revision_id = declared["population_revision_id"]
-    return (
-        None
-        if population_revision_id is None
-        else str(population_revision_id)
-    )
+    return None if population_revision_id is None else str(population_revision_id)
 
 
 def _serialize_opponent_assignments(
@@ -2058,10 +2069,7 @@ def train():
     game_data = GameData(gen=9)
     agent = PokeAgent(model_config, game_data)
     agent.to(device)
-    if (
-        phase_spec is not None
-        and agent.model_signature != phase_spec.model_signature
-    ):
+    if phase_spec is not None and agent.model_signature != phase_spec.model_signature:
         raise ValueError(
             "Runtime architecture/vocabulary does not match the phase model signature."
         )
@@ -2070,9 +2078,7 @@ def train():
         if phase_spec is not None
         else _main_run_identity(
             battle_format=env_config.battle_format,
-            team_pool_signature=(
-                None if team_pool is None else team_pool.signature()
-            ),
+            team_pool_signature=(None if team_pool is None else team_pool.signature()),
             model_signature=agent.model_signature,
             population_revision_id=None,
         )
@@ -2086,6 +2092,16 @@ def train():
 
     # Training
     trainer = PPOTrainer(agent, train_config, device)
+    optimizer_settings = trainer.optimizer_settings()
+    print(
+        "Optimizer: "
+        f"{optimizer_settings['name']} "
+        f"lr={optimizer_settings['lr']:g} "
+        f"betas={optimizer_settings['betas']} "
+        f"eps={optimizer_settings['eps']:g} "
+        f"weight_decay={optimizer_settings['weight_decay']:g} "
+        f"grouping={optimizer_settings['decay_grouping']}"
+    )
     league = League(
         train_config,
         env_config,
@@ -2212,16 +2228,12 @@ def train():
         population_revision_id = _validate_main_run_identity(
             extra_state.get("run_identity"),
             battle_format=env_config.battle_format,
-            team_pool_signature=(
-                None if team_pool is None else team_pool.signature()
-            ),
+            team_pool_signature=(None if team_pool is None else team_pool.signature()),
             model_signature=agent.model_signature,
         )
         main_run_identity = _main_run_identity(
             battle_format=env_config.battle_format,
-            team_pool_signature=(
-                None if team_pool is None else team_pool.signature()
-            ),
+            team_pool_signature=(None if team_pool is None else team_pool.signature()),
             model_signature=agent.model_signature,
             population_revision_id=population_revision_id,
         )
@@ -2325,8 +2337,13 @@ def train():
             "num_epochs": train_config.num_epochs,
             "num_minibatches": train_config.num_minibatches,
             "bptt_chunk_steps": train_config.bptt_chunk_steps,
+            "optimizer": trainer.optimizer_settings(),
             "gamma": train_config.gamma,
             "gae_lambda": train_config.gae_lambda,
+            "clip_eps": train_config.clip_eps,
+            "entropy_coef": train_config.entropy_coef,
+            "value_coef": train_config.value_coef,
+            "max_grad_norm": train_config.max_grad_norm,
             "team_preview_value_coef": train_config.team_preview_value_coef,
             "team_preview_bring_coef": train_config.team_preview_bring_coef,
             "team_preview_lead_coef": train_config.team_preview_lead_coef,
