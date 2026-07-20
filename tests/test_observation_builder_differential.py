@@ -122,7 +122,20 @@ class _ReferenceObservationBuilder(ObservationBuilder):
 
         effects = pokemon.effects
         for index, volatile in enumerate(observation_module.VOLATILES):
-            if isinstance(volatile, frozenset):
+            if volatile == observation_module.PERISH_EFFECTS:
+                counts = [
+                    count
+                    for effect, count in (
+                        (Effect.PERISH0, 0),
+                        (Effect.PERISH1, 1),
+                        (Effect.PERISH2, 2),
+                        (Effect.PERISH3, 3),
+                    )
+                    if effect in effects
+                ]
+                if counts:
+                    feats[offset + index] = (min(counts) + 1) / 4.0
+            elif isinstance(volatile, frozenset):
                 feats[offset + index] = float(
                     any(effect in effects for effect in volatile)
                 )
@@ -268,6 +281,7 @@ def test_optimized_encoder_is_byte_identical_as_battle_knowledge_changes() -> No
             [("p2:1", opponent_active), ("p2:2", opponent_bench)]
         ),
         active_pokemon=[own_active, None],
+        available_moves=[[], []],
         opponent_active_pokemon=[opponent_active, None],
         weather={},
         fields={},

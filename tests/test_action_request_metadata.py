@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 
 import numpy as np
@@ -8,7 +9,15 @@ from poke_env.battle import DoubleBattle, Move
 from poke_env.player import SingleBattleOrder
 
 import pokerl.env.actions as actions_module
-from pokerl.env.actions import _hydrate_move_for_request, build_legal_action_state
+from pokerl.data import GameData
+from pokerl.env.actions import (
+    NUM_TARGETS,
+    SWITCH_OFFSET,
+    _hydrate_move_for_request,
+    action_to_order,
+    build_legal_action_state,
+)
+from pokerl.env.observation import ObservationBuilder
 
 
 class _UnreadableRequestBattle:
@@ -189,6 +198,118 @@ def _parsed_double_battle() -> DoubleBattle:
     }
     battle.parse_request(request)
     return battle
+
+
+def _with_disabled_fake_out() -> DoubleBattle:
+    battle = _parsed_double_battle()
+    request = copy.deepcopy(battle.last_request)
+    request["active"][0]["moves"][0]["disabled"] = True
+    battle.parse_request(request)
+    return battle
+
+
+def _move_order_messages_by_slot(
+    battle: DoubleBattle,
+) -> dict[int, set[str]]:
+    state = build_legal_action_state(battle)
+    messages: dict[int, set[str]] = {}
+    for action_index in state.slot_action_orders[0]:
+        if action_index >= SWITCH_OFFSET:
+            continue
+        move_slot = action_index // NUM_TARGETS
+        messages.setdefault(move_slot, set()).add(
+            action_to_order(
+                action_index,
+                battle,
+                slot=0,
+                action_state=state,
+            ).message
+        )
+    return messages
+
+
+def test_disabled_move_keeps_showdown_request_slots_and_order_messages() -> None:
+    battle = _with_disabled_fake_out()
+    game_data = GameData(gen=9)
+
+    assert [(move.id, move.request_index) for move in battle.available_moves[0]] == [
+        ("protect", 2),
+        ("snarl", 3),
+        ("partingshot", 4),
+    ]
+    messages = _move_order_messages_by_slot(battle)
+
+    assert set(messages) == {1, 2, 3}
+    assert messages[1] == {"/choose move 2"}
+    assert messages[2] == {"/choose move 3"}
+    assert all(message.startswith("/choose move 4") for message in messages[3])
+    observation = ObservationBuilder(game_data).build(battle)
+    assert observation["own_request_moves"][0].tolist() == [
+        0,
+        game_data.move_to_idx["protect"],
+        game_data.move_to_idx["snarl"],
+        game_data.move_to_idx["partingshot"],
+    ]
+
+
+def test_single_move_request_uses_request_slot_zero_and_live_move_identity() -> None:
+    battle = _parsed_double_battle()
+    request = copy.deepcopy(battle.last_request)
+    request["active"][0]["moves"] = [
+        {"id": "snarl", "target": "allAdjacentFoes", "disabled": False}
+    ]
+    battle.parse_request(request)
+
+    assert [(move.id, move.request_index) for move in battle.available_moves[0]] == [
+        ("snarl", 1)
+    ]
+    assert _move_order_messages_by_slot(battle) == {0: {"/choose move 1"}}
+
+    game_data = GameData(gen=9)
+    observation = ObservationBuilder(game_data).build(battle)
+    assert observation["own_request_moves"][0].tolist() == [
+        game_data.move_to_idx["snarl"],
+        0,
+        0,
+        0,
+    ]
+
+
+def test_forced_struggle_request_uses_struggle_identity() -> None:
+    battle = _parsed_double_battle()
+    request = copy.deepcopy(battle.last_request)
+    request["active"][0]["moves"] = [
+        {"id": "struggle", "target": "randomNormal", "disabled": False}
+    ]
+    battle.parse_request(request)
+    game_data = GameData(gen=9)
+
+    observation = ObservationBuilder(game_data).build(battle)
+
+    assert observation["own_request_moves"][0].tolist() == [
+        game_data.move_to_idx["struggle"],
+        0,
+        0,
+        0,
+    ]
+    assert _move_order_messages_by_slot(battle) == {0: {"/choose move 1"}}
+
+
+@pytest.mark.parametrize("request_index", [None, True, 5])
+def test_invalid_available_move_request_index_fails_loudly(request_index) -> None:
+    battle = _parsed_double_battle()
+    battle.available_moves[0][0].request_index = request_index
+
+    with pytest.raises(RuntimeError, match="request index"):
+        build_legal_action_state(battle)
+
+
+def test_duplicate_available_move_request_index_fails_loudly() -> None:
+    battle = _parsed_double_battle()
+    battle.available_moves[0][1].request_index = 1
+
+    with pytest.raises(RuntimeError, match="share Showdown request index 1"):
+        build_legal_action_state(battle)
 
 
 def test_real_double_battle_request_fast_path_matches_forced_clone_fallback(

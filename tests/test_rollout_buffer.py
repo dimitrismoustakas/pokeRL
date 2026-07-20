@@ -1341,6 +1341,9 @@ def test_action_head_matchup_features_distinguish_super_effective_and_resisted_t
     )
     battle_obs = {
         "own_moves": torch.tensor([[[1, 0, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "own_request_moves": torch.tensor(
+            [[[1, 0, 0, 0], [0, 0, 0, 0]]], dtype=torch.long
+        ),
         "own_types": torch.tensor([[[1, 0, 0], [2, 0, 0]]], dtype=torch.long),
         "own_continuous": torch.zeros((1, 2, 44), dtype=torch.float32),
         "own_active_indices": torch.tensor([[0, 1]], dtype=torch.long),
@@ -1808,6 +1811,7 @@ class _FakeTargetBattle:
     OPPONENT_2_POSITION = 2
 
     def __init__(self, move: Move) -> None:
+        move.request_index = 1
         self.force_switch = [False, False]
         self.can_tera = [False, False]
         self.active_pokemon = [_FakePokemon("attacker"), _FakePokemon("ally")]
@@ -2114,7 +2118,9 @@ def test_parallel_battle_env_collate_reuses_batch_buffers() -> None:
 
 def test_joint_action_mask_comes_from_joined_valid_orders() -> None:
     first_move = Move("icespinner", gen=9)
+    first_move.request_index = 1
     second_move = Move("suckerpunch", gen=9)
+    second_move.request_index = 1
     lead_one = Pokemon(gen=9, species="Indeedee")
     lead_two = Pokemon(gen=9, species="Amoonguss")
     shared_switch = Pokemon(gen=9, species="Farigiraf")

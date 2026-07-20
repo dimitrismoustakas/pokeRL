@@ -35,7 +35,8 @@ shaping.
 - field, side, weather, terrain, Trick Room, and turn state;
 - recent exact public protocol events;
 - active-slot mechanics such as first active turn, consecutive protection
-  state, active-turn count, and the previous move's public resolution.
+  state, active-turn count, the exact public Perish Song countdown, and the
+  previous move's public resolution.
 
 `pokerl/model/encoders.py` applies a shared Pokémon encoder and separate
 set-attention team encoders. Field, recent-event, and active-mechanics
@@ -98,6 +99,13 @@ representations include move identity and public mechanics such as protection,
 switching, healing, field creation, Fake Out, recharge, and charge behavior.
 Move metadata describes mechanics, not strategic value.
 
+Move action slots follow Showdown's one-based request indices rather than the
+compacted `available_moves` list. The observation separately carries the exact
+live move ID in each request slot, so disabled moves retain their holes while
+one-entry locked and Struggle requests keep their true semantics. Forced
+pseudo-moves absent from the vocabulary remain unknown rather than inheriting
+an unrelated roster move.
+
 The value head shares the observation, belief-conditioned representations, and
 recurrent context with the policy.
 
@@ -144,13 +152,14 @@ clipped PPO with:
 Minibatches slice environments while retaining their full rollout sequences,
 so recurrent state and episode boundaries remain valid.
 
-One Adam optimizer owns the shared model. Preview and battle advantages are
-normalized together, and their policy/value/entropy sums are weighted by the
-complete rollout's number of decisions. Preview samples are independently
-shuffled and paired with the full-environment recurrent battle minibatches.
-Each pair produces one combined loss, one backward pass, one global gradient
-clip, and one optimizer step. Four epochs by four minibatches therefore means
-16 optimizer steps.
+One optimizer owns the shared model. It is currently selectable between Adam
+and AdamW; AdamW applies decay only to non-embedding matrix parameters. Preview
+and battle advantages are normalized together, and their
+policy/value/entropy sums are weighted by the complete rollout's number of
+decisions. Preview samples are independently shuffled and paired with the
+full-environment recurrent battle minibatches. Each pair produces one combined
+loss, one backward pass, one global gradient clip, and one optimizer step.
+Four epochs by four minibatches therefore means 16 optimizer steps.
 
 The complete old preview distribution is frozen before those steps and used
 for exact `KL(old || current)`. The action-time selected log probability remains
@@ -228,7 +237,7 @@ verified child population to a resumable main league.
 
 ## Checkpoints and resume
 
-Trainer checkpoints contain model and Adam state, counters, schema metadata,
+Trainer checkpoints contain model and optimizer state, counters, schema metadata,
 and RNG state. A paired league or phase-state file records the exact opponent
 sampler boundary and assignments.
 

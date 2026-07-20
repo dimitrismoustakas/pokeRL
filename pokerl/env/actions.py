@@ -166,6 +166,23 @@ def decode_action(action_idx: int) -> tuple[str, int, int]:
     return "move", move_idx, target_idx
 
 
+def request_move_slot(move: Move, *, active_slot: int) -> int:
+    """Return the fixed zero-based action slot from Showdown request metadata."""
+    request_index = getattr(move, "request_index", None)
+    if not isinstance(request_index, int) or isinstance(request_index, bool):
+        raise RuntimeError(
+            f"Available move {move.id!r} for active slot {active_slot} has no valid "
+            "Showdown request index."
+        )
+    move_slot = request_index - 1
+    if not 0 <= move_slot < NUM_MOVES:
+        raise RuntimeError(
+            f"Available move {move.id!r} for active slot {active_slot} has request "
+            f"index {request_index}; expected an index from 1 to {NUM_MOVES}."
+        )
+    return move_slot
+
+
 def decode_tera_choice(tera_choice: int) -> tuple[bool, bool]:
     """Decode the joint tera decision into per-slot booleans."""
     if tera_choice == TERA_NONE:
@@ -583,15 +600,18 @@ def _build_slot_action_state(
 
     active_pokemon = battle.active_pokemon[slot]
     if active_pokemon is not None and not force_switch[slot]:
-        for move_idx, move in enumerate(battle.available_moves[slot]):
-            if move_idx >= NUM_MOVES:
-                raise RuntimeError(
-                    f"poke-env exposed more than {NUM_MOVES} moves for slot {slot}. "
-                    "Expand the action encoding to represent every request move."
-                )
+        occupied_move_slots: set[int] = set()
+        for move in battle.available_moves[slot]:
             hydrated_move, target_locs = _request_aware_move_targets(
                 move, active_pokemon, battle, slot
             )
+            move_idx = request_move_slot(hydrated_move, active_slot=slot)
+            if move_idx in occupied_move_slots:
+                raise RuntimeError(
+                    f"Two available moves for active slot {slot} share Showdown "
+                    f"request index {move_idx + 1}."
+                )
+            occupied_move_slots.add(move_idx)
             for target_loc in target_locs:
                 target_idx = _showdown_target_to_index(target_loc, slot, battle)
                 action_idx = move_idx * NUM_TARGETS + target_idx

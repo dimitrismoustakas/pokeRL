@@ -40,6 +40,7 @@ def _make_head_and_inputs(batch_size: int = 3):
     present = torch.ones((batch_size, 2), dtype=torch.bool)
     battle_obs = {
         "own_moves": torch.randint(0, num_moves, (batch_size, 6, 4)),
+        "own_request_moves": torch.randint(0, num_moves, (batch_size, 2, 4)),
         "own_types": torch.randint(0, num_types, (batch_size, 6, 3)),
         "own_continuous": torch.rand(batch_size, 6, CONTINUOUS_DIM),
         "own_active_indices": active_indices,

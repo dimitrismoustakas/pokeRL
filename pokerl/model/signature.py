@@ -9,7 +9,7 @@ from dataclasses import asdict
 from ..config import ModelConfig
 
 
-MODEL_ARCHITECTURE_VERSION = 4
+MODEL_ARCHITECTURE_VERSION = 5
 
 
 def architecture_signature(config: ModelConfig) -> str:

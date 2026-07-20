@@ -28,6 +28,7 @@ from .actions import (
     TARGET_OPPONENT_1,
     TARGET_OPPONENT_2,
     TARGET_SELF,
+    request_move_slot,
 )
 
 
@@ -65,9 +66,14 @@ PROTECT_COUNTER_CAP = 4
 STATUS_COUNTER_CAP = 8
 ACTIVE_TURNS_CAP = 6
 
-# Volatile effects to track as binary flags.
-# Each entry is either a single Effect or a frozenset of Effects (any match = True).
-# Perish song is tracked as any of PERISH0/1/2/3 (countdown from 3 to 0).
+# Volatile effects to track. All are binary except the ordered Perish countdown.
+_PERISH_COUNTS = {
+    Effect.PERISH0: 0,
+    Effect.PERISH1: 1,
+    Effect.PERISH2: 2,
+    Effect.PERISH3: 3,
+}
+PERISH_EFFECTS = frozenset(_PERISH_COUNTS)
 VOLATILES: list = [
     Effect.CONFUSION,
     Effect.SUBSTITUTE,
@@ -77,7 +83,7 @@ VOLATILES: list = [
     Effect.TORMENT,
     Effect.DISABLE,
     Effect.YAWN,
-    frozenset({Effect.PERISH0, Effect.PERISH1, Effect.PERISH2, Effect.PERISH3}),
+    PERISH_EFFECTS,
     Effect.PROTECT,
     Effect.ENDURE,
     Effect.FOCUS_ENERGY,
@@ -87,6 +93,7 @@ VOLATILES: list = [
     Effect.FLASH_FIRE,
 ]
 NUM_VOLATILES = len(VOLATILES)
+PERISH_VOLATILE_INDEX = VOLATILES.index(PERISH_EFFECTS)
 
 # Status conditions for one-hot encoding
 STATUS_LIST = [
@@ -266,6 +273,7 @@ class ObservationBuilder:
             self._ordered_team_with_roles(battle, own=True)
         )
         self._encode_team(own_pokemon, own_roles, obs, prefix="own", full_info=True)
+        obs["own_request_moves"] = self._encode_own_request_moves(battle)
 
         opponent_team, opponent_source_lookup = self._public_opponent_team(battle)
         opp_pokemon, opp_roles, opp_active_indices, opp_active_present = (
@@ -294,6 +302,28 @@ class ObservationBuilder:
         self._encode_transition_history(battle, previous_intent, obs)
         self._encode_active_mechanics(obs)
         return obs
+
+    def _encode_own_request_moves(self, battle: DoubleBattle) -> np.ndarray:
+        """Encode the exact live move IDs in their fixed Showdown request slots."""
+        available_moves = battle.available_moves
+        if len(available_moves) != 2:
+            raise RuntimeError(
+                "A doubles battle must expose available moves for exactly two active slots."
+            )
+
+        encoded = np.zeros((2, NUM_MOVE_SLOTS), dtype=np.int64)
+        for active_slot, slot_moves in enumerate(available_moves):
+            occupied_slots: set[int] = set()
+            for move in slot_moves:
+                move_slot = request_move_slot(move, active_slot=active_slot)
+                if move_slot in occupied_slots:
+                    raise RuntimeError(
+                        f"Two available moves for active slot {active_slot} share "
+                        f"Showdown request index {move_slot + 1}."
+                    )
+                occupied_slots.add(move_slot)
+                encoded[active_slot, move_slot] = self._move_idx(move.id)
+        return encoded
 
     @staticmethod
     def _encode_active_mechanics(obs: dict[str, np.ndarray]) -> None:
@@ -339,11 +369,7 @@ class ObservationBuilder:
         # shortcut exposes only live public mechanics; the ordinary event
         # encoder still receives the retained history and overflow metadata.
         event_meta = obs["recent_event_meta"]
-        if (
-            event_meta[0] <= 0.0
-            or event_meta[1] > 0.0
-            or event_meta[2] > 0.0
-        ):
+        if event_meta[0] <= 0.0 or event_meta[1] > 0.0 or event_meta[2] > 0.0:
             obs["active_mechanics"] = features
             obs["active_mechanics_move"] = last_move
             return
@@ -819,10 +845,27 @@ class ObservationBuilder:
         for index, stat in enumerate(_BOOST_NAMES):
             feats[BOOSTS_OFFSET + index] = boosts.get(stat, 0) / 6.0
 
+        perish_count: int | None = None
         for effect in pokemon.effects:
+            effect_perish_count = _PERISH_COUNTS.get(effect)
+            if effect_perish_count is not None:
+                perish_count = (
+                    effect_perish_count
+                    if perish_count is None
+                    else min(perish_count, effect_perish_count)
+                )
+                continue
             volatile_index = _VOLATILE_INDICES.get(effect)
             if volatile_index is not None:
                 feats[VOLATILES_OFFSET + volatile_index] = 1.0
+
+        if perish_count is not None:
+            # poke-env retains earlier perishN effects as the countdown advances.
+            # The lowest public count is therefore the current one. Reserving zero
+            # for absence keeps all five states distinct in this existing scalar.
+            feats[VOLATILES_OFFSET + PERISH_VOLATILE_INDEX] = (perish_count + 1) / len(
+                _PERISH_COUNTS
+            )
 
         feats[PROTECT_COUNTER_OFFSET] = self._normalized_counter(
             pokemon.protect_counter, PROTECT_COUNTER_CAP
@@ -1051,6 +1094,7 @@ class _SyntheticTeamPreviewBattle:
         )
         self.active_pokemon = [None, None]
         self.opponent_active_pokemon = [None, None]
+        self.available_moves = [[], []]
         self.fields = {}
         self.weather = {}
         self.side_conditions = {}

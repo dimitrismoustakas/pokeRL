@@ -237,6 +237,7 @@ def test_target_decoder_sees_accuracy_evasion_and_ignore_evasion_exception() -> 
     opp_continuous[0, 0, BOOSTS_OFFSET + 6] = 3.0 / 6.0
     battle_obs = {
         "own_moves": torch.tensor([[[1, 2, 0, 0]] + [[0, 0, 0, 0]] * 5]),
+        "own_request_moves": torch.tensor([[[1, 2, 0, 0], [0, 0, 0, 0]]]),
         "own_types": torch.zeros((1, 6, 3), dtype=torch.long),
         "own_continuous": own_continuous,
         "own_active_indices": torch.tensor([[0, 1]]),
@@ -270,7 +271,7 @@ def test_target_decoder_sees_accuracy_evasion_and_ignore_evasion_exception() -> 
     assert mechanics[0, 0, 2, 4] == pytest.approx(3.0 / 6.0)
 
 
-def test_candidate_score_receives_selected_global_move_identity() -> None:
+def test_live_request_move_identity_drives_candidate_and_dependent_decisions() -> None:
     hidden_dim = 8
     num_moves = 3
     head = ActionHead(
@@ -306,11 +307,14 @@ def test_candidate_score_receives_selected_global_move_identity() -> None:
         head.score[2].bias.zero_()
         head.score[2].weight[0, 0] = 1.0
 
-    def semantics_for(move_id: int) -> torch.Tensor:
+    def battle_obs_for(move_id: int) -> dict[str, torch.Tensor]:
         own_moves = torch.zeros((1, 6, 4), dtype=torch.long)
-        own_moves[0, 0, 0] = move_id
-        battle_obs = {
+        own_moves[0, 0, 0] = 1
+        own_request_moves = torch.zeros((1, 2, 4), dtype=torch.long)
+        own_request_moves[0, 0, 0] = move_id
+        return {
             "own_moves": own_moves,
+            "own_request_moves": own_request_moves,
             "own_types": torch.zeros((1, 6, 3), dtype=torch.long),
             "own_continuous": torch.zeros((1, 6, 44)),
             "own_active_indices": torch.tensor([[0, 1]]),
@@ -320,6 +324,9 @@ def test_candidate_score_receives_selected_global_move_identity() -> None:
             "opp_active_indices": torch.tensor([[0, 1]]),
             "opp_active_present": torch.tensor([[True, True]]),
         }
+
+    def semantics_for(move_id: int) -> torch.Tensor:
+        battle_obs = battle_obs_for(move_id)
         context = head._matchup_context(battle_obs, 1, torch.device("cpu"))
         return head._candidate_move_semantics(
             context,
@@ -356,6 +363,48 @@ def test_candidate_score_receives_selected_global_move_identity() -> None:
     torch.testing.assert_close(
         second_logits[:, SWITCH_OFFSET:],
         first_logits[:, SWITCH_OFFSET:],
+    )
+
+    query2_inputs: list[torch.Tensor] = []
+    tera_inputs: list[torch.Tensor] = []
+    query2_handle = head.query2[0].register_forward_pre_hook(
+        lambda _module, args: query2_inputs.append(args[0].detach().clone())
+    )
+    tera_handle = head.tera_query[0].register_forward_pre_hook(
+        lambda _module, args: tera_inputs.append(args[0].detach().clone())
+    )
+    forward_inputs = {
+        "context": torch.zeros((1, 3)),
+        "active_reps": torch.zeros((1, 2, 2)),
+        "own_team_reps": torch.zeros((1, 6, 2)),
+        "opp_team_reps": torch.zeros((1, 6, 2)),
+        "opp_reserve_mask": torch.zeros((1, 6), dtype=torch.bool),
+        "opp_active_reps": torch.zeros((1, 2, 2)),
+        "masks": {
+            "joint": torch.ones(
+                (1, ACTIONS_PER_SLOT + 1, ACTIONS_PER_SLOT), dtype=torch.bool
+            ),
+            "can_tera": torch.zeros((1, 2), dtype=torch.bool),
+        },
+        "actions": torch.tensor([[0, 0, TERA_NONE]]),
+        "battle_obs": battle_obs_for(2),
+        "move_embedding": move_embedding,
+    }
+    try:
+        with torch.no_grad():
+            head(**forward_inputs)
+    finally:
+        query2_handle.remove()
+        tera_handle.remove()
+
+    selected_conditioning = (
+        head.action_id_emb(torch.tensor([0])) + semantics_for(2)[:, 0]
+    )
+    torch.testing.assert_close(query2_inputs[0][:, -hidden_dim:], selected_conditioning)
+    tera_action_offset = 3 + 4 * 2
+    torch.testing.assert_close(
+        tera_inputs[0][:, tera_action_offset : tera_action_offset + hidden_dim],
+        selected_conditioning,
     )
 
 

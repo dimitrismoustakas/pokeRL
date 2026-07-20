@@ -11,6 +11,7 @@ from poke_env.teambuilder.teambuilder import Teambuilder
 from pokerl.data import GameData, UNKNOWN_IDX
 from pokerl.env.observation import (
     ABILITY_KNOWN_OFFSET,
+    CONTINUOUS_DIM,
     FIELD_OPP_SIDE_OFFSET,
     FIELD_OPPONENT_USED_TERA_OFFSET,
     FIELD_OWN_SIDE_OFFSET,
@@ -23,6 +24,7 @@ from pokerl.env.observation import (
     KNOWN_MOVE_COUNT_OFFSET,
     MOVE_PP_OFFSET,
     ObservationBuilder,
+    PERISH_VOLATILE_INDEX,
     PROTECT_COUNTER_OFFSET,
     REVEALED_OFFSET,
     ROLE_ACTIVE_1,
@@ -31,6 +33,7 @@ from pokerl.env.observation import (
     STATUS_COUNTER_OFFSET,
     TERA_KNOWN_OFFSET,
     TERASTALLIZED_OFFSET,
+    VOLATILES_OFFSET,
     _init_team_preview_pokemon,
     build_packed_team_aux_labels,
 )
@@ -38,6 +41,43 @@ from pokerl.env.observation import (
 
 def _move(move_id: str, current_pp: int, max_pp: int) -> SimpleNamespace:
     return SimpleNamespace(id=move_id, current_pp=current_pp, max_pp=max_pp)
+
+
+@pytest.mark.parametrize(
+    ("effects", "expected"),
+    [
+        ({}, 0.0),
+        ({Effect.PERISH3: 1}, 1.0),
+        ({Effect.PERISH2: 1}, 0.75),
+        ({Effect.PERISH1: 1}, 0.5),
+        ({Effect.PERISH0: 1}, 0.25),
+        ({Effect.PERISH3: 1, Effect.PERISH1: 1}, 0.5),
+    ],
+)
+def test_perish_song_countdown_preserves_exact_public_state(
+    effects: dict[Effect, int], expected: float
+) -> None:
+    builder = ObservationBuilder(GameData(gen=9))
+    pokemon = SimpleNamespace(
+        max_hp=100,
+        current_hp=100,
+        current_hp_fraction=1.0,
+        status=None,
+        boosts={},
+        effects=effects,
+        protect_counter=0,
+        status_counter=0,
+        first_turn=False,
+        revealed=True,
+        tera_type=None,
+        is_terastallized=False,
+        active_turns=1,
+    )
+    features = np.zeros(CONTINUOUS_DIM, dtype=np.float32)
+
+    builder._fill_continuous_features(features, pokemon, {}, None, None)
+
+    assert features[VOLATILES_OFFSET + PERISH_VOLATILE_INDEX] == expected
 
 
 def test_packed_team_aux_labels_are_exact_private_targets_for_selected_team() -> None:
@@ -280,6 +320,7 @@ def test_observation_builder_reorders_actives_and_preserves_feature_values() -> 
         ),
         opponent_team=OrderedDict([("p2:1", opp_active), ("p2:2", opp_bench)]),
         active_pokemon=[own_active_1, own_active_2],
+        available_moves=[[], []],
         opponent_active_pokemon=[opp_active, None],
         weather={Weather.RAINDANCE: 1},
         fields={Field.TRICK_ROOM: 1},
@@ -466,6 +507,7 @@ def test_opponent_source_indices_remain_stable_when_actives_switch() -> None:
             (f"p2:{index}", pokemon) for index, pokemon in enumerate(opponents)
         ),
         active_pokemon=[None, None],
+        available_moves=[[], []],
         opponent_active_pokemon=[opponents[0], opponents[1]],
         weather={},
         fields={},
@@ -522,6 +564,7 @@ def test_public_preview_roster_persists_as_live_opponents_are_revealed() -> None
         opponent_team=OrderedDict((f"p2:{index}", live[index]) for index in (0, 1)),
         teampreview_opponent_team=preview,
         active_pokemon=[None, None],
+        available_moves=[[], []],
         opponent_active_pokemon=[live[0], live[1]],
         weather={},
         fields={},
@@ -582,6 +625,7 @@ def test_illusion_roster_keeps_display_but_withholds_ambiguous_source() -> None:
         opponent_team=OrderedDict([("p2:gengar", apparent_gengar)]),
         teampreview_opponent_team=preview,
         active_pokemon=[None, None],
+        available_moves=[[], []],
         opponent_active_pokemon=[apparent_gengar, None],
         weather={},
         fields={},
@@ -646,6 +690,7 @@ def test_observation_builder_raises_when_active_pokemon_is_missing_from_team() -
         team=OrderedDict([("p1:2", bench)]),
         opponent_team=OrderedDict(),
         active_pokemon=[missing_active, None],
+        available_moves=[[], []],
         opponent_active_pokemon=[None, None],
         weather={},
         fields={},
@@ -689,6 +734,7 @@ def test_observation_builder_keeps_unmatched_visible_opponent_active() -> None:
         team=OrderedDict(),
         opponent_team=OrderedDict([("p2:1", tracked_opponent)]),
         active_pokemon=[None, None],
+        available_moves=[[], []],
         opponent_active_pokemon=[visible_active, None],
         weather={},
         fields={},
@@ -744,6 +790,7 @@ def test_unrevealed_item_sentinel_is_encoded_as_unknown() -> None:
         team=OrderedDict(),
         opponent_team=OrderedDict([("amoonguss", opponent)]),
         active_pokemon=[None, None],
+        available_moves=[[], []],
         opponent_active_pokemon=[None, None],
         weather={},
         fields={},

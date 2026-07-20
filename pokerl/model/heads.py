@@ -600,9 +600,11 @@ class ActionHead(nn.Module):
             )
 
         a1_emb = self.action_id_emb(a1)
+        selected_move_semantics_1 = move_semantics_1[batch_indices, a1]
+        a1_conditioning = a1_emb + selected_move_semantics_1
         chosen_features_1 = matchup_features_1[batch_indices, a1]
         base_query2 = self.query2(
-            torch.cat([context, rep2, rep1, opp1, opp2, a1_emb], dim=-1)
+            torch.cat([context, rep2, rep1, opp1, opp2, a1_conditioning], dim=-1)
         )
         if reserve_item_projections is None:
             reserve_summary2 = self.reserve_attention(
@@ -650,6 +652,8 @@ class ActionHead(nn.Module):
             )
 
         a2_emb = self.action_id_emb(a2)
+        selected_move_semantics_2 = move_semantics_2[batch_indices, a2]
+        a2_conditioning = a2_emb + selected_move_semantics_2
         chosen_features_2 = matchup_features_2[batch_indices, a2]
         a1_is_move = self._action_is_move[a1]
         a2_is_move = self._action_is_move[a2]
@@ -669,8 +673,8 @@ class ActionHead(nn.Module):
                     rep2,
                     opp1,
                     opp2,
-                    a1_emb,
-                    a2_emb,
+                    a1_conditioning,
+                    a2_conditioning,
                     chosen_features_1,
                     chosen_features_2,
                 ],
@@ -1445,7 +1449,7 @@ class ActionHead(nn.Module):
             or any(
                 key not in battle_obs
                 for key in (
-                    "own_moves",
+                    "own_request_moves",
                     "own_types",
                     "own_continuous",
                     "own_active_indices",
@@ -1484,7 +1488,7 @@ class ActionHead(nn.Module):
         action_is_switch_float = action_is_switch.to(dtype=torch.float32)
 
         context = {
-            "own_moves": battle_obs["own_moves"],
+            "own_request_moves": battle_obs["own_request_moves"],
             "own_active_indices": own_active_indices,
             "own_types_active": own_types_active,
             "own_cont_active": own_cont_active,
@@ -1534,14 +1538,10 @@ class ActionHead(nn.Module):
                 device=device,
             )
 
-        own_active_indices = matchup_context["own_active_indices"]
         own_types_active = matchup_context["own_types_active"]
         own_cont_active = matchup_context["own_cont_active"]
 
-        actor_indices = own_active_indices[:, actor_slot]
-        actor_moves = self._gather_team_rows(
-            matchup_context["own_moves"], actor_indices
-        )
+        actor_request_moves = matchup_context["own_request_moves"][:, actor_slot]
         actor_types = own_types_active[:, actor_slot]
         actor_continuous = own_cont_active[:, actor_slot]
         actor_present = self._active_slot_present_from_context(
@@ -1565,7 +1565,7 @@ class ActionHead(nn.Module):
         opp_def_type_2 = matchup_context["opp_def_type_2"]
         opp_present = matchup_context["opp_present"]
 
-        action_move_ids = actor_moves.gather(1, matchup_context["move_slots"])
+        action_move_ids = actor_request_moves.gather(1, matchup_context["move_slots"])
         action_move_ids = torch.where(
             matchup_context["is_move_bool"],
             action_move_ids,
@@ -1766,10 +1766,10 @@ class ActionHead(nn.Module):
     ) -> torch.Tensor:
         """Bind each move candidate to its global identity and public mechanics.
 
-        The fixed action id only identifies a local move slot.  This gathers the
-        move occupying that slot for the acting Pokemon, embeds its global id
-        with the same table used by ``PokemonEncoder``, and attaches generic
-        simulator metadata.  Switch/pass candidates remain exactly zero.
+        The action id only identifies a slot in the current Showdown request.
+        This gathers the move actually offered in that slot, embeds its global
+        id with the same table used by ``PokemonEncoder``, and attaches generic
+        simulator metadata. Switch/pass candidates remain exactly zero.
         """
 
         if matchup_context is None or move_embedding is None:
@@ -1793,11 +1793,8 @@ class ActionHead(nn.Module):
                 f"configured={self.move_embedding_dim}."
             )
 
-        actor_indices = matchup_context["own_active_indices"][:, actor_slot]
-        actor_moves = self._gather_team_rows(
-            matchup_context["own_moves"], actor_indices
-        )
-        action_move_ids = actor_moves.gather(1, matchup_context["move_slots"])
+        actor_request_moves = matchup_context["own_request_moves"][:, actor_slot]
+        action_move_ids = actor_request_moves.gather(1, matchup_context["move_slots"])
         action_move_ids = torch.where(
             matchup_context["is_move_bool"],
             action_move_ids,
