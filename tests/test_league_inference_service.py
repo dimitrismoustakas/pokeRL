@@ -10,6 +10,7 @@ from pokerl.config import ModelConfig, TrainingConfig
 from pokerl.data import GameData
 from pokerl.env.vector_inputs import VectorInputRow
 from pokerl.model.agent import PokeAgent
+from pokerl.training.inference_batch import PackedInputs
 from pokerl.training.league import League
 from pokerl.training.league import (
     _InferenceRow,
@@ -288,7 +289,7 @@ def test_vector_lane_gather_preserves_request_order_and_padding() -> None:
     lanes = [2, 0, 3]
     rows = [VectorInputRow(columns, lane) for lane in lanes]
     schema = service._batch_schema(rows)
-    buffers = service._allocate_host_batch_buffers(schema, capacity=5)
+    buffers = PackedInputs(schema, 5, torch.device("cpu"))
     service._pack_input_rows(buffers, rows, size=5)
     for key, column in columns.items():
         np.testing.assert_array_equal(buffers.arrays[key], column[[2, 0, 3, 3, 3]])

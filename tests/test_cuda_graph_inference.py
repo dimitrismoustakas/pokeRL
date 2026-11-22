@@ -19,6 +19,8 @@ from pokerl.env.observation import (
 from pokerl.model.agent import PokeAgent
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
 from pokerl.training.league import _InferenceRow, _LeagueInferenceService
+from pokerl.training.rollout_policy import RolloutPolicy
+from scripts.train import array_to_device
 
 
 pytestmark = pytest.mark.skipif(
@@ -255,7 +257,7 @@ def test_cuda_graph_failure_restores_rng_and_falls_back_to_eager(
         service.close()
 
 
-def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() -> None:
+def _full_agent_inputs():
     game_data = GameData(gen=9)
     team_pool = load_team_pool(
         default_team_pool_manifest_path(Path.cwd(), "gen9vgc2026regf"),
@@ -291,7 +293,49 @@ def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() 
         ),
         "can_tera": np.ones(2, dtype=np.bool_),
     }
+    return game_data, one_obs, one_masks
 
+
+def test_feedback_buffer_reused_with_default_cuda_device() -> None:
+    device = torch.device("cuda")
+    buffer = array_to_device(np.array([1, 2]), device)
+    updated = array_to_device(np.array([3, 4]), device, buffer=buffer)
+    assert updated is buffer
+    np.testing.assert_array_equal(buffer.cpu().numpy(), [3, 4])
+
+
+@torch.no_grad()
+def test_learner_graph_matches_eager_on_changing_inputs_and_hidden_state() -> None:
+    data, row, mask = _full_agent_inputs()
+    device = torch.device("cuda")
+    agent = PokeAgent(ModelConfig(), data).to(device).eval()
+    obs = {key: np.repeat(value[None], 2, axis=0) for key, value in row.items()}
+    masks = {key: np.repeat(value[None], 2, axis=0) for key, value in mask.items()}
+    policy = RolloutPolicy(agent, obs, masks, device, 0.13)
+    hidden = agent.initial_hidden(2)
+    for move in (0, 5):
+        masks["joint"].fill(False)
+        masks["joint"][:, 0, move : move + 2] = True
+        masks["joint"][:, 1 + move : 3 + move, move : move + 2] = True
+        obs["own_continuous"][:, 0, 0] = move / 5
+        inputs = policy.observations.stage(obs)
+        legal = policy.masks.stage(masks)
+        before = torch.cuda.get_rng_state()
+        kwargs = dict(action_masks=legal, tera_exploration_prob=0.13)
+        eager = agent(inputs, hidden, **kwargs)
+        after = torch.cuda.get_rng_state()
+        torch.cuda.set_rng_state(before)
+        replay = policy.sample(hidden)
+        assert torch.equal(torch.cuda.get_rng_state(), after)
+        for key in ("actions", "log_prob", "value"):
+            torch.testing.assert_close(replay[key], eager[key], rtol=0, atol=0)
+        for actual, expected in zip(replay["hidden"], eager["hidden"], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        hidden = eager["hidden"]
+
+
+def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() -> None:
+    game_data, one_obs, one_masks = _full_agent_inputs()
     torch.manual_seed(77)
     torch.cuda.manual_seed_all(77)
     agent = PokeAgent(ModelConfig(), game_data).cuda().eval().requires_grad_(False)

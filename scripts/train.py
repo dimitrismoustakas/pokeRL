@@ -39,6 +39,7 @@ from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
 from pokerl.training.recurrent_history import RecurrentObservationHistory
 from pokerl.training.cuda_execution import cuda_model_execution
+from pokerl.training.rollout_policy import RolloutPolicy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SEED_MODULUS = 2**32
@@ -657,62 +658,6 @@ def _maintain_league_after_update(
     )
 
 
-def obs_to_device(
-    obs: dict[str, np.ndarray],
-    device: torch.device,
-    buffers: dict[str, torch.Tensor] | None = None,
-) -> dict[str, torch.Tensor]:
-    if buffers is None:
-        buffers = {}
-
-    for key, value in obs.items():
-        source = torch.from_numpy(value)
-        buffer = buffers.get(key)
-        if (
-            buffer is None
-            or buffer.shape != source.shape
-            or buffer.dtype != source.dtype
-            or buffer.device != device
-        ):
-            buffer = torch.empty(source.shape, dtype=source.dtype, device=device)
-            buffers[key] = buffer
-        buffer.copy_(source)
-
-    stale_keys = [key for key in buffers if key not in obs]
-    for key in stale_keys:
-        del buffers[key]
-
-    return buffers
-
-
-def action_masks_to_device(
-    masks: dict[str, np.ndarray],
-    device: torch.device,
-    buffers: dict[str, torch.Tensor] | None = None,
-) -> dict[str, torch.Tensor]:
-    if buffers is None:
-        buffers = {}
-
-    for key, value in masks.items():
-        buffer = buffers.get(key)
-        expected_shape = value.shape
-        if (
-            buffer is None
-            or buffer.shape != expected_shape
-            or buffer.dtype != torch.bool
-            or buffer.device != device
-        ):
-            buffer = torch.empty(expected_shape, dtype=torch.bool, device=device)
-            buffers[key] = buffer
-        buffer.copy_(torch.from_numpy(value))
-
-    stale_keys = [key for key in buffers if key not in masks]
-    for key in stale_keys:
-        del buffers[key]
-
-    return buffers
-
-
 def array_to_device(
     array: np.ndarray,
     device: torch.device,
@@ -720,6 +665,8 @@ def array_to_device(
     buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Copy a NumPy array into a reusable tensor on ``device``."""
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     source = torch.from_numpy(array)
     target_dtype = source.dtype if dtype is None else dtype
     if (
@@ -787,8 +734,6 @@ def collect_synchronous_rollout(
         "team_preview_episode_starts": float(len(initial_preview_starts)),
     }
     rollout_infos: list[dict] = []
-    obs_device_buffers: dict[str, torch.Tensor] | None = None
-    mask_device_buffers: dict[str, torch.Tensor] | None = None
     rewards_device_buffer: torch.Tensor | None = None
     dones_device_buffer: torch.Tensor | None = None
     opponent_intent_slot_labels_np = np.empty(
@@ -856,31 +801,21 @@ def collect_synchronous_rollout(
     public_consequence_cant_masks_device: torch.Tensor | None = None
     public_consequence_field_targets_device: torch.Tensor | None = None
     public_consequence_field_masks_device: torch.Tensor | None = None
+    policy = RolloutPolicy(agent, obs, action_masks, device, tera_exploration_prob)
     for _ in range(num_steps):
         with torch.no_grad(), cuda_model_execution(device):
             started = time.perf_counter() if collect_timing else 0.0
-            obs_t = obs_to_device(obs, device, buffers=obs_device_buffers)
-            obs_device_buffers = obs_t
+            obs_t = policy.observations.stage(obs)
             if collect_timing:
                 profile["obs_to_device_sec"] += time.perf_counter() - started
 
             started = time.perf_counter() if collect_timing else 0.0
-            masks_t = action_masks_to_device(
-                action_masks,
-                device,
-                buffers=mask_device_buffers,
-            )
-            mask_device_buffers = masks_t
+            masks_t = policy.masks.stage(action_masks)
             if collect_timing:
                 profile["mask_to_device_sec"] += time.perf_counter() - started
 
             started = time.perf_counter() if collect_timing else 0.0
-            out = agent(
-                obs_t,
-                hidden,
-                action_masks=masks_t,
-                tera_exploration_prob=tera_exploration_prob,
-            )
+            out = policy.sample(hidden)
             if collect_timing:
                 profile["policy_forward_sec"] += time.perf_counter() - started
 
@@ -1671,7 +1606,10 @@ def train():
                 # --- Compute advantages ---
                 advantage_started = time.perf_counter()
                 with torch.no_grad(), cuda_model_execution(device):
-                    obs_t = obs_to_device(obs, device)
+                    obs_t = {
+                        key: torch.from_numpy(value).to(device)
+                        for key, value in obs.items()
+                    }
                     last_value = agent.get_value(obs_t, hidden)
                     batch = buffer.compute_gae(
                         last_value,

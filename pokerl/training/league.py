@@ -16,6 +16,7 @@ import torch
 
 from ..model.agent import PokeAgent, policy_weights
 from ..model.preview_cache import TeamPreviewCache
+from .inference_batch import BatchSchema, PackedInputs
 from ..config import TrainingConfig
 from ..env.vector_inputs import VectorInputRow
 from ..env.actions import (
@@ -100,9 +101,6 @@ class _InferenceRow:
     hidden: tuple[torch.Tensor, torch.Tensor] | None
 
 
-_BatchSchema = tuple[tuple[str, tuple[int, ...], str], ...]
-
-
 def _shared_vector_columns(rows):
     first = rows[0]
     if isinstance(first, VectorInputRow) and all(
@@ -113,35 +111,16 @@ def _shared_vector_columns(rows):
 
 
 @dataclass
-class _HostBatchBuffers:
-    schema: _BatchSchema
-    capacity: int
-    arrays: dict[str, np.ndarray]
-    tensors: dict[str, torch.Tensor]
-    group_arrays: dict[str, np.ndarray]
-    group_tensors: dict[str, torch.Tensor]
-
-
-@dataclass
-class _DeviceBatchBuffers:
-    schema: _BatchSchema
-    capacity: int
-    force_bool: bool
-    tensors: dict[str, torch.Tensor]
-    group_tensors: dict[str, torch.Tensor]
-
-
-@dataclass
 class _CudaGraphExecutor:
     """One fixed-shape CUDA graph tied to a frozen checkpoint's parameters."""
 
     checkpoint_path: str
-    obs_schema: _BatchSchema
-    masks_schema: _BatchSchema
-    obs_host: _HostBatchBuffers
-    masks_host: _HostBatchBuffers
-    obs_device: _DeviceBatchBuffers | None
-    masks_device: _DeviceBatchBuffers | None
+    obs_schema: BatchSchema
+    masks_schema: BatchSchema
+    obs_host: PackedInputs
+    masks_host: PackedInputs
+    obs_device: PackedInputs | None
+    masks_device: PackedInputs | None
     hidden: tuple[torch.Tensor, torch.Tensor] | None
     sampling_exponentials: (
         tuple[
@@ -215,8 +194,8 @@ class _LeagueInferenceService:
         self._cache_misses = 0
         self._cache_loads = 0
         self._cache_evictions = 0
-        self._host_batch_buffers: dict[str, _HostBatchBuffers] = {}
-        self._device_batch_buffers: dict[str, _DeviceBatchBuffers] = {}
+        self._host_batch_buffers: dict[str, PackedInputs] = {}
+        self._device_batch_buffers: dict[str, PackedInputs] = {}
         self._cuda_graphs_enabled = bool(enable_cuda_graphs and device.type == "cuda")
         self._cuda_graph_batch_size = cuda_graph_batch_size
         self._cuda_graph_cache_size = cuda_graph_cache_size
@@ -309,7 +288,7 @@ class _LeagueInferenceService:
     @staticmethod
     def _batch_schema(
         mappings: list[Mapping[str, np.ndarray]],
-    ) -> _BatchSchema:
+    ) -> BatchSchema:
         columns = _shared_vector_columns(mappings)
         if columns is not None:
             return tuple(
@@ -324,83 +303,27 @@ class _LeagueInferenceService:
         self,
         cache_key: str,
         mappings: list[Mapping[str, np.ndarray]],
-    ) -> tuple[_HostBatchBuffers, int]:
+    ) -> tuple[PackedInputs, int]:
         """Pack one request batch into reusable worker-private CPU storage."""
         schema = self._batch_schema(mappings)
         batch_size = len(mappings)
         caches = self._host_batch_buffers
         buffers = caches.get(cache_key)
         if buffers is None or buffers.schema != schema:
-            buffers = self._allocate_host_batch_buffers(schema, batch_size)
+            buffers = PackedInputs(schema, batch_size, torch.device("cpu"))
             caches[cache_key] = buffers
         elif batch_size > buffers.capacity:
             capacity = max(batch_size, 2 * buffers.capacity)
-            buffers = self._allocate_host_batch_buffers(schema, capacity)
+            buffers = PackedInputs(schema, capacity, torch.device("cpu"))
             caches[cache_key] = buffers
 
         self._pack_input_rows(buffers, mappings, size=batch_size)
         return buffers, batch_size
 
-    def _allocate_host_batch_buffers(
-        self,
-        schema: _BatchSchema,
-        capacity: int,
-        *,
-        pin_memory: bool = False,
-    ) -> _HostBatchBuffers:
-        group_sizes: dict[str, int] = {}
-        for _, shape, dtype in schema:
-            row_size = int(np.prod(shape, dtype=np.int64))
-            group_sizes[dtype] = group_sizes.get(dtype, 0) + capacity * row_size
-        if pin_memory:
-            group_tensors = {
-                dtype: torch.empty(
-                    size,
-                    dtype=torch.from_numpy(np.empty((), dtype=np.dtype(dtype))).dtype,
-                    pin_memory=True,
-                )
-                for dtype, size in group_sizes.items()
-            }
-            group_arrays = {
-                dtype: value.numpy() for dtype, value in group_tensors.items()
-            }
-        else:
-            group_arrays = {
-                dtype: np.empty(size, dtype=np.dtype(dtype))
-                for dtype, size in group_sizes.items()
-            }
-            group_tensors = {
-                dtype: torch.from_numpy(value) for dtype, value in group_arrays.items()
-            }
-        group_offsets = dict.fromkeys(group_sizes, 0)
-        arrays: dict[str, np.ndarray] = {}
-        tensors: dict[str, torch.Tensor] = {}
-        for key, shape, dtype in schema:
-            row_size = int(np.prod(shape, dtype=np.int64))
-            field_size = capacity * row_size
-            offset = group_offsets[dtype]
-            arrays[key] = group_arrays[dtype][offset : offset + field_size].reshape(
-                capacity,
-                *shape,
-            )
-            tensors[key] = group_tensors[dtype][offset : offset + field_size].view(
-                capacity,
-                *shape,
-            )
-            group_offsets[dtype] = offset + field_size
-        return _HostBatchBuffers(
-            schema=schema,
-            capacity=capacity,
-            arrays=arrays,
-            tensors=tensors,
-            group_arrays=group_arrays,
-            group_tensors=group_tensors,
-        )
-
     def _copy_staged_batch_to_device(
         self,
         cache_key: str,
-        host_buffers: _HostBatchBuffers,
+        host_buffers: PackedInputs,
         batch_size: int,
         *,
         force_bool: bool = False,
@@ -424,8 +347,10 @@ class _LeagueInferenceService:
             or buffers.capacity < host_buffers.capacity
             or buffers.force_bool != force_bool
         ):
-            buffers = self._allocate_device_batch_buffers(
-                host_buffers,
+            buffers = PackedInputs(
+                host_buffers.schema,
+                host_buffers.capacity,
+                self._device,
                 force_bool=force_bool,
             )
             caches[cache_key] = buffers
@@ -442,52 +367,6 @@ class _LeagueInferenceService:
         return {
             key: buffers.tensors[key][:batch_size] for key, _, _ in host_buffers.schema
         }
-
-    def _allocate_device_batch_buffers(
-        self,
-        host_buffers: _HostBatchBuffers,
-        *,
-        force_bool: bool,
-    ) -> _DeviceBatchBuffers:
-        group_sizes: dict[str, int] = {}
-        group_dtypes: dict[str, torch.dtype] = {}
-        field_groups: dict[str, str] = {}
-        for key, shape, dtype in host_buffers.schema:
-            group_key = "bool" if force_bool else dtype
-            row_size = int(np.prod(shape, dtype=np.int64))
-            group_sizes[group_key] = (
-                group_sizes.get(group_key, 0) + host_buffers.capacity * row_size
-            )
-            group_dtypes[group_key] = (
-                torch.bool if force_bool else host_buffers.tensors[key].dtype
-            )
-            field_groups[key] = group_key
-        group_tensors = {
-            group_key: torch.empty(
-                size,
-                dtype=group_dtypes[group_key],
-                device=self._device,
-            )
-            for group_key, size in group_sizes.items()
-        }
-        group_offsets = dict.fromkeys(group_sizes, 0)
-        tensors: dict[str, torch.Tensor] = {}
-        for key, shape, _ in host_buffers.schema:
-            group_key = field_groups[key]
-            row_size = int(np.prod(shape, dtype=np.int64))
-            field_size = host_buffers.capacity * row_size
-            offset = group_offsets[group_key]
-            tensors[key] = group_tensors[group_key][offset : offset + field_size].view(
-                host_buffers.capacity, *shape
-            )
-            group_offsets[group_key] = offset + field_size
-        return _DeviceBatchBuffers(
-            schema=host_buffers.schema,
-            capacity=host_buffers.capacity,
-            force_bool=force_bool,
-            tensors=tensors,
-            group_tensors=group_tensors,
-        )
 
     def _device_execution_context(self):
         if self._device.type != "cuda":
@@ -618,14 +497,16 @@ class _LeagueInferenceService:
             while len(graphs) >= self._cuda_graph_cache_size:
                 stale_path = next(iter(graphs))
                 self._evict_cuda_graph(stale_path)
-            obs_host = self._allocate_host_batch_buffers(
+            obs_host = PackedInputs(
                 obs_schema,
                 self._cuda_graph_batch_size,
+                torch.device("cpu"),
                 pin_memory=True,
             )
-            masks_host = self._allocate_host_batch_buffers(
+            masks_host = PackedInputs(
                 masks_schema,
                 self._cuda_graph_batch_size,
+                torch.device("cpu"),
                 pin_memory=True,
             )
             executor = _CudaGraphExecutor(
@@ -656,7 +537,7 @@ class _LeagueInferenceService:
 
     @staticmethod
     def _pack_input_rows(
-        buffers: _HostBatchBuffers,
+        buffers: PackedInputs,
         mappings: list[Mapping[str, np.ndarray]],
         *,
         size: int,
@@ -692,12 +573,16 @@ class _LeagueInferenceService:
     ) -> None:
         if self._cuda_stream is None:
             self._cuda_stream = torch.cuda.Stream(device=self._device)
-        obs_buffers = self._allocate_device_batch_buffers(
-            executor.obs_host,
+        obs_buffers = PackedInputs(
+            executor.obs_host.schema,
+            executor.obs_host.capacity,
+            self._device,
             force_bool=False,
         )
-        masks_buffers = self._allocate_device_batch_buffers(
-            executor.masks_host,
+        masks_buffers = PackedInputs(
+            executor.masks_host.schema,
+            executor.masks_host.capacity,
+            self._device,
             force_bool=True,
         )
         if (
