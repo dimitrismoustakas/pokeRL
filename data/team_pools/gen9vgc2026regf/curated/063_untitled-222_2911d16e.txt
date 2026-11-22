@@ -1,0 +1,68 @@
+Whimsicott @ Covert Cloak  
+Ability: Prankster  
+Level: 50  
+Tera Type: Steel  
+EVs: 188 HP / 4 Def / 4 SpA / 60 SpD / 252 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Moonblast  
+- Tailwind  
+- Sunny Day  
+- Cotton Spore
+
+Flutter Mane @ Choice Specs  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Fairy  
+EVs: 100 HP / 124 Def / 76 SpA / 4 SpD / 204 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Moonblast  
+- Shadow Ball  
+- Dazzling Gleam  
+- Misty Terrain
+
+Walking Wake @ Life Orb  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Fire  
+EVs: 36 HP / 4 Def / 212 SpA / 4 SpD / 252 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Hydro Steam  
+- Draco Meteor  
+- Flamethrower  
+- Protect
+
+Chien-Pao @ Focus Sash  
+Ability: Sword of Ruin  
+Level: 50  
+Tera Type: Stellar  
+EVs: 252 Atk / 4 Def / 252 Spe  
+Jolly Nature  
+- Icicle Crash  
+- Sucker Punch  
+- Sacred Sword  
+- Protect
+
+Metagross @ Assault Vest  
+Ability: Clear Body  
+Level: 50  
+Tera Type: Dragon  
+EVs: 204 HP / 252 Atk / 4 Def / 12 SpD / 36 Spe  
+Adamant Nature  
+- Psychic Fangs  
+- Hard Press  
+- Bullet Punch  
+- Stomping Tantrum
+
+Entei @ Choice Band  
+Ability: Inner Focus  
+Level: 50  
+Tera Type: Normal  
+EVs: 4 HP / 252 Atk / 252 Spe  
+Adamant Nature  
+- Sacred Fire  
+- Stomping Tantrum  
+- Extreme Speed  
+- Flare Blitz

@@ -1,0 +1,61 @@
+LampoDiCampo (Raging Bolt) @ Booster Energy
+Ability: Protosynthesis
+Tera Type: Fairy
+EVs: 188 HP / 28 Def / 148 SpA / 4 SpD / 140 Spe
+Modest Nature
+IVs: 20 Atk
+- Thunderclap
+- Dragon Pulse
+- Calm Mind
+- Protect
+
+MDL (Ogerpon-Hearthflame) @ Hearthflame Mask
+Ability: Mold Breaker
+Tera Type: Fire
+EVs: 20 HP / 180 Atk / 52 Def / 4 SpD / 252 Spe
+Jolly Nature
+- Ivy Cudgel
+- Grassy Glide
+- Swords Dance
+- Spiky Shield
+
+Rikishi (Rillaboom) @ Assault Vest
+Ability: Grassy Surge
+Tera Type: Fire
+EVs: 204 HP / 116 Atk / 4 Def / 76 SpD / 108 Spe
+Adamant Nature
+- Wood Hammer
+- Grassy Glide
+- U-turn
+- Fake Out
+
+Joe Yabuli (Incineroar) @ Shuca Berry
+Ability: Intimidate
+Shiny: Yes
+Tera Type: Ghost
+EVs: 196 HP / 4 Atk / 4 Def / 60 SpD / 244 Spe
+Jolly Nature
+- Knock Off
+- Helping Hand
+- Parting Shot
+- Fake Out
+
+MioPadreMeme (Landorus) @ Life Orb
+Ability: Sheer Force
+Tera Type: Steel
+EVs: 52 HP / 44 Def / 156 SpA / 4 SpD / 252 Spe
+Timid Nature
+- Earth Power
+- Sludge Bomb
+- Substitute
+- Protect
+
+Urshifu (Urshifu-Rapid-Strike) @ Focus Sash
+Ability: Unseen Fist
+Tera Type: Stellar
+EVs: 252 Atk / 4 SpD / 252 Spe
+Jolly Nature
+- Surging Strikes
+- Close Combat
+- Aqua Jet
+- Detect

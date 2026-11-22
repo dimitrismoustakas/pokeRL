@@ -1,0 +1,2561 @@
+{
+  "purpose": "training",
+  "allow_training": true,
+  "format": "gen9vgc2026regf",
+  "source_page": "https://docs.google.com/spreadsheets/d/1nHEcS0r55JFVlC6EBX5zLgjwdnXTC9KOJnxIkduAs6Y/view",
+  "pool": [
+    {
+      "title": "0722poke_teku's Battle Stadium S15 9th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/001_0722poke-teku-s-battle-stadium-s15-9th-place-team_72a45526.txt"
+    },
+    {
+      "title": "15th at Portland",
+      "file": "data/team_pools/gen9vgc2026regf/pool/002_15th-at-portland_7a7ee6fe.txt"
+    },
+    {
+      "title": "2024 Portland 10-4 13th +80CP",
+      "file": "data/team_pools/gen9vgc2026regf/pool/003_2024-portland-10-4-13th-80cp_a52dc8c5.txt"
+    },
+    {
+      "title": "222",
+      "file": "data/team_pools/gen9vgc2026regf/pool/004_222_c25e9a52.txt"
+    },
+    {
+      "title": "36th / 664 Liverpool Regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/005_36th-664-liverpool-regionals_a9f209fd.txt"
+    },
+    {
+      "title": "37th 2024 Orlando Regional",
+      "file": "data/team_pools/gen9vgc2026regf/pool/006_37th-2024-orlando-regional_12ee98fa.txt"
+    },
+    {
+      "title": "Alta's Global Challenge I 46th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/007_alta-s-global-challenge-i-46th-place-team_fdfef86c.txt"
+    },
+    {
+      "title": "Arch Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/008_arch-team_167c99d2.txt"
+    },
+    {
+      "title": "BattleRoom's Portland Regionals Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/009_battleroom-s-portland-regionals-top-4-team_53f418b1.txt"
+    },
+    {
+      "title": "Baxcalibur Redux v2",
+      "file": "data/team_pools/gen9vgc2026regf/pool/010_baxcalibur-redux-v2_fe4e1484.txt"
+    },
+    {
+      "title": "blue's Battle Stadium S14 25th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/011_blue-s-battle-stadium-s14-25th-place-team_97529c78.txt"
+    },
+    {
+      "title": "bubs' Latias Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/012_bubs-latias-team_2853ce0d.txt"
+    },
+    {
+      "title": "Copy of Chien-Pao Torn",
+      "file": "data/team_pools/gen9vgc2026regf/pool/013_copy-of-chien-pao-torn_04996cb1.txt"
+    },
+    {
+      "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of UTRECHT WINNING TEAM",
+      "file": "data/team_pools/gen9vgc2026regf/pool/014_utrecht-winning-team_2bb60816.txt"
+    },
+    {
+      "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Testing Liverpoolada",
+      "file": "data/team_pools/gen9vgc2026regf/pool/015_testing-liverpoolada_b10211d2.txt"
+    },
+    {
+      "title": "Copy of Untitled 1089",
+      "file": "data/team_pools/gen9vgc2026regf/pool/016_untitled-1089_4f69cbdc.txt"
+    },
+    {
+      "title": "CritDra",
+      "file": "data/team_pools/gen9vgc2026regf/pool/017_critdra_2496d5a8.txt"
+    },
+    {
+      "title": "dengo v1.1 -- mc",
+      "file": "data/team_pools/gen9vgc2026regf/pool/018_dengo-v1-1-mc_48223523.txt"
+    },
+    {
+      "title": "dlc blob",
+      "file": "data/team_pools/gen9vgc2026regf/pool/019_dlc-blob_e25b6222.txt"
+    },
+    {
+      "title": "dlc cat",
+      "file": "data/team_pools/gen9vgc2026regf/pool/020_dlc-cat_757e96e7.txt"
+    },
+    {
+      "title": "dlc cotton",
+      "file": "data/team_pools/gen9vgc2026regf/pool/021_dlc-cotton_369b40ac.txt"
+    },
+    {
+      "title": "dlc lei",
+      "file": "data/team_pools/gen9vgc2026regf/pool/022_dlc-lei_8610e9df.txt"
+    },
+    {
+      "title": "dlc tank",
+      "file": "data/team_pools/gen9vgc2026regf/pool/023_dlc-tank_e178e369.txt"
+    },
+    {
+      "title": "dlc tree",
+      "file": "data/team_pools/gen9vgc2026regf/pool/024_dlc-tree_84698084.txt"
+    },
+    {
+      "title": "Dragonite - ChienPao LenVGC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/025_dragonite-chienpao-lenvgc_82d7ea8c.txt"
+    },
+    {
+      "title": "EUIC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/026_euic_ca7dc4da.txt"
+    },
+    {
+      "title": "EUIC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/027_euic_6634416e.txt"
+    },
+    {
+      "title": "EUIC Squad mejorado",
+      "file": "data/team_pools/gen9vgc2026regf/pool/028_euic-squad-mejorado_f5eb9a63.txt"
+    },
+    {
+      "title": "FuiYnb's Battle Stadium S15 17th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/029_fuiynb-s-battle-stadium-s15-17th-place-team_8b883179.txt"
+    },
+    {
+      "title": "gc final?",
+      "file": "data/team_pools/gen9vgc2026regf/pool/030_gc-final_087e9f7f.txt"
+    },
+    {
+      "title": "Gouging Fire 1.6.3",
+      "file": "data/team_pools/gen9vgc2026regf/pool/031_gouging-fire-1-6-3_b33684c1.txt"
+    },
+    {
+      "title": "hakushu_t's Global Challenge I 39th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/032_hakushu-t-s-global-challenge-i-39th-place-team_390e7e47.txt"
+    },
+    {
+      "title": "Hatterene - F",
+      "file": "data/team_pools/gen9vgc2026regf/pool/033_hatterene-f_62522355.txt"
+    },
+    {
+      "title": "hydrapple",
+      "file": "data/team_pools/gen9vgc2026regf/pool/034_hydrapple_7ab9ac71.txt"
+    },
+    {
+      "title": "Knoxville",
+      "file": "data/team_pools/gen9vgc2026regf/pool/035_knoxville_3753a30c.txt"
+    },
+    {
+      "title": "Knoxville 2024",
+      "file": "data/team_pools/gen9vgc2026regf/pool/036_knoxville-2024_cadf17c4.txt"
+    },
+    {
+      "title": "LUCK2222",
+      "file": "data/team_pools/gen9vgc2026regf/pool/037_luck2222_b459b31a.txt"
+    },
+    {
+      "title": "NikolajHoej's Dortmund Regionals Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/038_nikolajhoej-s-dortmund-regionals-top-16-team_2a4315d0.txt"
+    },
+    {
+      "title": "Orlando (17th)",
+      "file": "data/team_pools/gen9vgc2026regf/pool/039_orlando-17th_073036d3.txt"
+    },
+    {
+      "title": "Orlando 2024",
+      "file": "data/team_pools/gen9vgc2026regf/pool/040_orlando-2024_f40494af.txt"
+    },
+    {
+      "title": "Orlando 9-6 50 of 824",
+      "file": "data/team_pools/gen9vgc2026regf/pool/041_orlando-9-6-50-of-824_de4aa710.txt"
+    },
+    {
+      "title": "Orlando Regional (12-3, 10th of 824)",
+      "file": "data/team_pools/gen9vgc2026regf/pool/042_orlando-regional-12-3-10th-of-824_fe8dcd13.txt"
+    },
+    {
+      "title": "PlayestVGC's Portland Regionals Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/043_playestvgc-s-portland-regionals-top-32-team_f9ccb120.txt"
+    },
+    {
+      "title": "Portland",
+      "file": "data/team_pools/gen9vgc2026regf/pool/044_portland_ab7fd1ae.txt"
+    },
+    {
+      "title": "Portland Regional Finals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/045_portland-regional-finals_9e508f7c.txt"
+    },
+    {
+      "title": "Portland Regionals Final Copy January 6-7 2024",
+      "file": "data/team_pools/gen9vgc2026regf/pool/046_portland-regionals-final-copy-january-6-7-2024_a761e9e6.txt"
+    },
+    {
+      "title": "Reg F?",
+      "file": "data/team_pools/gen9vgc2026regf/pool/047_reg-f_a9f8a787.txt"
+    },
+    {
+      "title": "Rosenkreutz's Global Challenge I 64th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/048_rosenkreutz-s-global-challenge-i-64th-place-team_ababb35c.txt"
+    },
+    {
+      "title": "s6 balance - Chatlotte Top 32",
+      "file": "data/team_pools/gen9vgc2026regf/pool/049_s6-balance-chatlotte-top-32_152a8293.txt"
+    },
+    {
+      "title": "Sarapoke0914's Global Challenge I 11th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/050_sarapoke0914-s-global-challenge-i-11th-place-team_923db2d3.txt"
+    },
+    {
+      "title": "sora's Battle Stadium S14 20th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/051_sora-s-battle-stadium-s14-20th-place-team_1e6a6a89.txt"
+    },
+    {
+      "title": "Sun EUIC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/052_sun-euic_246e226f.txt"
+    },
+    {
+      "title": "t4 charlotte regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/053_t4-charlotte-regionals_c53b2442.txt"
+    },
+    {
+      "title": "t4 Vancouver regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/054_t4-vancouver-regionals_d605638e.txt"
+    },
+    {
+      "title": "Team Report Version",
+      "file": "data/team_pools/gen9vgc2026regf/pool/055_team-report-version_f3326620.txt"
+    },
+    {
+      "title": "TH NAT '24",
+      "file": "data/team_pools/gen9vgc2026regf/pool/056_th-nat-24_54321a44.txt"
+    },
+    {
+      "title": "Toby Kongmun's 2024 Melbourne Regional Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/057_toby-kongmun-s-2024-melbourne-regional-top-16-team_c4544256.txt"
+    },
+    {
+      "title": "Top 8 Knoxville Regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/058_top-8-knoxville-regionals_9884ea5a.txt"
+    },
+    {
+      "title": "Trick Room Araquanid LenVGC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/059_trick-room-araquanid-lenvgc_547cb57c.txt"
+    },
+    {
+      "title": "Untitled 1",
+      "file": "data/team_pools/gen9vgc2026regf/pool/060_untitled-1_71ac1f75.txt"
+    },
+    {
+      "title": "Untitled 13",
+      "file": "data/team_pools/gen9vgc2026regf/pool/061_untitled-13_b07c9e02.txt"
+    },
+    {
+      "title": "Untitled 132",
+      "file": "data/team_pools/gen9vgc2026regf/pool/062_untitled-132_29340006.txt"
+    },
+    {
+      "title": "Untitled 222",
+      "file": "data/team_pools/gen9vgc2026regf/pool/063_untitled-222_2911d16e.txt"
+    },
+    {
+      "title": "Untitled 223",
+      "file": "data/team_pools/gen9vgc2026regf/pool/064_untitled-223_7080d410.txt"
+    },
+    {
+      "title": "Untitled 465",
+      "file": "data/team_pools/gen9vgc2026regf/pool/065_untitled-465_6037689d.txt"
+    },
+    {
+      "title": "Untitled 5",
+      "file": "data/team_pools/gen9vgc2026regf/pool/066_untitled-5_5554a94e.txt"
+    },
+    {
+      "title": "Untitled 9",
+      "file": "data/team_pools/gen9vgc2026regf/pool/067_untitled-9_cc0dface.txt"
+    },
+    {
+      "title": "Untitled PokePaste",
+      "file": "data/team_pools/gen9vgc2026regf/pool/068_untitled-pokepaste_19cd045d.txt"
+    },
+    {
+      "title": "utrecht 1.5",
+      "file": "data/team_pools/gen9vgc2026regf/pool/069_utrecht-1-5_9e0b822f.txt"
+    },
+    {
+      "title": "Utrecht Day 2",
+      "file": "data/team_pools/gen9vgc2026regf/pool/070_utrecht-day-2_431be080.txt"
+    },
+    {
+      "title": "UTRECHT WINNING TEAM",
+      "file": "data/team_pools/gen9vgc2026regf/pool/071_utrecht-winning-team_c4962227.txt"
+    },
+    {
+      "title": "Vancouver 19th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/072_vancouver-19th-place-team_e8518474.txt"
+    },
+    {
+      "title": "vancouver final!",
+      "file": "data/team_pools/gen9vgc2026regf/pool/073_vancouver-final_91a8c855.txt"
+    },
+    {
+      "title": "weezing+doggy orlando",
+      "file": "data/team_pools/gen9vgc2026regf/pool/074_weezing-doggy-orlando_c561a292.txt"
+    },
+    {
+      "title": "Wolfe Glick's Charlotte Regionals 2024 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/075_wolfe-glick-s-charlotte-regionals-2024-champion-team_80590641.txt"
+    },
+    {
+      "title": "‘Saur!",
+      "file": "data/team_pools/gen9vgc2026regf/pool/076_saur_3e3274e5.txt"
+    },
+    {
+      "title": "奥兰多",
+      "file": "data/team_pools/gen9vgc2026regf/pool/077_team_9b52ac21.txt"
+    },
+    {
+      "title": "Calm Mind Raging Bolt + Icy Wind Chien-Pao",
+      "file": "data/team_pools/gen9vgc2026regf/pool/078_calm_mind_raging_bolt_icy_wind_chien_pao_a78a0275.txt"
+    },
+    {
+      "title": "Roaring Moon + Gholdengo Tailwind",
+      "file": "data/team_pools/gen9vgc2026regf/pool/079_roaring_moon_gholdengo_tailwind_ce12b22e.txt"
+    },
+    {
+      "title": "Regidrago + Gholdengo Tailwind",
+      "file": "data/team_pools/gen9vgc2026regf/pool/080_regidrago_gholdengo_tailwind_1ad305e8.txt"
+    },
+    {
+      "title": "Choice Band Landorus-Therian Tailwind",
+      "file": "data/team_pools/gen9vgc2026regf/pool/081_choice_band_landorus_therian_tailwind_9e20b218.txt"
+    },
+    {
+      "title": "Ursaluna + Porygon2 Tailroom",
+      "file": "data/team_pools/gen9vgc2026regf/pool/082_ursaluna_porygon2_tailroom_5ef7a954.txt"
+    },
+    {
+      "title": "Ursaluna + Farigiraf Tailroom",
+      "file": "data/team_pools/gen9vgc2026regf/pool/083_ursaluna_farigiraf_tailroom_3a3ba155.txt"
+    },
+    {
+      "title": "Archaludon Rain",
+      "file": "data/team_pools/gen9vgc2026regf/pool/084_archaludon_rain_8db9df67.txt"
+    },
+    {
+      "title": "Dondozo + Ting-Lu",
+      "file": "data/team_pools/gen9vgc2026regf/pool/085_dondozo_ting_lu_487b6228.txt"
+    },
+    {
+      "title": "AldrichYan's EUIC 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F767.txt",
+      "vgcpastes_id": "F767",
+      "source_links": [
+        "https://pokepast.es/71bc436c203d11bd"
+      ],
+      "published_by": "Aldrich Yan Sutandra",
+      "owner_source": "https://x.com/aldrichyan/status/2022686607766098083?s=46",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Hoej's EUIC 2026 Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F786.txt",
+      "vgcpastes_id": "F786",
+      "source_links": [
+        "https://pokepast.es/42374feb2d00ca84"
+      ],
+      "published_by": "Frederik Høj Nielsen",
+      "owner_source": "https://x.com/hoej_hs/status/2022726983680168122?s=46",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Alberto Cano García's EUIC 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F773.txt",
+      "vgcpastes_id": "F773",
+      "source_links": [
+        "https://pokepast.es/33a41429aa7fbb39"
+      ],
+      "published_by": "Alberto Cano García",
+      "owner_source": "https://x.com/CanovaxVGC/status/2023373754110521654",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Atalanta's Serperior Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F22.txt",
+      "vgcpastes_id": "F22",
+      "source_links": [
+        "https://pokepast.es/cf5896f581f5dc67"
+      ],
+      "published_by": "Atalanta",
+      "owner_source": "https://twitter.com/WandaLi11688951/status/1740389869418144183",
+      "event": "Tweet"
+    },
+    {
+      "title": "Slushi2k's Dragonite Chien-Pao Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F589.txt",
+      "vgcpastes_id": "F589",
+      "source_links": [
+        "https://pokepast.es/809515e737f6f800"
+      ],
+      "published_by": "Kian Campbell",
+      "owner_source": "https://x.com/slushi2k/status/2011107186236408114?s=46",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Max Morales's Mérida Regional 2026 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F641.txt",
+      "vgcpastes_id": "F641",
+      "source_links": [
+        "https://pokepast.es/1ebf52b67cf53261"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2017300122753704431?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "AndyLa's Houston Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F890.txt",
+      "vgcpastes_id": "F890",
+      "source_links": [
+        "https://pokepast.es/3099226dbd59156e"
+      ],
+      "published_by": "Andrew Lavigne",
+      "owner_source": "https://x.com/AndyLaVGC/status/2036069142424424952",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "Araluwen's Hatterene Series Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F384.txt",
+      "vgcpastes_id": "F384",
+      "source_links": [
+        "https://pokepast.es/124b8c550c6c52c1"
+      ],
+      "published_by": "Pros Leerman",
+      "owner_source": "https://twitter.com/araluwen/status/1761882305751072994?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Hatterene Series"
+    },
+    {
+      "title": "bsmiffy's Florida PC Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F389.txt",
+      "vgcpastes_id": "F389",
+      "source_links": [
+        "https://pokepast.es/283ff77e75b26a17"
+      ],
+      "published_by": "Brady Smith",
+      "owner_source": "https://twitter.com/vgccorner/status/1762199794808725672?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Florida PC"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of tyo's Utrecht Regional 2024 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F515.txt",
+      "vgcpastes_id": "F515",
+      "source_links": [
+        "https://pokepast.es/243d67ce66c1a336"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/MichaelderBeste/status/1995888470191980743?s=20",
+      "event": "Discord"
+    },
+    {
+      "title": "Deiv's Seville SPE 2026 Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F921.txt",
+      "vgcpastes_id": "F921",
+      "source_links": [
+        "https://pokepast.es/dd42ca1a3c25a30d"
+      ],
+      "published_by": "Davide Fazio",
+      "owner_source": "https://x.com/DeivVGC/status/2038897864693227568",
+      "event": "Seville SPE 2026"
+    },
+    {
+      "title": "masternerd's Landorus-I Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F69.txt",
+      "vgcpastes_id": "F69",
+      "source_links": [
+        "https://pokepast.es/75d7d88d480d2757"
+      ],
+      "published_by": "masternerd",
+      "owner_source": "https://discord.com/channels/958296048227471360/1189469456645230682/1192316200219316244",
+      "event": "Dscord"
+    },
+    {
+      "title": "45mice's Iron Boulder Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F197.txt",
+      "vgcpastes_id": "F197",
+      "source_links": [
+        "https://pokepast.es/7d48d9f90d266479"
+      ],
+      "published_by": "Justin Knox",
+      "owner_source": "https://twitter.com/45mice/status/1751628481601913277?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Misaka's 2-2-2 Psyspam Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F172.txt",
+      "vgcpastes_id": "F172",
+      "source_links": [
+        "https://pokepast.es/ff3ee888635b96a2"
+      ],
+      "published_by": "Misaka",
+      "owner_source": "https://twitter.com/agMewtwo/status/1748288143617573370?t=ELEROoOjH6ImF3T1AFRByA&s=19",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Aaron & Navjit's Toronto Regional Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F606.txt",
+      "vgcpastes_id": "F606",
+      "source_links": [
+        "https://pokepast.es/b68c33d14340c9f7"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2013622796346069429?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "blue's Eruption Entei Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F148.txt",
+      "vgcpastes_id": "F148",
+      "source_links": [
+        "https://pokepast.es/72b41c37ff1e6bf0"
+      ],
+      "published_by": "Seunghoon Cha",
+      "owner_source": "https://twitter.com/blue_vgc/status/1746196699838812554",
+      "event": "Tweet"
+    },
+    {
+      "title": "Huyubare's EUIC 2026 Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F780.txt",
+      "vgcpastes_id": "F780",
+      "source_links": [
+        "https://pokepast.es/734423ee72266014"
+      ],
+      "published_by": "Ko Tsukide",
+      "owner_source": "https://x.com/Huyubare_Poke/status/2022688491419897994",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Kaguya's Houston Regional 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F896.txt",
+      "vgcpastes_id": "F896",
+      "source_links": [
+        "https://pokepast.es/be3b7da35bde2a59"
+      ],
+      "published_by": "Blake Falls",
+      "owner_source": "https://x.com/kaguyafalls/status/2035903401314193733?s=46",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "hatsunechiyu's Iron Crown Okidogi Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F704.txt",
+      "vgcpastes_id": "F704",
+      "source_links": [
+        "https://pokepast.es/25d76f64160c0e5d"
+      ],
+      "published_by": "hatsunechiyu",
+      "owner_source": "https://x.com/hatsunechiyu/status/2020939163437007293?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Farigiraf Iron Hands Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F167.txt",
+      "vgcpastes_id": "F167",
+      "source_links": [
+        "https://pokepast.es/e4554cf899051b73"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/CloverBells21/status/1746678670033363077?t=L0UIy_ULuygQ6RwwN8HD6Q",
+      "event": "Video"
+    },
+    {
+      "title": "Panda's Recreation of Wolfe Glick's Orlando Regional 2024 Team (Rental by MethodsVGC)",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F499.txt",
+      "vgcpastes_id": "F499",
+      "source_links": [
+        "https://pokepast.es/8d604e145ba51dcd"
+      ],
+      "published_by": "Justin Tang",
+      "owner_source": "https://x.com/unironicpanda/status/1986458191371329566?s=46",
+      "event": "Video"
+    },
+    {
+      "title": "CloverBells' Cresselia Ursaluna Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F427.txt",
+      "vgcpastes_id": "F427",
+      "source_links": [
+        "https://pokepast.es/d7a8379e8d628804"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/cloverbells21/status/1765613198219096145?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Video"
+    },
+    {
+      "title": "ZacEmer's Global Challenge I Top 1000 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F235.txt",
+      "vgcpastes_id": "F235",
+      "source_links": [
+        "https://pokepast.es/4e5f852b43561acf"
+      ],
+      "published_by": "Zac Emerzian",
+      "owner_source": "https://twitter.com/zacemer/status/1754313724205400267?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "BigFrogStatus' Showdown Ladder Peak 10th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F742.txt",
+      "vgcpastes_id": "F742",
+      "source_links": [
+        "https://pokepast.es/bcc947e8dd514d5a"
+      ],
+      "published_by": "BigFrogStatus",
+      "owner_source": "https://x.com/hiscribble/status/2024907258958643211?s=46",
+      "event": "Showdown Ladder"
+    },
+    {
+      "title": "Jimmy's Charotte Regionals Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F282.txt",
+      "vgcpastes_id": "F282",
+      "source_links": [
+        "https://pokepast.es/0ff42f645dd14edb"
+      ],
+      "published_by": "Jimmy Friedle",
+      "owner_source": "https://twitter.com/flamingoaxis/status/1748881399845646590?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Charlotte Regionals"
+    },
+    {
+      "title": "ZardiChar's Recreation of 45mice and Eduardo Cunha's Gholdengo TW Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F503.txt",
+      "vgcpastes_id": "F503",
+      "source_links": [
+        "https://pokepast.es/d0650592a766acd3"
+      ],
+      "published_by": "Tyler Alexander",
+      "owner_source": "https://x.com/zardicharvgc/status/1991942737931989280?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Nino Ladder Tour 3rd Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F70.txt",
+      "vgcpastes_id": "F70",
+      "source_links": [
+        "https://pokepast.es/3f7470a97d4aa2ad"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/jaylun44/status/1742761265796141240?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "AndyBakes' Tinkaton Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F449.txt",
+      "vgcpastes_id": "F449",
+      "source_links": [
+        "https://pokepast.es/ae95ed48827fd798"
+      ],
+      "published_by": "AndyBakes",
+      "owner_source": "https://twitter.com/andybakesyt/status/1768371413046731157?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Latios Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F336.txt",
+      "vgcpastes_id": "F336",
+      "source_links": [
+        "https://pokepast.es/44e9734c42f4a0f8"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/jaylun44/status/1756744003805192636?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Philip Cohen's Knoxville MSS Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F215.txt",
+      "vgcpastes_id": "F215",
+      "source_links": [
+        "https://pokepast.es/93858dbd7394ddb2"
+      ],
+      "published_by": "Philip Cohen",
+      "owner_source": "https://twitter.com/infernoprod77/status/1754724684044607963?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Knoxville MSS"
+    },
+    {
+      "title": "Conner's Raging Bolt Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F574.txt",
+      "vgcpastes_id": "F574",
+      "source_links": [
+        "https://pokepast.es/5516076acbe231e3"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "Hamstermania's Scarf Regigigas Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F339.txt",
+      "vgcpastes_id": "F339",
+      "source_links": [
+        "https://pokepast.es/d2a3ef0cab771755"
+      ],
+      "published_by": "David Koutesh",
+      "owner_source": "https://twitter.com/hamstermaniavgc/status/1757725101162713422?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Arkaaali's Grand Challenge V 2026 8th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F800.txt",
+      "vgcpastes_id": "F800",
+      "source_links": [
+        "https://pokepast.es/68ab1ff6d856b63c"
+      ],
+      "published_by": "Arkaaali",
+      "owner_source": "https://x.com/Arkaaali/status/2025877282963730602?s=20",
+      "event": "Grand Challenge V 2026"
+    },
+    {
+      "title": "Peter's Gouging Fire Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F104.txt",
+      "vgcpastes_id": "F104",
+      "source_links": [
+        "https://pokepast.es/b33e497ba262a86a"
+      ],
+      "published_by": "Peter Chen",
+      "owner_source": "https://twitter.com/mrptpablo/status/1743897962449928310?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Rin Leiba's Mérida Regional 2026 Top 64 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F653.txt",
+      "vgcpastes_id": "F653",
+      "source_links": [
+        "https://pokepast.es/1c55368b17017809"
+      ],
+      "published_by": "Rin Leiba",
+      "owner_source": "https://x.com/Punihina1334/status/2016012352810819706",
+      "event": "Mérida Regional 2026"
+    },
+    {
+      "title": "Noah Carney's Toronto Regional 2026 Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F628.txt",
+      "vgcpastes_id": "F628",
+      "source_links": [
+        "https://pokepast.es/d5a700f21147f38f"
+      ],
+      "published_by": "Noah Carney",
+      "owner_source": "No Tweet",
+      "event": "Toronto Regional 2026"
+    },
+    {
+      "title": "Emir's Showdown Ladder Peak 1st Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F561.txt",
+      "vgcpastes_id": "F561",
+      "source_links": [
+        "https://pokepast.es/71cacfcede455436"
+      ],
+      "published_by": "Emir Abdulovski",
+      "owner_source": "https://x.com/emirnent/status/2003831982695051317?s=46",
+      "event": "Showdown Ladder"
+    },
+    {
+      "title": "Mahmoud's Knoxville Day 2 Challenge Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F443.txt",
+      "vgcpastes_id": "F443",
+      "source_links": [
+        "https://pokepast.es/15cc735854acb7b1"
+      ],
+      "published_by": "Mahmoud Tantawi",
+      "owner_source": "https://twitter.com/MacsTantawi/status/1772682898543407565",
+      "event": "Knoxville Day 2 Challenge"
+    },
+    {
+      "title": "Ze Banded's EUIC 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F765.txt",
+      "vgcpastes_id": "F765",
+      "source_links": [
+        "https://pokepast.es/457b70a655c36220"
+      ],
+      "published_by": "Ze Banded",
+      "owner_source": "https://x.com/ZeBanded/status/2022681352936841663",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "bsmiffy's Archaludon Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F75.txt",
+      "vgcpastes_id": "F75",
+      "source_links": [
+        "https://pokepast.es/a9139080c9f97ccb"
+      ],
+      "published_by": "Brady Smith",
+      "owner_source": "https://twitter.com/vgccorner/status/1743037219248406714?t=c4deRa-QUQC8pVHSQfJTzA&s=19",
+      "event": "Tweet"
+    },
+    {
+      "title": "PsychoR&R's Moltres Flutter Harc Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F866.txt",
+      "vgcpastes_id": "F866",
+      "source_links": [
+        "https://pokepast.es/63621cef9884ce61"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2035912704876318944?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "PokeReplaysVGC's Raging Bolt Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F739.txt",
+      "vgcpastes_id": "F739",
+      "source_links": [
+        "https://pokepast.es/7e798db1db1ddd77"
+      ],
+      "published_by": "Adam Wright",
+      "owner_source": "https://x.com/pokereplaysvgc/status/2023691916404224068?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Archaludon Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F54.txt",
+      "vgcpastes_id": "F54",
+      "source_links": [
+        "https://pokepast.es/0e61091c35b1e66f"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/CloverBells21/status/1741904474354958519",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of ChompyGM's Gouging Fire Prio Spam Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F741.txt",
+      "vgcpastes_id": "F741",
+      "source_links": [
+        "https://pokepast.es/609e9fb198f4488a"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2023812636119359999?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "PsychoR&R's Chien-Pao Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F684.txt",
+      "vgcpastes_id": "F684",
+      "source_links": [
+        "https://pokepast.es/8e7727f28c482f30"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2018387319678755192?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Panda's Recreation of Yuta's Balan VGC Tour Top 8 Team (Rental by MethodsVGC)",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F529.txt",
+      "vgcpastes_id": "F529",
+      "source_links": [
+        "https://pokepast.es/7e8e5cd0473da304"
+      ],
+      "published_by": "Justin Tang",
+      "owner_source": "https://x.com/unironicpanda/status/1998104369150210257",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Naoto Mizobuchi's VR December Challenge #1 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F534.txt",
+      "vgcpastes_id": "F534",
+      "source_links": [
+        "https://pokepast.es/54cdd917682e0e7f"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2002050929252794413?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "heKtik's Houston Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F891.txt",
+      "vgcpastes_id": "F891",
+      "source_links": [
+        "https://pokepast.es/1e3acbee0c14704d"
+      ],
+      "published_by": "Preston Gadling",
+      "owner_source": "https://x.com/not_hektikvgc/status/2035785821878415476?s=46",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "CloverBells' Tyranitar Excadrill Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F191.txt",
+      "vgcpastes_id": "F191",
+      "source_links": [
+        "https://pokepast.es/e2bac61156dc943d"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/cloverbells21/status/1750281411800563814?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of koon_ky's Flutter Ogerpon-Hearthflame Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F607.txt",
+      "vgcpastes_id": "F607",
+      "source_links": [
+        "https://pokepast.es/d1d002974b05e32b"
+      ],
+      "published_by": "MichaelderBeste",
+      "owner_source": "https://x.com/MichaelderBeste",
+      "event": "Video"
+    },
+    {
+      "title": "Dominik Freund's Iron Boulder Gouging Fire Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F343.txt",
+      "vgcpastes_id": "F343",
+      "source_links": [
+        "https://pokepast.es/5601d1c3c67e9ae9"
+      ],
+      "published_by": "Dominik Freund",
+      "owner_source": "https://twitter.com/tryplexxlol/status/1758473398026678772?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Max's VR December Challenge #2 Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F556.txt",
+      "vgcpastes_id": "F556",
+      "source_links": [
+        "https://pokepast.es/5d11b48038f4f511"
+      ],
+      "published_by": "Wu Chen",
+      "owner_source": "https://x.com/VGC_TW_Max/status/2002818727910449648",
+      "event": "VR December Challenge #2"
+    },
+    {
+      "title": "Jaylun's Nino Ladder Tour 3rd Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F48.txt",
+      "vgcpastes_id": "F48",
+      "source_links": [
+        "https://pokepast.es/a3e60cfb1adbddbb"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/Jaylun44/status/1741353009198895358",
+      "event": "Nino Ladder Tour"
+    },
+    {
+      "title": "betairya's Ribombee Rain Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F64.txt",
+      "vgcpastes_id": "F64",
+      "source_links": [
+        "https://pokepast.es/e6b83078f94d96fa"
+      ],
+      "published_by": "betairya",
+      "owner_source": "https://twitter.com/betairya/status/1742704882388443469",
+      "event": "Tweet"
+    },
+    {
+      "title": "Wiltank's Grand Challenge V 2026 38th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F798.txt",
+      "vgcpastes_id": "F798",
+      "source_links": [
+        "https://pokepast.es/44ec23af3c4d6489"
+      ],
+      "published_by": "Will Inabinet",
+      "owner_source": "https://x.com/wiltank/status/2026331768979132638?s=46",
+      "event": "Grand Challenge V 2026"
+    },
+    {
+      "title": "ethan_jpj's Sydney Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F723.txt",
+      "vgcpastes_id": "F723",
+      "source_links": [
+        "https://pokepast.es/dfdc099571ec5b71"
+      ],
+      "published_by": "ethan_jpj",
+      "owner_source": "https://x.com/ethan_jpj/status/2020373061984461035?s=46",
+      "event": "Sydney Regional 2026"
+    },
+    {
+      "title": "Kaoru's Tenerife PC Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F195.txt",
+      "vgcpastes_id": "F195",
+      "source_links": [
+        "https://pokepast.es/444c4e5849ff7900"
+      ],
+      "published_by": "Ramsés Quintana",
+      "owner_source": "https://twitter.com/kaoru_kitsune/status/1751297637259559202?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tenerife PC"
+    },
+    {
+      "title": "Carson St. Denis' Seattle Regional 2026 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F840.txt",
+      "vgcpastes_id": "F840",
+      "source_links": [
+        "https://pokepast.es/c5aa0265f879f3f2"
+      ],
+      "published_by": "Carson St. Denis",
+      "owner_source": "No Tweet",
+      "event": "Seattle Regional 2026"
+    },
+    {
+      "title": "Cosmos' Toronto Regional 2026 Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F636.txt",
+      "vgcpastes_id": "F636",
+      "source_links": [
+        "https://pokepast.es/405aec60e58c0e57"
+      ],
+      "published_by": "Jack Clarke",
+      "owner_source": "https://x.com/TheGoldenCosmos/status/2014475154424819885",
+      "event": "Toronto Regional 2026"
+    },
+    {
+      "title": "CloverBells' Entei Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F53.txt",
+      "vgcpastes_id": "F53",
+      "source_links": [
+        "https://pokepast.es/90ec55881801e752"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/CloverBells21/status/1741904474354958519",
+      "event": "Tweet"
+    },
+    {
+      "title": "Conner's Regidrago Gholdengo HO Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F581.txt",
+      "vgcpastes_id": "F581",
+      "source_links": [
+        "https://pokepast.es/bb584cc747145a9c"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "anboxing's Tornadus Sun Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F120.txt",
+      "vgcpastes_id": "F120",
+      "source_links": [
+        "https://pokepast.es/30f811bdab3a3f05"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1745773450990436544",
+      "event": "Tweet"
+    },
+    {
+      "title": "bsmiffy's Goodstuffs Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F50.txt",
+      "vgcpastes_id": "F50",
+      "source_links": [
+        "https://pokepast.es/a2067e2466b9de2a"
+      ],
+      "published_by": "Brady Smith",
+      "owner_source": "https://twitter.com/vgccorner/status/1741548880158720365",
+      "event": "Tweet"
+    },
+    {
+      "title": "Leunam's Local Challenge Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F708.txt",
+      "vgcpastes_id": "F708",
+      "source_links": [
+        "https://pokepast.es/b80574fa3e0187f1"
+      ],
+      "published_by": "Manuel Barea",
+      "owner_source": "https://x.com/manuelbarea98/status/2020792244534444331?s=46",
+      "event": "Local Challenge"
+    },
+    {
+      "title": "anboxing's Venusaur Charizard Sun Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F121.txt",
+      "vgcpastes_id": "F121",
+      "source_links": [
+        "https://pokepast.es/0d131b1fc89c911a"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1745773450990436544",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's 2026 Grand Challenge IV 6th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F598.txt",
+      "vgcpastes_id": "F598",
+      "source_links": [
+        "https://pokepast.es/7e89aae95a806122"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://youtu.be/xP8ZuSjz9KA?si=KzAqBYvdYyh9Ltu0",
+      "event": "2026 Grand Challenge IV"
+    },
+    {
+      "title": "jan_vgc's 2026 Grand Challenge IV (Juniors/Seniors) 1st Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F601.txt",
+      "vgcpastes_id": "F601",
+      "source_links": [
+        "https://pokepast.es/199b1425704ff105"
+      ],
+      "published_by": "jan_vgc",
+      "owner_source": "https://x.com/jan_vgc/status/2010737441427292394?s=20",
+      "event": "2026 Grand Challenge IV (Juniors/Seniors)"
+    },
+    {
+      "title": "PsychoR&R's Amoonguss Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F685.txt",
+      "vgcpastes_id": "F685",
+      "source_links": [
+        "https://pokepast.es/058959a43183079f"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2018387319678755192?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Suicune Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F429.txt",
+      "vgcpastes_id": "F429",
+      "source_links": [
+        "https://pokepast.es/a566a326a0dae65f"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/cloverbells21/status/1765613198219096145?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Video"
+    },
+    {
+      "title": "anboxing's Coalossal Trick Room Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F344.txt",
+      "vgcpastes_id": "F344",
+      "source_links": [
+        "https://pokepast.es/2e64ad31956f12fa"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1759686446779191518?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Brian's EUIC 2026 Top 64 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F771.txt",
+      "vgcpastes_id": "F771",
+      "source_links": [
+        "https://pokepast.es/3ccd6cdcde0ec705"
+      ],
+      "published_by": "Brian Youm",
+      "owner_source": "https://x.com/PlaymakerYoum/status/2022762649050607698?s=20",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Chen Ruijian's VR January Challenge Runner Up Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F617.txt",
+      "vgcpastes_id": "F617",
+      "source_links": [
+        "https://pokepast.es/733ca2358e6c233b"
+      ],
+      "published_by": "Chen Ruijian",
+      "owner_source": "https://x.com/RedsSnorlax143/status/2013539312391041066",
+      "event": "VR January Challenge"
+    },
+    {
+      "title": "Sebas' Curitiba Regional 2026 Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F884.txt",
+      "vgcpastes_id": "F884",
+      "source_links": [
+        "https://pokepast.es/82496dcbded9efab"
+      ],
+      "published_by": "Sebastián Escalante",
+      "owner_source": "https://x.com/sebastiannesc/status/2033335016822829396",
+      "event": "Curitiba Regional"
+    },
+    {
+      "title": "PlebDoctor's Latias Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F65.txt",
+      "vgcpastes_id": "F65",
+      "source_links": [
+        "https://pokepast.es/585a6d990b56c790"
+      ],
+      "published_by": "PlebDoctor",
+      "owner_source": "https://discord.com/channels/958296048227471360/1189469456645230682/1192276714810773524",
+      "event": "Discord"
+    },
+    {
+      "title": "anboxing's Global Challenge I Top 10000 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F228.txt",
+      "vgcpastes_id": "F228",
+      "source_links": [
+        "https://pokepast.es/0a185e3eb4c82da5"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1754484864600916332",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "sconet's Milotic Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F198.txt",
+      "vgcpastes_id": "F198",
+      "source_links": [
+        "https://pokepast.es/e0d6651c36534fa0"
+      ],
+      "published_by": "sconet",
+      "owner_source": "Discord Submission",
+      "event": "Discord"
+    },
+    {
+      "title": "hamanvgc's 2026 Grand Challenge IV 214th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F594.txt",
+      "vgcpastes_id": "F594",
+      "source_links": [
+        "https://pokepast.es/f819131f1cdb1979"
+      ],
+      "published_by": "hamanvgc",
+      "owner_source": "https://x.com/hamanvgc/status/2010781116702331344?s=46",
+      "event": "2026 Grand Challenge IV"
+    },
+    {
+      "title": "Conner's Ursaluna-Bloodmoon Tailroom Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F579.txt",
+      "vgcpastes_id": "F579",
+      "source_links": [
+        "https://pokepast.es/40ef70c48f13839e"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "Conner's Ogerpon-Hearthflame Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F572.txt",
+      "vgcpastes_id": "F572",
+      "source_links": [
+        "https://pokepast.es/789daaf7e305b876"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "xibolun2's Vietnamese Grassroots Tour Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F710.txt",
+      "vgcpastes_id": "F710",
+      "source_links": [
+        "https://pokepast.es/8ceb8de9b0ecd4a9"
+      ],
+      "published_by": "xibolun2",
+      "owner_source": "https://x.com/xibolun2/status/2020535865353916631?s=46",
+      "event": "Paldea Last Dance Vietnamese Grassroots"
+    },
+    {
+      "title": "SaxmasterProductions' Furret Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F390.txt",
+      "vgcpastes_id": "F390",
+      "source_links": [
+        "https://pokepast.es/11091fc2da7523e3"
+      ],
+      "published_by": "Matt Deeds",
+      "owner_source": "https://twitter.com/sopranosax4444/status/1762238998821347834?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "PsychoR&R's Moltres Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F683.txt",
+      "vgcpastes_id": "F683",
+      "source_links": [
+        "https://pokepast.es/49655e3be2a42699"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2018387319678755192?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Araquanid Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F169.txt",
+      "vgcpastes_id": "F169",
+      "source_links": [
+        "https://pokepast.es/16d908ad8c16a6f7"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/jaylun44/status/1747047041291927864?t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "squishvgc's FlorTour Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F354.txt",
+      "vgcpastes_id": "F354",
+      "source_links": [
+        "https://pokepast.es/ffeb7b3d63b95aeb"
+      ],
+      "published_by": "squishvgc",
+      "owner_source": "https://twitter.com/squishisquashi/status/1757580657998328033?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "FlorTour"
+    },
+    {
+      "title": "Zach Knight's Seattle Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F818.txt",
+      "vgcpastes_id": "F818",
+      "source_links": [
+        "https://pokepast.es/49a82ac57fde070a"
+      ],
+      "published_by": "Zach Knight",
+      "owner_source": "https://x.com/gworfvgc/status/2028590553198407739?s=46",
+      "event": "Seattle Regional 2026"
+    }
+  ],
+  "curated": [
+    {
+      "title": "0722poke_teku's Battle Stadium S15 9th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/001_0722poke-teku-s-battle-stadium-s15-9th-place-team_72a45526.txt"
+    },
+    {
+      "title": "15th at Portland",
+      "file": "data/team_pools/gen9vgc2026regf/pool/002_15th-at-portland_7a7ee6fe.txt"
+    },
+    {
+      "title": "2024 Portland 10-4 13th +80CP",
+      "file": "data/team_pools/gen9vgc2026regf/pool/003_2024-portland-10-4-13th-80cp_a52dc8c5.txt"
+    },
+    {
+      "title": "222",
+      "file": "data/team_pools/gen9vgc2026regf/pool/004_222_c25e9a52.txt"
+    },
+    {
+      "title": "36th / 664 Liverpool Regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/005_36th-664-liverpool-regionals_a9f209fd.txt"
+    },
+    {
+      "title": "37th 2024 Orlando Regional",
+      "file": "data/team_pools/gen9vgc2026regf/pool/006_37th-2024-orlando-regional_12ee98fa.txt"
+    },
+    {
+      "title": "Alta's Global Challenge I 46th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/007_alta-s-global-challenge-i-46th-place-team_fdfef86c.txt"
+    },
+    {
+      "title": "Arch Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/008_arch-team_167c99d2.txt"
+    },
+    {
+      "title": "BattleRoom's Portland Regionals Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/009_battleroom-s-portland-regionals-top-4-team_53f418b1.txt"
+    },
+    {
+      "title": "Baxcalibur Redux v2",
+      "file": "data/team_pools/gen9vgc2026regf/pool/010_baxcalibur-redux-v2_fe4e1484.txt"
+    },
+    {
+      "title": "blue's Battle Stadium S14 25th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/011_blue-s-battle-stadium-s14-25th-place-team_97529c78.txt"
+    },
+    {
+      "title": "bubs' Latias Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/012_bubs-latias-team_2853ce0d.txt"
+    },
+    {
+      "title": "Copy of Chien-Pao Torn",
+      "file": "data/team_pools/gen9vgc2026regf/pool/013_copy-of-chien-pao-torn_04996cb1.txt"
+    },
+    {
+      "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of UTRECHT WINNING TEAM",
+      "file": "data/team_pools/gen9vgc2026regf/pool/014_utrecht-winning-team_2bb60816.txt"
+    },
+    {
+      "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Testing Liverpoolada",
+      "file": "data/team_pools/gen9vgc2026regf/pool/015_testing-liverpoolada_b10211d2.txt"
+    },
+    {
+      "title": "Copy of Untitled 1089",
+      "file": "data/team_pools/gen9vgc2026regf/pool/016_untitled-1089_4f69cbdc.txt"
+    },
+    {
+      "title": "CritDra",
+      "file": "data/team_pools/gen9vgc2026regf/pool/017_critdra_2496d5a8.txt"
+    },
+    {
+      "title": "dengo v1.1 -- mc",
+      "file": "data/team_pools/gen9vgc2026regf/pool/018_dengo-v1-1-mc_48223523.txt"
+    },
+    {
+      "title": "dlc blob",
+      "file": "data/team_pools/gen9vgc2026regf/pool/019_dlc-blob_e25b6222.txt"
+    },
+    {
+      "title": "dlc cat",
+      "file": "data/team_pools/gen9vgc2026regf/pool/020_dlc-cat_757e96e7.txt"
+    },
+    {
+      "title": "dlc cotton",
+      "file": "data/team_pools/gen9vgc2026regf/pool/021_dlc-cotton_369b40ac.txt"
+    },
+    {
+      "title": "dlc lei",
+      "file": "data/team_pools/gen9vgc2026regf/pool/022_dlc-lei_8610e9df.txt"
+    },
+    {
+      "title": "dlc tank",
+      "file": "data/team_pools/gen9vgc2026regf/pool/023_dlc-tank_e178e369.txt"
+    },
+    {
+      "title": "dlc tree",
+      "file": "data/team_pools/gen9vgc2026regf/pool/024_dlc-tree_84698084.txt"
+    },
+    {
+      "title": "Dragonite - ChienPao LenVGC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/025_dragonite-chienpao-lenvgc_82d7ea8c.txt"
+    },
+    {
+      "title": "EUIC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/026_euic_ca7dc4da.txt"
+    },
+    {
+      "title": "EUIC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/027_euic_6634416e.txt"
+    },
+    {
+      "title": "EUIC Squad mejorado",
+      "file": "data/team_pools/gen9vgc2026regf/pool/028_euic-squad-mejorado_f5eb9a63.txt"
+    },
+    {
+      "title": "FuiYnb's Battle Stadium S15 17th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/029_fuiynb-s-battle-stadium-s15-17th-place-team_8b883179.txt"
+    },
+    {
+      "title": "gc final?",
+      "file": "data/team_pools/gen9vgc2026regf/pool/030_gc-final_087e9f7f.txt"
+    },
+    {
+      "title": "Gouging Fire 1.6.3",
+      "file": "data/team_pools/gen9vgc2026regf/pool/031_gouging-fire-1-6-3_b33684c1.txt"
+    },
+    {
+      "title": "hakushu_t's Global Challenge I 39th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/032_hakushu-t-s-global-challenge-i-39th-place-team_390e7e47.txt"
+    },
+    {
+      "title": "Hatterene - F",
+      "file": "data/team_pools/gen9vgc2026regf/pool/033_hatterene-f_62522355.txt"
+    },
+    {
+      "title": "hydrapple",
+      "file": "data/team_pools/gen9vgc2026regf/pool/034_hydrapple_7ab9ac71.txt"
+    },
+    {
+      "title": "Knoxville",
+      "file": "data/team_pools/gen9vgc2026regf/pool/035_knoxville_3753a30c.txt"
+    },
+    {
+      "title": "Knoxville 2024",
+      "file": "data/team_pools/gen9vgc2026regf/pool/036_knoxville-2024_cadf17c4.txt"
+    },
+    {
+      "title": "LUCK2222",
+      "file": "data/team_pools/gen9vgc2026regf/pool/037_luck2222_b459b31a.txt"
+    },
+    {
+      "title": "NikolajHoej's Dortmund Regionals Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/038_nikolajhoej-s-dortmund-regionals-top-16-team_2a4315d0.txt"
+    },
+    {
+      "title": "Orlando (17th)",
+      "file": "data/team_pools/gen9vgc2026regf/pool/039_orlando-17th_073036d3.txt"
+    },
+    {
+      "title": "Orlando 2024",
+      "file": "data/team_pools/gen9vgc2026regf/pool/040_orlando-2024_f40494af.txt"
+    },
+    {
+      "title": "Orlando 9-6 50 of 824",
+      "file": "data/team_pools/gen9vgc2026regf/pool/041_orlando-9-6-50-of-824_de4aa710.txt"
+    },
+    {
+      "title": "Orlando Regional (12-3, 10th of 824)",
+      "file": "data/team_pools/gen9vgc2026regf/pool/042_orlando-regional-12-3-10th-of-824_fe8dcd13.txt"
+    },
+    {
+      "title": "PlayestVGC's Portland Regionals Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/043_playestvgc-s-portland-regionals-top-32-team_f9ccb120.txt"
+    },
+    {
+      "title": "Portland",
+      "file": "data/team_pools/gen9vgc2026regf/pool/044_portland_ab7fd1ae.txt"
+    },
+    {
+      "title": "Portland Regional Finals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/045_portland-regional-finals_9e508f7c.txt"
+    },
+    {
+      "title": "Portland Regionals Final Copy January 6-7 2024",
+      "file": "data/team_pools/gen9vgc2026regf/pool/046_portland-regionals-final-copy-january-6-7-2024_a761e9e6.txt"
+    },
+    {
+      "title": "Reg F?",
+      "file": "data/team_pools/gen9vgc2026regf/pool/047_reg-f_a9f8a787.txt"
+    },
+    {
+      "title": "Rosenkreutz's Global Challenge I 64th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/048_rosenkreutz-s-global-challenge-i-64th-place-team_ababb35c.txt"
+    },
+    {
+      "title": "s6 balance - Chatlotte Top 32",
+      "file": "data/team_pools/gen9vgc2026regf/pool/049_s6-balance-chatlotte-top-32_152a8293.txt"
+    },
+    {
+      "title": "Sarapoke0914's Global Challenge I 11th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/050_sarapoke0914-s-global-challenge-i-11th-place-team_923db2d3.txt"
+    },
+    {
+      "title": "sora's Battle Stadium S14 20th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/051_sora-s-battle-stadium-s14-20th-place-team_1e6a6a89.txt"
+    },
+    {
+      "title": "Sun EUIC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/052_sun-euic_246e226f.txt"
+    },
+    {
+      "title": "t4 charlotte regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/053_t4-charlotte-regionals_c53b2442.txt"
+    },
+    {
+      "title": "t4 Vancouver regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/054_t4-vancouver-regionals_d605638e.txt"
+    },
+    {
+      "title": "Team Report Version",
+      "file": "data/team_pools/gen9vgc2026regf/pool/055_team-report-version_f3326620.txt"
+    },
+    {
+      "title": "TH NAT '24",
+      "file": "data/team_pools/gen9vgc2026regf/pool/056_th-nat-24_54321a44.txt"
+    },
+    {
+      "title": "Toby Kongmun's 2024 Melbourne Regional Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/057_toby-kongmun-s-2024-melbourne-regional-top-16-team_c4544256.txt"
+    },
+    {
+      "title": "Top 8 Knoxville Regionals",
+      "file": "data/team_pools/gen9vgc2026regf/pool/058_top-8-knoxville-regionals_9884ea5a.txt"
+    },
+    {
+      "title": "Trick Room Araquanid LenVGC",
+      "file": "data/team_pools/gen9vgc2026regf/pool/059_trick-room-araquanid-lenvgc_547cb57c.txt"
+    },
+    {
+      "title": "Untitled 1",
+      "file": "data/team_pools/gen9vgc2026regf/pool/060_untitled-1_71ac1f75.txt"
+    },
+    {
+      "title": "Untitled 13",
+      "file": "data/team_pools/gen9vgc2026regf/pool/061_untitled-13_b07c9e02.txt"
+    },
+    {
+      "title": "Untitled 132",
+      "file": "data/team_pools/gen9vgc2026regf/pool/062_untitled-132_29340006.txt"
+    },
+    {
+      "title": "Untitled 222",
+      "file": "data/team_pools/gen9vgc2026regf/pool/063_untitled-222_2911d16e.txt"
+    },
+    {
+      "title": "Untitled 223",
+      "file": "data/team_pools/gen9vgc2026regf/pool/064_untitled-223_7080d410.txt"
+    },
+    {
+      "title": "Untitled 465",
+      "file": "data/team_pools/gen9vgc2026regf/pool/065_untitled-465_6037689d.txt"
+    },
+    {
+      "title": "Untitled 5",
+      "file": "data/team_pools/gen9vgc2026regf/pool/066_untitled-5_5554a94e.txt"
+    },
+    {
+      "title": "Untitled 9",
+      "file": "data/team_pools/gen9vgc2026regf/pool/067_untitled-9_cc0dface.txt"
+    },
+    {
+      "title": "Untitled PokePaste",
+      "file": "data/team_pools/gen9vgc2026regf/pool/068_untitled-pokepaste_19cd045d.txt"
+    },
+    {
+      "title": "utrecht 1.5",
+      "file": "data/team_pools/gen9vgc2026regf/pool/069_utrecht-1-5_9e0b822f.txt"
+    },
+    {
+      "title": "Utrecht Day 2",
+      "file": "data/team_pools/gen9vgc2026regf/pool/070_utrecht-day-2_431be080.txt"
+    },
+    {
+      "title": "UTRECHT WINNING TEAM",
+      "file": "data/team_pools/gen9vgc2026regf/pool/071_utrecht-winning-team_c4962227.txt"
+    },
+    {
+      "title": "Vancouver 19th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/072_vancouver-19th-place-team_e8518474.txt"
+    },
+    {
+      "title": "vancouver final!",
+      "file": "data/team_pools/gen9vgc2026regf/pool/073_vancouver-final_91a8c855.txt"
+    },
+    {
+      "title": "weezing+doggy orlando",
+      "file": "data/team_pools/gen9vgc2026regf/pool/074_weezing-doggy-orlando_c561a292.txt"
+    },
+    {
+      "title": "Wolfe Glick's Charlotte Regionals 2024 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf/pool/075_wolfe-glick-s-charlotte-regionals-2024-champion-team_80590641.txt"
+    },
+    {
+      "title": "‘Saur!",
+      "file": "data/team_pools/gen9vgc2026regf/pool/076_saur_3e3274e5.txt"
+    },
+    {
+      "title": "奥兰多",
+      "file": "data/team_pools/gen9vgc2026regf/pool/077_team_9b52ac21.txt"
+    },
+    {
+      "title": "Calm Mind Raging Bolt + Icy Wind Chien-Pao",
+      "file": "data/team_pools/gen9vgc2026regf/pool/078_calm_mind_raging_bolt_icy_wind_chien_pao_a78a0275.txt"
+    },
+    {
+      "title": "Roaring Moon + Gholdengo Tailwind",
+      "file": "data/team_pools/gen9vgc2026regf/pool/079_roaring_moon_gholdengo_tailwind_ce12b22e.txt"
+    },
+    {
+      "title": "Regidrago + Gholdengo Tailwind",
+      "file": "data/team_pools/gen9vgc2026regf/pool/080_regidrago_gholdengo_tailwind_1ad305e8.txt"
+    },
+    {
+      "title": "Choice Band Landorus-Therian Tailwind",
+      "file": "data/team_pools/gen9vgc2026regf/pool/081_choice_band_landorus_therian_tailwind_9e20b218.txt"
+    },
+    {
+      "title": "Ursaluna + Porygon2 Tailroom",
+      "file": "data/team_pools/gen9vgc2026regf/pool/082_ursaluna_porygon2_tailroom_5ef7a954.txt"
+    },
+    {
+      "title": "Ursaluna + Farigiraf Tailroom",
+      "file": "data/team_pools/gen9vgc2026regf/pool/083_ursaluna_farigiraf_tailroom_3a3ba155.txt"
+    },
+    {
+      "title": "Archaludon Rain",
+      "file": "data/team_pools/gen9vgc2026regf/pool/084_archaludon_rain_8db9df67.txt"
+    },
+    {
+      "title": "Dondozo + Ting-Lu",
+      "file": "data/team_pools/gen9vgc2026regf/pool/085_dondozo_ting_lu_487b6228.txt"
+    },
+    {
+      "title": "AldrichYan's EUIC 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F767.txt",
+      "vgcpastes_id": "F767",
+      "source_links": [
+        "https://pokepast.es/71bc436c203d11bd"
+      ],
+      "published_by": "Aldrich Yan Sutandra",
+      "owner_source": "https://x.com/aldrichyan/status/2022686607766098083?s=46",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Hoej's EUIC 2026 Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F786.txt",
+      "vgcpastes_id": "F786",
+      "source_links": [
+        "https://pokepast.es/42374feb2d00ca84"
+      ],
+      "published_by": "Frederik Høj Nielsen",
+      "owner_source": "https://x.com/hoej_hs/status/2022726983680168122?s=46",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Alberto Cano García's EUIC 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F773.txt",
+      "vgcpastes_id": "F773",
+      "source_links": [
+        "https://pokepast.es/33a41429aa7fbb39"
+      ],
+      "published_by": "Alberto Cano García",
+      "owner_source": "https://x.com/CanovaxVGC/status/2023373754110521654",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Atalanta's Serperior Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F22.txt",
+      "vgcpastes_id": "F22",
+      "source_links": [
+        "https://pokepast.es/cf5896f581f5dc67"
+      ],
+      "published_by": "Atalanta",
+      "owner_source": "https://twitter.com/WandaLi11688951/status/1740389869418144183",
+      "event": "Tweet"
+    },
+    {
+      "title": "Slushi2k's Dragonite Chien-Pao Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F589.txt",
+      "vgcpastes_id": "F589",
+      "source_links": [
+        "https://pokepast.es/809515e737f6f800"
+      ],
+      "published_by": "Kian Campbell",
+      "owner_source": "https://x.com/slushi2k/status/2011107186236408114?s=46",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Max Morales's Mérida Regional 2026 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F641.txt",
+      "vgcpastes_id": "F641",
+      "source_links": [
+        "https://pokepast.es/1ebf52b67cf53261"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2017300122753704431?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "AndyLa's Houston Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F890.txt",
+      "vgcpastes_id": "F890",
+      "source_links": [
+        "https://pokepast.es/3099226dbd59156e"
+      ],
+      "published_by": "Andrew Lavigne",
+      "owner_source": "https://x.com/AndyLaVGC/status/2036069142424424952",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "Araluwen's Hatterene Series Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F384.txt",
+      "vgcpastes_id": "F384",
+      "source_links": [
+        "https://pokepast.es/124b8c550c6c52c1"
+      ],
+      "published_by": "Pros Leerman",
+      "owner_source": "https://twitter.com/araluwen/status/1761882305751072994?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Hatterene Series"
+    },
+    {
+      "title": "bsmiffy's Florida PC Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F389.txt",
+      "vgcpastes_id": "F389",
+      "source_links": [
+        "https://pokepast.es/283ff77e75b26a17"
+      ],
+      "published_by": "Brady Smith",
+      "owner_source": "https://twitter.com/vgccorner/status/1762199794808725672?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Florida PC"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of tyo's Utrecht Regional 2024 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F515.txt",
+      "vgcpastes_id": "F515",
+      "source_links": [
+        "https://pokepast.es/243d67ce66c1a336"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/MichaelderBeste/status/1995888470191980743?s=20",
+      "event": "Discord"
+    },
+    {
+      "title": "Deiv's Seville SPE 2026 Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F921.txt",
+      "vgcpastes_id": "F921",
+      "source_links": [
+        "https://pokepast.es/dd42ca1a3c25a30d"
+      ],
+      "published_by": "Davide Fazio",
+      "owner_source": "https://x.com/DeivVGC/status/2038897864693227568",
+      "event": "Seville SPE 2026"
+    },
+    {
+      "title": "masternerd's Landorus-I Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F69.txt",
+      "vgcpastes_id": "F69",
+      "source_links": [
+        "https://pokepast.es/75d7d88d480d2757"
+      ],
+      "published_by": "masternerd",
+      "owner_source": "https://discord.com/channels/958296048227471360/1189469456645230682/1192316200219316244",
+      "event": "Dscord"
+    },
+    {
+      "title": "45mice's Iron Boulder Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F197.txt",
+      "vgcpastes_id": "F197",
+      "source_links": [
+        "https://pokepast.es/7d48d9f90d266479"
+      ],
+      "published_by": "Justin Knox",
+      "owner_source": "https://twitter.com/45mice/status/1751628481601913277?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Misaka's 2-2-2 Psyspam Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F172.txt",
+      "vgcpastes_id": "F172",
+      "source_links": [
+        "https://pokepast.es/ff3ee888635b96a2"
+      ],
+      "published_by": "Misaka",
+      "owner_source": "https://twitter.com/agMewtwo/status/1748288143617573370?t=ELEROoOjH6ImF3T1AFRByA&s=19",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Aaron & Navjit's Toronto Regional Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F606.txt",
+      "vgcpastes_id": "F606",
+      "source_links": [
+        "https://pokepast.es/b68c33d14340c9f7"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2013622796346069429?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "blue's Eruption Entei Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F148.txt",
+      "vgcpastes_id": "F148",
+      "source_links": [
+        "https://pokepast.es/72b41c37ff1e6bf0"
+      ],
+      "published_by": "Seunghoon Cha",
+      "owner_source": "https://twitter.com/blue_vgc/status/1746196699838812554",
+      "event": "Tweet"
+    },
+    {
+      "title": "Huyubare's EUIC 2026 Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F780.txt",
+      "vgcpastes_id": "F780",
+      "source_links": [
+        "https://pokepast.es/734423ee72266014"
+      ],
+      "published_by": "Ko Tsukide",
+      "owner_source": "https://x.com/Huyubare_Poke/status/2022688491419897994",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Kaguya's Houston Regional 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F896.txt",
+      "vgcpastes_id": "F896",
+      "source_links": [
+        "https://pokepast.es/be3b7da35bde2a59"
+      ],
+      "published_by": "Blake Falls",
+      "owner_source": "https://x.com/kaguyafalls/status/2035903401314193733?s=46",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "hatsunechiyu's Iron Crown Okidogi Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F704.txt",
+      "vgcpastes_id": "F704",
+      "source_links": [
+        "https://pokepast.es/25d76f64160c0e5d"
+      ],
+      "published_by": "hatsunechiyu",
+      "owner_source": "https://x.com/hatsunechiyu/status/2020939163437007293?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Farigiraf Iron Hands Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F167.txt",
+      "vgcpastes_id": "F167",
+      "source_links": [
+        "https://pokepast.es/e4554cf899051b73"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/CloverBells21/status/1746678670033363077?t=L0UIy_ULuygQ6RwwN8HD6Q",
+      "event": "Video"
+    },
+    {
+      "title": "Panda's Recreation of Wolfe Glick's Orlando Regional 2024 Team (Rental by MethodsVGC)",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F499.txt",
+      "vgcpastes_id": "F499",
+      "source_links": [
+        "https://pokepast.es/8d604e145ba51dcd"
+      ],
+      "published_by": "Justin Tang",
+      "owner_source": "https://x.com/unironicpanda/status/1986458191371329566?s=46",
+      "event": "Video"
+    },
+    {
+      "title": "CloverBells' Cresselia Ursaluna Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F427.txt",
+      "vgcpastes_id": "F427",
+      "source_links": [
+        "https://pokepast.es/d7a8379e8d628804"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/cloverbells21/status/1765613198219096145?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Video"
+    },
+    {
+      "title": "ZacEmer's Global Challenge I Top 1000 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F235.txt",
+      "vgcpastes_id": "F235",
+      "source_links": [
+        "https://pokepast.es/4e5f852b43561acf"
+      ],
+      "published_by": "Zac Emerzian",
+      "owner_source": "https://twitter.com/zacemer/status/1754313724205400267?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "BigFrogStatus' Showdown Ladder Peak 10th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F742.txt",
+      "vgcpastes_id": "F742",
+      "source_links": [
+        "https://pokepast.es/bcc947e8dd514d5a"
+      ],
+      "published_by": "BigFrogStatus",
+      "owner_source": "https://x.com/hiscribble/status/2024907258958643211?s=46",
+      "event": "Showdown Ladder"
+    },
+    {
+      "title": "Jimmy's Charotte Regionals Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F282.txt",
+      "vgcpastes_id": "F282",
+      "source_links": [
+        "https://pokepast.es/0ff42f645dd14edb"
+      ],
+      "published_by": "Jimmy Friedle",
+      "owner_source": "https://twitter.com/flamingoaxis/status/1748881399845646590?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Charlotte Regionals"
+    },
+    {
+      "title": "ZardiChar's Recreation of 45mice and Eduardo Cunha's Gholdengo TW Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F503.txt",
+      "vgcpastes_id": "F503",
+      "source_links": [
+        "https://pokepast.es/d0650592a766acd3"
+      ],
+      "published_by": "Tyler Alexander",
+      "owner_source": "https://x.com/zardicharvgc/status/1991942737931989280?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Nino Ladder Tour 3rd Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F70.txt",
+      "vgcpastes_id": "F70",
+      "source_links": [
+        "https://pokepast.es/3f7470a97d4aa2ad"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/jaylun44/status/1742761265796141240?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "AndyBakes' Tinkaton Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F449.txt",
+      "vgcpastes_id": "F449",
+      "source_links": [
+        "https://pokepast.es/ae95ed48827fd798"
+      ],
+      "published_by": "AndyBakes",
+      "owner_source": "https://twitter.com/andybakesyt/status/1768371413046731157?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Latios Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F336.txt",
+      "vgcpastes_id": "F336",
+      "source_links": [
+        "https://pokepast.es/44e9734c42f4a0f8"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/jaylun44/status/1756744003805192636?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Philip Cohen's Knoxville MSS Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F215.txt",
+      "vgcpastes_id": "F215",
+      "source_links": [
+        "https://pokepast.es/93858dbd7394ddb2"
+      ],
+      "published_by": "Philip Cohen",
+      "owner_source": "https://twitter.com/infernoprod77/status/1754724684044607963?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Knoxville MSS"
+    },
+    {
+      "title": "Conner's Raging Bolt Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F574.txt",
+      "vgcpastes_id": "F574",
+      "source_links": [
+        "https://pokepast.es/5516076acbe231e3"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "Hamstermania's Scarf Regigigas Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F339.txt",
+      "vgcpastes_id": "F339",
+      "source_links": [
+        "https://pokepast.es/d2a3ef0cab771755"
+      ],
+      "published_by": "David Koutesh",
+      "owner_source": "https://twitter.com/hamstermaniavgc/status/1757725101162713422?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Arkaaali's Grand Challenge V 2026 8th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F800.txt",
+      "vgcpastes_id": "F800",
+      "source_links": [
+        "https://pokepast.es/68ab1ff6d856b63c"
+      ],
+      "published_by": "Arkaaali",
+      "owner_source": "https://x.com/Arkaaali/status/2025877282963730602?s=20",
+      "event": "Grand Challenge V 2026"
+    },
+    {
+      "title": "Peter's Gouging Fire Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F104.txt",
+      "vgcpastes_id": "F104",
+      "source_links": [
+        "https://pokepast.es/b33e497ba262a86a"
+      ],
+      "published_by": "Peter Chen",
+      "owner_source": "https://twitter.com/mrptpablo/status/1743897962449928310?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Rin Leiba's Mérida Regional 2026 Top 64 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F653.txt",
+      "vgcpastes_id": "F653",
+      "source_links": [
+        "https://pokepast.es/1c55368b17017809"
+      ],
+      "published_by": "Rin Leiba",
+      "owner_source": "https://x.com/Punihina1334/status/2016012352810819706",
+      "event": "Mérida Regional 2026"
+    },
+    {
+      "title": "Noah Carney's Toronto Regional 2026 Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F628.txt",
+      "vgcpastes_id": "F628",
+      "source_links": [
+        "https://pokepast.es/d5a700f21147f38f"
+      ],
+      "published_by": "Noah Carney",
+      "owner_source": "No Tweet",
+      "event": "Toronto Regional 2026"
+    },
+    {
+      "title": "Emir's Showdown Ladder Peak 1st Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F561.txt",
+      "vgcpastes_id": "F561",
+      "source_links": [
+        "https://pokepast.es/71cacfcede455436"
+      ],
+      "published_by": "Emir Abdulovski",
+      "owner_source": "https://x.com/emirnent/status/2003831982695051317?s=46",
+      "event": "Showdown Ladder"
+    },
+    {
+      "title": "Mahmoud's Knoxville Day 2 Challenge Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F443.txt",
+      "vgcpastes_id": "F443",
+      "source_links": [
+        "https://pokepast.es/15cc735854acb7b1"
+      ],
+      "published_by": "Mahmoud Tantawi",
+      "owner_source": "https://twitter.com/MacsTantawi/status/1772682898543407565",
+      "event": "Knoxville Day 2 Challenge"
+    },
+    {
+      "title": "Ze Banded's EUIC 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F765.txt",
+      "vgcpastes_id": "F765",
+      "source_links": [
+        "https://pokepast.es/457b70a655c36220"
+      ],
+      "published_by": "Ze Banded",
+      "owner_source": "https://x.com/ZeBanded/status/2022681352936841663",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "bsmiffy's Archaludon Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F75.txt",
+      "vgcpastes_id": "F75",
+      "source_links": [
+        "https://pokepast.es/a9139080c9f97ccb"
+      ],
+      "published_by": "Brady Smith",
+      "owner_source": "https://twitter.com/vgccorner/status/1743037219248406714?t=c4deRa-QUQC8pVHSQfJTzA&s=19",
+      "event": "Tweet"
+    },
+    {
+      "title": "PsychoR&R's Moltres Flutter Harc Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F866.txt",
+      "vgcpastes_id": "F866",
+      "source_links": [
+        "https://pokepast.es/63621cef9884ce61"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2035912704876318944?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "PokeReplaysVGC's Raging Bolt Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F739.txt",
+      "vgcpastes_id": "F739",
+      "source_links": [
+        "https://pokepast.es/7e798db1db1ddd77"
+      ],
+      "published_by": "Adam Wright",
+      "owner_source": "https://x.com/pokereplaysvgc/status/2023691916404224068?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Archaludon Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F54.txt",
+      "vgcpastes_id": "F54",
+      "source_links": [
+        "https://pokepast.es/0e61091c35b1e66f"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/CloverBells21/status/1741904474354958519",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of ChompyGM's Gouging Fire Prio Spam Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F741.txt",
+      "vgcpastes_id": "F741",
+      "source_links": [
+        "https://pokepast.es/609e9fb198f4488a"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2023812636119359999?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "PsychoR&R's Chien-Pao Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F684.txt",
+      "vgcpastes_id": "F684",
+      "source_links": [
+        "https://pokepast.es/8e7727f28c482f30"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2018387319678755192?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Panda's Recreation of Yuta's Balan VGC Tour Top 8 Team (Rental by MethodsVGC)",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F529.txt",
+      "vgcpastes_id": "F529",
+      "source_links": [
+        "https://pokepast.es/7e8e5cd0473da304"
+      ],
+      "published_by": "Justin Tang",
+      "owner_source": "https://x.com/unironicpanda/status/1998104369150210257",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Naoto Mizobuchi's VR December Challenge #1 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F534.txt",
+      "vgcpastes_id": "F534",
+      "source_links": [
+        "https://pokepast.es/54cdd917682e0e7f"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://x.com/michaelderbeste/status/2002050929252794413?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "heKtik's Houston Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F891.txt",
+      "vgcpastes_id": "F891",
+      "source_links": [
+        "https://pokepast.es/1e3acbee0c14704d"
+      ],
+      "published_by": "Preston Gadling",
+      "owner_source": "https://x.com/not_hektikvgc/status/2035785821878415476?s=46",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "CloverBells' Tyranitar Excadrill Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F191.txt",
+      "vgcpastes_id": "F191",
+      "source_links": [
+        "https://pokepast.es/e2bac61156dc943d"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/cloverbells21/status/1750281411800563814?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of koon_ky's Flutter Ogerpon-Hearthflame Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F607.txt",
+      "vgcpastes_id": "F607",
+      "source_links": [
+        "https://pokepast.es/d1d002974b05e32b"
+      ],
+      "published_by": "MichaelderBeste",
+      "owner_source": "https://x.com/MichaelderBeste",
+      "event": "Video"
+    },
+    {
+      "title": "Dominik Freund's Iron Boulder Gouging Fire Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F343.txt",
+      "vgcpastes_id": "F343",
+      "source_links": [
+        "https://pokepast.es/5601d1c3c67e9ae9"
+      ],
+      "published_by": "Dominik Freund",
+      "owner_source": "https://twitter.com/tryplexxlol/status/1758473398026678772?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Max's VR December Challenge #2 Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F556.txt",
+      "vgcpastes_id": "F556",
+      "source_links": [
+        "https://pokepast.es/5d11b48038f4f511"
+      ],
+      "published_by": "Wu Chen",
+      "owner_source": "https://x.com/VGC_TW_Max/status/2002818727910449648",
+      "event": "VR December Challenge #2"
+    },
+    {
+      "title": "Jaylun's Nino Ladder Tour 3rd Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F48.txt",
+      "vgcpastes_id": "F48",
+      "source_links": [
+        "https://pokepast.es/a3e60cfb1adbddbb"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/Jaylun44/status/1741353009198895358",
+      "event": "Nino Ladder Tour"
+    },
+    {
+      "title": "betairya's Ribombee Rain Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F64.txt",
+      "vgcpastes_id": "F64",
+      "source_links": [
+        "https://pokepast.es/e6b83078f94d96fa"
+      ],
+      "published_by": "betairya",
+      "owner_source": "https://twitter.com/betairya/status/1742704882388443469",
+      "event": "Tweet"
+    },
+    {
+      "title": "Wiltank's Grand Challenge V 2026 38th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F798.txt",
+      "vgcpastes_id": "F798",
+      "source_links": [
+        "https://pokepast.es/44ec23af3c4d6489"
+      ],
+      "published_by": "Will Inabinet",
+      "owner_source": "https://x.com/wiltank/status/2026331768979132638?s=46",
+      "event": "Grand Challenge V 2026"
+    },
+    {
+      "title": "ethan_jpj's Sydney Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F723.txt",
+      "vgcpastes_id": "F723",
+      "source_links": [
+        "https://pokepast.es/dfdc099571ec5b71"
+      ],
+      "published_by": "ethan_jpj",
+      "owner_source": "https://x.com/ethan_jpj/status/2020373061984461035?s=46",
+      "event": "Sydney Regional 2026"
+    },
+    {
+      "title": "Kaoru's Tenerife PC Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F195.txt",
+      "vgcpastes_id": "F195",
+      "source_links": [
+        "https://pokepast.es/444c4e5849ff7900"
+      ],
+      "published_by": "Ramsés Quintana",
+      "owner_source": "https://twitter.com/kaoru_kitsune/status/1751297637259559202?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tenerife PC"
+    },
+    {
+      "title": "Carson St. Denis' Seattle Regional 2026 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F840.txt",
+      "vgcpastes_id": "F840",
+      "source_links": [
+        "https://pokepast.es/c5aa0265f879f3f2"
+      ],
+      "published_by": "Carson St. Denis",
+      "owner_source": "No Tweet",
+      "event": "Seattle Regional 2026"
+    },
+    {
+      "title": "Cosmos' Toronto Regional 2026 Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F636.txt",
+      "vgcpastes_id": "F636",
+      "source_links": [
+        "https://pokepast.es/405aec60e58c0e57"
+      ],
+      "published_by": "Jack Clarke",
+      "owner_source": "https://x.com/TheGoldenCosmos/status/2014475154424819885",
+      "event": "Toronto Regional 2026"
+    },
+    {
+      "title": "CloverBells' Entei Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F53.txt",
+      "vgcpastes_id": "F53",
+      "source_links": [
+        "https://pokepast.es/90ec55881801e752"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/CloverBells21/status/1741904474354958519",
+      "event": "Tweet"
+    },
+    {
+      "title": "Conner's Regidrago Gholdengo HO Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F581.txt",
+      "vgcpastes_id": "F581",
+      "source_links": [
+        "https://pokepast.es/bb584cc747145a9c"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "anboxing's Tornadus Sun Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F120.txt",
+      "vgcpastes_id": "F120",
+      "source_links": [
+        "https://pokepast.es/30f811bdab3a3f05"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1745773450990436544",
+      "event": "Tweet"
+    },
+    {
+      "title": "bsmiffy's Goodstuffs Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F50.txt",
+      "vgcpastes_id": "F50",
+      "source_links": [
+        "https://pokepast.es/a2067e2466b9de2a"
+      ],
+      "published_by": "Brady Smith",
+      "owner_source": "https://twitter.com/vgccorner/status/1741548880158720365",
+      "event": "Tweet"
+    },
+    {
+      "title": "Leunam's Local Challenge Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F708.txt",
+      "vgcpastes_id": "F708",
+      "source_links": [
+        "https://pokepast.es/b80574fa3e0187f1"
+      ],
+      "published_by": "Manuel Barea",
+      "owner_source": "https://x.com/manuelbarea98/status/2020792244534444331?s=46",
+      "event": "Local Challenge"
+    },
+    {
+      "title": "anboxing's Venusaur Charizard Sun Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F121.txt",
+      "vgcpastes_id": "F121",
+      "source_links": [
+        "https://pokepast.es/0d131b1fc89c911a"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1745773450990436544",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's 2026 Grand Challenge IV 6th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F598.txt",
+      "vgcpastes_id": "F598",
+      "source_links": [
+        "https://pokepast.es/7e89aae95a806122"
+      ],
+      "published_by": "Michael Kelsch",
+      "owner_source": "https://youtu.be/xP8ZuSjz9KA?si=KzAqBYvdYyh9Ltu0",
+      "event": "2026 Grand Challenge IV"
+    },
+    {
+      "title": "jan_vgc's 2026 Grand Challenge IV (Juniors/Seniors) 1st Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F601.txt",
+      "vgcpastes_id": "F601",
+      "source_links": [
+        "https://pokepast.es/199b1425704ff105"
+      ],
+      "published_by": "jan_vgc",
+      "owner_source": "https://x.com/jan_vgc/status/2010737441427292394?s=20",
+      "event": "2026 Grand Challenge IV (Juniors/Seniors)"
+    },
+    {
+      "title": "PsychoR&R's Amoonguss Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F685.txt",
+      "vgcpastes_id": "F685",
+      "source_links": [
+        "https://pokepast.es/058959a43183079f"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2018387319678755192?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Suicune Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F429.txt",
+      "vgcpastes_id": "F429",
+      "source_links": [
+        "https://pokepast.es/a566a326a0dae65f"
+      ],
+      "published_by": "CloverBells",
+      "owner_source": "https://twitter.com/cloverbells21/status/1765613198219096145?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Video"
+    },
+    {
+      "title": "anboxing's Coalossal Trick Room Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F344.txt",
+      "vgcpastes_id": "F344",
+      "source_links": [
+        "https://pokepast.es/2e64ad31956f12fa"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1759686446779191518?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Brian's EUIC 2026 Top 64 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F771.txt",
+      "vgcpastes_id": "F771",
+      "source_links": [
+        "https://pokepast.es/3ccd6cdcde0ec705"
+      ],
+      "published_by": "Brian Youm",
+      "owner_source": "https://x.com/PlaymakerYoum/status/2022762649050607698?s=20",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Chen Ruijian's VR January Challenge Runner Up Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F617.txt",
+      "vgcpastes_id": "F617",
+      "source_links": [
+        "https://pokepast.es/733ca2358e6c233b"
+      ],
+      "published_by": "Chen Ruijian",
+      "owner_source": "https://x.com/RedsSnorlax143/status/2013539312391041066",
+      "event": "VR January Challenge"
+    },
+    {
+      "title": "Sebas' Curitiba Regional 2026 Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F884.txt",
+      "vgcpastes_id": "F884",
+      "source_links": [
+        "https://pokepast.es/82496dcbded9efab"
+      ],
+      "published_by": "Sebastián Escalante",
+      "owner_source": "https://x.com/sebastiannesc/status/2033335016822829396",
+      "event": "Curitiba Regional"
+    },
+    {
+      "title": "PlebDoctor's Latias Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F65.txt",
+      "vgcpastes_id": "F65",
+      "source_links": [
+        "https://pokepast.es/585a6d990b56c790"
+      ],
+      "published_by": "PlebDoctor",
+      "owner_source": "https://discord.com/channels/958296048227471360/1189469456645230682/1192276714810773524",
+      "event": "Discord"
+    },
+    {
+      "title": "anboxing's Global Challenge I Top 10000 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F228.txt",
+      "vgcpastes_id": "F228",
+      "source_links": [
+        "https://pokepast.es/0a185e3eb4c82da5"
+      ],
+      "published_by": "anboxing",
+      "owner_source": "https://twitter.com/anboxing11/status/1754484864600916332",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "sconet's Milotic Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F198.txt",
+      "vgcpastes_id": "F198",
+      "source_links": [
+        "https://pokepast.es/e0d6651c36534fa0"
+      ],
+      "published_by": "sconet",
+      "owner_source": "Discord Submission",
+      "event": "Discord"
+    },
+    {
+      "title": "hamanvgc's 2026 Grand Challenge IV 214th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F594.txt",
+      "vgcpastes_id": "F594",
+      "source_links": [
+        "https://pokepast.es/f819131f1cdb1979"
+      ],
+      "published_by": "hamanvgc",
+      "owner_source": "https://x.com/hamanvgc/status/2010781116702331344?s=46",
+      "event": "2026 Grand Challenge IV"
+    },
+    {
+      "title": "Conner's Ursaluna-Bloodmoon Tailroom Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F579.txt",
+      "vgcpastes_id": "F579",
+      "source_links": [
+        "https://pokepast.es/40ef70c48f13839e"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "Conner's Ogerpon-Hearthflame Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F572.txt",
+      "vgcpastes_id": "F572",
+      "source_links": [
+        "https://pokepast.es/789daaf7e305b876"
+      ],
+      "published_by": "Conner P.",
+      "owner_source": "https://x.com/conner138382472/status/2007241420923646249?s=46",
+      "event": "Tweet"
+    },
+    {
+      "title": "xibolun2's Vietnamese Grassroots Tour Top 4 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F710.txt",
+      "vgcpastes_id": "F710",
+      "source_links": [
+        "https://pokepast.es/8ceb8de9b0ecd4a9"
+      ],
+      "published_by": "xibolun2",
+      "owner_source": "https://x.com/xibolun2/status/2020535865353916631?s=46",
+      "event": "Paldea Last Dance Vietnamese Grassroots"
+    },
+    {
+      "title": "SaxmasterProductions' Furret Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F390.txt",
+      "vgcpastes_id": "F390",
+      "source_links": [
+        "https://pokepast.es/11091fc2da7523e3"
+      ],
+      "published_by": "Matt Deeds",
+      "owner_source": "https://twitter.com/sopranosax4444/status/1762238998821347834?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "PsychoR&R's Moltres Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F683.txt",
+      "vgcpastes_id": "F683",
+      "source_links": [
+        "https://pokepast.es/49655e3be2a42699"
+      ],
+      "published_by": "PsychoR&R",
+      "owner_source": "https://x.com/psyr_r/status/2018387319678755192?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Araquanid Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F169.txt",
+      "vgcpastes_id": "F169",
+      "source_links": [
+        "https://pokepast.es/16d908ad8c16a6f7"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "owner_source": "https://twitter.com/jaylun44/status/1747047041291927864?t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "Tweet"
+    },
+    {
+      "title": "squishvgc's FlorTour Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F354.txt",
+      "vgcpastes_id": "F354",
+      "source_links": [
+        "https://pokepast.es/ffeb7b3d63b95aeb"
+      ],
+      "published_by": "squishvgc",
+      "owner_source": "https://twitter.com/squishisquashi/status/1757580657998328033?s=46&t=WmXEnVa3rTSw0P9A0n6S3Q",
+      "event": "FlorTour"
+    },
+    {
+      "title": "Zach Knight's Seattle Regional 2026 Top 128 Team",
+      "file": "data/team_pools/gen9vgc2026regf_expanded/teams/F818.txt",
+      "vgcpastes_id": "F818",
+      "source_links": [
+        "https://pokepast.es/49a82ac57fde070a"
+      ],
+      "published_by": "Zach Knight",
+      "owner_source": "https://x.com/gworfvgc/status/2028590553198407739?s=46",
+      "event": "Seattle Regional 2026"
+    }
+  ],
+  "generated": []
+}

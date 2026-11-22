@@ -1,18 +1,82 @@
 """Converts a poke-env DoubleBattle into the tensor dict the model expects."""
 
+from collections import OrderedDict
+from functools import lru_cache
+
 import numpy as np
-from poke_env.battle import DoubleBattle, Effect, Field, Pokemon, SideCondition, Status, Weather
+from poke_env.battle import (
+    DoubleBattle,
+    Effect,
+    Field,
+    Pokemon,
+    PublicBattleEventKind,
+    SideCondition,
+    Status,
+    Weather,
+)
+from poke_env.data import GenData
+from poke_env.data.normalize import to_id_str
+from poke_env.teambuilder import TeambuilderPokemon
+from poke_env.teambuilder.teambuilder import Teambuilder
 
-from ..data import GameData, UNKNOWN_IDX
+from ..data import GameData, NUM_MOVE_SCOPES, UNKNOWN_IDX
+from .actions import (
+    INTENT_MOVE,
+    INTENT_SWITCH,
+    SemanticActionIntent,
+    TARGET_ALLY,
+    TARGET_NONE,
+    TARGET_OPPONENT_1,
+    TARGET_OPPONENT_2,
+    TARGET_SELF,
+    own_request_team,
+    request_move_slot,
+)
 
 
-# Continuous features per pokemon: hp(1) + status_one_hot(7) + stat_stages(7)
-# + volatiles(16) + move_pp(4) = 35 total. Must match PokemonEncoder continuous_dim.
-CONTINUOUS_DIM = 35
+NUM_STATUS = 7
+NUM_BOOSTS = 7
+NUM_MOVE_SLOTS = 4
+_NON_HP_STATS = ("atk", "def", "spa", "spd", "spe")
+NUM_EXTRA_POKEMON_FEATURES = 10 + 1 + len(_NON_HP_STATS)
 
-# Volatile effects to track as binary flags.
-# Each entry is either a single Effect or a frozenset of Effects (any match = True).
-# Perish song is tracked as any of PERISH0/1/2/3 (countdown from 3 to 0).
+WEATHER_TYPES = [
+    Weather.SUNNYDAY,
+    Weather.DESOLATELAND,
+    Weather.RAINDANCE,
+    Weather.PRIMORDIALSEA,
+    Weather.SANDSTORM,
+    Weather.HAIL,
+    Weather.SNOW,
+    Weather.DELTASTREAM,
+]
+TERRAIN_TYPES = [
+    Field.ELECTRIC_TERRAIN,
+    Field.GRASSY_TERRAIN,
+    Field.MISTY_TERRAIN,
+    Field.PSYCHIC_TERRAIN,
+]
+FIELD_TIMER_CAPS = {
+    "weather": 8,
+    "terrain": 8,
+    "screen": 8,
+    "tailwind": 4,
+    "trick_room": 5,
+    "turn": 20,
+}
+
+PROTECT_COUNTER_CAP = 4
+STATUS_COUNTER_CAP = 8
+ACTIVE_TURNS_CAP = 6
+
+# Volatile effects to track. All are binary except the ordered Perish countdown.
+_PERISH_COUNTS = {
+    Effect.PERISH0: 0,
+    Effect.PERISH1: 1,
+    Effect.PERISH2: 2,
+    Effect.PERISH3: 3,
+}
+PERISH_EFFECTS = frozenset(_PERISH_COUNTS)
 VOLATILES: list = [
     Effect.CONFUSION,
     Effect.SUBSTITUTE,
@@ -22,7 +86,7 @@ VOLATILES: list = [
     Effect.TORMENT,
     Effect.DISABLE,
     Effect.YAWN,
-    frozenset({Effect.PERISH0, Effect.PERISH1, Effect.PERISH2, Effect.PERISH3}),
+    PERISH_EFFECTS,
     Effect.PROTECT,
     Effect.ENDURE,
     Effect.FOCUS_ENERGY,
@@ -32,18 +96,164 @@ VOLATILES: list = [
     Effect.FLASH_FIRE,
 ]
 NUM_VOLATILES = len(VOLATILES)
+PERISH_VOLATILE_INDEX = VOLATILES.index(PERISH_EFFECTS)
 
 # Status conditions for one-hot encoding
-STATUS_LIST = [None, Status.BRN, Status.FRZ, Status.PAR, Status.PSN, Status.SLP, Status.TOX]
+STATUS_LIST = [
+    None,
+    Status.BRN,
+    Status.FRZ,
+    Status.PAR,
+    Status.PSN,
+    Status.SLP,
+    Status.TOX,
+]
+_STATUS_INDICES = {status: index for index, status in enumerate(STATUS_LIST)}
+_BOOST_NAMES = ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
+_NEUTRAL_BOOSTS = dict.fromkeys(_BOOST_NAMES, 0)
+_VOLATILE_INDICES = {
+    effect: index
+    for index, volatile in enumerate(VOLATILES)
+    for effect in (volatile if isinstance(volatile, frozenset) else (volatile,))
+}
+
+HP_OFFSET = 0
+STATUS_OFFSET = HP_OFFSET + 1
+BOOSTS_OFFSET = STATUS_OFFSET + NUM_STATUS
+VOLATILES_OFFSET = BOOSTS_OFFSET + NUM_BOOSTS
+MOVE_PP_OFFSET = VOLATILES_OFFSET + NUM_VOLATILES
+EXTRA_FEATURES_OFFSET = MOVE_PP_OFFSET + NUM_MOVE_SLOTS
+
+PROTECT_COUNTER_OFFSET = EXTRA_FEATURES_OFFSET + 0
+STATUS_COUNTER_OFFSET = EXTRA_FEATURES_OFFSET + 1
+FIRST_TURN_OFFSET = EXTRA_FEATURES_OFFSET + 2
+REVEALED_OFFSET = EXTRA_FEATURES_OFFSET + 3
+KNOWN_MOVE_COUNT_OFFSET = EXTRA_FEATURES_OFFSET + 4
+ABILITY_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 5
+ITEM_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 6
+TERA_KNOWN_OFFSET = EXTRA_FEATURES_OFFSET + 7
+TERASTALLIZED_OFFSET = EXTRA_FEATURES_OFFSET + 8
+ACTIVE_TURNS_OFFSET = EXTRA_FEATURES_OFFSET + 9
+OWN_STATS_OFFSET = EXTRA_FEATURES_OFFSET + 10
+
+# Continuous features per pokemon:
+# hp(1) + status_one_hot(7) + stat_stages(7) + volatiles(16) + move_pp(4)
+# + legal state/history features(10) + the owner's unboosted battle stats(6).
+# Must match PokemonEncoder continuous_dim.
+CONTINUOUS_DIM = EXTRA_FEATURES_OFFSET + NUM_EXTRA_POKEMON_FEATURES
+
+FIELD_WEATHER_OFFSET = 0
+FIELD_TERRAIN_OFFSET = 10
+FIELD_OWN_SIDE_OFFSET = 16
+FIELD_OPP_SIDE_OFFSET = 24
+FIELD_TRICK_ROOM_OFFSET = 32
+FIELD_USED_TERA_OFFSET = 33
+FIELD_OPPONENT_USED_TERA_OFFSET = 34
+FIELD_TURN_OFFSET = 35
 
 # Role indices
 ROLE_ACTIVE_1 = 0
 ROLE_ACTIVE_2 = 1
 ROLE_BENCH = 2
+_ILLUSION_SPECIES = frozenset(("zoroark", "zoroarkhisui"))
+_IVY_CUDGEL_TYPES = {
+    "ogerponwellspring": "water",
+    "ogerponhearthflame": "fire",
+    "ogerponcornerstone": "rock",
+}
 
-assert 1 + 7 + 7 + NUM_VOLATILES + 4 == CONTINUOUS_DIM, (
+MAX_RECENT_EVENTS = 12
+EVENT_PAD = 0
+EVENT_KIND_TO_INDEX = {
+    PublicBattleEventKind.MOVE: 1,
+    PublicBattleEventKind.SWITCH: 2,
+    PublicBattleEventKind.DRAG: 3,
+    PublicBattleEventKind.CANT: 4,
+    PublicBattleEventKind.FAINT: 5,
+    PublicBattleEventKind.TERA: 6,
+}
+NUM_EVENT_KINDS = 7
+POSITION_UNKNOWN = 0
+POSITION_OWN_1 = 1
+POSITION_OWN_2 = 2
+POSITION_OPP_1 = 3
+POSITION_OPP_2 = 4
+POSITION_IMPLICIT = 5
+NUM_EVENT_POSITIONS = 6
+EVENT_FLAG_FAILED = 0
+EVENT_FLAG_MISSED = 1
+EVENT_FLAG_SPREAD = 2
+EVENT_FLAG_ACTION_FAILED = 3
+EVENT_FLAG_NO_TARGET = 4
+NUM_PUBLIC_EVENT_FLAGS = 5
+
+NUM_PUBLIC_TARGET_POSITIONS = 4
+TARGET_OUTCOME_PRESENT = 0
+TARGET_OUTCOME_MISSED = 1
+TARGET_OUTCOME_IMMUNE = 2
+TARGET_OUTCOME_BLOCKED = 3
+TARGET_OUTCOME_FAILED = 4
+TARGET_OUTCOME_PROTECTED = 5
+TARGET_OUTCOME_HIT_COUNT = 6
+TARGET_OUTCOME_DECLARED = 7
+NUM_TARGET_OUTCOME_FEATURES = 8
+
+# Slot-aligned public mechanic summary.  Public positions are always ordered as
+# own 1, own 2, opponent 1, opponent 2.  The full ordered event segment remains
+# available separately; this summary gives the current policy a direct binding
+# between the active entity and the last public resolution at its position.
+ACTIVE_MECHANICS_PRESENT = 0
+ACTIVE_MECHANICS_FIRST_TURN = 1
+ACTIVE_MECHANICS_PROTECT_CHAIN = 2
+ACTIVE_MECHANICS_ACTIVE_TURNS = 3
+ACTIVE_MECHANICS_ENTERED = 4
+ACTIVE_MECHANICS_TERA_EVENT = 5
+ACTIVE_MECHANICS_RESOLUTION_OFFSET = 6
+ACTIVE_RESOLUTION_NONE = 0
+ACTIVE_RESOLUTION_MOVE = 1
+ACTIVE_RESOLUTION_CANT = 2
+ACTIVE_RESOLUTION_SWITCH = 3
+ACTIVE_RESOLUTION_FAINT = 4
+NUM_ACTIVE_RESOLUTION_CLASSES = 5
+ACTIVE_MECHANICS_FAILED = 11
+ACTIVE_MECHANICS_MISSED = 12
+ACTIVE_MECHANICS_IMMUNE = 13
+ACTIVE_MECHANICS_PROTECTED = 14
+ACTIVE_MECHANICS_BLOCKED = 15
+ACTIVE_MECHANICS_HIT = 16
+ACTIVE_MECHANICS_FEATURE_DIM = 17
+
+_PROTECTION_ACTIVATION_IDS = frozenset(
+    {
+        "banefulbunker",
+        "burningbulwark",
+        "craftyshield",
+        "detect",
+        "kingsshield",
+        "matblock",
+        "maxguard",
+        "obstruct",
+        "protect",
+        "quickguard",
+        "silktrap",
+        "spikyshield",
+        "wideguard",
+    }
+)
+
+assert (
+    1
+    + NUM_STATUS
+    + NUM_BOOSTS
+    + NUM_VOLATILES
+    + NUM_MOVE_SLOTS
+    + NUM_EXTRA_POKEMON_FEATURES
+    == CONTINUOUS_DIM
+), (
     f"CONTINUOUS_DIM={CONTINUOUS_DIM} does not match the actual feature count "
-    f"(1 + 7 + 7 + {NUM_VOLATILES} + 4 = {1 + 7 + 7 + NUM_VOLATILES + 4}). "
+    "(1 + "
+    f"{NUM_STATUS} + {NUM_BOOSTS} + {NUM_VOLATILES} + {NUM_MOVE_SLOTS} + {NUM_EXTRA_POKEMON_FEATURES}"
+    f" = {1 + NUM_STATUS + NUM_BOOSTS + NUM_VOLATILES + NUM_MOVE_SLOTS + NUM_EXTRA_POKEMON_FEATURES}). "
     "Update CONTINUOUS_DIM or the feature list."
 )
 
@@ -54,71 +264,550 @@ class ObservationBuilder:
     def __init__(self, game_data: GameData, team_size: int = 6):
         self.gd = game_data
         self.team_size = team_size
+        self._move_target_scopes = game_data.move_target_scope_vector()
+        self._move_types = game_data.move_type_indices()
+        self._move_categories = game_data.move_category_indices()
+        if np.any(
+            (self._move_target_scopes < 0)
+            | (self._move_target_scopes >= NUM_MOVE_SCOPES)
+        ):
+            raise ValueError("Move target scope metadata contains an invalid class.")
 
-    def build(self, battle: DoubleBattle) -> dict[str, np.ndarray]:
-        """Convert a battle state to a dict of numpy arrays.
-
-        All arrays have no batch dimension (added by the env wrapper / collation).
-        """
+    def build(
+        self,
+        battle: DoubleBattle,
+        previous_intent: SemanticActionIntent | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Convert a battle state to a dict of numpy arrays."""
         obs = {}
 
-        # Own team
-        own_pokemon = self._ordered_team(battle, own=True)
-        own_active_slots = self._active_slot_map(battle, own=True)
-        self._encode_team(own_pokemon, own_active_slots, obs, prefix="own", full_info=True)
+        own_pokemon, own_roles, own_active_indices, own_active_present = (
+            self._ordered_team_with_roles(battle, own=True)
+        )
+        self._encode_team(own_pokemon, own_roles, obs, prefix="own", full_info=True)
+        obs["own_request_moves"], obs["own_request_move_metadata"] = (
+            self._encode_own_request_moves(battle)
+        )
 
-        # Opponent team
-        opp_pokemon = self._ordered_team(battle, own=False)
-        opp_active_slots = self._active_slot_map(battle, own=False)
-        self._encode_team(opp_pokemon, opp_active_slots, obs, prefix="opp", full_info=False)
-
-        # Field conditions
-        obs["field"] = self._encode_field(battle)
-
-        # Which own slots are active (indices into the team array)
-        obs["own_active_indices"] = np.array(
-            [self._find_active_index(own_pokemon, battle.active_pokemon[s]) for s in range(2)],
+        opponent_team, opponent_source_lookup = self._public_opponent_team(battle)
+        opp_pokemon, opp_roles, opp_active_indices, opp_active_present = (
+            self._ordered_team_with_roles(
+                battle,
+                own=False,
+                team_override=opponent_team,
+            )
+        )
+        self._encode_team(opp_pokemon, opp_roles, obs, prefix="opp", full_info=False)
+        obs["opp_source_index"] = np.asarray(
+            [
+                opponent_source_lookup.get(id(pokemon), -1)
+                if pokemon is not None
+                else -1
+                for pokemon in opp_pokemon
+            ],
             dtype=np.int64,
         )
 
+        obs["field"] = self._encode_field(battle)
+        obs["own_active_indices"] = own_active_indices
+        obs["own_active_present"] = own_active_present
+        obs["opp_active_indices"] = opp_active_indices
+        obs["opp_active_present"] = opp_active_present
+        self._encode_transition_history(battle, previous_intent, obs)
+        self._encode_active_mechanics(obs)
         return obs
+
+    def _encode_own_request_moves(
+        self, battle: DoubleBattle
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Encode the ID, current type and damage category of each request move."""
+        available_moves = battle.available_moves
+        if len(available_moves) != 2:
+            raise RuntimeError(
+                "A doubles battle must expose available moves for exactly two active slots."
+            )
+
+        encoded = np.zeros((2, NUM_MOVE_SLOTS), dtype=np.int64)
+        metadata = np.zeros((2, NUM_MOVE_SLOTS, 2), dtype=np.int64)
+        # BattleStream retains the last request after a win or loss. A terminal
+        # observation has no pending move choices, even if those lists are full.
+        if getattr(battle, "finished", False):
+            return encoded, metadata
+        for active_slot, (actor, slot_moves) in enumerate(
+            zip(battle.active_pokemon, available_moves, strict=True)
+        ):
+            if actor is None:
+                continue
+            occupied_slots: set[int] = set()
+            for move in slot_moves:
+                move_slot = request_move_slot(move, active_slot=active_slot)
+                if move_slot in occupied_slots:
+                    raise RuntimeError(
+                        f"Two available moves for active slot {active_slot} share "
+                        f"Showdown request index {move_slot + 1}."
+                    )
+                occupied_slots.add(move_slot)
+                move_id = self._move_idx(move.id)
+                encoded[active_slot, move_slot] = move_id
+                move_type = self._move_types[move_id]
+                category = self._move_categories[move_id]
+                if move.id == "ivycudgel":
+                    species = actor.species
+                    element = _IVY_CUDGEL_TYPES.get(
+                        species.removesuffix("tera"), "grass"
+                    )
+                    move_type = self.gd.type_to_idx[element]
+                elif move.id == "terablast" and actor.is_terastallized:
+                    move_type = self.gd.type_to_idx[actor.tera_type.name.lower()]
+                    if self._boosted_stat(actor, "atk") > self._boosted_stat(
+                        actor, "spa"
+                    ):
+                        category = 1  # Physical
+                metadata[active_slot, move_slot] = move_type, category
+        return encoded, metadata
+
+    @staticmethod
+    def _boosted_stat(pokemon: Pokemon, stat: str) -> int:
+        stage = pokemon.boosts[stat]
+        return pokemon.stats[stat] * (2 + max(stage, 0)) // (2 - min(stage, 0))
+
+    @staticmethod
+    def _encode_active_mechanics(obs: dict[str, np.ndarray]) -> None:
+        """Build an exact current-slot shortcut from public state and events."""
+
+        features = np.zeros(
+            (NUM_PUBLIC_TARGET_POSITIONS, ACTIVE_MECHANICS_FEATURE_DIM),
+            dtype=np.float32,
+        )
+        features[
+            :,
+            ACTIVE_MECHANICS_RESOLUTION_OFFSET + ACTIVE_RESOLUTION_NONE,
+        ] = 1.0
+        last_move = np.zeros(NUM_PUBLIC_TARGET_POSITIONS, dtype=np.int64)
+
+        for side_offset, prefix in ((0, "own"), (2, "opp")):
+            active_indices = obs[f"{prefix}_active_indices"]
+            active_present = obs[f"{prefix}_active_present"]
+            continuous = obs[f"{prefix}_continuous"]
+            for active_slot in range(2):
+                public_slot = side_offset + active_slot
+                present = bool(active_present[active_slot])
+                features[public_slot, ACTIVE_MECHANICS_PRESENT] = float(present)
+                if not present:
+                    continue
+                team_index = int(active_indices[active_slot])
+                if not 0 <= team_index < continuous.shape[0]:
+                    continue
+                current = continuous[team_index]
+                features[public_slot, ACTIVE_MECHANICS_FIRST_TURN] = current[
+                    FIRST_TURN_OFFSET
+                ]
+                features[public_slot, ACTIVE_MECHANICS_PROTECT_CHAIN] = current[
+                    PROTECT_COUNTER_OFFSET
+                ]
+                features[public_slot, ACTIVE_MECHANICS_ACTIVE_TURNS] = current[
+                    ACTIVE_TURNS_OFFSET
+                ]
+
+        # poke-env retains the first MAX_RECENT_EVENTS entries when a segment
+        # overflows, so the tail that determines the final slot resolution is
+        # unknown. Partial segments are likewise not exact. In either case the
+        # shortcut exposes only live public mechanics; the ordinary event
+        # encoder still receives the retained history and overflow metadata.
+        event_meta = obs["recent_event_meta"]
+        if event_meta[0] <= 0.0 or event_meta[1] > 0.0 or event_meta[2] > 0.0:
+            obs["active_mechanics"] = features
+            obs["active_mechanics_move"] = last_move
+            return
+
+        def set_resolution(public_slot: int, resolution: int) -> None:
+            start = ACTIVE_MECHANICS_RESOLUTION_OFFSET
+            features[public_slot, start : start + NUM_ACTIVE_RESOLUTION_CLASSES] = 0.0
+            features[public_slot, start + resolution] = 1.0
+
+        def clear_entity_events(public_slot: int) -> None:
+            last_move[public_slot] = UNKNOWN_IDX
+            features[public_slot, ACTIVE_MECHANICS_TERA_EVENT] = 0.0
+            features[
+                public_slot,
+                ACTIVE_MECHANICS_FAILED : ACTIVE_MECHANICS_HIT + 1,
+            ] = 0.0
+
+        target_outcomes = obs["recent_event_target_outcomes"].any(axis=1)
+        for event_index in range(obs["recent_event_kind"].shape[0]):
+            if obs["recent_event_mask"][event_index]:
+                continue
+            public_position = int(obs["recent_event_actor"][event_index])
+            if not 1 <= public_position <= NUM_PUBLIC_TARGET_POSITIONS:
+                continue
+            public_slot = public_position - 1
+            kind = int(obs["recent_event_kind"][event_index])
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.TERA]:
+                features[public_slot, ACTIVE_MECHANICS_TERA_EVENT] = 1.0
+                continue
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.MOVE]:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_MOVE)
+                last_move[public_slot] = obs["recent_event_move"][event_index]
+                flags = obs["recent_event_flags"][event_index]
+                outcomes = target_outcomes[event_index]
+                failed = bool(
+                    flags[EVENT_FLAG_FAILED]
+                    or flags[EVENT_FLAG_ACTION_FAILED]
+                    or flags[EVENT_FLAG_NO_TARGET]
+                    or outcomes[TARGET_OUTCOME_FAILED]
+                )
+                missed = bool(
+                    flags[EVENT_FLAG_MISSED] or outcomes[TARGET_OUTCOME_MISSED]
+                )
+                immune = outcomes[TARGET_OUTCOME_IMMUNE]
+                protected = outcomes[TARGET_OUTCOME_PROTECTED]
+                blocked = outcomes[TARGET_OUTCOME_BLOCKED]
+                hit = outcomes[TARGET_OUTCOME_PRESENT] and not (
+                    failed or missed or immune or protected or blocked
+                )
+                features[
+                    public_slot, ACTIVE_MECHANICS_FAILED : ACTIVE_MECHANICS_HIT + 1
+                ] = (failed, missed, immune, protected, blocked, hit)
+                continue
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.CANT]:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_CANT)
+                continue
+            if kind in {
+                EVENT_KIND_TO_INDEX[PublicBattleEventKind.SWITCH],
+                EVENT_KIND_TO_INDEX[PublicBattleEventKind.DRAG],
+            }:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_SWITCH)
+                clear_entity_events(public_slot)
+                features[public_slot, ACTIVE_MECHANICS_ENTERED] = 1.0
+                continue
+            if kind == EVENT_KIND_TO_INDEX[PublicBattleEventKind.FAINT]:
+                set_resolution(public_slot, ACTIVE_RESOLUTION_FAINT)
+                clear_entity_events(public_slot)
+                features[public_slot, ACTIVE_MECHANICS_ENTERED] = 0.0
+
+        obs["active_mechanics"] = features
+        obs["active_mechanics_move"] = last_move
+
+    def _encode_transition_history(
+        self,
+        battle: DoubleBattle,
+        previous_intent: SemanticActionIntent | None,
+        obs: dict[str, np.ndarray],
+    ) -> None:
+        event_kind = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_actor = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_target = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_move = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_source_move = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_move_scope = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_species = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_tera_type = np.zeros(MAX_RECENT_EVENTS, dtype=np.int64)
+        event_flags = np.zeros(
+            (MAX_RECENT_EVENTS, NUM_PUBLIC_EVENT_FLAGS), dtype=np.float32
+        )
+        event_target_outcomes = np.zeros(
+            (
+                MAX_RECENT_EVENTS,
+                NUM_PUBLIC_TARGET_POSITIONS,
+                NUM_TARGET_OUTCOME_FEATURES,
+            ),
+            dtype=np.float32,
+        )
+        event_target_activation_move = np.zeros(
+            (MAX_RECENT_EVENTS, NUM_PUBLIC_TARGET_POSITIONS),
+            dtype=np.int64,
+        )
+        event_mask = np.ones(MAX_RECENT_EVENTS, dtype=bool)
+        event_meta = np.zeros(3, dtype=np.float32)
+
+        segment = getattr(battle, "recent_public_events", None)
+        if segment is not None and segment.valid:
+            player_role = getattr(battle, "player_role", None)
+            events = segment.events[:MAX_RECENT_EVENTS]
+            for index, event in enumerate(events):
+                event_kind[index] = EVENT_KIND_TO_INDEX[event.kind]
+                event_actor[index] = self._public_position(event.actor, player_role)
+                event_target[index] = self._public_position(event.target, player_role)
+                if event.move:
+                    event_move[index] = self.gd.move_to_idx.get(
+                        to_id_str(event.move), UNKNOWN_IDX
+                    )
+                    event_move_scope[index] = self._move_target_scopes[
+                        event_move[index]
+                    ]
+                source_effect = getattr(event, "source_effect", None)
+                if source_effect and str(source_effect).lower().startswith("move:"):
+                    event_source_move[index] = self.gd.move_to_idx.get(
+                        to_id_str(str(source_effect).split(":", 1)[1]),
+                        UNKNOWN_IDX,
+                    )
+                if (
+                    event.kind
+                    in {
+                        PublicBattleEventKind.SWITCH,
+                        PublicBattleEventKind.DRAG,
+                    }
+                    and event.details
+                ):
+                    switched = Pokemon(gen=self.gd.gen, details=event.details)
+                    event_species[index] = self._species_idx(switched)
+                if event.kind is PublicBattleEventKind.TERA and event.details:
+                    event_tera_type[index] = self.gd.type_to_idx.get(
+                        to_id_str(event.details), UNKNOWN_IDX
+                    )
+                event_flags[index] = (
+                    event.failed,
+                    event.missed,
+                    event.spread,
+                    getattr(event, "action_failed", False),
+                    getattr(event, "no_target", False),
+                )
+                for outcome in getattr(event, "target_outcomes", ()):
+                    position = self._public_position(outcome.target, player_role)
+                    if not 1 <= position <= NUM_PUBLIC_TARGET_POSITIONS:
+                        continue
+                    features = event_target_outcomes[index, position - 1]
+                    features[TARGET_OUTCOME_PRESENT] = 1.0
+                    features[TARGET_OUTCOME_MISSED] = float(outcome.missed)
+                    features[TARGET_OUTCOME_IMMUNE] = float(outcome.immune)
+                    features[TARGET_OUTCOME_BLOCKED] = float(
+                        outcome.blocked_by is not None
+                    )
+                    features[TARGET_OUTCOME_FAILED] = float(
+                        getattr(outcome, "failed", False)
+                        or outcome.failed_action is not None
+                    )
+                    features[TARGET_OUTCOME_PROTECTED] = float(
+                        any(
+                            self._is_protection_activation(activation)
+                            for activation in outcome.activations
+                        )
+                    )
+                    features[TARGET_OUTCOME_DECLARED] = float(
+                        getattr(outcome, "declared_on_move_line", False)
+                    )
+                    for activation in outcome.activations:
+                        effect = str(activation)
+                        if ":" not in effect:
+                            continue
+                        source_kind, source_name = effect.split(":", 1)
+                        if to_id_str(source_kind) != "move":
+                            continue
+                        event_target_activation_move[index, position - 1] = (
+                            self.gd.move_to_idx.get(
+                                to_id_str(source_name),
+                                UNKNOWN_IDX,
+                            )
+                        )
+                        break
+                    if outcome.hit_count is not None:
+                        features[TARGET_OUTCOME_HIT_COUNT] = (
+                            min(
+                                max(int(outcome.hit_count), 0),
+                                10,
+                            )
+                            / 10.0
+                        )
+                event_mask[index] = False
+            event_meta[:] = (
+                1.0,
+                float(segment.partial),
+                min(segment.overflow_count, MAX_RECENT_EVENTS)
+                / float(MAX_RECENT_EVENTS),
+            )
+
+        own_kind = np.zeros(2, dtype=np.int64)
+        own_move = np.zeros(2, dtype=np.int64)
+        own_target = np.zeros(2, dtype=np.int64)
+        own_switch_species = np.zeros(2, dtype=np.int64)
+        own_tera = np.zeros(2, dtype=bool)
+        own_valid = np.zeros(2, dtype=bool)
+        if previous_intent is not None:
+            for slot, intent in enumerate(previous_intent.slots):
+                own_kind[slot] = intent.kind
+                if intent.kind == INTENT_MOVE and intent.move_id:
+                    own_move[slot] = self.gd.move_to_idx.get(
+                        to_id_str(intent.move_id), UNKNOWN_IDX
+                    )
+                    own_target[slot] = self._intent_target_position(intent.target, slot)
+                elif intent.kind == INTENT_SWITCH and intent.switch_species:
+                    own_switch_species[slot] = self.gd.species_to_idx.get(
+                        to_id_str(intent.switch_species), UNKNOWN_IDX
+                    )
+                own_tera[slot] = intent.terastallize
+                own_valid[slot] = True
+
+        obs["recent_event_kind"] = event_kind
+        obs["recent_event_actor"] = event_actor
+        obs["recent_event_target"] = event_target
+        obs["recent_event_move"] = event_move
+        obs["recent_event_source_move"] = event_source_move
+        obs["recent_event_move_scope"] = event_move_scope
+        obs["recent_event_species"] = event_species
+        obs["recent_event_tera_type"] = event_tera_type
+        obs["recent_event_flags"] = event_flags
+        obs["recent_event_target_outcomes"] = event_target_outcomes
+        obs["recent_event_target_activation_move"] = event_target_activation_move
+        obs["recent_event_mask"] = event_mask
+        obs["recent_event_meta"] = event_meta
+        obs["prev_own_kind"] = own_kind
+        obs["prev_own_move"] = own_move
+        obs["prev_own_target"] = own_target
+        obs["prev_own_switch_species"] = own_switch_species
+        obs["prev_own_tera"] = own_tera
+        obs["prev_own_valid"] = own_valid
+
+    @staticmethod
+    def _public_position(identifier: str | None, player_role: str | None) -> int:
+        if not identifier or player_role not in {"p1", "p2"}:
+            return POSITION_UNKNOWN
+        prefix = identifier[:3]
+        if len(prefix) != 3 or prefix[:2] not in {"p1", "p2"}:
+            return POSITION_UNKNOWN
+        slot = prefix[2]
+        if slot not in {"a", "b"}:
+            return POSITION_UNKNOWN
+        own = prefix[:2] == player_role
+        if own:
+            return POSITION_OWN_1 if slot == "a" else POSITION_OWN_2
+        return POSITION_OPP_1 if slot == "a" else POSITION_OPP_2
+
+    @staticmethod
+    def _is_protection_activation(activation: str) -> bool:
+        effect = str(activation)
+        if ":" in effect:
+            effect = effect.split(":", 1)[1]
+        return to_id_str(effect) in _PROTECTION_ACTIVATION_IDS
+
+    @staticmethod
+    def _intent_target_position(target: int, actor_slot: int) -> int:
+        if target == TARGET_OPPONENT_1:
+            return POSITION_OPP_1
+        if target == TARGET_OPPONENT_2:
+            return POSITION_OPP_2
+        if target == TARGET_SELF:
+            return POSITION_OWN_1 if actor_slot == 0 else POSITION_OWN_2
+        if target == TARGET_ALLY:
+            return POSITION_OWN_2 if actor_slot == 0 else POSITION_OWN_1
+        if target == TARGET_NONE:
+            return POSITION_IMPLICIT
+        return POSITION_UNKNOWN
+
+    def _public_opponent_team(
+        self,
+        battle: DoubleBattle,
+    ) -> tuple[list[Pokemon], dict[int, int]]:
+        """Overlay public live state onto the immutable team-preview roster."""
+        live_team = list(battle.opponent_team.values())
+        preview_team = list(getattr(battle, "teampreview_opponent_team", ()) or ())[
+            : self.team_size
+        ]
+        if not preview_team:
+            return live_team, {
+                id(pokemon): index for index, pokemon in enumerate(live_team)
+            }
+
+        roster = list(preview_team)
+        source_lookup = {
+            id(pokemon): index for index, pokemon in enumerate(preview_team)
+        }
+        preview_object_ids = set(source_lookup)
+        preview_slots_by_species: dict[str, list[int]] = {}
+        for index, pokemon in enumerate(preview_team):
+            preview_slots_by_species.setdefault(
+                self._base_species_id(pokemon),
+                [],
+            ).append(index)
+
+        public_live_team = [
+            pokemon for pokemon in live_team if id(pokemon) not in preview_object_ids
+        ]
+        illusion_is_confirmed = any(
+            self._base_species_id(pokemon) in _ILLUSION_SPECIES
+            for pokemon in public_live_team
+        )
+        illusion_is_ambiguous = (
+            any(species in preview_slots_by_species for species in _ILLUSION_SPECIES)
+            and not illusion_is_confirmed
+        )
+
+        for pokemon in public_live_team:
+            species = self._base_species_id(pokemon)
+            candidate_slots = preview_slots_by_species.get(species, ())
+            if len(candidate_slots) != 1:
+                source_lookup[id(pokemon)] = -1
+                continue
+            source_index = candidate_slots[0]
+            roster[source_index] = pokemon
+            source_lookup[id(pokemon)] = (
+                -1
+                if illusion_is_ambiguous and species not in _ILLUSION_SPECIES
+                else source_index
+            )
+
+        return roster, source_lookup
+
+    @staticmethod
+    def _base_species_id(pokemon: Pokemon) -> str:
+        return to_id_str(getattr(pokemon, "base_species", pokemon.species))
 
     def _encode_team(
         self,
         pokemon_list: list[Pokemon | None],
-        active_map: dict,
+        roles: np.ndarray,
         obs: dict,
         prefix: str,
         full_info: bool,
-    ):
+    ) -> None:
         """Encode a team into arrays."""
         ts = self.team_size
         species = np.zeros(ts, dtype=np.int64)
         moves = np.zeros((ts, 4), dtype=np.int64)
+        last_move = np.zeros(ts, dtype=np.int64)
         ability = np.zeros(ts, dtype=np.int64)
         item = np.zeros(ts, dtype=np.int64)
-        types = np.zeros((ts, 3), dtype=np.int64)  # type_1, type_2, tera_type
+        types = np.zeros((ts, 3), dtype=np.int64)
         continuous = np.zeros((ts, CONTINUOUS_DIM), dtype=np.float32)
-        roles = np.full(ts, ROLE_BENCH, dtype=np.int64)
-        mask = np.ones(ts, dtype=bool)  # True = padding
+        mask = np.ones(ts, dtype=bool)
 
-        for i, pokemon in enumerate(pokemon_list):
-            if pokemon is None or i >= ts:
+        for index, pokemon in enumerate(pokemon_list):
+            if pokemon is None or index >= ts:
                 break
-            mask[i] = False
-            species[i] = self._species_idx(pokemon)
-            moves[i] = self._move_indices(pokemon)
-            ability[i] = self._ability_idx(pokemon)
-            item[i] = self._item_idx(pokemon)
-            types[i] = self._type_indices(pokemon)
-            continuous[i] = self._continuous_features(pokemon, full_info)
-
-            # Role
-            if pokemon in active_map:
-                roles[i] = active_map[pokemon]
+            pokemon_moves = pokemon.moves or {}
+            ability_value = pokemon.ability
+            item_value = pokemon.item
+            last_move_value = pokemon.last_move
+            mask[index] = False
+            species[index] = self._species_idx(pokemon)
+            ability[index] = self._ability_idx(ability_value)
+            item[index] = self._item_idx(item_value)
+            last_move[index] = self._move_idx(
+                last_move_value.id if last_move_value is not None else None
+            )
+            self._fill_type_indices(types[index], pokemon)
+            self._fill_continuous_features(
+                continuous[index],
+                pokemon,
+                pokemon_moves,
+                ability_value,
+                item_value,
+            )
+            if prefix == "own":
+                stats = pokemon.stats
+                continuous[index, OWN_STATS_OFFSET:] = (
+                    pokemon.max_hp / 256,
+                    *(stats[stat] / 256 for stat in _NON_HP_STATS),
+                )
+            self._fill_move_features(
+                moves[index],
+                continuous[index, MOVE_PP_OFFSET : MOVE_PP_OFFSET + NUM_MOVE_SLOTS],
+                pokemon_moves,
+                full_info,
+            )
 
         obs[f"{prefix}_species"] = species
         obs[f"{prefix}_moves"] = moves
+        obs[f"{prefix}_last_move"] = last_move
         obs[f"{prefix}_ability"] = ability
         obs[f"{prefix}_item"] = item
         obs[f"{prefix}_types"] = types
@@ -127,199 +816,583 @@ class ObservationBuilder:
         obs[f"{prefix}_mask"] = mask
 
     def _species_idx(self, pokemon: Pokemon) -> int:
-        key = pokemon.species.lower() if pokemon.species else "<unk>"
+        species = pokemon.species
+        key = species.lower() if species else "<unk>"
         return self.gd.species_to_idx.get(key, UNKNOWN_IDX)
 
-    def _move_indices(self, pokemon: Pokemon) -> np.ndarray:
-        # poke-env tracks only revealed moves for the opponent; zeros = unknown
-        indices = np.zeros(4, dtype=np.int64)
-        known_moves = list(pokemon.moves.values()) if pokemon.moves else []
-        for j, move in enumerate(known_moves[:4]):
-            key = move.id.lower() if move.id else "<unk>"
-            indices[j] = self.gd.move_to_idx.get(key, UNKNOWN_IDX)
-        return indices
+    def _move_idx(self, move_id: str | None) -> int:
+        key = move_id.lower() if move_id else "<unk>"
+        return self.gd.move_to_idx.get(key, UNKNOWN_IDX)
 
-    def _ability_idx(self, pokemon: Pokemon) -> int:
-        # poke-env fills in the ability once it is revealed; None = still unknown
-        ab = pokemon.ability
-        if ab is None:
+    def _ability_idx(self, ability: str | None) -> int:
+        if ability is None:
             return UNKNOWN_IDX
-        return self.gd.abilities_to_idx.get(ab.lower(), UNKNOWN_IDX)
+        return self.gd.abilities_to_idx.get(to_id_str(ability), UNKNOWN_IDX)
 
-    def _item_idx(self, pokemon: Pokemon) -> int:
-        # poke-env fills in the item once it is revealed; None/empty = still unknown
-        it = pokemon.item
-        if it is None or it == "":
+    def _item_idx(self, item: str | None) -> int:
+        if item in (None, "", GenData.UNKNOWN_ITEM):
             return UNKNOWN_IDX
-        return self.gd.item_index(it)
+        return self.gd.item_index(item)
 
-    def _type_indices(self, pokemon: Pokemon) -> np.ndarray:
-        indices = np.zeros(3, dtype=np.int64)
-        if pokemon.type_1:
-            indices[0] = self.gd.type_to_idx.get(pokemon.type_1.name.lower(), UNKNOWN_IDX)
-        if pokemon.type_2:
-            indices[1] = self.gd.type_to_idx.get(pokemon.type_2.name.lower(), UNKNOWN_IDX)
-        if pokemon.tera_type:
-            indices[2] = self.gd.type_to_idx.get(pokemon.tera_type.name.lower(), UNKNOWN_IDX)
-        return indices
+    def _fill_type_indices(self, indices: np.ndarray, pokemon: Pokemon) -> None:
+        # The matchup head derives defensive typing from these and the Tera flag.
+        # STAB still uses the original types after Terastallization.
+        for slot, base_type in enumerate(pokemon.base_types[:2]):
+            indices[slot] = self.gd.type_to_idx.get(base_type.name.lower(), UNKNOWN_IDX)
+        tera_type = pokemon.tera_type
+        if tera_type:
+            indices[2] = self.gd.type_to_idx.get(tera_type.name.lower(), UNKNOWN_IDX)
 
-    def _continuous_features(self, pokemon: Pokemon, full_info: bool) -> np.ndarray:
-        feats = np.zeros(CONTINUOUS_DIM, dtype=np.float32)
-        offset = 0
-
-        # HP (normalized)
-        if pokemon.max_hp and pokemon.max_hp > 0:
-            feats[offset] = pokemon.current_hp / pokemon.max_hp
-        elif pokemon.current_hp_fraction is not None:
-            feats[offset] = pokemon.current_hp_fraction
-        offset += 1
-
-        # Status one-hot (7)
-        for j, status in enumerate(STATUS_LIST):
-            if pokemon.status == status:
-                feats[offset + j] = 1.0
+    def _fill_move_features(
+        self,
+        move_indices: np.ndarray,
+        pp_features: np.ndarray,
+        pokemon_moves: dict,
+        full_info: bool,
+    ) -> None:
+        # poke-env tracks only revealed moves for the opponent; zeros = unknown.
+        for move_index, move in enumerate(pokemon_moves.values()):
+            if move_index >= 4:
                 break
-        offset += 7
+            move_indices[move_index] = self._move_idx(move.id)
+            if full_info:
+                max_pp = move.max_pp
+                if max_pp > 0:
+                    pp_features[move_index] = move.current_pp / max_pp
 
-        # Stat stages (7): atk, def, spa, spd, spe, accuracy, evasion, normalized to [-1, 1]
-        boosts = pokemon.boosts if pokemon.boosts else {}
-        for j, stat in enumerate(["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]):
-            feats[offset + j] = boosts.get(stat, 0) / 6.0
-        offset += 7
+    def _fill_continuous_features(
+        self,
+        feats: np.ndarray,
+        pokemon: Pokemon,
+        pokemon_moves: dict,
+        ability: str | None,
+        item: str | None,
+    ) -> None:
 
-        # Volatile statuses (NUM_VOLATILES binary flags)
-        effects = pokemon.effects  # Dict[Effect, int]
-        for j, vol in enumerate(VOLATILES):
-            if isinstance(vol, frozenset):
-                feats[offset + j] = float(any(e in effects for e in vol))
-            else:
-                feats[offset + j] = float(vol in effects)
-        offset += NUM_VOLATILES
-
-        # Move PP (4), normalized by max PP, only for own pokemon (full_info)
-        if full_info and pokemon.moves:
-            for j, move in enumerate(list(pokemon.moves.values())[:4]):
-                if move.max_pp and move.max_pp > 0:
-                    feats[offset + j] = move.current_pp / move.max_pp
-        offset += 4
-
-        return feats
-
-    def _ordered_team(self, battle: DoubleBattle, own: bool) -> list[Pokemon | None]:
-        """Get team as a list, active pokemon first, then bench."""
-        if own:
-            team = list(battle.team.values())
+        max_hp = pokemon.max_hp
+        if max_hp and max_hp > 0:
+            feats[HP_OFFSET] = pokemon.current_hp / max_hp
         else:
-            team = list(battle.opponent_team.values())
+            fraction = pokemon.current_hp_fraction
+            if fraction is not None:
+                feats[HP_OFFSET] = fraction
 
-        # Sort: active first, then bench, then pad with None
-        active_set = set()
-        for p in (battle.active_pokemon if own else battle.opponent_active_pokemon):
-            if p is not None:
-                active_set.add(p)
+        status_index = _STATUS_INDICES.get(pokemon.status)
+        if status_index is not None:
+            feats[STATUS_OFFSET + status_index] = 1.0
 
-        active = [p for p in team if p in active_set]
-        bench = [p for p in team if p not in active_set]
-        ordered = active + bench
+        boosts = pokemon.boosts
+        if boosts and boosts != _NEUTRAL_BOOSTS:
+            for index, stat in enumerate(_BOOST_NAMES):
+                feats[BOOSTS_OFFSET + index] = boosts.get(stat, 0) / 6.0
 
-        # Pad to team_size
+        perish_count: int | None = None
+        for effect in pokemon.effects:
+            effect_perish_count = _PERISH_COUNTS.get(effect)
+            if effect_perish_count is not None:
+                perish_count = (
+                    effect_perish_count
+                    if perish_count is None
+                    else min(perish_count, effect_perish_count)
+                )
+                continue
+            volatile_index = _VOLATILE_INDICES.get(effect)
+            if volatile_index is not None:
+                feats[VOLATILES_OFFSET + volatile_index] = 1.0
+
+        if perish_count is not None:
+            # poke-env retains earlier perishN effects as the countdown advances.
+            # The lowest public count is therefore the current one. Reserving zero
+            # for absence keeps all five states distinct in this existing scalar.
+            feats[VOLATILES_OFFSET + PERISH_VOLATILE_INDEX] = (perish_count + 1) / len(
+                _PERISH_COUNTS
+            )
+
+        feats[PROTECT_COUNTER_OFFSET] = self._normalized_counter(
+            pokemon.protect_counter, PROTECT_COUNTER_CAP
+        )
+        feats[STATUS_COUNTER_OFFSET] = self._normalized_counter(
+            pokemon.status_counter, STATUS_COUNTER_CAP
+        )
+        first_turn = pokemon.first_turn
+        feats[FIRST_TURN_OFFSET] = first_turn
+        feats[REVEALED_OFFSET] = pokemon.revealed
+        feats[KNOWN_MOVE_COUNT_OFFSET] = min(
+            len(pokemon_moves), NUM_MOVE_SLOTS
+        ) / float(NUM_MOVE_SLOTS)
+        feats[ABILITY_KNOWN_OFFSET] = ability is not None
+        feats[ITEM_KNOWN_OFFSET] = item not in (None, "", GenData.UNKNOWN_ITEM)
+        feats[TERA_KNOWN_OFFSET] = pokemon.tera_type is not None
+        feats[TERASTALLIZED_OFFSET] = pokemon.is_terastallized
+        feats[ACTIVE_TURNS_OFFSET] = self._normalized_counter(
+            getattr(pokemon, "active_turns", first_turn),
+            ACTIVE_TURNS_CAP,
+        )
+
+    def _ordered_team_with_roles(
+        self,
+        battle: DoubleBattle,
+        own: bool,
+        team_override: list[Pokemon] | None = None,
+    ) -> tuple[list[Pokemon | None], np.ndarray, np.ndarray, np.ndarray]:
+        """Return ordered team members plus role and active-index metadata."""
+        team = (
+            list(team_override)
+            if team_override is not None
+            else (
+                own_request_team(battle) if own else list(battle.opponent_team.values())
+            )
+        )
+        active_list = battle.active_pokemon if own else battle.opponent_active_pokemon
+        active_lookup = {
+            id(pokemon): slot
+            for slot, pokemon in enumerate(active_list)
+            if pokemon is not None
+        }
+
+        ordered: list[Pokemon | None] = []
+        roles = np.full(self.team_size, ROLE_BENCH, dtype=np.int64)
+        active_indices = np.zeros(2, dtype=np.int64)
+        active_present = np.zeros(2, dtype=bool)
+        ordered_ids: set[int] = set()
+
+        def append_active(pokemon: Pokemon, slot: int) -> None:
+            if len(ordered) >= self.team_size:
+                return
+            ordered.append(pokemon)
+            ordered_ids.add(id(pokemon))
+            ordered_index = len(ordered) - 1
+            roles[ordered_index] = ROLE_ACTIVE_1 if slot == 0 else ROLE_ACTIVE_2
+            active_indices[slot] = ordered_index
+            active_present[slot] = True
+
+        for pokemon in team:
+            slot = active_lookup.get(id(pokemon))
+            if slot is None:
+                continue
+            append_active(pokemon, slot)
+
+        if not own:
+            for slot, pokemon in enumerate(active_list):
+                if pokemon is not None and not active_present[slot]:
+                    append_active(pokemon, slot)
+
+        for pokemon in team:
+            if id(pokemon) in active_lookup or id(pokemon) in ordered_ids:
+                continue
+            if len(ordered) >= self.team_size:
+                break
+            ordered.append(pokemon)
+            ordered_ids.add(id(pokemon))
+
+        for slot, pokemon in enumerate(active_list):
+            if pokemon is not None and not active_present[slot]:
+                raise ValueError(
+                    f"Active pokemon {pokemon.species!r} was not found in the ordered team list. "
+                    "This indicates a mismatch between battle.active_pokemon and battle.team - "
+                    "check poke-env battle state tracking."
+                )
+
         while len(ordered) < self.team_size:
             ordered.append(None)
-        return ordered[:self.team_size]
-
-    def _active_slot_map(self, battle: DoubleBattle, own: bool) -> dict:
-        """Map active pokemon objects to their role indices."""
-        active_list = battle.active_pokemon if own else battle.opponent_active_pokemon
-        mapping = {}
-        for slot, pokemon in enumerate(active_list):
-            if pokemon is not None:
-                mapping[pokemon] = ROLE_ACTIVE_1 if slot == 0 else ROLE_ACTIVE_2
-        return mapping
-
-    @staticmethod
-    def _find_active_index(team_list: list, pokemon) -> int:
-        """Find where a specific pokemon is in the ordered team list.
-
-        Returns 0 if the slot is empty (fainted/not yet sent out) — the action
-        mask will force pass or switch for that slot so the rep value doesn't matter.
-        Raises if a non-None pokemon cannot be found, which indicates a bug.
-        """
-        if pokemon is None:
-            return 0
-        for i, p in enumerate(team_list):
-            if p is pokemon:
-                return i
-        raise ValueError(
-            f"Active pokemon {pokemon.species!r} was not found in the ordered team list. "
-            "This indicates a mismatch between battle.active_pokemon and battle.team — "
-            "check poke-env battle state tracking."
-        )
+        return ordered, roles, active_indices, active_present
 
     @staticmethod
     def _encode_field(battle: DoubleBattle) -> np.ndarray:
         """Encode field conditions into a flat feature vector."""
-        feats = np.zeros(31, dtype=np.float32)
+        feats = np.zeros(FIELD_TURN_OFFSET + 1, dtype=np.float32)
         offset = 0
+        current_turn = getattr(battle, "turn", 0)
 
-        # Weather (9: 8 types + none). Use first slot as "no weather"
-        weather_types = [
-            Weather.SUNNYDAY, Weather.DESOLATELAND, Weather.RAINDANCE,
-            Weather.PRIMORDIALSEA, Weather.SANDSTORM, Weather.HAIL,
-            Weather.SNOW, Weather.DELTASTREAM,
-        ]
         if not battle.weather:
             feats[offset] = 1.0
         else:
-            for j, w in enumerate(weather_types):
-                if w in battle.weather:
-                    feats[offset + 1 + j] = 1.0
+            for index, weather in enumerate(WEATHER_TYPES):
+                started_turn = battle.weather.get(weather)
+                if started_turn is not None:
+                    feats[offset + 1 + index] = 1.0
+                    feats[offset + 9] = ObservationBuilder._normalized_timer_age(
+                        current_turn,
+                        started_turn,
+                        FIELD_TIMER_CAPS["weather"],
+                    )
                     break
-        offset += 9
+        offset += 10
 
-        # Terrain (5: 4 types + none).
-        # Note: battle.fields also contains TRICK_ROOM and other non-terrain effects,
-        # so we must check for each terrain type explicitly rather than using `not battle.fields`.
-        terrain_types = [
-            Field.ELECTRIC_TERRAIN, Field.GRASSY_TERRAIN,
-            Field.MISTY_TERRAIN, Field.PSYCHIC_TERRAIN,
-        ]
         terrain_active = False
-        for j, t in enumerate(terrain_types):
-            if battle.fields and t in battle.fields:
-                feats[offset + 1 + j] = 1.0
+        for index, terrain in enumerate(TERRAIN_TYPES):
+            started_turn = battle.fields.get(terrain)
+            if started_turn is not None:
+                feats[offset + 1 + index] = 1.0
+                feats[offset + 5] = ObservationBuilder._normalized_timer_age(
+                    current_turn,
+                    started_turn,
+                    FIELD_TIMER_CAPS["terrain"],
+                )
                 terrain_active = True
                 break
         if not terrain_active:
-            feats[offset] = 1.0  # no terrain
-        offset += 5
+            feats[offset] = 1.0
+        offset += 6
 
-        # Side conditions, per side (own then opp)
-        for side_conditions in [battle.side_conditions, battle.opponent_side_conditions]:
-            # Stealth Rock (1)
+        for side_conditions in [
+            battle.side_conditions,
+            battle.opponent_side_conditions,
+        ]:
             feats[offset] = float(SideCondition.STEALTH_ROCK in side_conditions)
             offset += 1
-            # Spikes (0-3)
             feats[offset] = side_conditions.get(SideCondition.SPIKES, 0) / 3.0
             offset += 1
-            # Toxic Spikes (0-2)
             feats[offset] = side_conditions.get(SideCondition.TOXIC_SPIKES, 0) / 2.0
             offset += 1
-            # Sticky Web (1)
             feats[offset] = float(SideCondition.STICKY_WEB in side_conditions)
             offset += 1
-            # Screens
-            feats[offset] = float(SideCondition.REFLECT in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.REFLECT,
+                current_turn,
+                FIELD_TIMER_CAPS["screen"],
+            )
             offset += 1
-            feats[offset] = float(SideCondition.LIGHT_SCREEN in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.LIGHT_SCREEN,
+                current_turn,
+                FIELD_TIMER_CAPS["screen"],
+            )
             offset += 1
-            feats[offset] = float(SideCondition.AURORA_VEIL in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.AURORA_VEIL,
+                current_turn,
+                FIELD_TIMER_CAPS["screen"],
+            )
             offset += 1
-            # Tailwind
-            feats[offset] = float(SideCondition.TAILWIND in side_conditions)
+            feats[offset] = ObservationBuilder._condition_age_feature(
+                side_conditions,
+                SideCondition.TAILWIND,
+                current_turn,
+                FIELD_TIMER_CAPS["tailwind"],
+            )
             offset += 1
 
-        # Trick Room (global)
-        feats[offset] = float(Field.TRICK_ROOM in battle.fields)
+        feats[offset] = ObservationBuilder._condition_age_feature(
+            battle.fields,
+            Field.TRICK_ROOM,
+            current_turn,
+            FIELD_TIMER_CAPS["trick_room"],
+        )
         offset += 1
 
+        feats[offset] = float(getattr(battle, "used_tera", False))
+        offset += 1
+        feats[offset] = float(getattr(battle, "opponent_used_tera", False))
+        offset += 1
+        feats[offset] = ObservationBuilder._normalized_timer_age(
+            current_turn,
+            0,
+            FIELD_TIMER_CAPS["turn"],
+        )
         return feats
+
+    @staticmethod
+    def _condition_age_feature(
+        conditions: dict,
+        condition,
+        current_turn: int,
+        timer_cap: int,
+    ) -> float:
+        started_turn = conditions.get(condition)
+        if started_turn is None or not isinstance(started_turn, int):
+            return 0.0
+        # These timed conditions have no separate presence bit. Reserve zero for
+        # absence and number active turns from one so their activation turn is
+        # observable as well.
+        turns_active = max(current_turn - started_turn, 0) + 1
+        return min(turns_active, timer_cap) / float(timer_cap)
+
+    @staticmethod
+    def _normalized_timer_age(
+        current_turn: int, started_turn: int, timer_cap: int
+    ) -> float:
+        turns_active = max(current_turn - started_turn, 0)
+        return min(turns_active, timer_cap) / float(timer_cap)
+
+    @staticmethod
+    def _normalized_counter(value: int, cap: int) -> float:
+        return min(max(int(value), 0), cap) / cap if value else 0.0
+
+
+class _SyntheticTeamPreviewBattle:
+    def __init__(self, own_team: list[Pokemon], opponent_team: list[Pokemon]):
+        self.team = OrderedDict(
+            (f"p1:{index}", pokemon) for index, pokemon in enumerate(own_team, start=1)
+        )
+        self.opponent_team = OrderedDict(
+            (f"p2:{index}", pokemon)
+            for index, pokemon in enumerate(opponent_team, start=1)
+        )
+        self.active_pokemon = [None, None]
+        self.opponent_active_pokemon = [None, None]
+        self.available_moves = [[], []]
+        self.fields = {}
+        self.weather = {}
+        self.side_conditions = {}
+        self.opponent_side_conditions = {}
+        self.turn = 0
+        self.used_tera = False
+        self.opponent_used_tera = False
+
+
+_TEAM_PREVIEW_SIDE_CACHE_SIZE = 512
+
+
+def _pokemon_from_simulator_set(gen: int, entry: TeambuilderPokemon) -> Pokemon:
+    pokemon = Pokemon(gen=gen, teambuilder=entry)
+    if gen == 9 and pokemon.tera_type is None:
+        # The simulator assigns the primary type when a submitted set omits Tera.
+        pokemon._terastallized_type = pokemon.base_types[0]
+    return pokemon
+
+
+def _freeze_observation_arrays(
+    observation: dict[str, np.ndarray],
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Return cache-safe, read-only observation entries."""
+    for value in observation.values():
+        value.setflags(write=False)
+    return tuple(observation.items())
+
+
+def _copy_observation_arrays(
+    entries: tuple[tuple[str, np.ndarray], ...],
+) -> dict[str, np.ndarray]:
+    """Materialize independent writable arrays from cached observation entries."""
+    return {key: value.copy() for key, value in entries}
+
+
+@lru_cache(maxsize=_TEAM_PREVIEW_SIDE_CACHE_SIZE)
+def _cached_team_preview_side(
+    game_data: GameData,
+    team_size: int,
+    packed_team: str,
+    own_team: bool,
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Encode one packed roster once for repeated preview matchups.
+
+    Team-preview state before turn zero is a pure function of one packed team,
+    its public-information role, the categorical vocabulary, and team size.
+    Caching each side separately gives reuse across every opposing roster while
+    keeping the bounded cache independent of the number of possible pairings.
+    """
+    entries = Teambuilder.parse_packed_team(packed_team)[:team_size]
+    if own_team:
+        for entry in entries:
+            # Showdown uses level 100 when the packed team leaves it blank.
+            entry.level = entry.level or 100
+        pokemon = [
+            _init_team_preview_pokemon(
+                _pokemon_from_simulator_set(game_data.gen, entry),
+                own_team=True,
+            )
+            for entry in entries
+        ]
+        prefix = "own"
+    else:
+        pokemon = [
+            _init_team_preview_pokemon(
+                Pokemon(
+                    gen=game_data.gen,
+                    species=_preview_visible_species(game_data.gen, entry),
+                ),
+                own_team=False,
+            )
+            for entry in entries
+        ]
+        prefix = "opp"
+
+    padded_team: list[Pokemon | None] = [*pokemon]
+    padded_team.extend([None] * (team_size - len(padded_team)))
+    observation: dict[str, np.ndarray] = {}
+    ObservationBuilder(game_data, team_size)._encode_team(
+        padded_team,
+        np.full(team_size, ROLE_BENCH, dtype=np.int64),
+        observation,
+        prefix=prefix,
+        full_info=own_team,
+    )
+    if not own_team:
+        source_indices = np.full(team_size, -1, dtype=np.int64)
+        source_indices[: len(pokemon)] = np.arange(len(pokemon), dtype=np.int64)
+        observation["opp_source_index"] = source_indices
+    return _freeze_observation_arrays(observation)
+
+
+@lru_cache(maxsize=32)
+def _cached_empty_team_preview_observation(
+    game_data: GameData,
+    team_size: int,
+) -> tuple[tuple[str, np.ndarray], ...]:
+    """Cache the team-independent, neutral turn-zero observation fields."""
+    empty_battle = _SyntheticTeamPreviewBattle([], [])
+    observation = ObservationBuilder(game_data, team_size).build(empty_battle)
+    return _freeze_observation_arrays(observation)
+
+
+def build_team_preview_observation(
+    game_data: GameData,
+    team_size: int,
+    own_packed_team: str,
+    opponent_packed_team: str,
+) -> dict[str, np.ndarray]:
+    observation = _copy_observation_arrays(
+        _cached_empty_team_preview_observation(game_data, team_size)
+    )
+    observation.update(
+        _copy_observation_arrays(
+            _cached_team_preview_side(
+                game_data,
+                team_size,
+                own_packed_team,
+                True,
+            )
+        )
+    )
+    observation.update(
+        _copy_observation_arrays(
+            _cached_team_preview_side(
+                game_data,
+                team_size,
+                opponent_packed_team,
+                False,
+            )
+        )
+    )
+    return observation
+
+
+def summarize_observation_mismatch(
+    actual: dict[str, np.ndarray],
+    prepared: dict[str, np.ndarray],
+) -> str:
+    """Describe a failed prepared-observation equality check compactly."""
+    if actual.keys() != prepared.keys():
+        missing = sorted(prepared.keys() - actual.keys())
+        extra = sorted(actual.keys() - prepared.keys())
+        return f"missing keys={missing}, extra keys={extra}"
+
+    summaries: list[str] = []
+    for key in actual:
+        left = np.asarray(actual[key])
+        right = np.asarray(prepared[key])
+        if np.array_equal(left, right):
+            continue
+        if left.shape != right.shape:
+            summaries.append(f"{key} shape live={left.shape} prepared={right.shape}")
+            continue
+        differing = np.flatnonzero(left.reshape(-1) != right.reshape(-1))
+        samples = [
+            (
+                int(index),
+                left.reshape(-1)[index].item(),
+                right.reshape(-1)[index].item(),
+            )
+            for index in differing[:4]
+        ]
+        summaries.append(
+            f"{key} differs at {len(differing)} value(s) "
+            f"(flat index, live, prepared)={samples}"
+        )
+    return "; ".join(summaries) or "unknown difference"
+
+
+@lru_cache(maxsize=512)
+def _cached_packed_team_aux_labels(
+    game_data: GameData,
+    team_size: int,
+    packed_team: str,
+) -> dict[str, np.ndarray]:
+    """Encode a packed team once for trainer-private auxiliary targets."""
+    pokemon = [
+        _pokemon_from_simulator_set(game_data.gen, entry)
+        for entry in Teambuilder.parse_packed_team(packed_team)[:team_size]
+    ]
+    padded_team: list[Pokemon | None] = [*pokemon]
+    padded_team.extend([None] * (team_size - len(padded_team)))
+    labels: dict[str, np.ndarray] = {}
+    ObservationBuilder(game_data, team_size)._encode_team(
+        padded_team,
+        np.full(team_size, ROLE_BENCH, dtype=np.int64),
+        labels,
+        prefix="opp",
+        full_info=True,
+    )
+    source_indices = np.full(team_size, -1, dtype=np.int64)
+    source_indices[: len(pokemon)] = np.arange(len(pokemon), dtype=np.int64)
+    labels["opp_source_index"] = source_indices
+    return labels
+
+
+def build_packed_team_aux_labels(
+    game_data: GameData,
+    team_size: int,
+    packed_team: str,
+    *,
+    selected_indices: np.ndarray | list[int] | tuple[int, ...] | None = None,
+) -> dict[str, np.ndarray]:
+    """Return exact, trainer-only opponent labels in team-preview order.
+
+    The packed team is already assigned to the simulator, but none of these
+    arrays are included in the policy observation. They are registered with the
+    trainer at episode start so the hidden-information auxiliary head can learn
+    from complete item, ability, Tera-type, and move-set targets.
+    """
+    labels = {
+        key: value.copy()
+        for key, value in _cached_packed_team_aux_labels(
+            game_data,
+            team_size,
+            packed_team,
+        ).items()
+    }
+    if selected_indices is None:
+        return labels
+
+    selected = np.asarray(selected_indices, dtype=np.int64)
+    if selected.ndim != 1:
+        raise ValueError("selected_indices must be one-dimensional.")
+    available = int((~labels["opp_mask"]).sum())
+    if (
+        len(np.unique(selected)) != len(selected)
+        or np.any(selected < 0)
+        or np.any(selected >= available)
+    ):
+        raise ValueError("selected_indices must contain unique packed-team positions.")
+    selected_mask = np.ones(team_size, dtype=bool)
+    selected_mask[selected] = False
+    labels["opp_mask"] |= selected_mask
+    return labels
+
+
+def _preview_visible_species(gen: int, tb) -> str:
+    species = Pokemon(gen=gen, teambuilder=tb).species
+    if species is None:
+        raise ValueError(
+            f"Could not infer canonical species from teambuilder pokemon: {tb}"
+        )
+    if species == "urshifurapidstrike":
+        return "urshifu"
+    return species
+
+
+def _init_team_preview_pokemon(pokemon: Pokemon, *, own_team: bool) -> Pokemon:
+    if own_team:
+        max_hp = pokemon.stats.get("hp") if pokemon.stats else None
+        if max_hp is None or max_hp <= 0:
+            max_hp = 100
+        pokemon._max_hp = max_hp
+        pokemon._current_hp = max_hp
+    else:
+        pokemon._max_hp = 0
+        pokemon._current_hp = 0
+    return pokemon

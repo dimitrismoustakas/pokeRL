@@ -1,0 +1,611 @@
+{
+  "purpose": "evaluation_only",
+  "allow_training": false,
+  "format": "gen9vgc2026regf",
+  "source_page": "https://docs.google.com/spreadsheets/d/1nHEcS0r55JFVlC6EBX5zLgjwdnXTC9KOJnxIkduAs6Y/view",
+  "curated": [
+    {
+      "title": "yvarvgc's EUIC 2026 Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F782.txt",
+      "vgcpastes_id": "F782",
+      "source_links": [
+        "https://pokepast.es/6dc6ae02782a813f"
+      ],
+      "published_by": "yvarvgc",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "CloverBells' Rhyperior Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F430.txt",
+      "vgcpastes_id": "F430",
+      "source_links": [
+        "https://pokepast.es/45880c401771015d"
+      ],
+      "published_by": "CloverBells",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's EUIC 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F772.txt",
+      "vgcpastes_id": "F772",
+      "source_links": [
+        "https://pokepast.es/6bcec85a1377ce66"
+      ],
+      "published_by": "Michael Kelsch",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Luis Sánchez's Seville SPE 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F915.txt",
+      "vgcpastes_id": "F915",
+      "source_links": [
+        "https://pokepast.es/5e06b40fb548ab23"
+      ],
+      "published_by": "Luis Sánchez",
+      "event": "Seville SPE 2026"
+    },
+    {
+      "title": "WoodTofu's Pikachu Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F457.txt",
+      "vgcpastes_id": "F457",
+      "source_links": [
+        "https://pokepast.es/2c61e82060c644a3"
+      ],
+      "published_by": "WoodTofu",
+      "event": "Team Report"
+    },
+    {
+      "title": "M. Khoa Nguyen's Gardevoir Trick Room Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F691.txt",
+      "vgcpastes_id": "F691",
+      "source_links": [
+        "https://pokepast.es/1dd031ca4d79d893"
+      ],
+      "published_by": "M. Khoa Nguyen",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Yoav Reuven's Auckland SPE 2026 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F640.txt",
+      "vgcpastes_id": "F640",
+      "source_links": [
+        "https://pokepast.es/adaafbfb3e0a1375"
+      ],
+      "published_by": "Michael Kelsch",
+      "event": "Tweet"
+    },
+    {
+      "title": "Hamstermania's Klefki Tsareena Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F340.txt",
+      "vgcpastes_id": "F340",
+      "source_links": [
+        "https://pokepast.es/07949ca5647dd084"
+      ],
+      "published_by": "David Koutesh",
+      "event": "Tweet"
+    },
+    {
+      "title": "Atalanta's Priority Attack Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F27.txt",
+      "vgcpastes_id": "F27",
+      "source_links": [
+        "https://pokepast.es/de8650188dab066d"
+      ],
+      "published_by": "Atalanta",
+      "event": "Tweet"
+    },
+    {
+      "title": "TalonVGC's Entei Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F84.txt",
+      "vgcpastes_id": "F84",
+      "source_links": [
+        "https://pokepast.es/fda49bc01d39b272"
+      ],
+      "published_by": "Cedric Bernier",
+      "event": "Tweet"
+    },
+    {
+      "title": "TalonVGC's Recreation of PengyVGC's Jumpluff Sun Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F82.txt",
+      "vgcpastes_id": "F82",
+      "source_links": [
+        "https://pokepast.es/2b8ed331af94b720"
+      ],
+      "published_by": "Cedric Bernier",
+      "event": "Tweet"
+    },
+    {
+      "title": "LenVGC's Standard Trick Room Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F106.txt",
+      "vgcpastes_id": "F106",
+      "source_links": [
+        "https://pokepast.es/dac7509ceaf86396"
+      ],
+      "published_by": "Alex Soto",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Sylveon Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F442.txt",
+      "vgcpastes_id": "F442",
+      "source_links": [
+        "https://pokepast.es/d1a9683529ad4597"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "event": "Tweet"
+    },
+    {
+      "title": "Lucy Fleming's Houston Regional 2026 Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F902.txt",
+      "vgcpastes_id": "F902",
+      "source_links": [
+        "https://pokepast.es/8c06287c8e389f5d"
+      ],
+      "published_by": "Lucy Fleming",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "mentalsyndrome's Houston Regional 2026 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F889.txt",
+      "vgcpastes_id": "F889",
+      "source_links": [
+        "https://pokepast.es/6134b999d2f8b195"
+      ],
+      "published_by": "mentalsyndrome",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "tsltang0508's Global Challenge II 83th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F417.txt",
+      "vgcpastes_id": "F417",
+      "source_links": [
+        "https://pokepast.es/4b1b38b195d08b56"
+      ],
+      "published_by": "Tang Shiliang",
+      "event": "Global Challenge II"
+    },
+    {
+      "title": "WhimVGC's EUIC 2026 Runner Up Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F791.txt",
+      "vgcpastes_id": "F791",
+      "source_links": [
+        "https://pokepast.es/e9014dc881ba007d"
+      ],
+      "published_by": "Zachary Weed",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "amlothi's Charlotte Regionals Top 256 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F280.txt",
+      "vgcpastes_id": "F280",
+      "source_links": [
+        "https://pokepast.es/1f4e2b3e6dd16db9"
+      ],
+      "published_by": "Taylor Keller",
+      "event": "Charlotte Regionals"
+    },
+    {
+      "title": "Khoa Nguyen's Global Challenge I Top 3000 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F230.txt",
+      "vgcpastes_id": "F230",
+      "source_links": [
+        "https://pokepast.es/ad7f8ee9dd31472b"
+      ],
+      "published_by": "M. Khoa Nguyen",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "Xeno's Birmingham Regional 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F669.txt",
+      "vgcpastes_id": "F669",
+      "source_links": [
+        "https://pokepast.es/6bb4cb0f258aec92"
+      ],
+      "published_by": "Eden Batchelor",
+      "event": "Birmingham Regional 2026"
+    },
+    {
+      "title": "Lexicon's Global Challenge I Top 250 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F242.txt",
+      "vgcpastes_id": "F242",
+      "source_links": [
+        "https://pokepast.es/81d74c99772deaed"
+      ],
+      "published_by": "Alex Underhill",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "Magnetman's Archaludon Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F58.txt",
+      "vgcpastes_id": "F58",
+      "source_links": [
+        "https://pokepast.es/5901e88b4e5f6ef5"
+      ],
+      "published_by": "Adryan Sutantoso",
+      "event": "Tweet"
+    },
+    {
+      "title": "DragonairJordan's Tinkaton Gouging Fire Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F174.txt",
+      "vgcpastes_id": "F174",
+      "source_links": [
+        "https://pokepast.es/e2c336c6671b3076"
+      ],
+      "published_by": "Elijah Gardner",
+      "event": "Tweet"
+    },
+    {
+      "title": "JMOdri's Grand Challenge V 2026 48th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F797.txt",
+      "vgcpastes_id": "F797",
+      "source_links": [
+        "https://pokepast.es/72f4120e725f4fe9"
+      ],
+      "published_by": "Juan Manuel Odriozola",
+      "event": "Grand Challenge V 2026"
+    },
+    {
+      "title": "PsychoR&R's Urshifu Single Strike Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F686.txt",
+      "vgcpastes_id": "F686",
+      "source_links": [
+        "https://pokepast.es/ed82eab14e1808d8"
+      ],
+      "published_by": "PsychoR&R",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Gouging Fire Ting-Lu Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F201.txt",
+      "vgcpastes_id": "F201",
+      "source_links": [
+        "https://pokepast.es/0b35c653801b17ff"
+      ],
+      "published_by": "CloverBells",
+      "event": "Video"
+    },
+    {
+      "title": "SwampVGC's 2026 Grand Challenge IV Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F592.txt",
+      "vgcpastes_id": "F592",
+      "source_links": [
+        "https://pokepast.es/a331ede1534441db"
+      ],
+      "published_by": "SwampVGC",
+      "event": "2026 Grand Challenge IV"
+    },
+    {
+      "title": "Panda's Recreation of Evelyn's Balan VGC Tour Top 16 Team (Rental by MethodsVGC)",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F525.txt",
+      "vgcpastes_id": "F525",
+      "source_links": [
+        "https://pokepast.es/215544f3eca295e7"
+      ],
+      "published_by": "Justin Tang",
+      "event": "Video"
+    },
+    {
+      "title": "condornj's Houston Regional 2026 Top 64 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F894.txt",
+      "vgcpastes_id": "F894",
+      "source_links": [
+        "https://pokepast.es/0ba16e1bb991ab8d"
+      ],
+      "published_by": "Connor Swikart",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "Misaka's Muk-Alola Smeargle Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F122.txt",
+      "vgcpastes_id": "F122",
+      "source_links": [
+        "https://pokepast.es/899bbb56fb81fc26"
+      ],
+      "published_by": "Misaka",
+      "event": "Tweet"
+    }
+  ],
+  "generated": [],
+  "pool": [
+    {
+      "title": "yvarvgc's EUIC 2026 Top 16 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F782.txt",
+      "vgcpastes_id": "F782",
+      "source_links": [
+        "https://pokepast.es/6dc6ae02782a813f"
+      ],
+      "published_by": "yvarvgc",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "CloverBells' Rhyperior Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F430.txt",
+      "vgcpastes_id": "F430",
+      "source_links": [
+        "https://pokepast.es/45880c401771015d"
+      ],
+      "published_by": "CloverBells",
+      "event": "Video"
+    },
+    {
+      "title": "MichaelderBeste's EUIC 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F772.txt",
+      "vgcpastes_id": "F772",
+      "source_links": [
+        "https://pokepast.es/6bcec85a1377ce66"
+      ],
+      "published_by": "Michael Kelsch",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "Luis Sánchez's Seville SPE 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F915.txt",
+      "vgcpastes_id": "F915",
+      "source_links": [
+        "https://pokepast.es/5e06b40fb548ab23"
+      ],
+      "published_by": "Luis Sánchez",
+      "event": "Seville SPE 2026"
+    },
+    {
+      "title": "WoodTofu's Pikachu Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F457.txt",
+      "vgcpastes_id": "F457",
+      "source_links": [
+        "https://pokepast.es/2c61e82060c644a3"
+      ],
+      "published_by": "WoodTofu",
+      "event": "Team Report"
+    },
+    {
+      "title": "M. Khoa Nguyen's Gardevoir Trick Room Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F691.txt",
+      "vgcpastes_id": "F691",
+      "source_links": [
+        "https://pokepast.es/1dd031ca4d79d893"
+      ],
+      "published_by": "M. Khoa Nguyen",
+      "event": "Tweet"
+    },
+    {
+      "title": "MichaelderBeste's Recreation of Yoav Reuven's Auckland SPE 2026 Champion Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F640.txt",
+      "vgcpastes_id": "F640",
+      "source_links": [
+        "https://pokepast.es/adaafbfb3e0a1375"
+      ],
+      "published_by": "Michael Kelsch",
+      "event": "Tweet"
+    },
+    {
+      "title": "Hamstermania's Klefki Tsareena Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F340.txt",
+      "vgcpastes_id": "F340",
+      "source_links": [
+        "https://pokepast.es/07949ca5647dd084"
+      ],
+      "published_by": "David Koutesh",
+      "event": "Tweet"
+    },
+    {
+      "title": "Atalanta's Priority Attack Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F27.txt",
+      "vgcpastes_id": "F27",
+      "source_links": [
+        "https://pokepast.es/de8650188dab066d"
+      ],
+      "published_by": "Atalanta",
+      "event": "Tweet"
+    },
+    {
+      "title": "TalonVGC's Entei Balance Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F84.txt",
+      "vgcpastes_id": "F84",
+      "source_links": [
+        "https://pokepast.es/fda49bc01d39b272"
+      ],
+      "published_by": "Cedric Bernier",
+      "event": "Tweet"
+    },
+    {
+      "title": "TalonVGC's Recreation of PengyVGC's Jumpluff Sun Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F82.txt",
+      "vgcpastes_id": "F82",
+      "source_links": [
+        "https://pokepast.es/2b8ed331af94b720"
+      ],
+      "published_by": "Cedric Bernier",
+      "event": "Tweet"
+    },
+    {
+      "title": "LenVGC's Standard Trick Room Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F106.txt",
+      "vgcpastes_id": "F106",
+      "source_links": [
+        "https://pokepast.es/dac7509ceaf86396"
+      ],
+      "published_by": "Alex Soto",
+      "event": "Tweet"
+    },
+    {
+      "title": "Jaylun's Sylveon Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F442.txt",
+      "vgcpastes_id": "F442",
+      "source_links": [
+        "https://pokepast.es/d1a9683529ad4597"
+      ],
+      "published_by": "Yang Chieh-Lun",
+      "event": "Tweet"
+    },
+    {
+      "title": "Lucy Fleming's Houston Regional 2026 Top 8 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F902.txt",
+      "vgcpastes_id": "F902",
+      "source_links": [
+        "https://pokepast.es/8c06287c8e389f5d"
+      ],
+      "published_by": "Lucy Fleming",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "mentalsyndrome's Houston Regional 2026 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F889.txt",
+      "vgcpastes_id": "F889",
+      "source_links": [
+        "https://pokepast.es/6134b999d2f8b195"
+      ],
+      "published_by": "mentalsyndrome",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "tsltang0508's Global Challenge II 83th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F417.txt",
+      "vgcpastes_id": "F417",
+      "source_links": [
+        "https://pokepast.es/4b1b38b195d08b56"
+      ],
+      "published_by": "Tang Shiliang",
+      "event": "Global Challenge II"
+    },
+    {
+      "title": "WhimVGC's EUIC 2026 Runner Up Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F791.txt",
+      "vgcpastes_id": "F791",
+      "source_links": [
+        "https://pokepast.es/e9014dc881ba007d"
+      ],
+      "published_by": "Zachary Weed",
+      "event": "EUIC 2026"
+    },
+    {
+      "title": "amlothi's Charlotte Regionals Top 256 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F280.txt",
+      "vgcpastes_id": "F280",
+      "source_links": [
+        "https://pokepast.es/1f4e2b3e6dd16db9"
+      ],
+      "published_by": "Taylor Keller",
+      "event": "Charlotte Regionals"
+    },
+    {
+      "title": "Khoa Nguyen's Global Challenge I Top 3000 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F230.txt",
+      "vgcpastes_id": "F230",
+      "source_links": [
+        "https://pokepast.es/ad7f8ee9dd31472b"
+      ],
+      "published_by": "M. Khoa Nguyen",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "Xeno's Birmingham Regional 2026 Top 32 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F669.txt",
+      "vgcpastes_id": "F669",
+      "source_links": [
+        "https://pokepast.es/6bb4cb0f258aec92"
+      ],
+      "published_by": "Eden Batchelor",
+      "event": "Birmingham Regional 2026"
+    },
+    {
+      "title": "Lexicon's Global Challenge I Top 250 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F242.txt",
+      "vgcpastes_id": "F242",
+      "source_links": [
+        "https://pokepast.es/81d74c99772deaed"
+      ],
+      "published_by": "Alex Underhill",
+      "event": "Global Challenge I"
+    },
+    {
+      "title": "Magnetman's Archaludon Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F58.txt",
+      "vgcpastes_id": "F58",
+      "source_links": [
+        "https://pokepast.es/5901e88b4e5f6ef5"
+      ],
+      "published_by": "Adryan Sutantoso",
+      "event": "Tweet"
+    },
+    {
+      "title": "DragonairJordan's Tinkaton Gouging Fire Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F174.txt",
+      "vgcpastes_id": "F174",
+      "source_links": [
+        "https://pokepast.es/e2c336c6671b3076"
+      ],
+      "published_by": "Elijah Gardner",
+      "event": "Tweet"
+    },
+    {
+      "title": "JMOdri's Grand Challenge V 2026 48th Place Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F797.txt",
+      "vgcpastes_id": "F797",
+      "source_links": [
+        "https://pokepast.es/72f4120e725f4fe9"
+      ],
+      "published_by": "Juan Manuel Odriozola",
+      "event": "Grand Challenge V 2026"
+    },
+    {
+      "title": "PsychoR&R's Urshifu Single Strike Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F686.txt",
+      "vgcpastes_id": "F686",
+      "source_links": [
+        "https://pokepast.es/ed82eab14e1808d8"
+      ],
+      "published_by": "PsychoR&R",
+      "event": "Tweet"
+    },
+    {
+      "title": "CloverBells' Gouging Fire Ting-Lu Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F201.txt",
+      "vgcpastes_id": "F201",
+      "source_links": [
+        "https://pokepast.es/0b35c653801b17ff"
+      ],
+      "published_by": "CloverBells",
+      "event": "Video"
+    },
+    {
+      "title": "SwampVGC's 2026 Grand Challenge IV Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F592.txt",
+      "vgcpastes_id": "F592",
+      "source_links": [
+        "https://pokepast.es/a331ede1534441db"
+      ],
+      "published_by": "SwampVGC",
+      "event": "2026 Grand Challenge IV"
+    },
+    {
+      "title": "Panda's Recreation of Evelyn's Balan VGC Tour Top 16 Team (Rental by MethodsVGC)",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F525.txt",
+      "vgcpastes_id": "F525",
+      "source_links": [
+        "https://pokepast.es/215544f3eca295e7"
+      ],
+      "published_by": "Justin Tang",
+      "event": "Video"
+    },
+    {
+      "title": "condornj's Houston Regional 2026 Top 64 Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F894.txt",
+      "vgcpastes_id": "F894",
+      "source_links": [
+        "https://pokepast.es/0ba16e1bb991ab8d"
+      ],
+      "published_by": "Connor Swikart",
+      "event": "Houston Regional 2026"
+    },
+    {
+      "title": "Misaka's Muk-Alola Smeargle Team",
+      "file": "data/team_pools/gen9vgc2026regf_heldout30/teams/F122.txt",
+      "vgcpastes_id": "F122",
+      "source_links": [
+        "https://pokepast.es/899bbb56fb81fc26"
+      ],
+      "published_by": "Misaka",
+      "event": "Tweet"
+    }
+  ]
+}

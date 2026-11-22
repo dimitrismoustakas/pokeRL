@@ -1,0 +1,69 @@
+Baby Don’t Go (Articuno) @ Sitrus Berry
+Ability: Snow Cloak
+Level: 50
+Tera Type: Dragon
+EVs: 252 HP / 76 Def / 140 SpA / 36 SpD / 4 Spe
+Modest Nature
+IVs: 0 Atk
+- Freeze-Dry
+- Blizzard
+- Protect
+- Roost
+
+Cold Outside (Ninetales-Alola) @ Light Clay
+Ability: Snow Warning
+Level: 50
+Tera Type: Water
+EVs: 116 HP / 84 Def / 76 SpA / 4 SpD / 228 Spe
+Timid Nature
+IVs: 0 Atk
+- Aurora Veil
+- Blizzard
+- Moonblast
+- Protect
+
+Saint Nick (Dondozo) @ Leftovers
+Ability: Unaware
+Level: 50
+Tera Type: Fire
+EVs: 116 HP / 4 Atk / 116 Def / 220 SpD / 52 Spe
+Impish Nature
+- Body Press
+- Wave Crash
+- Protect
+- Order Up
+
+Milk&Cookies (Tatsugiri-Droopy) @ Choice Scarf
+Ability: Commander
+Level: 50
+Shiny: Yes
+Tera Type: Dragon
+EVs: 20 HP / 132 Def / 156 SpA / 4 SpD / 196 Spe
+Timid Nature
+IVs: 0 Atk
+- Muddy Water
+- Icy Wind
+- Draco Meteor
+- Sleep Talk
+
+Krampus (Incineroar) @ Assault Vest
+Ability: Intimidate
+Level: 50
+Tera Type: Grass
+EVs: 252 HP / 244 Atk / 12 SpD
+Brave Nature
+- Fake Out
+- Flare Blitz
+- Snarl
+- U-turn
+
+Cindy Lou (Ogerpon) (F) @ Life Orb
+Ability: Defiant
+Level: 50
+Tera Type: Grass
+EVs: 36 HP / 252 Atk / 4 Def / 4 SpD / 212 Spe
+Adamant Nature
+- Ivy Cudgel
+- Superpower
+- Spiky Shield
+- Taunt

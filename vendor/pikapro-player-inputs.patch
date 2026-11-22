@@ -1,0 +1,1514 @@
+diff --git a/crates/pikapro-py/pyproject.toml b/crates/pikapro-py/pyproject.toml
+index 5287d70..1287b83 100644
+--- a/crates/pikapro-py/pyproject.toml
++++ b/crates/pikapro-py/pyproject.toml
+@@ -46,7 +46,7 @@ classifiers = [
+     "Typing :: Typed",
+ ]
+ dependencies = ["numpy>=1.21"]
+-dynamic = ["version"]
++version = "0.2.0+pokerl.1"
+ 
+ [project.optional-dependencies]
+ # Adapters in pikapro.rl, imported lazily: the core needs only numpy.
+diff --git a/crates/pikapro-py/src/python.rs b/crates/pikapro-py/src/python.rs
+index d9ba739..cf26940 100644
+--- a/crates/pikapro-py/src/python.rs
++++ b/crates/pikapro-py/src/python.rs
+@@ -332,7 +332,7 @@ fn perspective_arg(p: &Bound<'_, PyAny>) -> PyResult<Perspective> {
+ /// `Battle`'s and `Battle.fork`'s `seed`: an int (anything with
+ /// `__index__`, such as the numpy ints `BattlePool.seeds()` holds), four
+ /// 16-bit ints or 32 bytes.
+-fn seed_arg(seed: &Bound<'_, PyAny>) -> PyResult<Seed> {
++pub(crate) fn seed_arg(seed: &Bound<'_, PyAny>) -> PyResult<Seed> {
+     match arg::seed(seed) {
+         Ok(s) => return Ok(Seed::fast(s)),
+         // An int out of range, or a bool.
+diff --git a/crates/pikapro-py/src/rl.rs b/crates/pikapro-py/src/rl.rs
+index eb8254f..06a5836 100644
+--- a/crates/pikapro-py/src/rl.rs
++++ b/crates/pikapro-py/src/rl.rs
+@@ -377,10 +377,433 @@ fn bindable<T: Element>(a: &Bound<'_, PyAny>, name: &str, len: usize, dtype: &st
+     Ok(arr.clone().unbind())
+ }
+ 
++/// The v6 checkpoint indexes switches by its own (living actives first) roster.
++/// Slots which have fainted remain valid explicit targets for Showdown retargeting.
++fn v6_request_menu(
++    view: &PlayerView<'_>,
++    shown: impl FnOnce() -> LegalActions,
++    own_rows: &[i64],
++    moves: &[i64],
++    recharge: i64,
++    base_meta: &[[i64; 2]],
++    types: &[i64],
++    joint: &mut [bool],
++    tera: &mut [bool],
++    ids: &mut [i64],
++    meta: &mut [i64],
++) {
++    use pikapro_data::{
++        MoveId, MoveTarget as T, Type,
++        gen9::{moves as mv, species as sp},
++    };
++    use pikapro_view::{OwnMoves, OwnRequest, PublicVolatiles};
++    const PASS: usize = 26;
++    let own = view.own;
++    if view.public.outcome.is_some() {
++        joint[PASS] = true;
++        joint[(1 + PASS) * 27 + PASS] = true;
++        return;
++    }
++    match own.request {
++        OwnRequest::Move => {}
++        OwnRequest::ForceSwitch { .. } => {
++            // A prior switch can still be queued when an Eject Pack interrupts it.
++            // Translate the same player-visible choices VecEnv offers for this request.
++            let menu = shown();
++            if menu.is_waiting() {
++                joint[PASS] = true;
++                joint[(1 + PASS) * 27 + PASS] = true;
++                return;
++            }
++            let index = |choice| match choice {
++                SlotAction::Pass => PASS,
++                SlotAction::Switch(position) => {
++                    20 + own_rows
++                        .chunks_exact(13)
++                        .position(|row| row[12] == i64::from(position))
++                        .expect("switch must refer to an own team position")
++                }
++                _ => unreachable!("a replacement request offers only switch or pass"),
++            };
++            for choice in menu.joint() {
++                let Choice::Actions([first, second]) = choice else { unreachable!() };
++                let (a, b) = (index(first), index(second));
++                joint[a] = true;
++                joint[(1 + a) * 27 + b] = true;
++            }
++            return;
++        }
++        _ => {
++            joint[PASS] = true;
++            joint[(1 + PASS) * 27 + PASS] = true;
++            return;
++        }
++    }
++    let live = |m: &&pikapro_view::OwnMon| m.active && m.hp > 0;
++    let ordered = own.mons.iter().filter(live).chain(own.mons.iter().filter(|m| !live(m)));
++    let switches: Vec<_> = ordered.enumerate().filter_map(|(i, m)| (!m.active && m.hp > 0).then_some(20 + i)).collect();
++    let mut masks = [[false; 27]; 2];
++    for slot in 0..2 {
++        let enabled = &mut masks[slot];
++        let active = own.active[slot].as_ref();
++        let mon = own.mons.get(slot);
++        let living = mon.is_some_and(|m| m.active && m.hp > 0);
++        if !(living && (own.known_trapped[slot] || active.is_some_and(|a| a.trapped))) {
++            for &s in &switches {
++                enabled[s] = true;
++            }
++        }
++        if let (Some(a), Some(mon)) = (active, mon.filter(|_| living)) {
++            tera[slot] = a.can_terastallize.is_some();
++            let mut add = |j: usize, id: Option<MoveId>, target: T| {
++                let id_index = id.map_or(recharge, |m| moves[1 + m.index()]);
++                let mut info = base_meta[id_index as usize];
++                if id == Some(mv::IVY_CUDGEL) {
++                    let ty = match mon.species {
++                        sp::OGERPON_WELLSPRING | sp::OGERPON_WELLSPRING_TERA => Type::Water,
++                        sp::OGERPON_CORNERSTONE | sp::OGERPON_CORNERSTONE_TERA => Type::Rock,
++                        sp::OGERPON_HEARTHFLAME | sp::OGERPON_HEARTHFLAME_TERA => Type::Fire,
++                        _ => Type::Grass,
++                    };
++                    info[0] = types[ty as usize];
++                } else if id == Some(mv::TERA_BLAST) {
++                    if let Some(ty) = mon.terastallized {
++                        info[0] = types[ty as usize];
++                        let boosts = &view.my_side().slots[slot].boosts;
++                        let stat = |i: usize| {
++                            let stage = i32::from(boosts[i]);
++                            i32::from(mon.stats[i]) * (2 + stage.max(0)) / (2 - stage.min(0))
++                        };
++                        if stat(0) > stat(2) {
++                            info[1] = 1;
++                        }
++                    }
++                }
++                ids[slot * 4 + j] = id_index;
++                meta[(slot * 4 + j) * 2..(slot * 4 + j + 1) * 2].copy_from_slice(&info);
++                let target = if id == Some(mv::POLLEN_PUFF)
++                    && view.my_side().slots[slot].volatiles.has(PublicVolatiles::HEAL_BLOCK)
++                {
++                    T::AdjacentFoe
++                } else if id == Some(mv::TERA_STARSTORM) && mon.terastallized == Some(Type::Stellar) {
++                    T::AllAdjacentFoes
++                } else {
++                    target
++                };
++                let offsets: &[usize] = match target {
++                    T::Normal | T::Any => &[0, 1, 2],
++                    T::AdjacentFoe => &[0, 1],
++                    T::AdjacentAlly => &[2],
++                    T::AdjacentAllyOrSelf => &[2, 3],
++                    _ => &[4],
++                };
++                for &offset in offsets {
++                    let recorded = match offset {
++                        0 | 1 => view.foe_side().slots[offset].row.is_some(),
++                        2 => view.my_side().slots[1 - slot].row.is_some(),
++                        3 => view.my_side().slots[slot].row.is_some(),
++                        _ => true,
++                    };
++                    enabled[5 * j + offset] = recorded;
++                }
++            };
++            if mon.commanding {
++                if !enabled.iter().any(|&b| b) {
++                    enabled[PASS] = true;
++                }
++                continue;
++            }
++            match &a.moves {
++                OwnMoves::Struggle => add(0, Some(mv::STRUGGLE), T::RandomNormal),
++                OwnMoves::Recharge => add(0, None, T::User),
++                OwnMoves::Locked(m) => add(0, Some(*m), T::User),
++                OwnMoves::Moves(ms) => {
++                    for (j, m) in ms.iter().enumerate() {
++                        if !m.disabled && own.known_disabled[slot] & (1 << j) == 0 {
++                            add(j, Some(m.id), m.target);
++                        }
++                    }
++                }
++            }
++        }
++        if !enabled.iter().any(|&b| b) {
++            enabled[PASS] = true;
++        }
++    }
++    for (a, &yes) in masks[0].iter().enumerate() {
++        if !yes {
++            continue;
++        }
++        for (b, &yes2) in masks[1].iter().enumerate() {
++            if yes2 && !(a == b && (20..26).contains(&a)) {
++                joint[a] = true;
++                joint[(1 + a) * 27 + b] = true;
++            }
++        }
++    }
++}
++
++/// Checkpoint categorical team inputs from the two information sets.
++/// The opponent is read exclusively through the public side of the view.
++/// Resolve the four public field positions from the same arrays exposed to the policy.
++fn v6_active_mechanics(
++    teams: &[i64],
++    continuous: &[f32],
++    events: &[i64],
++    flags: &[f32],
++    outcomes: &[f32],
++    meta: &[f32],
++    features: &mut [f32],
++    last_move: &mut [i64],
++) {
++    const WIDTH: usize = 17;
++    const RESOLUTION: usize = 6;
++    const FIRST_TURN: usize = 37;
++    const PROTECT_CHAIN: usize = 35;
++    const ACTIVE_TURNS: usize = 44;
++
++    for (pos, active) in features.chunks_exact_mut(WIDTH).enumerate() {
++        active[RESOLUTION] = 1.;
++        let side = pos / 2;
++        let slot = (pos % 2) as i64;
++        let team = &teams[side * 78..(side + 1) * 78];
++        if let Some(row) = team.chunks_exact(13).position(|mon| mon[10] == slot) {
++            let offset = (side * 6 + row) * 51;
++            active[0] = 1.;
++            for (dest, column) in active[1..4].iter_mut().zip([FIRST_TURN, PROTECT_CHAIN, ACTIVE_TURNS]) {
++                *dest = continuous[offset + column];
++            }
++        }
++    }
++    // Partial or overflowed history cannot determine the last resolution.
++    if meta[0] <= 0. || meta[1] > 0. || meta[2] > 0. {
++        return;
++    }
++    for (event_index, event) in events.chunks_exact(8).enumerate() {
++        let actor = event[1];
++        if !(1..=4).contains(&actor) {
++            continue;
++        }
++        let pos = actor as usize - 1;
++        let active = &mut features[pos * WIDTH..(pos + 1) * WIDTH];
++        let kind = event[0];
++        let resolution = match kind {
++            1 => 1,     // move
++            4 => 2,     // cant
++            2 | 3 => 3, // switch or drag
++            5 => 4,     // faint
++            6 => {
++                active[5] = 1.; // tera
++                continue;
++            }
++            _ => continue,
++        };
++        active[RESOLUTION..RESOLUTION + 5].fill(0.);
++        active[RESOLUTION + resolution] = 1.;
++        if kind == 1 {
++            last_move[pos] = event[3];
++            let event_flags = &flags[event_index * 5..(event_index + 1) * 5];
++            let targets = &outcomes[event_index * 32..(event_index + 1) * 32];
++            let any = |column: usize| targets.chunks_exact(8).any(|target| target[column] != 0.);
++            let failed = event_flags[0] != 0. || event_flags[3] != 0. || event_flags[4] != 0. || any(4);
++            let missed = event_flags[1] != 0. || any(1);
++            let immune = any(2);
++            let protected = any(5);
++            let blocked = any(3);
++            let hit = any(0) && !(failed || missed || immune || protected || blocked);
++            for (dest, flag) in active[11..].iter_mut().zip([failed, missed, immune, protected, blocked, hit]) {
++                *dest = f32::from(u8::from(flag));
++            }
++        } else if matches!(kind, 2 | 3 | 5) {
++            last_move[pos] = 0;
++            active[4] = f32::from(u8::from(kind != 5));
++            active[5] = 0.;
++            active[11..].fill(0.);
++        }
++    }
++}
++
++fn v6_team_categories(
++    view: &PlayerView<'_>,
++    tables: &pikapro_rl::tables::Tables,
++    vocab: &PyVecEnv,
++    own_order: &[(u8, pikapro_data::SpeciesId)],
++    shown: &[Option<pikapro_data::SpeciesId>; 6],
++    rows: &mut [i64],
++    continuous: &mut [f32],
++    last_moves: &mut [i64],
++) {
++    use pikapro_rl::encode::ViewCtx;
++    use pikapro_view::{AbilityState, ItemState, Phase};
++    let state = ViewCtx::new(view, tables);
++    let started = !matches!(view.public.phase, Phase::Setup | Phase::TeamPreview);
++    for who in 0..2 {
++        let count = if who == 0 { own_order.len() } else { view.foe_side().mons.len() };
++        let index = |i: usize| if who == 0 { usize::from(own_order[i].0) } else { i };
++        let active = |i: usize| {
++            let m = state.mon(who, index(i));
++            started && m.slot.is_some() && !m.is_fainted()
++        };
++        let order = (0..count).filter(|&i| active(i)).chain((0..count).filter(|&i| !active(i)));
++        for i in 0..6 {
++            let k = (who * 6 + i) * 13;
++            rows[k + 10] = 2;
++            rows[k + 11] = 1;
++            rows[k + 12] = -1;
++        }
++        for (i, original) in order.enumerate() {
++            let m = state.mon(who, index(original));
++            let start = (who * 6 + i) * 13;
++            let r = &mut rows[start..start + 13];
++            let identity = match who {
++                0 if view.public.outcome.is_some() => Some(own_order[original].1),
++                0 => m.species(),
++                _ => shown[index(original)].or(m.species()),
++            };
++            if let Some(s) = identity {
++                r[0] = vocab.v6_species[s.index()];
++            }
++            if let AbilityState::Known(a) = m.ability() {
++                r[1] = vocab.v6_abilities[a.index()];
++            }
++            if let ItemState::Known(a) = m.item() {
++                r[2] = vocab.v6_items[a.index()];
++            }
++            if let Some(current) = m.species() {
++                let types = m.active.and_then(|a| a.types).unwrap_or(tables.dex.species(current).types);
++                r[3] = vocab.v6_types[types.primary as usize];
++                if let Some(t) = types.secondary {
++                    r[4] = vocab.v6_types[t as usize];
++                }
++            }
++            let tera = if who == 0 { m.own_mon.map(|o| o.tera_type) } else { m.public.and_then(|p| p.tera_type) };
++            if let Some(t) = tera {
++                r[5] = vocab.v6_types[t as usize];
++            }
++            if who == 1 {
++                if let Some(public) = m.public {
++                    for (j, mv) in public.moves.iter().filter(|mv| mv.uses > 0).take(4).enumerate() {
++                        r[6 + j] = vocab.v6_moves[1 + mv.id.index()];
++                    }
++                }
++            } else {
++                for (j, mv) in m.moves().iter().enumerate() {
++                    if let Some(id) = mv.slot.id() {
++                        r[6 + j] = vocab.v6_moves[1 + id.index()];
++                    }
++                }
++            }
++            if let Some(slot) = m.slot.filter(|_| active(original)) {
++                r[10] = i64::from(slot);
++            }
++            r[11] = 0;
++            r[12] = if who == 0 { m.team_pos.map_or(-1, i64::from) } else { index(original) as i64 };
++            if let Some(last) = m.active.and_then(|a| a.last_move) {
++                last_moves[who * 6 + i] = vocab.v6_moves[1 + last.index()];
++            }
++            let offset = (who * 6 + i) * 51;
++            let out = &mut continuous[offset..offset + 51];
++            let truth = |b: bool| f32::from(u8::from(b));
++            let (v, max) = m.hp();
++            if max > 0 && (who == 0 || m.public.is_some_and(|p| p.hp.is_known())) {
++                out[0] = f32::from(v) / f32::from(max);
++            }
++            use pikapro_view::{PublicVolatiles as V, StatusKind};
++            if !m.is_fainted() {
++                let status = match m.status() {
++                    StatusKind::None => 0,
++                    StatusKind::Burn => 1,
++                    StatusKind::Freeze => 2,
++                    StatusKind::Paralysis => 3,
++                    StatusKind::Poison => 4,
++                    StatusKind::Sleep => 5,
++                    StatusKind::Toxic => 6,
++                };
++                out[1 + status] = 1.;
++            }
++            for (j, boost) in m.boosts().iter().enumerate() {
++                out[8 + j] = f32::from(*boost) / 6.;
++            }
++            if let Some(active) = m.active {
++                // Nightmare is unavailable in Generation 9 Regulation F.
++                let effects = [
++                    V::CONFUSION,
++                    V::SUBSTITUTE,
++                    V::LEECH_SEED,
++                    V::TAUNT,
++                    V::ENCORE,
++                    V::TORMENT,
++                    V::DISABLE,
++                    V::YAWN,
++                    V::PERISH_SONG,
++                    V::PROTECT,
++                    V::ENDURE,
++                    V::FOCUS_ENERGY,
++                    V::ATTRACT,
++                    V::CURSE,
++                    0,
++                    V::FLASH_FIRE,
++                ];
++                for (j, flag) in effects.iter().enumerate() {
++                    if *flag != 0 && active.volatiles.has(*flag) {
++                        out[15 + j] =
++                            if *flag == V::PERISH_SONG { f32::from(active.counters.perish + 1) / 4. } else { 1. };
++                    }
++                }
++                out[35] = f32::from(active.counters.protect_chain.min(4)) / 4.;
++                out[37] = truth(active.turns_active == 1);
++                out[44] = f32::from(active.turns_active.min(6)) / 6.;
++            }
++            if matches!(m.status(), StatusKind::Toxic | StatusKind::Sleep) {
++                out[36] = f32::from(m.status_turns().min(8)) / 8.;
++            }
++            if who == 0 {
++                for (j, mv) in m.moves().iter().enumerate() {
++                    let requested = m
++                        .request
++                        .and_then(|req| match &req.moves {
++                            pikapro_view::OwnMoves::Moves(moves) => moves.get(j),
++                            _ => None,
++                        })
++                        .is_some_and(|slot| Some(slot.id) == mv.slot.id());
++                    // A pivot or forced switch can spend PP after the last
++                    // private move menu. Use the public PP tally between menus.
++                    out[31 + j] = match (requested, mv.max_pp) {
++                        (false, Some(max)) if mv.revealed && max > 0 => {
++                            f32::from(max.saturating_sub(mv.pp_spent)) / f32::from(max)
++                        }
++                        _ => mv.pp_frac(tables),
++                    };
++                }
++                if let Some(stats) = m.exact_stats() {
++                    for (j, x) in stats.into_iter().enumerate() {
++                        out[45 + j] = f32::from(x) / 256.;
++                    }
++                }
++            }
++            out[38] = truth(m.is_revealed());
++            out[39] = r[6..10].iter().filter(|&&id| id != 0).count() as f32 / 4.;
++            out[40] = truth(matches!(m.ability(), AbilityState::Known(_)));
++            out[41] = truth(matches!(m.item(), ItemState::Known(_)));
++            out[42] = truth(tera.is_some());
++            out[43] =
++                truth(m.terastallized() || m.public.is_some_and(|p| p.flags.has(pikapro_view::MonFlags::USED_TERA)));
++        }
++    }
++}
++
+ /// The vector environment, with numpy output buffers bound once. See
+ /// `pikapro.rl.VecEnv`, which wraps it.
+ #[pyclass(module = "pikapro._pikapro", name = "_VecEnv", skip_from_py_object)]
+ pub struct PyVecEnv {
++    v6_moves: Vec<i64>,
++    v6_recharge: i64,
++    v6_meta: Vec<[i64; 2]>,
++    v6_scopes: Vec<i64>,
++    v6_types: Vec<i64>,
++    v6_species: Vec<i64>,
++    v6_items: Vec<i64>,
++    v6_abilities: Vec<i64>,
+     env: VecEnv,
+     info: ObsInfo,
+     bufs: Bufs,
+@@ -574,7 +997,19 @@ impl PyVecEnv {
+         let threads = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+         let env = py.detach(|| VecEnv::new(config, threads)).map_err(err)?;
+         let bufs = new_bufs(py, &env);
+-        Ok(PyVecEnv { env, info, bufs })
++        Ok(PyVecEnv {
++            env,
++            info,
++            bufs,
++            v6_moves: Vec::new(),
++            v6_recharge: 0,
++            v6_meta: Vec::new(),
++            v6_scopes: Vec::new(),
++            v6_types: Vec::new(),
++            v6_species: Vec::new(),
++            v6_items: Vec::new(),
++            v6_abilities: Vec::new(),
++        })
+     }
+ 
+     #[getter]
+@@ -837,6 +1272,335 @@ impl PyVecEnv {
+         Ok(Some(d))
+     }
+ 
++    fn set_v6_vocab(
++        &mut self,
++        vocab: std::collections::HashMap<String, i64>,
++        meta: Vec<[i64; 2]>,
++        types: std::collections::HashMap<String, i64>,
++        species: std::collections::HashMap<String, i64>,
++        abilities: std::collections::HashMap<String, i64>,
++        items: std::collections::HashMap<String, i64>,
++        scopes: Vec<i64>,
++    ) {
++        self.v6_recharge = vocab.get("recharge").copied().unwrap_or(0);
++        self.v6_meta = meta;
++        self.v6_scopes = scopes;
++        self.v6_types = pikapro_data::Type::TERA
++            .iter()
++            .chain([pikapro_data::Type::Unknown].iter())
++            .map(|t| types.get(&t.name().to_lowercase()).copied().unwrap_or(0))
++            .collect();
++        let dex = self.env.config().format.dex;
++        self.v6_species = vec![0; dex.species.len()];
++        self.v6_abilities = vec![0; dex.abilities.len()];
++        self.v6_items = vec![0; dex.items.len()];
++        for (name, i) in species {
++            if let Some(id) = dex.species_by_name(&name) {
++                self.v6_species[id.index()] = i;
++            }
++        }
++        for (name, i) in abilities {
++            if name.bytes().all(|b| b.is_ascii_alphanumeric())
++                && let Some(id) = dex.ability_by_name(&name)
++            {
++                self.v6_abilities[id.index()] = i;
++            }
++        }
++        for (name, i) in items {
++            if name.bytes().all(|b| b.is_ascii_alphanumeric())
++                && let Some(id) = dex.item_by_name(&name)
++            {
++                self.v6_items[id.index()] = i;
++            }
++        }
++        self.v6_moves = vec![0; dex.moves.len() + 1];
++        for (name, index) in vocab {
++            if let Some(id) = dex.move_by_name(&name) {
++                self.v6_moves[1 + id.index()] = index;
++            }
++        }
++    }
++
++    /// Own request stats, public HP of opposing actives, and bounded public actions.
++    /// Batched direct arrays in checkpoint index space. No battle state or renderer.
++    #[pyo3(signature = (lanes=None))]
++    fn v6_player_inputs<'py>(&self, py: Python<'py>, lanes: Option<Vec<usize>>) -> PyResult<Bound<'py, PyDict>> {
++        if self.v6_moves.is_empty() {
++            return Err(err("set the checkpoint move vocabulary first".into()));
++        }
++        let selected = lanes.unwrap_or_else(|| (0..self.n()).collect());
++        for &lane in &selected {
++            self.check_battle(lane)?;
++        }
++        let n = selected.len();
++        let (
++            events,
++            flags,
++            outcomes,
++            activations,
++            meta,
++            joint,
++            tera,
++            requests,
++            request_meta,
++            field,
++            teams,
++            continuous,
++            last_moves,
++            mechanics,
++            mechanics_move,
++        ) = py.detach(|| {
++            let mut events = vec![0i64; n * 2 * 12 * 8];
++            let mut flags = vec![0f32; n * 2 * 12 * 5];
++            let mut outcomes = vec![0f32; n * 2 * 12 * 4 * 8];
++            let mut activations = vec![0i64; n * 2 * 12 * 4];
++            let mut meta = vec![0f32; n * 2 * 3];
++            let tables = pikapro_rl::tables::Tables::for_format(&self.env.config().format);
++            let mut mechanics = vec![0f32; n * 2 * 4 * 17];
++            let mut mechanics_move = vec![0i64; n * 2 * 4];
++            let mut teams = vec![0i64; n * 2 * 2 * 6 * 13];
++            let mut last_moves = vec![0i64; n * 2 * 2 * 6];
++            let mut continuous = vec![0f32; n * 2 * 2 * 6 * 51];
++            let mut field = vec![0f32; n * 2 * 36];
++            let mut joint = vec![false; n * 2 * 28 * 27];
++            let mut tera = vec![false; n * 2 * 2];
++            let mut requests = vec![0i64; n * 2 * 8];
++            let mut request_meta = vec![0i64; n * 2 * 16];
++            for (row, &lane) in selected.iter().enumerate() {
++                self.env
++                    .with_env(lane, |e| {
++                        for side in SideId::BOTH {
++                            let seat = row * 2 + side.index();
++                            let v = e.slot.view(side);
++                            v6_team_categories(
++                                &v,
++                                &tables,
++                                self,
++                                &e.slot.last_own_roster[side.index()],
++                                &e.slot.shown_species[side.foe().index()],
++                                &mut teams[seat * 156..(seat + 1) * 156],
++                                &mut continuous[seat * 612..(seat + 1) * 612],
++                                &mut last_moves[seat * 12..(seat + 1) * 12],
++                            );
++                            v6_request_menu(
++                                &v,
++                                || pikapro_rl::env::shown(&e.battle, e.slot.own(side), e.slot.tracker_of(side), side),
++                                &teams[seat * 156..seat * 156 + 78],
++                                &self.v6_moves,
++                                self.v6_recharge,
++                                &self.v6_meta,
++                                &self.v6_types,
++                                &mut joint[seat * 756..(seat + 1) * 756],
++                                &mut tera[seat * 2..(seat + 1) * 2],
++                                &mut requests[seat * 8..(seat + 1) * 8],
++                                &mut request_meta[seat * 16..(seat + 1) * 16],
++                            );
++                            let history = &e.slot.public_actions;
++                            let f = &mut field[seat * 36..(seat + 1) * 36];
++                            use pikapro::state::{SideCondition as C, Terrain as T, Weather as W};
++                            let public = v.field();
++                            let age = |start, cap: u16, base: u16| {
++                                f32::from((history.turn.saturating_sub(start) + base).min(cap)) / f32::from(cap)
++                            };
++                            let weather = match public.weather {
++                                None => 0,
++                                Some(W::Sun) => 1,
++                                Some(W::HarshSun) => 2,
++                                Some(W::Rain) => 3,
++                                Some(W::HeavyRain) => 4,
++                                Some(W::Sand) => 5,
++                                Some(W::Snow) => 7,
++                                Some(W::StrongWinds) => 8,
++                            };
++                            f[weather] = 1.;
++                            if weather != 0 {
++                                f[9] = age(history.weather_start, 8, 0);
++                            }
++                            let terrain = match public.terrain {
++                                None => 0,
++                                Some(T::Electric) => 1,
++                                Some(T::Grassy) => 2,
++                                Some(T::Misty) => 3,
++                                Some(T::Psychic) => 4,
++                            };
++                            f[10 + terrain] = 1.;
++                            if terrain != 0 {
++                                f[15] = age(history.terrain_start, 8, 0);
++                            }
++                            for (relative, (which, observed)) in
++                                [(side, v.my_side()), (side.foe(), v.foe_side())].into_iter().enumerate()
++                            {
++                                let j = 16 + relative * 8;
++                                for (k, (c, cap)) in
++                                    [(C::StealthRock, 1.), (C::Spikes, 3.), (C::ToxicSpikes, 2.), (C::StickyWeb, 1.)]
++                                        .into_iter()
++                                        .enumerate()
++                                {
++                                    f[j + k] = f32::from(observed.condition(c).layers) / cap;
++                                }
++                                for (k, start) in history.side_starts[which.index()].iter().enumerate() {
++                                    if let Some(t) = start {
++                                        f[j + 4 + k] = age(*t, if k == 3 { 4 } else { 8 }, 1);
++                                    }
++                                }
++                            }
++                            if public.trick_room.is_some() {
++                                f[32] = age(history.trick_start, 5, 1);
++                            }
++                            f[33] = u8::from(v.my_side().tera_used) as f32;
++                            f[34] = u8::from(v.foe_side().tera_used) as f32;
++                            f[35] = age(0, 20, 0);
++                            let partial = !history.current.is_empty();
++                            let (rows, overflow) = if partial {
++                                (&history.current, history.current_overflow)
++                            } else {
++                                (&history.previous, history.previous_overflow)
++                            };
++                            let rel = |x: u16| {
++                                if x == 0 || side.index() == 0 { i64::from(x) } else { i64::from((x - 1 + 2) % 4 + 1) }
++                            };
++                            if !rows.is_empty() {
++                                meta[seat * 3] = 1.;
++                                meta[seat * 3 + 1] = u8::from(partial && v.public.outcome.is_none()) as f32;
++                                meta[seat * 3 + 2] = f32::from(overflow.min(12)) / 12.;
++                            }
++                            for (j, action) in rows.iter().enumerate() {
++                                let [kind, actor, target, mv] = action.core;
++                                let row = seat * 12 + j;
++                                let id = self.v6_moves[usize::from(mv)];
++                                events[row * 8..row * 8 + 8].copy_from_slice(&[
++                                    i64::from(kind),
++                                    rel(actor),
++                                    rel(target),
++                                    id,
++                                    action.source_move.map_or(0, |m| self.v6_moves[1 + m.index()]),
++                                    if mv == 0 { 0 } else { self.v6_scopes[id as usize] },
++                                    action.species.map_or(0, |s| self.v6_species[s.index()]),
++                                    action.tera.map_or(0, |t| self.v6_types[t as usize]),
++                                ]);
++                                for bit in 0..5 {
++                                    flags[row * 5 + bit] = f32::from((action.flags >> bit) & 1);
++                                }
++                                for (absolute, t) in action.outcomes.iter().enumerate() {
++                                    let p = row * 4 + rel(absolute as u16 + 1) as usize - 1;
++                                    let declared = if action.spread != 0 {
++                                        action.spread & (1 << absolute) != 0
++                                    } else {
++                                        target as usize == absolute + 1
++                                    };
++                                    let mut bits = t.flags;
++                                    if declared {
++                                        bits |= 1 | 1 << 7;
++                                        if action.miss_on_line {
++                                            bits |= 1 << 1;
++                                        }
++                                    }
++                                    for bit in 0..8 {
++                                        outcomes[p * 8 + bit] = f32::from((bits >> bit) & 1);
++                                    }
++                                    outcomes[p * 8 + 6] = f32::from(t.hit_count) / 10.;
++                                    activations[p] = t.activation.map_or(0, |m| self.v6_moves[1 + m.index()]);
++                                }
++                            }
++                            v6_active_mechanics(
++                                &teams[seat * 156..(seat + 1) * 156],
++                                &continuous[seat * 612..(seat + 1) * 612],
++                                &events[seat * 96..(seat + 1) * 96],
++                                &flags[seat * 60..(seat + 1) * 60],
++                                &outcomes[seat * 384..(seat + 1) * 384],
++                                &meta[seat * 3..(seat + 1) * 3],
++                                &mut mechanics[seat * 68..(seat + 1) * 68],
++                                &mut mechanics_move[seat * 4..(seat + 1) * 4],
++                            );
++                        }
++                    })
++                    .expect("index is within n");
++            }
++            (
++                events,
++                flags,
++                outcomes,
++                activations,
++                meta,
++                joint,
++                tera,
++                requests,
++                request_meta,
++                field,
++                teams,
++                continuous,
++                last_moves,
++                mechanics,
++                mechanics_move,
++            )
++        });
++        let out = PyDict::new(py);
++        out.set_item("own_request_moves", array(py, requests, vec![n, 2, 2, 4])?)?;
++        out.set_item("own_request_move_metadata", array(py, request_meta, vec![n, 2, 2, 4, 2])?)?;
++        out.set_item("teams", array(py, teams, vec![n, 2, 2, 6, 13])?)?;
++        out.set_item("last_moves", array(py, last_moves, vec![n, 2, 2, 6])?)?;
++        out.set_item("continuous", array(py, continuous, vec![n, 2, 2, 6, 51])?)?;
++        out.set_item("field", array(py, field, vec![n, 2, 36])?)?;
++        out.set_item("joint", array(py, joint, vec![n, 2, 28, 27])?)?;
++        out.set_item("can_tera", array(py, tera, vec![n, 2, 2])?)?;
++        out.set_item("active_mechanics", array(py, mechanics, vec![n, 2, 4, 17])?)?;
++        out.set_item("active_mechanics_move", array(py, mechanics_move, vec![n, 2, 4])?)?;
++        out.set_item("events", array(py, events, vec![n, 2, 12, 8])?)?;
++        out.set_item("recent_event_flags", array(py, flags, vec![n, 2, 12, 5])?)?;
++        out.set_item("recent_event_target_outcomes", array(py, outcomes, vec![n, 2, 12, 4, 8])?)?;
++        out.set_item("recent_event_target_activation_move", array(py, activations, vec![n, 2, 12, 4])?)?;
++        out.set_item("meta", array(py, meta, vec![n, 2, 3])?)?;
++        Ok(out)
++    }
++
++    /// Set the simulator seed for the next battle in this lane.
++    fn set_battle_seed(&self, i: usize, seed: &Bound<'_, PyAny>) -> PyResult<()> {
++        self.check_battle(i)?;
++        self.env.set_battle_seed(i, crate::python::seed_arg(seed)?);
++        Ok(())
++    }
++
++    /// Last public protocol segment and each player's private request.
++    #[pyo3(signature = (i, opening, names=None))]
++    fn player_frame(
++        &self,
++        py: Python<'_>,
++        i: usize,
++        opening: bool,
++        names: Option<[String; 2]>,
++    ) -> PyResult<(u64, [Vec<String>; 2], [String; 2])> {
++        self.check_battle(i)?;
++        let space = Arc::new(self.env.space().clone());
++        py.detach(|| {
++            self.env.with_env(i, |e| {
++                let mut g = Game::from_battle(e.battle.clone(), space, e.sheets.clone());
++                if let Some(names) = names {
++                    g.players = names;
++                }
++                let logs = SideId::BOTH.map(|side| {
++                    let renderer = g.renderer(pikapro_protocol::Perspective::Player(side));
++                    let mut lines = if opening { renderer.header() } else { Vec::new() };
++                    lines.extend(renderer.log(&e.slot.recent_events));
++                    lines
++                });
++                let requests = SideId::BOTH.map(|side| {
++                    let changes = &mut g.changes[side.index()];
++                    changes.revealed = e.slot.own(side).revealed();
++                    changes.updated = changes.revealed != Default::default();
++                    for slot in 0..changes.cleared_disabled.len() {
++                        if changes.revealed.disabled[slot] != 0 {
++                            changes.cleared_disabled[slot] = true;
++                            changes.cleared_locked[slot] = true;
++                        }
++                    }
++                    g.request_json(side)
++                });
++                (e.slot.resolution, logs, requests)
++            })
++        })
++        .ok_or_else(|| PyIndexError::new_err("battle"))
++    }
++
+     /// A copy of battle `i` as a `pikapro.Battle` (its event log holds only
+     /// what the environment hasn't consumed yet).
+     fn battle(&self, py: Python<'_>, #[pyo3(from_py_with = arg::i)] i: usize) -> PyResult<PyBattle> {
+diff --git a/crates/pikapro-rl/src/env/battle.rs b/crates/pikapro-rl/src/env/battle.rs
+index c8a321a..be60011 100644
+--- a/crates/pikapro-rl/src/env/battle.rs
++++ b/crates/pikapro-rl/src/env/battle.rs
+@@ -12,11 +12,335 @@ use pikapro_view::{OpenSheet, OwnOverlay, OwnTeam, PlayerView, PublicTracker, Se
+ 
+ use super::{Ctx, EpisodeRecord, OpponentSpec, OtsView, Profile};
+ use crate::eval::POLICY_TRIES;
+-use crate::pool::{BattleError, Env, PoolConfig, Slot, episode_seed, new_battle, panic_message};
++use crate::pool::{BattleError, Env, PoolConfig, Slot, episode_seed, new_seeded_battle, panic_message};
+ use crate::reward::RewardPreset;
+ use crate::series::{SERIES_WIDTH, Series};
+ use crate::vec::{Autoreset, EnvEndReason, Opponent, PreviewMode, RANDOM_ACTION, StepBuffers, StepOut, status};
+ 
++/// Species revealed for this identity, independently of its current battle forme.
++fn record_switch(
++    tracker: &PublicTracker,
++    event: &pikapro::BattleEvent,
++    shown: &mut [[Option<pikapro_data::SpeciesId>; 6]; 2],
++) {
++    use pikapro::BattleEvent::*;
++    let actor = match event {
++        Switch { actor, .. } | Drag { actor, .. } | Replace { actor, .. } => actor,
++        _ => return,
++    };
++    let side = tracker.side(actor.pos.side);
++    if let Some((row, mon)) = side.active(actor.pos.slot as usize) {
++        let identity = &mut shown[actor.pos.side.index()][row as usize];
++        if matches!(event, Replace { .. }) || identity.is_none() {
++            *identity = Some(mon.details_species);
++        }
++    }
++}
++
++/// Public outcomes for the four field positions, observed after a move.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct TargetResult {
++    pub flags: u8,
++    pub hit_count: u8,
++    pub activation: Option<pikapro_data::MoveId>,
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++pub struct PublicAction {
++    pub core: [u16; 4],
++    pub source_move: Option<pikapro_data::MoveId>,
++    pub species: Option<pikapro_data::SpeciesId>,
++    pub tera: Option<pikapro_data::Type>,
++    pub flags: u8,
++    pub spread: u8,
++    pub miss_on_line: bool,
++    pub outcomes: [TargetResult; 4],
++}
++
++fn field_position(a: &pikapro::event::Actor) -> u16 {
++    if a.active && a.pos.slot < 2 { 1 + a.pos.side.index() as u16 * 2 + u16::from(a.pos.slot) } else { 0 }
++}
++
++impl PublicAction {
++    fn outcome(&mut self, actor: &pikapro::event::Actor, flag: u8) -> Option<&mut TargetResult> {
++        let p = field_position(actor);
++        if p == 0 {
++            return None;
++        }
++        let t = &mut self.outcomes[usize::from(p - 1)];
++        t.flags |= 1 | flag;
++        Some(t)
++    }
++
++    fn activation(&mut self, actor: &pikapro::event::Actor, id: pikapro_data::MoveId) {
++        use pikapro_data::gen9::moves as m;
++        if let Some(t) = self.outcome(actor, 0) {
++            t.activation.get_or_insert(id);
++            if matches!(
++                id,
++                m::BANEFUL_BUNKER
++                    | m::BURNING_BULWARK
++                    | m::CRAFTY_SHIELD
++                    | m::DETECT
++                    | m::KINGS_SHIELD
++                    | m::MAT_BLOCK
++                    | m::OBSTRUCT
++                    | m::PROTECT
++                    | m::QUICK_GUARD
++                    | m::SILK_TRAP
++                    | m::SPIKY_SHIELD
++                    | m::WIDE_GUARD
++            ) {
++                t.flags |= 1 << 5;
++            }
++        }
++    }
++
++    fn failed(&mut self, actor: &pikapro::event::Actor) {
++        self.flags |= 1;
++        if field_position(actor) == self.core[1] {
++            self.flags |= 1 << 3;
++        }
++        self.outcome(actor, 1 << 4);
++    }
++
++    fn minor(&mut self, event: &pikapro::BattleEvent) {
++        use pikapro::BattleEvent::*;
++        use pikapro::event::{EffectName, VolatileEffect as V};
++        use pikapro::state::Terrain;
++        use pikapro_data::gen9::moves as m;
++        match event {
++            Miss { user, target } if field_position(user) == self.core[1] => {
++                self.flags |= 1 << 1;
++                self.outcome(target, 1 << 1);
++            }
++            Immune { target } | OhkoImmune { target } | ImmuneFrom { target, .. } => {
++                self.outcome(target, 1 << 2);
++            }
++            Block { actor, .. } => {
++                self.outcome(actor, 1 << 3);
++            }
++            Fail { user } | NoTarget { user } | MoveFail { user, .. } | WeatherMoveFail { user, .. } => {
++                self.failed(user)
++            }
++            HealFail { target }
++            | StatusFail { target, .. }
++            | UproarPreventsSleep { target, .. }
++            | FailFrom { target, .. }
++            | FailBy { target, .. } => self.failed(target),
++            WeatherFail { source, effect: EffectName::Move(_) | EffectName::Item(_), .. } => self.failed(source),
++            HitCount { target, hits } => {
++                if let Some(t) = self.outcome(target, 0) {
++                    t.hit_count = (*hits).min(10);
++                }
++            }
++            Protected { target } => self.activation(target, m::PROTECT),
++            ProtectionBroken { target, move_id } | ActivateMove { target, move_id, .. } => {
++                self.activation(target, *move_id)
++            }
++            MoveActivate { actor, move_id, .. }
++            | ActivateEffect { actor, effect: EffectName::Move(move_id), .. }
++            | EffectStart { actor, effect: V::PartiallyTrapped(move_id), .. } => self.activation(actor, *move_id),
++            StruggleStart { actor } => self.activation(actor, m::STRUGGLE),
++            PpDrain { target, .. } => self.activation(target, m::EERIE_SPELL),
++            TerrainActivate { target, terrain } => self.activation(
++                target,
++                match terrain {
++                    Terrain::Electric => m::ELECTRIC_TERRAIN,
++                    Terrain::Grassy => m::GRASSY_TERRAIN,
++                    Terrain::Misty => m::MISTY_TERRAIN,
++                    Terrain::Psychic => m::PSYCHIC_TERRAIN,
++                },
++            ),
++            EffectActivate { actor, effect, .. } => {
++                let mv = match effect {
++                    V::Substitute => m::SUBSTITUTE,
++                    V::PartiallyTrapped(m) => *m,
++                    V::LeechSeed => m::LEECH_SEED,
++                    V::Curse => m::CURSE,
++                    V::PerishSong => m::PERISH_SONG,
++                    V::DestinyBond => m::DESTINY_BOND,
++                    V::Attract => m::ATTRACT,
++                    V::Torment => m::TORMENT,
++                    V::SaltCure => m::SALT_CURE,
++                    V::SyrupBomb => m::SYRUP_BOMB,
++                    V::ThroatChop => m::THROAT_CHOP,
++                    V::GlaiveRush => m::GLAIVE_RUSH,
++                    V::Endure => m::ENDURE,
++                    V::SmackDown => m::SMACK_DOWN,
++                    V::MagnetRise => m::MAGNET_RISE,
++                    V::FairyLock => m::FAIRY_LOCK,
++                    V::Octolock => m::OCTOLOCK,
++                    V::NoRetreat => m::NO_RETREAT,
++                    V::Yawn => m::YAWN,
++                    V::HealBlock => m::HEAL_BLOCK,
++                    V::Imprison => m::IMPRISON,
++                    V::Trapped => {
++                        self.outcome(actor, 0);
++                        return;
++                    }
++                };
++                self.activation(actor, mv);
++            }
++            _ => {}
++        }
++    }
++}
++
++#[derive(Clone, Debug, Default)]
++pub struct PublicActions {
++    pub current: Vec<PublicAction>,
++    pub previous: Vec<PublicAction>,
++    pub current_overflow: u16,
++    pub previous_overflow: u16,
++    last_move_line: Option<usize>,
++    active_move: Option<usize>,
++    pub turn: u16,
++    pub weather_start: u16,
++    pub terrain_start: u16,
++    pub trick_start: u16,
++    pub side_starts: [[Option<u16>; 4]; 2],
++}
++
++impl PublicActions {
++    pub fn observe(&mut self, event: &pikapro::BattleEvent) {
++        use pikapro::BattleEvent::*;
++        use pikapro::event::{CantReason, FieldEffect, MoveAttr as Attribute, MoveFrom};
++        use pikapro::state::SideCondition as C;
++        let screen = |c: &C| match c {
++            C::Reflect => Some(0),
++            C::LightScreen => Some(1),
++            C::AuroraVeil => Some(2),
++            C::Tailwind => Some(3),
++            _ => None,
++        };
++        match event {
++            Weather { upkeep: false, .. } | WeatherFrom { .. } => self.weather_start = self.turn,
++            FieldStart { effect, .. } | FieldStartFrom { effect, .. } => match effect {
++                FieldEffect::Terrain(_) => self.terrain_start = self.turn,
++                FieldEffect::TrickRoom => self.trick_start = self.turn,
++                _ => {}
++            },
++            SideStart { side, condition } => {
++                if let Some(j) = screen(condition) {
++                    self.side_starts[side.index()][j].get_or_insert(self.turn);
++                }
++            }
++            SideEnd { side, condition } => {
++                if let Some(j) = screen(condition) {
++                    self.side_starts[side.index()][j] = None;
++                }
++            }
++            SwapSideConditions => self.side_starts.swap(0, 1),
++            _ => {}
++        }
++        let mut action = PublicAction::default();
++        let index = |m: pikapro_data::MoveId| 1 + m.index() as u16;
++        let pos = field_position;
++        action.core = match event {
++            Turn { turn } => {
++                self.turn = *turn;
++                std::mem::swap(&mut self.previous, &mut self.current);
++                self.current.clear();
++                self.previous_overflow = std::mem::take(&mut self.current_overflow);
++                if *turn <= 1 {
++                    self.previous.clear();
++                    self.previous_overflow = 0;
++                }
++                self.last_move_line = None;
++                self.active_move = None;
++                return;
++            }
++            Timestamp => {
++                self.last_move_line = None;
++                return;
++            }
++            Blank | Upkeep | Win { .. } | Tie => {
++                self.active_move = None;
++                return;
++            }
++            Anim { .. } => {
++                self.last_move_line = None;
++                return;
++            }
++            MoveAttr { attr } => {
++                if let Some(i) = self.last_move_line {
++                    let m = &mut self.current[i];
++                    match attr {
++                        Attribute::Still => m.core[2] = 0,
++                        Attribute::Miss => {
++                            m.flags |= 3;
++                            m.miss_on_line = true;
++                        }
++                        Attribute::NoTarget => m.flags |= 1 | 1 << 3 | 1 << 4,
++                        Attribute::Spread(slots) => {
++                            for s in slots.as_slice() {
++                                m.spread |= 1 << (2 * s.side.index() + usize::from(s.slot));
++                            }
++                            if m.spread != 0 {
++                                m.flags |= 1 << 2;
++                            }
++                        }
++                        Attribute::Anim(_) => {}
++                    }
++                }
++                return;
++            }
++            Move { user, move_id, target, from } => {
++                if let Some(MoveFrom::Move(id)) = from {
++                    action.source_move = Some(*id);
++                }
++                [1, pos(user), target.as_ref().map_or(0, pos), index(*move_id)]
++            }
++            MoveNull { user, move_id, from } => {
++                if let Some(MoveFrom::Move(id)) = from {
++                    action.source_move = Some(*id);
++                }
++                [1, pos(user), 0, index(*move_id)]
++            }
++            Switch { actor, shown, .. } | Drag { actor, shown, .. } => {
++                action.species = Some(shown.unwrap_or(actor.species));
++                [if matches!(event, Switch { .. }) { 2 } else { 3 }, pos(actor), 0, 0]
++            }
++            Cant { actor, reason } => [
++                4,
++                pos(actor),
++                0,
++                match *reason {
++                    CantReason::Taunt(m) | CantReason::Disable(m) => index(m),
++                    _ => 0,
++                },
++            ],
++            StatusCant { actor, .. } => [4, pos(actor), 0, 0],
++            CantFrom { actor, move_id, .. } | EffectCant { actor, move_id, .. } | CantNoPp { actor, move_id } => {
++                [4, pos(actor), 0, move_id.map_or(0, index)]
++            }
++            GravityCant { actor, move_id } => [4, pos(actor), 0, index(*move_id)],
++            LostFocus { actor } => [4, pos(actor), 0, index(pikapro_data::gen9::moves::FOCUS_PUNCH)],
++            Faint { actor } => [5, pos(actor), 0, 0],
++            Terastallize { actor, ty } => {
++                action.tera = Some(*ty);
++                [6, pos(actor), 0, 0]
++            }
++            _ => {
++                if let Some(i) = self.active_move {
++                    self.current[i].minor(event);
++                }
++                return;
++            }
++        };
++        self.active_move = (action.core[0] == 1 && self.current.len() < 12).then_some(self.current.len());
++        if action.core[0] == 1 {
++            self.last_move_line = self.active_move;
++        }
++        if self.current.len() < 12 {
++            self.current.push(action);
++        } else {
++            self.current_overflow += 1;
++        }
++    }
++}
++
+ /// Mixed into an episode's battle seed for its own draws (side, opponent,
+ /// open sheets), so they don't share the battle's stream.
+ const META_SEED: u64 = 0x5EED_0FE9_150D_E5E5;
+@@ -32,6 +356,12 @@ pub struct EnvSlot {
+     /// With [`OtsView::Player0`] and open sheets, player 0's alone
+     /// ([`EnvSlot::tracker_of`]).
+     pub(crate) tracker: PublicTracker,
++    /// Latest resolution for player-channel consumers (cleared at the next resolution).
++    pub recent_events: Vec<pikapro::BattleEvent>,
++    pub resolution: u64,
++    pub public_actions: PublicActions,
++    pub last_own_roster: [Vec<(u8, pikapro_data::SpeciesId)>; 2],
++    pub shown_species: [[Option<pikapro_data::SpeciesId>; 6]; 2],
+     /// With [`OtsView::Player0`] and open sheets, player 1's: the same
+     /// events, with closed sheets. `None`
+     /// otherwise: both players read `tracker`.
+@@ -109,10 +439,15 @@ impl EnvSlot {
+                 tracker.set_open_sheet(side, sheet);
+             }
+         }
+-        for e in battle.drain_events() {
+-            tracker.apply(&e);
++        let recent_events: Vec<_> = battle.drain_events().collect();
++        let mut shown_species = [[None; 6]; 2];
++        let mut public_actions = PublicActions::default();
++        for e in &recent_events {
++            public_actions.observe(e);
++            tracker.apply(e);
++            record_switch(&tracker, e, &mut shown_species);
+             if let Some(c) = &mut closed {
+-                c.apply(&e);
++                c.apply(e);
+             }
+         }
+         let own = SideId::BOTH.map(|s| OwnOverlay::from_battle(battle, s));
+@@ -122,6 +457,11 @@ impl EnvSlot {
+             t
+         });
+         EnvSlot {
++            recent_events,
++            last_own_roster: own.each_ref().map(|o| o.mons.iter().map(|m| (m.id, m.species)).collect()),
++            public_actions,
++            shown_species,
++            resolution: 0,
+             tracker,
+             closed,
+             own,
+@@ -289,6 +629,7 @@ pub(crate) struct Job<'a> {
+     pub ctx: &'a Ctx,
+     pub config: &'a PoolConfig,
+     pub base_seed: u64,
++    pub battle_seeds: &'a [Option<Seed>],
+     pub opponents: &'a [OpponentSpec],
+     pub profile: bool,
+ }
+@@ -317,6 +658,11 @@ fn run(
+         *stage = Stage::Starting(next_episode(job, env, i));
+         begin(job, env, i, actions.is_some() && !failed)?;
+         prof.other += clock.lap();
++    } else if let Some(actions) = actions
++        && actions[0] == i64::MIN + 2
++    {
++        env.battle.forfeit(env.slot.side_of(actions[1] as usize));
++        dirty = true;
+     } else if let Some(actions) = actions {
+         // Who was asked before anything is submitted: a player's choice can
+         // resolve the turn and issue the other a new request, which this
+@@ -611,7 +957,8 @@ fn episode(job: &Job<'_>, i: usize, started: u64, carry: Option<Carry>, place: P
+             (sheets, agent_side, opponent, ctx.series.map(|b| Box::new(Series::new(b))))
+         }
+     };
+-    let battle = new_battle(config, &sheets, seed).map_err(|e| format!("episode {episode}: {e}"))?;
++    let battle = new_seeded_battle(config, &sheets, job.battle_seeds[i].unwrap_or(Seed::fast(seed)))
++        .map_err(|e| format!("episode {episode}: {e}"))?;
+     // The sheets player 0 sees, by side.
+     let open = ots.then(|| [&sheets[0], &sheets[1]]);
+     let closed = ots && ctx.ots_view != OtsView::Both;
+@@ -713,12 +1060,24 @@ fn submit(
+     legal: Option<&LegalActions>,
+     choice: Choice,
+     dirty: &mut bool,
++) -> Submitted {
++    submit_checked(env, side, legal, choice, dirty, false)
++}
++
++fn submit_checked(
++    env: &mut Env<EnvSlot>,
++    side: SideId,
++    legal: Option<&LegalActions>,
++    choice: Choice,
++    dirty: &mut bool,
++    parsed: bool,
+ ) -> Submitted {
+     // Unless the request hides something, what it shows is what the battle
+     // accepts: the battle's own check is enough.
+     let hidden = hides(&env.slot.own[side.index()]);
+     debug_assert!(!hidden || legal.is_some(), "a hidden request's shown actions");
+     if hidden
++        && !parsed
+         && let Some(legal) = legal
+         && let Err(e) = legal.check(&choice)
+     {
+@@ -754,13 +1113,18 @@ fn submit(
+ fn act(ctx: &Ctx, env: &mut Env<EnvSlot>, p: usize, acts: &[i64], dirty: &mut bool) -> i8 {
+     let side = env.slot.side_of(p);
+     let legal = slot_shown(&env.battle, &env.slot, side);
+-    let choice = if acts[0] == RANDOM_ACTION {
++    // A command parsed by Showdown's choice reader may legally target an empty
++    // foe position. The factored policy mask omits redundant auto-retargets.
++    let parsed = acts[0] >= 1i64 << 32;
++    let choice = if parsed {
++        ctx.space.decode((acts[0] - (1i64 << 32)) as usize)
++    } else if acts[0] == RANDOM_ACTION {
+         Some(legal.sample(&mut env.slot.rng[p]))
+     } else {
+         ctx.space.decode_player(ctx.layout, ctx.switch_by, &legal, &env.slot.own[side.index()], acts)
+     };
+     let Some(choice) = choice else { return status::REJECTED };
+-    match submit(env, side, hidden_shown(legal).as_ref(), choice, dirty) {
++    match submit_checked(env, side, hidden_shown(legal).as_ref(), choice, dirty, parsed) {
+         Submitted::Ok => status::SUBMITTED,
+         Submitted::Unavailable => status::UNAVAILABLE,
+         Submitted::Rejected(_) => status::REJECTED,
+@@ -829,14 +1193,25 @@ fn sync(ctx: &Ctx, env: &mut Env<EnvSlot>, prof: &mut Profile, clock: &mut Clock
+     // Read in place, then dropped (a drain would copy each event out first).
+     for e in env.battle.events() {
+         slot.tracker.apply(e);
++        record_switch(&slot.tracker, e, &mut slot.shown_species);
+         if let Some(c) = &mut slot.closed {
+             c.apply(e);
+         }
+     }
+-    env.battle.drain_events();
++    slot.recent_events.clear();
++    slot.recent_events.extend(env.battle.drain_events());
++    for event in &slot.recent_events {
++        slot.public_actions.observe(event);
++    }
++    slot.resolution += 1;
+     prof.view += clock.lap();
+     for side in SideId::BOTH {
+         slot.own[side.index()].refresh(&env.battle, side);
++        if slot.tracker.outcome.is_none() {
++            let roster = &mut slot.last_own_roster[side.index()];
++            roster.clear();
++            roster.extend(slot.own[side.index()].mons.iter().map(|m| (m.id, m.species)));
++        }
+         slot.team[side.index()].observe(&slot.own[side.index()]);
+     }
+     prof.overlay += clock.lap();
+diff --git a/crates/pikapro-rl/src/env/mod.rs b/crates/pikapro-rl/src/env/mod.rs
+index 1435fee..cc9854e 100644
+--- a/crates/pikapro-rl/src/env/mod.rs
++++ b/crates/pikapro-rl/src/env/mod.rs
+@@ -380,6 +380,7 @@ pub struct VecEnv {
+     /// Each battle's opponent, from its next episode. Shared with a call by
+     /// cloning the `Arc`: the workers never wait on it.
+     opponents: Mutex<Arc<Vec<OpponentSpec>>>,
++    battle_seeds: Mutex<Arc<Vec<Option<pikapro::Seed>>>>,
+     /// [`VecEnv::reset`] was called: [`VecEnv::step`] may run.
+     ready: AtomicBool,
+     profile: AtomicBool,
+@@ -467,11 +468,18 @@ impl VecEnv {
+             ..PoolConfig::new(config.format.clone(), config.n, config.teams.clone())
+         };
+         let opponents = Arc::new(vec![config.opponent.clone(); config.n]);
++        let battle_seeds = Arc::new(vec![None; config.n]);
+         // Each battle holds its first episode's battle, provisionally: the
+         // first reset starts it again (`started` 0).
+         let make = |pool: &PoolConfig, i: usize| {
+-            let job =
+-                battle::Job { ctx: &ctx, config: pool, base_seed: config.seed, opponents: &opponents, profile: false };
++            let job = battle::Job {
++                ctx: &ctx,
++                config: pool,
++                base_seed: config.seed,
++                battle_seeds: &battle_seeds,
++                opponents: &opponents,
++                profile: false,
++            };
+             battle::provisional(&job, i)
+         };
+         let pool = Pool::with_envs(pool_config, threads, config.shards_per_thread, make)?;
+@@ -479,6 +487,7 @@ impl VecEnv {
+             bounds: pool.shard_bounds(),
+             pool,
+             opponents: Mutex::new(opponents),
++            battle_seeds: Mutex::new(battle_seeds),
+             ctx,
+             config,
+             ready: AtomicBool::new(false),
+@@ -585,6 +594,10 @@ impl VecEnv {
+         self.pool.set_pairs(updates)
+     }
+ 
++    pub fn set_battle_seed(&self, i: usize, seed: pikapro::Seed) {
++        Arc::make_mut(&mut *lock(&self.battle_seeds))[i] = Some(seed);
++    }
++
+     /// Starts a new episode in every battle and writes its first
+     /// observations into `out` (status 0, no reward; a battle that fails
+     /// to start ends with [`EnvEndReason::Error`](crate::vec::EnvEndReason::Error)
+@@ -647,6 +660,7 @@ impl VecEnv {
+         let start = Instant::now();
+         let profile = self.profile.load(Ordering::Relaxed);
+         let opponents = lock(&self.opponents).clone();
++        let battle_seeds = lock(&self.battle_seeds).clone();
+         let ctx = self.ctx.clone();
+         let per = 2 * ctx.per;
+         // Runs a shard's battles into `target` (the shard's own buffers, or
+@@ -654,7 +668,14 @@ impl VecEnv {
+         let shard =
+             move |start: usize, envs: &mut [Env<EnvSlot>], target: &mut battle::Target<'_, '_>, config: &PoolConfig| {
+                 // The pool's seed: the last reset's.
+-                let job = battle::Job { ctx: &ctx, config, base_seed: config.seed, opponents: &opponents, profile };
++                let job = battle::Job {
++                    ctx: &ctx,
++                    config,
++                    base_seed: config.seed,
++                    battle_seeds: &battle_seeds,
++                    opponents: &opponents,
++                    profile,
++                };
+                 *target.profile = Profile::default();
+                 target.errors.clear();
+                 for (j, env) in envs.iter_mut().enumerate() {
+@@ -663,6 +684,10 @@ impl VecEnv {
+                         env.started = 0;
+                     }
+                     let acts = actions.as_ref().map(|a| &a[i * per..][..per]);
++                    if acts.is_some_and(|a| a[0] == i64::MIN) {
++                        continue;
++                    }
++                    let acts = acts.filter(|a| a[0] != i64::MIN + 1);
+                     battle::run_guarded(&job, env, i, j, acts, target);
+                 }
+                 Ok(())
+diff --git a/crates/pikapro-rl/src/pool.rs b/crates/pikapro-rl/src/pool.rs
+index d2118f1..00abfa3 100644
+--- a/crates/pikapro-rl/src/pool.rs
++++ b/crates/pikapro-rl/src/pool.rs
+@@ -350,7 +350,11 @@ fn reveal(battle: &Battle, side: SideId, slot: usize, action: SlotAction, reveal
+ /// A new battle for `sheets` (p1's, p2's) with battle seed `seed`, events
+ /// as the pool records them.
+ pub(crate) fn new_battle(config: &PoolConfig, sheets: &[TeamSheet; 2], seed: u64) -> Result<Battle, TeamError> {
+-    let mut options = BattleOptions::new(Seed::fast(seed));
++    new_seeded_battle(config, sheets, Seed::fast(seed))
++}
++
++pub(crate) fn new_seeded_battle(config: &PoolConfig, sheets: &[TeamSheet; 2], seed: Seed) -> Result<Battle, TeamError> {
++    let mut options = BattleOptions::new(seed);
+     options.log_events = config.log;
+     let teams = [sheets[0].team.clone(), sheets[1].team.clone()];
+     Battle::new(config.format.clone(), teams, options)
+diff --git a/crates/pikapro-view/src/apply.rs b/crates/pikapro-view/src/apply.rs
+index 1db5ae2..f1b0c69 100644
+--- a/crates/pikapro-view/src/apply.rs
++++ b/crates/pikapro-view/src/apply.rs
+@@ -259,6 +259,7 @@ impl PublicTracker {
+                 }
+                 if let Some(mon) = self.mon_mut(actor) {
+                     mon.flags.set(MonFlags::TERASTALLIZED, true);
++                    mon.flags.set(MonFlags::USED_TERA, true);
+                     mon.tera_type = Some(ty);
+                     // A Morpeko Terastallized in its Hangry forme keeps it
+                     // (`terastallize`: its `baseSpecies` becomes the forme),
+@@ -1318,9 +1319,7 @@ impl PublicTracker {
+         flags.set(MonFlags::FORME_HIDDEN, wild.is_some());
+         let shown = wild.unwrap_or(species);
+         let mut mon = MonView { species: shown, details_species: shown, level, gender, flags, ..MonView::default() };
+-        if wild.is_none()
+-            && let Some(a) = single_ability(dex, shown)
+-        {
++        if let Some(a) = crate::tracker::preview_ability(dex, shown, wild.is_some()) {
+             mon.ability = AbilityState::Known(a);
+             mon.base_ability = AbilityState::Known(a);
+         }
+@@ -3840,6 +3839,9 @@ fn moved_facts(mon: &mut MonView, shown: &MonView, before: &MonView, shared: boo
+     // `|replace|` doesn't show it (`getUpdatedDetails`). Unless the record was
+     // shared with the Pokémon it shows, whose Tera it may be.
+     let tera_before = shared && before.flags.has(MonFlags::TERASTALLIZED);
++    if shown.flags.has(MonFlags::USED_TERA) && !before.flags.has(MonFlags::USED_TERA) {
++        mon.flags.set(MonFlags::USED_TERA, true);
++    }
+     if shown.flags.has(MonFlags::TERASTALLIZED) && !tera_before {
+         mon.flags.set(MonFlags::TERASTALLIZED, true);
+         mon.tera_type = shown.tera_type;
+diff --git a/crates/pikapro-view/src/mon.rs b/crates/pikapro-view/src/mon.rs
+index 0c43794..666c179 100644
+--- a/crates/pikapro-view/src/mon.rs
++++ b/crates/pikapro-view/src/mon.rs
+@@ -230,6 +230,8 @@ impl MonFlags {
+     /// which lasts exactly 3 turns (Showdown's `rest.onHit` sets
+     /// `statusState.time = 3`); cleared when its status changes.
+     pub const SLEEP_FROM_REST: u16 = 1 << 8;
++    /// The public log named this Pokémon as its side's Tera user.
++    pub const USED_TERA: u16 = 1 << 9;
+ 
+     #[inline]
+     pub const fn has(self, bit: u16) -> bool {
+diff --git a/crates/pikapro-view/src/tests/rules.rs b/crates/pikapro-view/src/tests/rules.rs
+index 53f9520..5c11106 100644
+--- a/crates/pikapro-view/src/tests/rules.rs
++++ b/crates/pikapro-view/src/tests/rules.rs
+@@ -787,6 +787,10 @@ fn tera_and_displayed_types() {
+     // Stellar keeps its types.
+     t.apply(&E::Terastallize { actor: gho, ty: Type::Stellar });
+     assert_eq!(t.types(P2, 0), Some(TypeSet::dual(Type::Steel, Type::Ghost)));
++    t.apply(&E::Faint { actor: inc });
++    assert!(!row(&t, inc).flags.has(MonFlags::TERASTALLIZED));
++    assert!(row(&t, inc).flags.has(MonFlags::USED_TERA));
++    assert!(!row(&t, ril).flags.has(MonFlags::USED_TERA));
+ }
+ 
+ /// D: Double Shock announces its type change on a Terastallized user,
+@@ -1628,6 +1632,8 @@ fn wildcard_formes_share_only_their_common_types() {
+     let r = *t.side(P2).mon(0).unwrap();
+     assert!(r.flags.has(MonFlags::FORME_HIDDEN));
+     assert_eq!(wildcard_types(dex, r.species), ([Some(Type::Fighting), None], false));
++    assert_eq!(r.ability, AbilityState::Known(a::UNSEEN_FIST));
++    assert_eq!(crate::tracker::preview_ability(dex, s::GRENINJA, true), None);
+     assert_eq!(wildcard_types(dex, s::ZACIAN), ([Some(Type::Fairy), None], false), "Zacian-Crowned is Fairy/Steel");
+     assert_eq!(wildcard_types(dex, s::GRENINJA), ([Some(Type::Water), Some(Type::Dark)], true));
+     assert_eq!(wildcard_types(dex, s::DUDUNSPARCE), ([Some(Type::Normal), None], true));
+diff --git a/crates/pikapro-view/src/tracker.rs b/crates/pikapro-view/src/tracker.rs
+index 47d7d62..bda3166 100644
+--- a/crates/pikapro-view/src/tracker.rs
++++ b/crates/pikapro-view/src/tracker.rs
+@@ -605,7 +605,25 @@ pub(crate) fn fill_from_sheet(dex: &Dex, mon: &mut MonView, entry: &SheetMon, st
+ 
+ /// The ability a species must have, if it has only one possible one.
+ pub(crate) fn single_ability(dex: &Dex, species: SpeciesId) -> Option<AbilityId> {
+-    let a = dex.species(species).abilities;
++    ability_in_all_slots(dex.species(species).abilities)
++}
++
++fn ability_in_all_slots(a: pikapro_data::AbilitySlots) -> Option<AbilityId> {
+     let only = |x: Option<AbilityId>| x.is_none_or(|x| x == a.primary);
+     (only(a.secondary) && only(a.hidden) && only(a.special)).then_some(a.primary)
+ }
++
++/// A hidden forme can still reveal its ability if every forme shares it.
++pub(crate) fn preview_ability(dex: &Dex, shown: SpeciesId, wildcard: bool) -> Option<AbilityId> {
++    let ability = single_ability(dex, shown)?;
++    if wildcard
++        && dex
++            .species
++            .iter()
++            .filter(|s| s.base_species == shown)
++            .any(|s| ability_in_all_slots(s.abilities) != Some(ability))
++    {
++        return None;
++    }
++    Some(ability)
++}

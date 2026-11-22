@@ -1,0 +1,70 @@
+Archaludon @ Assault Vest
+Ability: Stamina
+Level: 50
+Tera Type: Fairy
+EVs: 212 HP / 4 Def / 4 SpA / 148 SpD / 140 Spe
+Modest Nature
+IVs: 0 Atk
+- Electro Shot
+- Body Press
+- Draco Meteor
+- Flash Cannon
+
+Pelipper @ Eject Button
+Ability: Drizzle
+Level: 50
+Tera Type: Ground
+EVs: 252 HP / 84 SpA / 172 SpD
+Modest Nature
+IVs: 0 Atk
+- Wide Guard
+- Hurricane
+- Hydro Pump
+- Protect
+
+Ribombee (F) @ Focus Sash
+Ability: Sweet Veil
+Level: 50
+Shiny: Yes
+Tera Type: Dark
+EVs: 68 HP / 4 Def / 188 SpA / 36 SpD / 212 Spe
+Timid Nature
+IVs: 0 Atk
+- Tailwind
+- Struggle Bug
+- Pollen Puff
+- Moonblast
+
+Urshifu-Rapid-Strike @ Choice Scarf
+Ability: Unseen Fist
+Level: 50
+Tera Type: Grass
+EVs: 252 Atk / 4 SpD / 252 Spe
+Jolly Nature
+- Surging Strikes
+- Close Combat
+- Aqua Jet
+- U-turn
+
+Sinistcha-Masterpiece @ Rocky Helmet
+Ability: Hospitality
+Level: 50
+Tera Type: Water
+EVs: 228 HP / 60 Def / 220 SpD
+Bold Nature
+IVs: 0 Atk
+- Matcha Gotcha
+- Rage Powder
+- Strength Sap
+- Life Dew
+
+Incineroar @ Sitrus Berry
+Ability: Intimidate
+Level: 50
+Tera Type: Water
+EVs: 236 HP / 4 Atk / 100 Def / 156 SpD / 12 Spe
+Careful Nature
+- Fake Out
+- Flare Blitz
+- Parting Shot
+- Knock Off

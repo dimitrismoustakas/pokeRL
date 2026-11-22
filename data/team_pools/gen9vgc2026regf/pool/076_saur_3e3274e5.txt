@@ -1,0 +1,70 @@
+Venusaur @ Wide Lens  
+Ability: Chlorophyll  
+Level: 50  
+Tera Type: Fire  
+EVs: 84 HP / 124 Def / 76 SpA / 44 SpD / 180 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Weather Ball  
+- Giga Drain  
+- Sleep Powder  
+- Protect
+
+Chi-Yu @ Choice Specs  
+Ability: Beads of Ruin  
+Level: 50  
+Tera Type: Ghost  
+EVs: 116 HP / 56 Def / 180 SpA / 40 SpD / 116 Spe  
+Modest Nature  
+IVs: 0 Atk  
+- Heat Wave  
+- Snarl  
+- Overheat  
+- Dark Pulse
+
+Walking Wake @ Life Orb  
+Ability: Protosynthesis  
+Level: 50  
+Tera Type: Poison  
+EVs: 4 HP / 252 SpA / 252 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Hydro Steam  
+- Flamethrower  
+- Draco Meteor  
+- Protect
+
+Ninetales @ Eject Pack  
+Ability: Drought  
+Level: 50  
+Tera Type: Water  
+EVs: 252 HP / 140 Def / 4 SpA / 4 SpD / 108 Spe  
+Bold Nature  
+IVs: 0 Atk  
+- Overheat  
+- Helping Hand  
+- Will-O-Wisp  
+- Roar
+
+Landorus-Therian @ Choice Scarf  
+Ability: Intimidate  
+Level: 50  
+Tera Type: Flying  
+EVs: 36 HP / 244 Atk / 12 Def / 4 SpD / 212 Spe  
+Adamant Nature  
+- Tera Blast  
+- Rock Slide  
+- U-turn  
+- Stomping Tantrum
+
+Whimsicott @ Focus Sash  
+Ability: Prankster  
+Level: 50  
+Tera Type: Dark  
+EVs: 252 HP / 4 SpA / 252 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Moonblast  
+- Tailwind  
+- Sunny Day  
+- Protect

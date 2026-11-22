@@ -1,0 +1,68 @@
+Flutter Mane @ Choice Specs
+Ability: Protosynthesis
+Shiny: Yes
+Tera Type: Fairy
+EVs: 52 HP / 100 Def / 100 SpA / 4 SpD / 252 Spe
+Timid Nature
+IVs: 0 Atk
+- Dazzling Gleam
+- Moonblast
+- Shadow Ball
+- Power Gem
+
+Ogerpon-Wellspring @ Wellspring Mask
+Ability: Water Absorb
+Tera Type: Water
+EVs: 236 HP / 4 Atk / 4 Def / 12 SpD / 252 Spe
+Jolly Nature
+- Ivy Cudgel
+- Horn Leech
+- Follow Me
+- Spiky Shield
+
+Incineroar @ Assault Vest
+Ability: Intimidate
+Shiny: Yes
+Tera Type: Ghost
+EVs: 236 HP / 148 Atk / 4 Def / 108 SpD / 12 Spe
+Adamant Nature
+- Fake Out
+- Flare Blitz
+- Knock Off
+- U-Turn
+
+Raging Bolt @ Life Orb
+Ability: Protosynthesis
+Tera Type: Bug
+EVs: 228 HP / 60 Def / 220 SpA
+Modest Nature
+IVs: 20 Atk
+- Thunderbolt
+- Thunderclap
+- Dragon Pulse
+- Protect
+
+Ursaluna @ Flame Orb
+Ability: Guts
+Level: 50
+Shiny: Yes
+Tera Type: Ghost
+EVs: 252 HP / 252 Atk / 4 SpD
+Brave Nature
+IVs: 14 SpA / 0 Spe
+- Earthquake
+- Facade
+- Swords Dance
+- Protect
+
+Cresselia @ Safety Goggles
+Ability: Levitate
+Shiny: Yes
+Tera Type: Fairy
+EVs: 236 HP / 116 Def / 156 SpD
+Sassy Nature
+IVs: 21 Atk / 0 Spe
+- Moonblast
+- Trick Room
+- Lunar Blessing
+- Helping Hand

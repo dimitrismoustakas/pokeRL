@@ -1,0 +1,71 @@
+Tornadus @ Sharp Beak
+Ability: Prankster
+Level: 50
+Tera Type: Ghost
+EVs: 92 HP / 92 Def / 68 SpA / 4 SpD / 252 Spe
+Timid Nature
+IVs: 0 Atk
+- Tailwind
+- Bleakwind Storm
+- Substitute
+- Protect
+
+Flutter Mane @ Choice Specs
+Ability: Protosynthesis
+Level: 50
+Shiny: Yes
+Tera Type: Fairy
+EVs: 204 HP / 68 Def / 36 SpA / 4 SpD / 196 Spe
+Modest Nature
+IVs: 0 Atk
+- Moonblast
+- Dazzling Gleam
+- Shadow Ball
+- Power Gem
+
+Sneasler @ Psychic Seed
+Ability: Unburden
+Level: 50
+Tera Type: Dark
+EVs: 172 HP / 92 Atk / 108 Def / 4 SpD / 132 Spe
+Adamant Nature
+- Dire Claw
+- Close Combat
+- Throat Chop
+- Protect
+
+Indeedee @ Choice Scarf
+Ability: Psychic Surge
+Level: 50
+Shiny: Yes
+Tera Type: Ground
+EVs: 4 HP / 252 SpA / 252 Spe
+Timid Nature
+- Expanding Force
+- Tera Blast
+- Imprison
+- Trick Room
+
+Ninetales (F) @ Life Orb
+Ability: Drought
+Level: 50
+Shiny: Yes
+Tera Type: Grass
+EVs: 100 HP / 60 Def / 156 SpA / 4 SpD / 188 Spe
+Timid Nature
+IVs: 0 Atk
+- Heat Wave
+- Encore
+- Helping Hand
+- Protect
+
+Urshifu @ Focus Sash
+Ability: Unseen Fist
+Level: 50
+Tera Type: Dark
+EVs: 4 HP / 252 Atk / 252 Spe
+Jolly Nature
+- Wicked Blow
+- Close Combat
+- Sucker Punch
+- Detect

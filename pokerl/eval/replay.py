@@ -23,7 +23,9 @@ def save_replay_json(battle: DoubleBattle, output_dir: str = "replays") -> str |
 
     data = {
         "battle_tag": battle.battle_tag,
-        "format": battle.battle_tag.split("]")[0].lstrip("[") if battle.battle_tag else "",
+        "format": battle.battle_tag.split("]")[0].lstrip("[")
+        if battle.battle_tag
+        else "",
         "won": battle.won,
         "lost": battle.lost,
         "turn": battle.turn,

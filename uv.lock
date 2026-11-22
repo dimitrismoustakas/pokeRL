@@ -453,16 +453,49 @@ wheels = [
 
 [[package]]
 name = "pettingzoo"
-version = "1.25.0"
+version = "1.27.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "gymnasium" },
     { name = "numpy" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/38/cb/cbb8d0e973b284f709ce93a80354d464588301957220f031c51324b464b2/pettingzoo-1.25.0.tar.gz", hash = "sha256:4b8a8552eab07a9c8f37dca094e59ee194003c57e2a7e7348bdf7c62049eecf6", size = 723959, upload-time = "2025-04-22T14:37:37.36Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e5/14/2c089f488135e699db7d473490b6ceb84df5b470b4bc64f435d9b42041e9/pettingzoo-1.27.0.tar.gz", hash = "sha256:d61210fff2ba59f54e191796dc8b16b37d201137b28882f4c96dd7121a749033", size = 472105, upload-time = "2026-08-13T18:02:41.809Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/9a/33fb244264573687ef27b2f436ae98b524c5e8e5edc7c36183a59c5b4748/pettingzoo-1.25.0-py3-none-any.whl", hash = "sha256:f385bccbebdad73a0c3da884344aea6e2614aa962b653c790b06ef9ab162d651", size = 852489, upload-time = "2025-04-22T14:37:36.036Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/1f/ff1bebbe1fc168b6435b482a34d9757249c9da1b14ebc61868cc19998cca/pettingzoo-1.27.0-py3-none-any.whl", hash = "sha256:075a6ab7c32d32d9a674f1af395010198bf09c172341aa38fa5415461601ac61", size = 668492, upload-time = "2026-08-13T18:02:40.528Z" },
 ]
+
+[[package]]
+name = "pikapro"
+version = "0.2.0+pokerl.1"
+source = { path = "vendor/pikapro-0.2.0+pokerl.1.tar.gz" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { hash = "sha256:dc0d6482acde1e05e2283c9c4fadcf732dd010663dd905305c1fb15f57e9c33a" }
+
+[package.metadata]
+requires-dist = [
+    { name = "gymnasium", marker = "extra == 'all'", specifier = ">=1.0" },
+    { name = "gymnasium", marker = "extra == 'gym'", specifier = ">=1.0" },
+    { name = "gymnasium", marker = "extra == 'pettingzoo'", specifier = ">=1.0" },
+    { name = "gymnasium", marker = "extra == 'sb3'", specifier = ">=1.0" },
+    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.9.4,<2" },
+    { name = "numpy", specifier = ">=1.21" },
+    { name = "pettingzoo", marker = "extra == 'all'", specifier = ">=1.24" },
+    { name = "pettingzoo", marker = "extra == 'pettingzoo'", specifier = ">=1.24" },
+    { name = "poke-env", marker = "extra == 'all'", specifier = ">=0.16,<0.17" },
+    { name = "poke-env", marker = "extra == 'poke-env'", specifier = ">=0.16,<0.17" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=7" },
+    { name = "sb3-contrib", marker = "extra == 'all'", specifier = ">=2.3" },
+    { name = "sb3-contrib", marker = "extra == 'sb3'", specifier = ">=2.3" },
+    { name = "stable-baselines3", marker = "extra == 'all'", specifier = ">=2.3" },
+    { name = "stable-baselines3", marker = "extra == 'sb3'", specifier = ">=2.3" },
+    { name = "websockets", marker = "extra == 'all'", specifier = ">=13" },
+    { name = "websockets", marker = "extra == 'showdown'", specifier = ">=13" },
+]
+provides-extras = ["gym", "pettingzoo", "sb3", "poke-env", "showdown", "all", "test", "dev"]
 
 [[package]]
 name = "pluggy"
@@ -475,8 +508,8 @@ wheels = [
 
 [[package]]
 name = "poke-env"
-version = "0.15.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.15.0+pokerl.1"
+source = { path = "vendor/poke_env-0.15.0+pokerl.1.tar.gz" }
 dependencies = [
     { name = "gymnasium" },
     { name = "numpy" },
@@ -486,18 +519,30 @@ dependencies = [
     { name = "tabulate" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ab/bc/f1977f42261f45e185402d7ea06741bbeb24791b1f7a79902bcf6853f4eb/poke_env-0.15.0.tar.gz", hash = "sha256:15ed408dd48885d9d589dfda3616ace329a38682992af9b283bf3309b2fce486", size = 1249874, upload-time = "2026-04-14T20:57:09.291Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/35/2e/2825f5b79354a0440a87debb6fda9921950224771167d077d811801dcf99/poke_env-0.15.0-py3-none-any.whl", hash = "sha256:6d2d60f95f93e36a40f8f4af9bb7440b4bd068def9859d4c53b2ac57ae202b11", size = 1374722, upload-time = "2026-04-14T20:57:07.228Z" },
+sdist = { hash = "sha256:d1cfb6f65e861fed8fc31d00fd86806961e6ee1428d614c68028a400321d1f05" }
+
+[package.metadata]
+requires-dist = [
+    { name = "gymnasium", specifier = ">=1.0.0" },
+    { name = "nbsphinx", marker = "extra == 'docs'", specifier = ">=0.9.6" },
+    { name = "numpy", specifier = ">=2.0.2" },
+    { name = "orjson", specifier = ">=3.10.15" },
+    { name = "pettingzoo", specifier = ">=1.24.3" },
+    { name = "requests", specifier = ">=2.32.3" },
+    { name = "sphinx", marker = "extra == 'docs'", specifier = ">=7.4.7" },
+    { name = "sphinx-rtd-theme", marker = "extra == 'docs'", specifier = ">=3.0.2" },
+    { name = "tabulate", specifier = ">=0.9.0" },
+    { name = "websockets", specifier = "==16.0" },
 ]
+provides-extras = ["docs"]
 
 [[package]]
 name = "pokerl"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "gymnasium" },
     { name = "numpy" },
+    { name = "pikapro" },
     { name = "poke-env" },
     { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'AMD64' or sys_platform != 'win32'" },
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
@@ -506,14 +551,15 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "gymnasium", specifier = ">=0.29" },
     { name = "numpy", specifier = ">=1.24" },
-    { name = "poke-env", specifier = ">=0.15,<0.16" },
+    { name = "pikapro", path = "vendor/pikapro-0.2.0+pokerl.1.tar.gz" },
+    { name = "poke-env", path = "vendor/poke_env-0.15.0+pokerl.1.tar.gz" },
     { name = "torch", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.11,<3" },
     { name = "torch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.11,<3", index = "https://download.pytorch.org/whl/cu130" },
 ]
@@ -521,6 +567,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest" },
+    { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
 
@@ -547,6 +594,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7d/0d/549bd94f1a0a402dc8cf64563a117c0f3765662e2e668477624baeec44d5/pytest-9.0.3.tar.gz", hash = "sha256:b86ada508af81d19edeb213c681b1d48246c1a91d304c6c81a427674c17eb91c", size = 1572165, upload-time = "2026-04-07T17:16:18.027Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl", hash = "sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9", size = 375249, upload-time = "2026-04-07T17:16:16.13Z" },
+]
+
+[[package]]
+name = "pytest-asyncio"
+version = "1.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2c/de/80724f9b5b9eca1a654179cae6edc51aaa0a355a9834a736e2a188b91780/pytest_asyncio-1.5.0.tar.gz", hash = "sha256:92c8fa83ca419fd0d4bd6a34df6520dae435841d3733c319343249492adf37f7", size = 146227, upload-time = "2026-11-12T16:35:49.845Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/2d/e600d8f47597a803641704aba367c7266cd621f86561ec36da9888f160ec/pytest_asyncio-1.5.0-py3-none-any.whl", hash = "sha256:557f255ee03cc84f84a8d5f438bc9c6e0f714bf86970ae743c7ecb5a38d7e07d", size = 17215, upload-time = "2026-11-12T16:35:48.446Z" },
 ]
 
 [[package]]
@@ -670,8 +729,8 @@ dependencies = [
     { name = "typing-extensions", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp313-cp313-win_amd64.whl" },
-    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp313-cp313t-win_amd64.whl" },
+    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp313-cp313-win_amd64.whl", hash = "sha256:339801f2163698a53c7fb3c91883e7f44331d22c34d45acfbce4eff71f2332fa", upload-time = "2026-04-27T20:06:44Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp313-cp313t-win_amd64.whl", hash = "sha256:21d2734fd02af45d19bb88c0ff2e86b238ce73f7bde6003ade7f1454ae299198", upload-time = "2026-04-27T20:10:20Z" },
 ]
 
 [[package]]

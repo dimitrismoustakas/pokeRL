@@ -1,0 +1,64 @@
+Clefairy @ Eviolite  
+Ability: Friend Guard  
+Tera Type: Grass  
+EVs: 252 HP / 144 Def / 112 SpD  
+Bold Nature  
+IVs: 0 Atk  
+- Sing  
+- Helping Hand  
+- Follow Me  
+- Protect
+
+Ogerpon-Wellspring (F) @ Wellspring Mask  
+Ability: Water Absorb  
+Level: 50  
+Tera Type: Water  
+EVs: 196 HP / 252 Atk / 36 Def / 20 SpD / 4 Spe  
+Jolly Nature  
+- Ivy Cudgel  
+- Horn Leech  
+- Swords Dance  
+- Spiky Shield
+
+Incineroar @ Sitrus Berry  
+Ability: Intimidate  
+Tera Type: Fairy  
+EVs: 244 HP / 4 Atk / 72 Def / 188 SpD  
+Careful Nature  
+- Parting Shot  
+- Darkest Lariat  
+- Fake Out  
+- Flare Blitz
+
+Raging Bolt @ Leftovers  
+Ability: Protosynthesis  
+Tera Type: Grass  
+EVs: 252 HP / 12 Def / 152 SpA / 92 SpD  
+Modest Nature  
+- Thunderclap  
+- Thunderbolt  
+- Calm Mind  
+- Protect
+
+Flutter Mane @ Booster Energy  
+Ability: Protosynthesis  
+Level: 97  
+Tera Type: Fairy  
+EVs: 108 HP / 132 Def / 164 SpA / 4 SpD / 100 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Dazzling Gleam  
+- Moonblast  
+- Shadow Ball  
+- Protect
+
+Kingambit @ Assault Vest  
+Ability: Defiant  
+Level: 50  
+Tera Type: Dark  
+EVs: 196 HP / 252 Atk / 4 Def / 12 SpD / 44 Spe  
+Adamant Nature  
+- Kowtow Cleave  
+- Iron Head  
+- Sucker Punch  
+- Brick Break
