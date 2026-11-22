@@ -18,7 +18,7 @@ handoff.
   demonstrated use case.
 - Prefer the smallest implementation that solves a demonstrated problem. Do not
   add speculative abstractions, sidecars, or defensive checks without a clear
-  failure mode and payoff.
+  failure mode and payoff. Validate external input once at its trust boundary.
 - Keep one clear production path. Put retired experiments in a pinned,
   reproducible archive rather than runtime compatibility branches.
 - Separate simulation, environment, model, training, evaluation, and
@@ -30,5 +30,4 @@ handoff.
 - Preserve user changes and unrelated worktree state.
 - Speak like a working ML engineer: use ordinary established terms, define
   necessary jargon, and do not invent process labels.
-- Keep documentation current and compact. Replace
-  `docs/INDEPENDENT_REVIEW.md`; do not append a chronological project diary.
+- Keep documentation current and compact. Keep experiment reports outside the source tree.
