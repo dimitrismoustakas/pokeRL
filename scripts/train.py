@@ -701,6 +701,7 @@ def collect_synchronous_rollout(
     preview_policy_version: int,
     tera_exploration_prob: float,
     collect_timing: bool,
+    capture_stream: torch.cuda.Stream | None = None,
 ) -> tuple[
     dict[str, np.ndarray],
     dict[str, np.ndarray],
@@ -801,7 +802,9 @@ def collect_synchronous_rollout(
     public_consequence_cant_masks_device: torch.Tensor | None = None
     public_consequence_field_targets_device: torch.Tensor | None = None
     public_consequence_field_masks_device: torch.Tensor | None = None
-    policy = RolloutPolicy(agent, obs, action_masks, device, tera_exploration_prob)
+    policy = RolloutPolicy(
+        agent, obs, action_masks, device, tera_exploration_prob, capture_stream
+    )
     for _ in range(num_steps):
         with torch.no_grad(), cuda_model_execution(device):
             started = time.perf_counter() if collect_timing else 0.0
@@ -1490,6 +1493,10 @@ def train():
             start_time = time.time()
             invocation_start_global_step = trainer.global_step
 
+            # cuBLAS keeps a workspace for each stream used by the learner.
+            capture_stream = (
+                torch.cuda.Stream(device=device) if device.type == "cuda" else None
+            )
             for update in range(updates_done + 1, num_updates + 1):
                 rollout_opponent_assignments = dict(current_opponent_assignments)
                 rollout_policy_version = parallel_env.policy_version
@@ -1532,6 +1539,7 @@ def train():
                         preview_policy_version=rollout_policy_version,
                         tera_exploration_prob=tera_eps,
                         collect_timing=collect_timing,
+                        capture_stream=capture_stream,
                     )
                 )
 

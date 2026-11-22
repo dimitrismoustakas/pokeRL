@@ -7,10 +7,13 @@ from .inference_batch import InputTransfer
 
 
 class RolloutPolicy:
-    def __init__(self, agent, obs, masks, device, tera_exploration_prob):
+    def __init__(
+        self, agent, obs, masks, device, tera_exploration_prob, capture_stream=None
+    ):
         self.agent = agent
         self.device = device
         self.tera_exploration_prob = tera_exploration_prob
+        self.capture_stream = capture_stream
         self.observations = InputTransfer(obs, device)
         self.masks = InputTransfer(masks, device, force_bool=True)
         self.graph = None
@@ -34,7 +37,9 @@ class RolloutPolicy:
             torch.ones(batch_size, size, device=self.device)
             for size in (actions, actions, NUM_TERA_CHOICES)
         )
-        stream = torch.cuda.Stream(device=self.device)
+        stream = self.capture_stream
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
             for _ in range(3):

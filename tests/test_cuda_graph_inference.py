@@ -311,7 +311,9 @@ def test_learner_graph_matches_eager_on_changing_inputs_and_hidden_state() -> No
     agent = PokeAgent(ModelConfig(), data).to(device).eval()
     obs = {key: np.repeat(value[None], 2, axis=0) for key, value in row.items()}
     masks = {key: np.repeat(value[None], 2, axis=0) for key, value in mask.items()}
-    policy = RolloutPolicy(agent, obs, masks, device, 0.13)
+    policy = RolloutPolicy(
+        agent, obs, masks, device, 0.13, capture_stream=torch.cuda.Stream(device=device)
+    )
     hidden = agent.initial_hidden(2)
     for move in (0, 5):
         masks["joint"].fill(False)
