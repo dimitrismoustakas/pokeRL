@@ -95,7 +95,7 @@ class PPOTrainer:
     """Proximal Policy Optimization with clipped surrogate objective."""
 
     _LOG_RATIO_CLAMP = 20.0
-    _HEAD_BATCH_TARGET = 1024
+    _HEAD_BATCH_TARGET = 2304  # One 64-step minibatch of 36 environments.
 
     def __init__(self, agent: PokeAgent, config: TrainingConfig, device: torch.device):
         self.agent = agent.to(device)
