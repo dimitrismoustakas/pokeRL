@@ -201,13 +201,12 @@ There is currently no production controller or supported CLI for step 6.
 
 | Use | Teams | Manifest |
 | --- | ---: | --- |
-| Training | 85 | [Regulation F training teams](data/team_pools/gen9vgc2026regf/manifest.json) |
-| Expanded training pool | 170 | [Original teams and 85 additional published rosters](data/team_pools/gen9vgc2026regf_expanded/manifest.json) |
+| Training | 170 | [Regulation F training teams](data/team_pools/gen9vgc2026regf/manifest.json) |
 | Development evaluation | 15 | [Original evaluation panel](data/team_pools/gen9vgc2026regf_heldout/manifest.json) |
 | Independent roster evaluation | 30 | [Additional evaluation panel](data/team_pools/gen9vgc2026regf_heldout30/manifest.json) |
 
 Every team plays at level 50 with its published spread. The 15-team panel
 shares two visible six-species combinations with training. The 30-team panel
-excludes all visible combinations in the original training teams, the
-85-team expansion and the development panel. Both evaluation manifests
+excludes all visible combinations in the 170 training teams and the
+development panel. Both evaluation manifests
 reject training use. Pass `--team-pool-manifest` to select a panel.

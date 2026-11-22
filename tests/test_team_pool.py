@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 from poke_env.teambuilder.teambuilder import Teambuilder
 
-from pokerl.team_pool import TeamPool, TeamPoolEntry, load_team_pool
+from pokerl.team_pool import (
+    TeamPool,
+    TeamPoolEntry,
+    default_team_pool_manifest_path,
+    load_team_pool,
+)
 
 
 def test_load_team_pool_rejects_duplicate_manifest_keys(tmp_path: Path) -> None:
@@ -29,11 +34,11 @@ def test_load_team_pool_rejects_duplicate_manifest_keys(tmp_path: Path) -> None:
 
 
 def test_checked_in_team_pool_manifest_loads() -> None:
-    manifest_path = Path("data/team_pools/gen9vgc2026regf/manifest.json")
+    manifest_path = default_team_pool_manifest_path(Path.cwd(), "gen9vgc2026regf")
 
     pool = load_team_pool(manifest_path, subset="pool", seed=0)
 
-    assert pool.size == 85
+    assert pool.size == len({entry.packed_team for entry in pool.entries}) == 170
     assert {
         pokemon.level
         for entry in pool.entries
@@ -41,8 +46,9 @@ def test_checked_in_team_pool_manifest_loads() -> None:
     } == {50}
 
 
-def test_heldout_team_pool_is_evaluation_only() -> None:
-    manifest_path = Path("data/team_pools/gen9vgc2026regf_heldout/manifest.json")
+@pytest.mark.parametrize(("panel", "size"), [("heldout", 15), ("heldout30", 30)])
+def test_heldout_team_pool_is_evaluation_only(panel: str, size: int) -> None:
+    manifest_path = Path(f"data/team_pools/gen9vgc2026regf_{panel}/manifest.json")
 
     with pytest.raises(ValueError, match="evaluation-only"):
         load_team_pool(manifest_path, subset="pool", seed=0)
@@ -53,7 +59,7 @@ def test_heldout_team_pool_is_evaluation_only() -> None:
         seed=0,
         usage="evaluation",
     )
-    assert heldout.size == 15
+    assert heldout.size == size
     assert {
         pokemon.level
         for entry in heldout.entries
