@@ -77,7 +77,7 @@ class _PublicConsequenceState(NamedTuple):
     public_target_reps: torch.Tensor
     target_mechanics: torch.Tensor
     all_logits: dict[str, torch.Tensor] | None
-    current_public_field: torch.Tensor | None = None
+    field_persistence: torch.Tensor | None = None
 
 
 class MaskedSetAttention(nn.Module):
@@ -368,6 +368,15 @@ class ActionHead(nn.Module):
         self.register_buffer("_action_ids", metadata["action_ids"], persistent=False)
         self.register_buffer("_action_kind", metadata["kind"], persistent=False)
         self.register_buffer(
+            "_action_entity_slot",
+            torch.where(
+                metadata["is_switch"],
+                NUM_TARGETS + metadata["switch_slot"],
+                metadata["target_slot"],
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
             "_action_move_slot", metadata["move_slot"], persistent=False
         )
         self.register_buffer(
@@ -493,7 +502,7 @@ class ActionHead(nn.Module):
         opp2 = opp_active_reps[:, 1]
         batch_size = context.shape[0]
         device = context.device
-        current_public_field = self._current_public_field(
+        field_persistence = self._field_persistence(
             battle_obs,
             batch_size=batch_size,
             device=device,
@@ -518,14 +527,14 @@ class ActionHead(nn.Module):
             batch_size=batch_size,
             device=device,
         )
-        move_semantics_1 = self._candidate_move_semantics(
+        move_semantics_1 = self._offered_move_semantics(
             matchup_context,
             actor_slot=0,
             move_embedding=move_embedding,
             batch_size=batch_size,
             device=device,
         )
-        move_semantics_2 = self._candidate_move_semantics(
+        move_semantics_2 = self._offered_move_semantics(
             matchup_context,
             actor_slot=1,
             move_embedding=move_embedding,
@@ -573,7 +582,7 @@ class ActionHead(nn.Module):
             action_features,
             public_target_reps,
             target_mechanics_1,
-            current_public_field,
+            field_persistence,
         )
         logits1 = logits1.masked_fill(~mask1, -1e8)
         a1, log_prob1, entropy1 = self._categorical_choice(
@@ -607,7 +616,9 @@ class ActionHead(nn.Module):
             )
 
         a1_emb = self.action_id_emb(a1)
-        selected_move_semantics_1 = move_semantics_1[batch_indices, a1]
+        selected_move_semantics_1 = move_semantics_1[
+            batch_indices, self._action_move_slot[a1]
+        ]
         a1_conditioning = a1_emb + selected_move_semantics_1
         chosen_features_1 = matchup_features_1[batch_indices, a1]
         base_query2 = self.query2(
@@ -637,7 +648,7 @@ class ActionHead(nn.Module):
             action_features,
             public_target_reps,
             target_mechanics_2,
-            current_public_field,
+            field_persistence,
         )
         logits2 = logits2.masked_fill(~mask2, -1e8)
         a2, log_prob2, entropy2 = self._categorical_choice(
@@ -659,7 +670,9 @@ class ActionHead(nn.Module):
             )
 
         a2_emb = self.action_id_emb(a2)
-        selected_move_semantics_2 = move_semantics_2[batch_indices, a2]
+        selected_move_semantics_2 = move_semantics_2[
+            batch_indices, self._action_move_slot[a2]
+        ]
         a2_conditioning = a2_emb + selected_move_semantics_2
         chosen_features_2 = matchup_features_2[batch_indices, a2]
         a1_is_move = self._action_is_move[a1]
@@ -1006,29 +1019,31 @@ class ActionHead(nn.Module):
         action_features: torch.Tensor,
         public_target_reps: torch.Tensor,
         target_mechanics: torch.Tensor,
-        current_public_field: torch.Tensor | None = None,
+        field_persistence: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, _PublicConsequenceState]:
-        query_features = query.unsqueeze(1).expand(-1, self.num_actions, -1)
-        action_features = action_features.unsqueeze(0).expand(query.shape[0], -1, -1)
-        entity_features = self.entity_proj(
-            self._dynamic_action_entities(
-                actor_rep, partner_rep, own_team_reps, opp_active_reps
-            )
+        # The first score layer is linear across these five inputs. Project each
+        # query, target and offered move once before gathering the 27 action rows.
+        layer = self.score[0]
+        w_query, w_action, w_entity, w_matchup, w_move = layer.weight.chunk(5, dim=1)
+        entities = torch.cat(
+            (
+                opp_active_reps,
+                partner_rep.unsqueeze(1),
+                actor_rep.unsqueeze(1),
+                torch.zeros_like(actor_rep).unsqueeze(1),
+                own_team_reps,
+            ),
+            dim=1,
         )
-        matchup_emb = self.matchup_proj(matchup_features)
-        candidate_inputs = torch.cat(
-            [
-                query_features,
-                action_features,
-                entity_features,
-                matchup_emb,
-                move_semantics,
-            ],
-            dim=-1,
+        entity_scores = F.linear(self.entity_proj(entities), w_entity)
+        move_scores = F.linear(move_semantics, w_move)
+        score_hidden = self.score[1](
+            F.linear(query, w_query, layer.bias).unsqueeze(1)
+            + F.linear(action_features, w_action)
+            + entity_scores.index_select(1, self._action_entity_slot)
+            + F.linear(self.matchup_proj(matchup_features), w_matchup)
+            + move_scores.index_select(1, self._action_move_slot)
         )
-        # Preserve the original raw score path exactly while exposing its
-        # existing hidden candidate representation to the auxiliary model.
-        score_hidden = self.score[1](self.score[0](candidate_inputs))
         raw_logits = self.score[2](score_hidden).squeeze(-1)
 
         # Actor gradients never enter the consequence model: the adapter consumes
@@ -1041,7 +1056,7 @@ class ActionHead(nn.Module):
                 score_hidden.detach(),
                 public_target_reps.detach(),
                 target_mechanics.detach(),
-                current_public_field,
+                field_persistence,
             )
             detached_predictions = self._public_consequence_adapter_predictions(
                 all_consequence_logits,
@@ -1066,19 +1081,19 @@ class ActionHead(nn.Module):
             # In inference the already decoded tensors are also the selected
             # output.  PPO needs a gradient-bearing selected recomputation.
             all_logits=None if recompute_selected else all_consequence_logits,
-            current_public_field=current_public_field,
+            field_persistence=field_persistence,
         )
         return raw_logits + consequence_residual, state
 
     @staticmethod
-    def _current_public_field(
+    def _field_persistence(
         battle_obs: dict[str, torch.Tensor] | None,
         *,
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Read the public field prefix or construct the neutral battle field."""
+        """Advance public timers once per board, before scoring either actor."""
         if battle_obs is None or "field" not in battle_obs:
             field = torch.zeros(
                 batch_size,
@@ -1100,51 +1115,14 @@ class ActionHead(nn.Module):
                 "ActionHead battle_obs['field'] must have shape "
                 f"({batch_size}, >= {PUBLIC_FIELD_DIM})."
             )
-        return encoded_field[..., :PUBLIC_FIELD_DIM].to(device=device, dtype=dtype)
-
-    @staticmethod
-    def _public_field_persistence_for_scores(
-        score_hidden: torch.Tensor,
-        current_public_field: torch.Tensor | None,
-    ) -> torch.Tensor:
-        target_shape = (*score_hidden.shape[:-1], PUBLIC_FIELD_DIM)
-        if current_public_field is None:
-            expanded_field = score_hidden.new_zeros(target_shape)
-            expanded_field[..., WEATHER_CLASS_SLICE.start] = 1.0
-            expanded_field[..., TERRAIN_CLASS_SLICE.start] = 1.0
-        elif tuple(current_public_field.shape) == target_shape:
-            expanded_field = current_public_field.to(
-                device=score_hidden.device,
-                dtype=score_hidden.dtype,
-            )
-        elif (
-            current_public_field.ndim == 2
-            and current_public_field.shape[0] == score_hidden.shape[0]
-            and current_public_field.shape[-1] == PUBLIC_FIELD_DIM
-        ):
-            singleton_shape = (
-                current_public_field.shape[0],
-                *((1,) * (score_hidden.ndim - 2)),
-                PUBLIC_FIELD_DIM,
-            )
-            expanded_field = (
-                current_public_field.to(
-                    device=score_hidden.device,
-                    dtype=score_hidden.dtype,
-                )
-                .reshape(singleton_shape)
-                .expand(target_shape)
-            )
-        else:
-            raise ValueError(
-                "Current public field cannot be broadcast to candidate score shape."
-            )
-        return advanced_public_field_persistence(expanded_field)
+        return advanced_public_field_persistence(
+            encoded_field[..., :PUBLIC_FIELD_DIM].to(device=device, dtype=dtype)
+        )
 
     def _public_consequence_action_logits(
         self,
         score_hidden: torch.Tensor,
-        current_public_field: torch.Tensor | None = None,
+        field_persistence: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         action_consequence_logits = self.public_consequence_action_head(score_hidden)
         (
@@ -1165,10 +1143,17 @@ class ActionHead(nn.Module):
         field_alternative_logits = self.public_consequence_field_alternative_head(
             score_hidden
         )
-        field_persistence = self._public_field_persistence_for_scores(
-            score_hidden,
-            current_public_field,
-        )
+        if field_persistence is None:
+            field_persistence = self._field_persistence(
+                None,
+                batch_size=score_hidden.shape[0],
+                device=score_hidden.device,
+                dtype=score_hidden.dtype,
+            )
+        if score_hidden.ndim == 3:
+            field_persistence = field_persistence.unsqueeze(1).expand_as(
+                field_alternative_logits
+            )
         field_transition = decode_public_field_transition(
             persistence=field_persistence,
             change_logits=field_change_logits,
@@ -1237,11 +1222,11 @@ class ActionHead(nn.Module):
         score_hidden: torch.Tensor,
         public_target_reps: torch.Tensor,
         target_mechanics: torch.Tensor,
-        current_public_field: torch.Tensor | None = None,
+        field_persistence: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         logits = self._public_consequence_action_logits(
             score_hidden,
-            current_public_field,
+            field_persistence,
         )
         move_target_logits = self._public_consequence_target_logits(
             score_hidden[:, :SWITCH_OFFSET],
@@ -1277,7 +1262,7 @@ class ActionHead(nn.Module):
         selected_hidden = state.score_hidden[batch_indices, selected_actions]
         logits = self._public_consequence_action_logits(
             selected_hidden,
-            state.current_public_field,
+            state.field_persistence,
         )
         move_indices = selected_actions.clamp(max=SWITCH_OFFSET - 1)
         selected_mechanics = state.target_mechanics[batch_indices, move_indices]
@@ -1406,43 +1391,6 @@ class ActionHead(nn.Module):
             self._static_action_features_cache = features
             self._static_action_features_cache_key = cache_key
         return features
-
-    def _dynamic_action_entities(
-        self,
-        actor_rep: torch.Tensor,
-        partner_rep: torch.Tensor,
-        own_team_reps: torch.Tensor,
-        opp_active_reps: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, pokemon_dim = actor_rep.shape
-        zero_rep = torch.zeros_like(actor_rep)
-
-        target_bank = torch.stack(
-            [
-                opp_active_reps[:, 0],
-                opp_active_reps[:, 1],
-                partner_rep,
-                actor_rep,
-                zero_rep,
-                zero_rep,
-            ],
-            dim=1,
-        )
-        target_indices = self._action_target_slot.view(1, self.num_actions, 1).expand(
-            batch_size, -1, pokemon_dim
-        )
-        target_entities = target_bank.gather(1, target_indices)
-
-        switch_bank = torch.cat([own_team_reps, zero_rep.unsqueeze(1)], dim=1)
-        switch_indices = self._action_switch_slot.view(1, self.num_actions, 1).expand(
-            batch_size, -1, pokemon_dim
-        )
-        switch_entities = switch_bank.gather(1, switch_indices)
-
-        is_switch = self._action_is_switch.view(1, self.num_actions, 1).to(
-            device=actor_rep.device
-        )
-        return torch.where(is_switch, switch_entities, target_entities)
 
     def _matchup_context(
         self,
@@ -1809,7 +1757,7 @@ class ActionHead(nn.Module):
             dim=-1,
         )
 
-    def _candidate_move_semantics(
+    def _offered_move_semantics(
         self,
         matchup_context: dict[str, torch.Tensor] | None,
         *,
@@ -1818,59 +1766,30 @@ class ActionHead(nn.Module):
         batch_size: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Bind each move candidate to its global identity and public mechanics.
-
-        The action id only identifies a slot in the current battle request.
-        This gathers the move actually offered in that slot, embeds its global
-        id with the same table used by ``PokemonEncoder``, and attaches generic
-        simulator metadata. Switch/pass candidates remain exactly zero.
-        """
-
+        """Embed the four offered moves and append a zero for switch and pass."""
         if matchup_context is None or move_embedding is None:
-            raw_semantics = self.move_semantic_proj[0].weight.new_zeros(
+            semantics = self.move_semantic_proj[0].weight.new_zeros(
+                (batch_size, NUM_MOVES, self.move_semantic_proj[0].in_features),
+                device=device,
+            )
+        else:
+            if move_embedding.embedding_dim != self.move_embedding_dim:
+                raise ValueError(
+                    "ActionHead move embedding width does not match its configured "
+                    f"semantic width: embedding={move_embedding.embedding_dim}, "
+                    f"configured={self.move_embedding_dim}."
+                )
+            move_ids = matchup_context["own_request_moves"][:, actor_slot]
+            embedding_ids = move_ids.clamp(0, move_embedding.num_embeddings - 1)
+            mechanics_ids = move_ids.clamp(0, self._move_mechanics_lookup.shape[0] - 1)
+            semantics = torch.cat(
                 (
-                    batch_size,
-                    self.num_actions,
-                    self.move_semantic_proj[0].in_features,
+                    move_embedding(embedding_ids),
+                    self._move_mechanics_lookup[mechanics_ids],
                 ),
-                device=device,
+                dim=-1,
             )
-            projected = self.move_semantic_proj(raw_semantics)
-            return projected * self._action_is_move.view(1, self.num_actions, 1).to(
-                dtype=projected.dtype,
-                device=device,
-            )
-        if move_embedding.embedding_dim != self.move_embedding_dim:
-            raise ValueError(
-                "ActionHead move embedding width does not match its configured "
-                f"semantic width: embedding={move_embedding.embedding_dim}, "
-                f"configured={self.move_embedding_dim}."
-            )
-
-        actor_request_moves = matchup_context["own_request_moves"][:, actor_slot]
-        action_move_ids = actor_request_moves.gather(1, matchup_context["move_slots"])
-        action_move_ids = torch.where(
-            matchup_context["is_move_bool"],
-            action_move_ids,
-            torch.zeros_like(action_move_ids),
-        )
-        embedding_ids = action_move_ids.clamp(
-            min=0,
-            max=move_embedding.num_embeddings - 1,
-        )
-        mechanics_ids = action_move_ids.clamp(
-            min=0,
-            max=self._move_mechanics_lookup.shape[0] - 1,
-        )
-        semantics = torch.cat(
-            [
-                move_embedding(embedding_ids),
-                self._move_mechanics_lookup[mechanics_ids],
-            ],
-            dim=-1,
-        )
-        projected = self.move_semantic_proj(semantics)
-        return projected * matchup_context["is_move"].unsqueeze(-1).to(projected.dtype)
+        return F.pad(self.move_semantic_proj(semantics), (0, 0, 0, 1))
 
     def _candidate_public_target_mechanics(
         self,

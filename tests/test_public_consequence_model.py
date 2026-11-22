@@ -5,7 +5,13 @@ import torch
 
 from pokerl.config import TrainingConfig
 from pokerl.data import MOVE_MECHANICS_DIM
-from pokerl.env.actions import ACTIONS_PER_SLOT, SWITCH_OFFSET, TERA_NONE
+from pokerl.env.actions import (
+    ACTIONS_PER_SLOT,
+    NUM_MOVES,
+    NUM_TARGETS,
+    SWITCH_OFFSET,
+    TERA_NONE,
+)
 from pokerl.env.observation import BOOSTS_OFFSET
 from pokerl.field_transition import (
     FIELD_CHANGE_COMPONENT_DIM,
@@ -326,7 +332,7 @@ def test_live_request_move_identity_drives_candidate_and_dependent_decisions() -
     def semantics_for(move_id: int) -> torch.Tensor:
         battle_obs = battle_obs_for(move_id)
         context = head._matchup_context(battle_obs, 1, torch.device("cpu"))
-        return head._candidate_move_semantics(
+        return head._offered_move_semantics(
             context,
             actor_slot=0,
             move_embedding=move_embedding,
@@ -404,6 +410,63 @@ def test_live_request_move_identity_drives_candidate_and_dependent_decisions() -
         tera_inputs[0][:, tera_action_offset : tera_action_offset + hidden_dim],
         selected_conditioning,
     )
+
+
+def test_candidate_scores_match_dense_layer_for_moves_switches_and_pass() -> None:
+    head, board = _head_and_inputs(batch_size=2)
+    actor, partner = board["active_reps"].unbind(1)
+    opponents = board["opp_active_reps"]
+    team = board["own_team_reps"]
+    query = torch.randn(2, 12)
+    action_features = head._static_action_features()
+    matchups = torch.randn(2, ACTIONS_PER_SLOT, head._MATCHUP_FEATURE_DIM)
+    moves = torch.randn(2, NUM_MOVES + 1, 12)
+    moves[:, -1] = 0
+    _, state = head._score_actions(
+        query,
+        actor,
+        partner,
+        team,
+        opponents,
+        matchups,
+        moves,
+        action_features,
+        torch.cat((board["active_reps"], opponents), dim=1),
+        torch.zeros(2, SWITCH_OFFSET, 4, 6),
+    )
+
+    blank = torch.zeros_like(actor).unsqueeze(1)
+    targets = torch.cat((opponents, partner[:, None], actor[:, None], blank), dim=1)
+    entities = torch.cat((targets.repeat(1, NUM_MOVES, 1), team, blank), dim=1)
+    move_rows = torch.cat(
+        (
+            moves[:, :NUM_MOVES].repeat_interleave(NUM_TARGETS, dim=1),
+            moves[:, -1:].expand(-1, ACTIONS_PER_SLOT - SWITCH_OFFSET, -1),
+        ),
+        dim=1,
+    )
+    dense_input = torch.cat(
+        (
+            query[:, None].expand_as(move_rows),
+            action_features.expand_as(move_rows),
+            head.entity_proj(entities),
+            head.matchup_proj(matchups),
+            move_rows,
+        ),
+        dim=-1,
+    )
+    expected = head.score[1](head.score[0](dense_input))
+    torch.testing.assert_close(state.score_hidden, expected)
+    weights = torch.randn_like(expected)
+    params = (
+        head.score[0].weight,
+        head.entity_proj[0].weight,
+        head.matchup_proj[0].weight,
+    )
+    actual_grad = torch.autograd.grad(state.score_hidden, params, weights)
+    dense_grad = torch.autograd.grad(expected, params, weights)
+    for actual, wanted in zip(actual_grad, dense_grad, strict=True):
+        torch.testing.assert_close(actual, wanted)
 
 
 def test_amortized_target_decoder_matches_explicit_broadcast_reference() -> None:
