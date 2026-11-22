@@ -2,7 +2,6 @@
 
 import math
 import random
-import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -37,11 +36,7 @@ from ..field_transition import (
     advanced_public_field_persistence,
     public_field_change_targets,
 )
-from ..model.agent import PokeAgent
-from ..model.checkpoint import (
-    model_checkpoint_metadata,
-    validate_model_checkpoint_metadata,
-)
+from ..model.agent import PokeAgent, policy_weights
 from ..public_consequence import (
     MAX_PUBLIC_HIT_COUNT,
     NUM_MOVE_BRANCHES,
@@ -57,12 +52,9 @@ from .aux_metrics import (
 from .rollout import RolloutBatch
 
 
-# Increment when trainer-checkpoint semantics or same-shaped model inputs change.
-TRAINER_CHECKPOINT_FORMAT_VERSION = 9
-
 _ADAM_BETAS = (0.9, 0.999)
 _ADAM_EPS = 1e-5
-_ADAMW_DECAY_GROUPING = "non_embedding_matrices_v1"
+_ADAMW_DECAY_GROUPING = "non_embedding_matrices"
 
 
 _PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
@@ -92,91 +84,11 @@ def _capture_rng_state() -> dict[str, object]:
 
 
 def _restore_rng_state(rng_state: Mapping[str, object]) -> None:
-    required = {"python", "numpy", "torch_cpu", "torch_cuda"}
-    missing = sorted(required.difference(rng_state))
-    if missing:
-        raise ValueError(
-            "Trainer checkpoint RNG state is missing key(s): " + ", ".join(missing)
-        )
-
     random.setstate(rng_state["python"])
     np.random.set_state(rng_state["numpy"])
-
-    torch_cpu_state = rng_state["torch_cpu"]
-    if not isinstance(torch_cpu_state, torch.Tensor):
-        raise ValueError("Trainer checkpoint torch CPU RNG state must be a tensor.")
-    torch.set_rng_state(torch_cpu_state.detach().to(device="cpu"))
-
-    cuda_states = rng_state["torch_cuda"]
-    if cuda_states is None or not torch.cuda.is_available():
-        return
-    if not isinstance(cuda_states, (tuple, list)) or not all(
-        isinstance(state, torch.Tensor) for state in cuda_states
-    ):
-        raise ValueError("Trainer checkpoint torch CUDA RNG state must be tensor list.")
-    device_count = torch.cuda.device_count()
-    if len(cuda_states) != device_count:
-        raise ValueError(
-            "Trainer checkpoint CUDA RNG state count does not match this runtime: "
-            f"checkpoint={len(cuda_states)}, runtime={device_count}."
-        )
-    torch.cuda.set_rng_state_all(
-        [state.detach().to(device="cpu") for state in cuda_states]
-    )
-
-
-def _validate_restorable_rng_state(rng_state: object) -> Mapping[str, object]:
-    if not isinstance(rng_state, Mapping):
-        raise ValueError("Trainer checkpoint RNG state must be a mapping.")
-    current_state = _capture_rng_state()
-    try:
-        _restore_rng_state(rng_state)
-    except (TypeError, ValueError, RuntimeError) as exc:
-        raise ValueError(f"Trainer checkpoint RNG state is invalid: {exc}") from exc
-    finally:
-        _restore_rng_state(current_state)
-    return rng_state
-
-
-def _validate_checkpoint_tera_exploration_schedule(
-    value: object,
-) -> tuple[float, float, int]:
-    if not isinstance(value, Mapping):
-        raise ValueError(
-            "Trainer checkpoint tera_exploration_schedule must be a mapping."
-        )
-    required = {"start", "end", "decay_updates"}
-    missing = sorted(required.difference(value))
-    if missing:
-        raise ValueError(
-            "Trainer checkpoint tera_exploration_schedule is missing key(s): "
-            + ", ".join(missing)
-        )
-    probabilities: list[float] = []
-    for name in ("start", "end"):
-        probability = value[name]
-        if (
-            isinstance(probability, bool)
-            or not isinstance(probability, (int, float))
-            or not math.isfinite(probability)
-            or not 0.0 <= probability <= 1.0
-        ):
-            raise ValueError(
-                "Trainer checkpoint tera_exploration_schedule "
-                f"{name} must be finite and within [0, 1] (got {probability!r})."
-            )
-        probabilities.append(float(probability))
-    decay_updates = value["decay_updates"]
-    if (
-        isinstance(decay_updates, bool)
-        or not isinstance(decay_updates, int)
-        or decay_updates < 0
-    ):
-        raise ValueError(
-            "Trainer checkpoint tera_exploration_schedule decay_updates must be a "
-            f"non-negative integer (got {decay_updates!r})."
-        )
-    return probabilities[0], probabilities[1], decay_updates
+    torch.set_rng_state(rng_state["torch_cpu"].cpu())
+    if torch.cuda.is_available() and rng_state["torch_cuda"] is not None:
+        torch.cuda.set_rng_state_all([state.cpu() for state in rng_state["torch_cuda"]])
 
 
 class PPOTrainer:
@@ -215,8 +127,6 @@ class PPOTrainer:
         )
         self.global_step = 0
         self.completed_updates = 0
-        self.loaded_training_state_id: str | None = None
-        self.initialized_from_training_state_id: str | None = None
 
     def optimizer_settings(self) -> dict[str, object]:
         """Return the optimizer settings recorded with the run."""
@@ -2386,37 +2296,24 @@ class PPOTrainer:
         # auxiliary objective rather than growing with added target fields.
         return torch.stack(component_losses).mean()
 
-    def save(self, path: str, *, training_state_id: str | None = None) -> None:
+    def save(self, path: str, *, run_state: dict | None = None) -> None:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(target.suffix + ".tmp")
-        state_id = training_state_id or uuid.uuid4().hex
-        if not isinstance(state_id, str) or not state_id:
-            raise ValueError("training_state_id must be a non-empty string.")
-        if self.config.tera_exploration_decay_updates is None:
-            raise ValueError(
-                "tera_exploration_decay_updates must be configured before saving "
-                "a trainer checkpoint."
-            )
-        tera_exploration_schedule = {
-            "start": self.config.tera_exploration_start,
-            "end": self.config.tera_exploration_end,
-            "decay_updates": self.config.tera_exploration_decay_updates,
-        }
-        _validate_checkpoint_tera_exploration_schedule(tera_exploration_schedule)
         try:
             torch.save(
                 {
-                    "checkpoint_type": "trainer",
-                    "format_version": TRAINER_CHECKPOINT_FORMAT_VERSION,
-                    "model_metadata": model_checkpoint_metadata(self.agent),
-                    "agent": self.agent.state_dict(),
+                    **policy_weights(self.agent),
                     "optimizer": self.optimizer.state_dict(),
                     "global_step": self.global_step,
                     "completed_updates": self.completed_updates,
-                    "tera_exploration_schedule": tera_exploration_schedule,
-                    "training_state_id": state_id,
+                    "tera_exploration_schedule": {
+                        "start": self.config.tera_exploration_start,
+                        "end": self.config.tera_exploration_end,
+                        "decay_updates": self.config.tera_exploration_decay_updates,
+                    },
                     "rng_state": _capture_rng_state(),
+                    "run_state": run_state,
                 },
                 temporary,
             )
@@ -2424,183 +2321,27 @@ class PPOTrainer:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def initialize_from_trainer_weights(self, path: str) -> None:
-        """Strictly initialize model weights without inheriting training state.
-
-        Best-response policies are new learners. They may start from a
-        competent main policy, but must not silently inherit its Adam moments,
-        update counters, or RNG streams. This method accepts only the current
-        versioned trainer format so architecture and vocabulary metadata can be
-        validated before loading exact weights.
-        """
-        fresh_rng_state = _capture_rng_state()
-        try:
-            checkpoint = torch.load(
-                path,
-                map_location=self.device,
-                weights_only=False,
-            )
-            if not isinstance(checkpoint, dict):
-                raise ValueError(
-                    "Weight initializer checkpoint must be a mapping, got "
-                    f"{type(checkpoint).__name__}."
-                )
-            if checkpoint.get("checkpoint_type") != "trainer":
-                raise ValueError(
-                    f"Weight initializer {path!r} must be a versioned trainer "
-                    "checkpoint; league and legacy checkpoints do not carry the "
-                    "strict model metadata required for a new learner."
-                )
-            if checkpoint.get("format_version") != TRAINER_CHECKPOINT_FORMAT_VERSION:
-                raise ValueError(
-                    f"Weight initializer {path!r} has unsupported format_version="
-                    f"{checkpoint.get('format_version')!r}; expected "
-                    f"{TRAINER_CHECKPOINT_FORMAT_VERSION}."
-                )
-            required = {
-                "agent",
-                "model_metadata",
-                "tera_exploration_schedule",
-                "training_state_id",
-            }
-            missing = sorted(required.difference(checkpoint))
-            if missing:
-                raise ValueError(
-                    f"Weight initializer {path!r} is missing required key(s): "
-                    + ", ".join(missing)
-                )
-            checkpoint_state = validate_model_checkpoint_metadata(
-                path=path,
-                checkpoint_state=checkpoint["agent"],
-                checkpoint_metadata=checkpoint["model_metadata"],
-                current_agent=self.agent,
-            )
-            source_state_id = checkpoint["training_state_id"]
-            if not isinstance(source_state_id, str) or not source_state_id:
-                raise ValueError(
-                    "Weight initializer training_state_id must be non-empty string."
-                )
-            _validate_checkpoint_tera_exploration_schedule(
-                checkpoint["tera_exploration_schedule"]
-            )
-            try:
-                self.agent.load_state_dict(checkpoint_state, strict=True)
-            except RuntimeError as exc:
-                raise ValueError(
-                    f"Weight initializer {path!r} failed strict model loading: {exc}"
-                ) from exc
-
-            # Construct a new optimizer after loading.  No source optimizer
-            # tensors, rollout boundary, or random stream is adopted.
-            self.optimizer = self._make_optimizer()
-            self.global_step = 0
-            self.completed_updates = 0
-            self.loaded_training_state_id = None
-            self.initialized_from_training_state_id = source_state_id
-        finally:
-            # Loading checkpoint bytes and validating metadata must be RNG
-            # transparent.  The caller's freshly configured phase streams stay
-            # in force even if initialization fails.
-            _restore_rng_state(fresh_rng_state)
-
-    def load(self, path: str) -> None:
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        if not isinstance(checkpoint, dict):
-            raise ValueError(
-                f"Trainer checkpoint must be a mapping, got {type(checkpoint).__name__}."
-            )
-        checkpoint_type = checkpoint.get("checkpoint_type")
-        if checkpoint_type != "trainer":
-            raise ValueError(
-                f"Trainer checkpoint {path!r} has checkpoint_type={checkpoint_type!r}; "
-                "only a versioned checkpoint_type='trainer' checkpoint can be used "
-                "with --resume. Legacy and league checkpoints are unsupported."
-            )
-        format_version = checkpoint.get("format_version")
-        if format_version != TRAINER_CHECKPOINT_FORMAT_VERSION:
-            raise ValueError(
-                f"Trainer checkpoint {path!r} has unsupported format_version="
-                f"{format_version!r}; expected {TRAINER_CHECKPOINT_FORMAT_VERSION}. "
-                "Legacy trainer checkpoints cannot be resumed."
-            )
-        required_keys = {
-            "agent",
-            "optimizer",
-            "global_step",
-            "completed_updates",
-            "tera_exploration_schedule",
-            "training_state_id",
-            "model_metadata",
-            "rng_state",
-        }
-        missing_keys = sorted(required_keys.difference(checkpoint))
-        if missing_keys:
-            missing = ", ".join(missing_keys)
-            raise ValueError(
-                f"Trainer checkpoint {path!r} is missing required key(s): {missing}."
-            )
-
-        checkpoint_state = validate_model_checkpoint_metadata(
-            path=path,
-            checkpoint_state=checkpoint["agent"],
-            checkpoint_metadata=checkpoint["model_metadata"],
-            current_agent=self.agent,
+    def load_state_dict(self, checkpoint: dict) -> None:
+        """Restore learner parameters, optimizer, counters and random streams."""
+        optimizer_state = checkpoint["optimizer"]
+        name = (
+            "adamw"
+            if optimizer_state["param_groups"][0]["decoupled_weight_decay"]
+            else "adam"
         )
-        global_step = checkpoint["global_step"]
-        if isinstance(global_step, bool) or not isinstance(global_step, int):
-            raise ValueError("Trainer checkpoint global_step must be an integer.")
-        if global_step < 0:
-            raise ValueError("Trainer checkpoint global_step must be non-negative.")
-        completed_updates = checkpoint["completed_updates"]
-        if isinstance(completed_updates, bool) or not isinstance(
-            completed_updates,
-            int,
-        ):
-            raise ValueError("Trainer checkpoint completed_updates must be an integer.")
-        if completed_updates < 0:
-            raise ValueError(
-                "Trainer checkpoint completed_updates must be non-negative."
-            )
-        tera_start, tera_end, tera_decay_updates = (
-            _validate_checkpoint_tera_exploration_schedule(
-                checkpoint["tera_exploration_schedule"]
-            )
-        )
-        training_state_id = checkpoint["training_state_id"]
-        if not isinstance(training_state_id, str) or not training_state_id:
-            raise ValueError(
-                "Trainer checkpoint training_state_id must be a non-empty string."
-            )
-        rng_state = _validate_restorable_rng_state(checkpoint["rng_state"])
-
-        try:
-            optimizer_state = checkpoint["optimizer"]
-            groups = optimizer_state["param_groups"]
-            name = "adamw" if groups[0]["decoupled_weight_decay"] else "adam"
-            loaded_optimizer = self._make_optimizer(name)
-            loaded_optimizer.load_state_dict(optimizer_state)
-        except (IndexError, KeyError, TypeError, ValueError, RuntimeError) as exc:
-            raise ValueError(
-                f"Trainer checkpoint {path!r} optimizer state is incompatible: {exc}"
-            ) from exc
-
-        try:
-            self.agent.load_state_dict(checkpoint_state, strict=True)
-        except RuntimeError as exc:
-            raise ValueError(
-                f"Trainer checkpoint {path!r} model state failed strict loading: {exc}"
-            ) from exc
-        self.optimizer = loaded_optimizer
+        optimizer = self._make_optimizer(name)
+        optimizer.load_state_dict(optimizer_state)
+        self.agent.load_state_dict(checkpoint["agent"])
+        self.optimizer = optimizer
         self.config.optimizer_name = name
-        self.config.lr = loaded_optimizer.param_groups[0]["lr"]
+        self.config.lr = optimizer.param_groups[0]["lr"]
         self.config.weight_decay = max(
-            group["weight_decay"] for group in loaded_optimizer.param_groups
+            group["weight_decay"] for group in optimizer.param_groups
         )
-        self.global_step = global_step
-        self.completed_updates = completed_updates
-        self.config.tera_exploration_start = tera_start
-        self.config.tera_exploration_end = tera_end
-        self.config.tera_exploration_decay_updates = tera_decay_updates
-        self.loaded_training_state_id = training_state_id
-        self.initialized_from_training_state_id = None
-        _restore_rng_state(rng_state)
+        self.global_step = checkpoint["global_step"]
+        self.completed_updates = checkpoint["completed_updates"]
+        schedule = checkpoint["tera_exploration_schedule"]
+        self.config.tera_exploration_start = schedule["start"]
+        self.config.tera_exploration_end = schedule["end"]
+        self.config.tera_exploration_decay_updates = schedule["decay_updates"]
+        _restore_rng_state(checkpoint["rng_state"])

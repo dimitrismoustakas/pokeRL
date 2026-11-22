@@ -6,7 +6,7 @@ import torch
 
 from pokerl.config import ModelConfig
 from pokerl.data import GameData
-from pokerl.env.observation import build_team_preview_observation
+from pokerl.env.vector_inputs import preview_observations
 from pokerl.model.agent import PokeAgent
 from pokerl.model.heads import MaskedSetAttention, TeamPreviewHead
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
@@ -603,15 +603,8 @@ def test_full_preview_policy_is_equivariant_to_own_roster_permutation() -> None:
         seed=0,
     )
     own_team, opponent_team = team_pool.sample_packed_pair()
-    observation = build_team_preview_observation(
-        game_data,
-        6,
-        own_team,
-        opponent_team,
-    )
-    obs = {
-        key: torch.from_numpy(value).unsqueeze(0) for key, value in observation.items()
-    }
+    observation = preview_observations([(own_team, opponent_team)], game_data)
+    obs = {key: torch.from_numpy(value) for key, value in observation.items()}
     permutation = torch.tensor([4, 1, 5, 0, 3, 2])
     inverse_permutation = torch.empty_like(permutation)
     inverse_permutation[permutation] = torch.arange(6)

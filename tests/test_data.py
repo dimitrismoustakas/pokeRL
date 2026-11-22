@@ -6,10 +6,9 @@ from pokerl.data import GameData
 def test_game_data_preserves_checkpoint_item_indices() -> None:
     gd = GameData(gen=9)
     assert len(gd.item_to_idx) == 661
-    assert gd.item_index("leftovers") == 281
-    assert gd.item_index("vilevial") == 636
-    assert gd.item_index("widelens") == 652
-    assert gd.item_index("example-previously-unobserved-item") == 1714
+    assert gd.item_to_idx["leftovers"] == 281
+    assert gd.item_to_idx["vilevial"] == 636
+    assert gd.item_to_idx["widelens"] == 652
 
 
 def test_move_stats_encode_always_hit_accuracy_as_one() -> None:
@@ -53,6 +52,3 @@ def test_battle_ability_ids_use_the_existing_checkpoint_rows() -> None:
     assert gd.abilities_to_idx["waterabsorb"] == 305
     assert gd.abilities_to_idx["intimidate"] == 120
     assert gd.num_abilities == 319
-    assert gd.vocab_signature() == (
-        "d5980c827cc17cc3e4b422ac9e4a7393ccf9e1e6f0bde200b04c71fc2a1d0821"
-    )

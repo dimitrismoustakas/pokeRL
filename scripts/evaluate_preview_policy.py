@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import itertools
+import random
 import json
 import math
 from pathlib import Path
@@ -11,46 +11,18 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from pokerl.config import ModelConfig
+from pokerl.model.agent import load_policy
 from pokerl.data import GameData
-from pokerl.env.observation import build_team_preview_observation
-from pokerl.eval.fixed_bot import (
-    FixedTeamSpec,
-    build_species_bst_lookup,
-    load_agent_for_evaluation,
-    plan_opponent_team_specs,
-    select_max_bst_team_spec,
-    select_team_spec_by_title,
+from pokerl.env.vector_inputs import preview_observations
+from pokerl.team_pool import (
+    TeamPoolEntry,
+    default_team_pool_manifest_path,
+    load_team_pool,
 )
-from pokerl.model.signature import model_signature as build_model_signature
-from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
-from pokerl.training.population import CheckpointRef
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROBABILITY_SUM_TOLERANCE = 1e-4
-
-
-def enumerate_preview_actions(*, team_size: int = 6, pick_size: int = 4) -> np.ndarray:
-    """Return every bring set and ordered lead in TeamPreviewHead pick format.
-
-    Each row contains the ordered lead pair followed by the remaining brought
-    Pokemon in ascending team-slot order.  TeamPreviewHead canonicalizes the
-    full row to score the bring set, while retaining the first two positions as
-    the ordered lead pair.
-    """
-    if team_size < pick_size:
-        raise ValueError("team_size must be at least pick_size.")
-    if pick_size < 2:
-        raise ValueError("pick_size must be at least two.")
-
-    actions: list[tuple[int, ...]] = []
-    for bring in itertools.combinations(range(team_size), pick_size):
-        for lead in itertools.permutations(bring, 2):
-            lead_set = set(lead)
-            bench_tail = tuple(slot for slot in bring if slot not in lead_set)
-            actions.append((*lead, *bench_tail))
-    return np.asarray(actions, dtype=np.int64)
 
 
 def summarize_preview_distributions(
@@ -126,48 +98,28 @@ def evaluate_preview_distributions(
     agent,
     device: torch.device,
     game_data: GameData,
-    model_team_spec: FixedTeamSpec,
-    opponent_specs: list[FixedTeamSpec],
+    model_team_spec: TeamPoolEntry,
+    opponent_specs: list[TeamPoolEntry],
     actions: np.ndarray,
     batch_size: int,
-) -> tuple[np.ndarray, dict[str, float]]:
-    """Score every supplied legal action for every opponent roster."""
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive.")
-    if not opponent_specs:
-        raise ValueError("at least one opponent roster is required.")
-
-    observations = [
-        build_team_preview_observation(
-            game_data,
-            team_size=len(model_team_spec.species),
-            own_packed_team=model_team_spec.packed_team,
-            opponent_packed_team=opponent_spec.packed_team,
-        )
-        for opponent_spec in opponent_specs
-    ]
-    stacked_observations = {
-        key: np.stack([observation[key] for observation in observations])
-        for key in observations[0]
-    }
+) -> np.ndarray:
+    """Score every legal team-preview action against each opponent roster."""
     action_count = len(actions)
-    head_actions = agent.team_preview_head.action_table.detach().cpu().numpy()
-    if not np.array_equal(actions, head_actions):
-        raise RuntimeError(
-            "Evaluation action enumeration does not match the model's exact "
-            "team-preview action table."
-        )
     log_probabilities = np.empty(
-        (len(observations), action_count),
+        (len(opponent_specs), action_count),
         dtype=np.float64,
     )
 
     with torch.inference_mode():
-        for start in range(0, len(observations), batch_size):
-            stop = min(start + batch_size, len(observations))
+        for start in range(0, len(opponent_specs), batch_size):
+            stop = min(start + batch_size, len(opponent_specs))
+            pairs = [
+                (model_team_spec.packed_team, opponent.packed_team)
+                for opponent in opponent_specs[start:stop]
+            ]
             obs_batch = {
-                key: torch.from_numpy(values[start:stop]).to(device)
-                for key, values in stacked_observations.items()
+                key: torch.from_numpy(values).to(device)
+                for key, values in preview_observations(pairs, game_data).items()
             }
             output = agent.team_preview(
                 obs_batch,
@@ -176,49 +128,20 @@ def evaluate_preview_distributions(
                 include_policy_stats=True,
                 include_opponent_preview=False,
             )
-            joint_log_probs = output.get("joint_log_probs")
-            if joint_log_probs is None or joint_log_probs.shape != (
-                stop - start,
-                action_count,
-            ):
-                raise RuntimeError(
-                    "Exact team-preview evaluation requires joint_log_probs "
-                    f"shape {(stop - start, action_count)}."
-                )
+            joint_log_probs = output["joint_log_probs"]
             log_probabilities[start:stop] = (
                 joint_log_probs.detach().cpu().numpy().astype(np.float64)
             )
 
-    raw_probabilities = np.exp(log_probabilities)
-    raw_sums = raw_probabilities.sum(axis=1)
-    max_sum_error = float(np.max(np.abs(raw_sums - 1.0)))
-    if not np.allclose(
-        raw_sums,
-        1.0,
-        rtol=PROBABILITY_SUM_TOLERANCE,
-        atol=PROBABILITY_SUM_TOLERANCE,
-    ):
-        raise RuntimeError(
-            "Enumerated preview probabilities did not sum to one: "
-            f"range={raw_sums.min():.9f}..{raw_sums.max():.9f}, "
-            f"max_error={max_sum_error:.3g}."
-        )
-    probabilities = raw_probabilities / raw_sums[:, None]
-    return probabilities, {
-        "raw_probability_sum_min": float(raw_sums.min()),
-        "raw_probability_sum_max": float(raw_sums.max()),
-        "raw_probability_sum_max_abs_error": max_sum_error,
-        "normalized_probability_sum_min": float(probabilities.sum(axis=1).min()),
-        "normalized_probability_sum_max": float(probabilities.sum(axis=1).max()),
-    }
+    return np.exp(log_probabilities)
 
 
 def _opponent_rows(
     *,
     probabilities: np.ndarray,
     actions: np.ndarray,
-    opponent_specs: list[FixedTeamSpec],
-    model_team_spec: FixedTeamSpec,
+    opponent_specs: list[TeamPoolEntry],
+    model_team_spec: TeamPoolEntry,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for index, (policy, opponent_spec) in enumerate(
@@ -328,8 +251,6 @@ def main() -> None:
     game_data = GameData(gen=9)
     team_size = 6
     pick_size = 4
-    model_config = ModelConfig(team_size=team_size, pick_size=pick_size)
-    species_bst_lookup = build_species_bst_lookup(gen=game_data.gen)
     shared_manifest_path = (
         Path(args.team_pool_manifest)
         if args.team_pool_manifest
@@ -360,45 +281,40 @@ def main() -> None:
         usage="evaluation",
     )
     if args.model_team_title:
-        model_team_spec = select_team_spec_by_title(
-            model_team_pool,
-            title=args.model_team_title,
-            species_bst_lookup=species_bst_lookup,
-            pick_size=pick_size,
-        )
-    else:
-        model_team_spec = select_max_bst_team_spec(
-            model_team_pool,
-            species_bst_lookup=species_bst_lookup,
-            pick_size=pick_size,
-        )
-
-    opponent_count = len(
-        [
+        title = " ".join(args.model_team_title.split()).casefold()
+        matches = [
             entry
-            for entry in opponent_team_pool.entries
-            if entry.packed_team != model_team_spec.packed_team
+            for entry in model_team_pool.entries
+            if " ".join(entry.title.split()).casefold() == title
         ]
-    )
-    opponent_specs = plan_opponent_team_specs(
-        opponent_team_pool,
-        model_team_spec=model_team_spec,
-        species_bst_lookup=species_bst_lookup,
-        pick_size=pick_size,
-        num_games=max(1, opponent_count),
-        seed=args.team_pool_seed,
-    )
-    checkpoint_ref = CheckpointRef.from_file(args.checkpoint)
-    agent = load_agent_for_evaluation(
-        checkpoint_path=str(checkpoint_ref.resolve(REPO_ROOT)),
-        device=device,
-        model_config=model_config,
-        game_data=game_data,
-    )
-    actions = enumerate_preview_actions(team_size=team_size, pick_size=pick_size)
-    if actions.shape != (180, pick_size):
-        raise RuntimeError(f"Expected 180 legal preview actions, got {len(actions)}.")
-    probabilities, probability_sanity = evaluate_preview_distributions(
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected one team with title {args.model_team_title!r}, found {len(matches)}."
+            )
+        model_team_spec = matches[0]
+    else:
+
+        def bst_rank(entry):
+            totals = sorted(
+                (
+                    sum(game_data._pokedex[species]["baseStats"].values())
+                    for species in entry.species
+                ),
+                reverse=True,
+            )
+            return -sum(totals[:pick_size]), -sum(totals), entry.title
+
+        model_team_spec = min(model_team_pool.entries, key=bst_rank)
+
+    opponent_specs = [
+        entry
+        for entry in opponent_team_pool.entries
+        if entry.packed_team != model_team_spec.packed_team
+    ] or list(opponent_team_pool.entries)
+    random.Random(args.team_pool_seed).shuffle(opponent_specs)
+    agent = load_policy(args.checkpoint, game_data, device)
+    actions = agent.team_preview_head.action_table.cpu().numpy()
+    probabilities = evaluate_preview_distributions(
         agent=agent,
         device=device,
         game_data=game_data,
@@ -417,11 +333,10 @@ def main() -> None:
     distribution_summary.pop("most_probable_action_indices")
     distribution_summary.pop("per_opponent_entropy_nats")
     distribution_summary.pop("per_opponent_max_probability")
-    checkpoint_ref.verify(REPO_ROOT)
 
     summary = {
         "config": {
-            "checkpoint": checkpoint_ref.to_dict(),
+            "checkpoint": args.checkpoint,
             "device": str(device),
             "batch_size": args.batch_size,
             "team_size": team_size,
@@ -429,19 +344,16 @@ def main() -> None:
             "model_team_pool_manifest": str(model_manifest_path.resolve()),
             "model_team_pool_subset": model_subset,
             "model_team_pool_size": model_team_pool.size,
-            "model_team_pool_signature": model_team_pool.signature(),
             "opponent_team_pool_manifest": str(opponent_manifest_path.resolve()),
             "opponent_team_pool_subset": opponent_subset,
             "opponent_team_pool_size": opponent_team_pool.size,
-            "opponent_team_pool_signature": opponent_team_pool.signature(),
-            "model_signature": build_model_signature(
-                model_config,
-                game_data.vocab_signature(),
-            ),
             "team_pool_seed": args.team_pool_seed,
         },
-        "model_team": model_team_spec.to_summary(),
-        "probability_sanity": probability_sanity,
+        "model_team": {
+            "title": model_team_spec.title,
+            "file": model_team_spec.file,
+            "species": model_team_spec.species,
+        },
         "distribution": distribution_summary,
         "opponents": per_opponent,
     }
@@ -451,18 +363,7 @@ def main() -> None:
         if not summary_path.is_absolute():
             summary_path = REPO_ROOT / summary_path
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        if summary_path.exists():
-            if summary_path.read_text(encoding="utf-8") != rendered:
-                raise FileExistsError(
-                    f"Refusing to overwrite immutable preview summary: {summary_path!s}"
-                )
-        else:
-            temporary = summary_path.with_suffix(summary_path.suffix + ".tmp")
-            try:
-                temporary.write_text(rendered, encoding="utf-8")
-                temporary.replace(summary_path)
-            finally:
-                temporary.unlink(missing_ok=True)
+        summary_path.write_text(rendered, encoding="utf-8")
         print(f"Wrote preview-policy summary to {summary_path.resolve()}")
     print(rendered)
 

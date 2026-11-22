@@ -11,7 +11,6 @@ from pokerl.env.actions import (
     TERA_SLOT_1,
 )
 from pokerl.env.observation import (
-    FIELD_TIMER_CAPS,
     FIELD_TURN_OFFSET,
     ROLE_ACTIVE_1,
     ROLE_ACTIVE_2,
@@ -236,7 +235,7 @@ def _minimal_head_inputs(batch_size: int = 1):
     battle_obs = {
         "field": torch.zeros((batch_size, FIELD_TURN_OFFSET + 1), dtype=torch.float32)
     }
-    battle_obs["field"][:, FIELD_TURN_OFFSET] = 1.0 / float(FIELD_TIMER_CAPS["turn"])
+    battle_obs["field"][:, FIELD_TURN_OFFSET] = 1.0 / 20.0
     return (
         head,
         context,
@@ -420,7 +419,7 @@ def _ppo_obs(num_envs: int) -> dict[str, np.ndarray]:
         (num_envs, 6),
     ).copy()
     field = np.zeros((num_envs, FIELD_TURN_OFFSET + 1), dtype=np.float32)
-    field[:, FIELD_TURN_OFFSET] = 1.0 / float(FIELD_TIMER_CAPS["turn"])
+    field[:, FIELD_TURN_OFFSET] = 1.0 / 20.0
     return {
         "context": np.zeros((num_envs, 3), dtype=np.float32),
         "active": np.zeros((num_envs, 2, 2), dtype=np.float32),

@@ -30,33 +30,16 @@ class ModelConfig:
     action_hidden: int = 256
     value_hidden: int = 256
     team_size: int = 6
-    pick_size: int = (
-        4  # how many pokemon to select at team preview (must match EnvConfig.pick_size)
-    )
+    pick_size: int = 4
 
     # Stat-based embedding init
     init_embeddings_from_stats: bool = True
 
 
 @dataclass
-class EnvConfig:
-    battle_format: str = REGULATION_F
-    num_envs: int = 16
-    team_size: int = 6
-    pick_size: int = 4  # how many pokemon to bring from team_size
-    showdown_dir: str | None = None
-    worker_count: int | None = None
-    battles_per_worker: int | None = None
-    runtime_loop_count: int | None = None
-    battle_loop_count: int | None = None
-    battlestream_startup_timeout: float = 30.0
-    reset_concurrency: int | None = None
-    opponent_group: int = 0
-    simulator: str = "pikapro"
-
-
-@dataclass
 class TrainingConfig:
+    num_envs: int = 16
+
     # PPO
     optimizer_name: str = "adam"
     lr: float = 2.5e-4
@@ -113,7 +96,6 @@ class TrainingConfig:
     league_size: int = 12
     league_update_interval: int = 10
     league_refresh_interval: int = 1
-    league_coalesce_ms: float = 5.0
     # Online current-policy results form an exponentially discounted payoff
     # estimate for each archived opponent. PFSP focuses on opponents the live
     # policy struggles against while retaining a uniform coverage component.
@@ -131,8 +113,6 @@ class TrainingConfig:
     league_cuda_graph_batch_size: int = 16
     league_cuda_graph_cache_size: int = 4
     # ``action`` reuses the frozen battle-policy service/device for preview.
-    # This avoids competing CPU inference with local Showdown workers on CUDA
-    # trainers.  ``cpu`` remains available for explicit throughput A/B tests.
     league_preview_device: str = "action"
 
     def __post_init__(self) -> None:

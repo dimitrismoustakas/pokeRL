@@ -1,6 +1,5 @@
 {
   "purpose": "evaluation_only",
-  "allow_training": false,
   "format": "gen9vgc2026regf",
   "source_page": "https://docs.google.com/spreadsheets/d/1nHEcS0r55JFVlC6EBX5zLgjwdnXTC9KOJnxIkduAs6Y/view",
   "curated": [

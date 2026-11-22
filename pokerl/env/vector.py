@@ -7,7 +7,6 @@ import numpy as np
 from pikapro import rl
 import torch
 
-from pokerl.env.observation import build_packed_team_aux_labels
 from pokerl.env.vector_inputs import (
     DECODED_CHOICE,
     HOLD,
@@ -17,6 +16,7 @@ from pokerl.env.vector_inputs import (
     configure_player_inputs,
     forced_passes,
     model_inputs,
+    player_env,
     opponent_intent_labels,
     remember_actions,
 )
@@ -36,21 +36,22 @@ _INTENT_KEYS = (
 class PikaproVectorEnv:
     def __init__(
         self,
-        config,
+        num_envs,
         data,
         league,
-        preview_batcher,
+        learner,
+        policy_version,
         team_pair_provider,
         assignments,
         *,
         seed,
         collect_timing,
     ):
-        self.num_envs = config.num_envs
+        self.num_envs = num_envs
         self.threads = min(4, self.num_envs)
-        self.data = data
         self.league = league
-        self.preview_batcher = preview_batcher
+        self.learner = learner
+        self.policy_version = policy_version
         self.team_pair_provider = team_pair_provider
         self.assignments = dict(assignments)
         self.groups = np.arange(self.num_envs) % len(assignments)
@@ -60,25 +61,13 @@ class PikaproVectorEnv:
         self.previous = np.zeros((self.num_envs, 2, 2, 5), dtype=np.int64)
         self.preview_starts = []
         self.preview_cache = TeamPreviewCache()
-        self.preview_version = preview_batcher.policy_version
         self.episode_start = np.zeros(self.num_envs)
         self.first_tera = np.full(self.num_envs, -1, dtype=np.int64)
         self.opponent_turn_calls = [Counter() for _ in range(self.num_envs)]
         self.collect_timing = collect_timing
         self.timing = Counter()
         self.pairs = [team_pair_provider() for _ in range(self.num_envs)]
-        self.env = rl.VecEnv(
-            "gen9vgc",
-            n=self.num_envs,
-            teams=self.pairs,
-            threads=self.threads,
-            masks="factored",
-            switch_by="position",
-            hp="percent",
-            reward="terminal",
-            opponent="external",
-            spin_us=0,
-        )
+        self.env = player_env(self.pairs, threads=self.threads)
         try:
             configure_player_inputs(self.env, data)
             self.actions = VectorActionCodec(self.env.space)
@@ -146,10 +135,7 @@ class PikaproVectorEnv:
             .all()
         ):
             raise RuntimeError("Pikapro did not request both previews at reset.")
-        version = self.preview_batcher.policy_version
-        if self.preview_version != version:
-            self.preview_cache = TeamPreviewCache()
-            self.preview_version = version
+        version = self.policy_version
         paths = [self.assignments[int(self.groups[lane])] for lane in lanes]
         for lane, path in zip(lanes, paths, strict=True):
             self.active_paths[lane] = path
@@ -160,7 +146,7 @@ class PikaproVectorEnv:
         rows = self._rows(lanes, 0)
         with cuda_model_execution(self.league.device):
             result = self.preview_cache.predict(
-                self.league.agent_template, self.league.device, rows, include_value=True
+                self.learner, self.league.device, rows, include_value=True
             )
             picks = result["picks"].cpu().numpy()
             log_probs = result["log_prob"].cpu().numpy()
@@ -176,9 +162,14 @@ class PikaproVectorEnv:
             commands[lanes, side, 0] = self.actions.preview[tuple(orders.T)]
             commands[lanes, side, 1] = -1
         for i, lane in enumerate(lanes):
-            labels = build_packed_team_aux_labels(
-                self.data, 6, self.pairs[lane][1], selected_indices=opponent_picks[i]
-            )
+            # Private labels come from the other seat's own preview, in source-team order.
+            opponent_row = 2 * lane + 1
+            labels = {
+                "opp_" + key: self.obs["own_" + key][opponent_row]
+                for key in ("moves", "types", "ability", "item", "continuous")
+            }
+            labels["opp_source_index"] = np.arange(self.obs["own_mask"].shape[1])
+            labels["opp_mask"] = ~np.isin(labels["opp_source_index"], opponent_picks[i])
             self.preview_starts.append(
                 (
                     int(lane),
@@ -224,16 +215,6 @@ class PikaproVectorEnv:
                 self.pending_intents[lane] = None
 
     def _issue(self, commands, side, lanes, actions):
-        rows = np.arange(len(lanes))
-        joint = self.block["joint"][lanes, side]
-        can_tera = self.block["can_tera"][lanes, side]
-        used = actions[:, 2] != 0
-        if not (
-            joint[rows, 0, actions[:, 0]].all()
-            and joint[rows, 1 + actions[:, 0], actions[:, 1]].all()
-            and can_tera[rows[used], actions[used, 2] - 1].all()
-        ):
-            raise ValueError("The policy selected an illegal action.")
         moves = self.obs["own_request_moves"][2 * lanes + side]
         species = self.obs["own_species"][2 * lanes + side]
         previous = remember_actions(actions, moves, species)
@@ -243,7 +224,12 @@ class PikaproVectorEnv:
         )
         if side == 1:
             targets = opponent_intent_labels(
-                actions, previous, moves, species, joint, can_tera
+                actions,
+                previous,
+                moves,
+                species,
+                self.block["joint"][lanes, side],
+                self.block["can_tera"][lanes, side],
             )
             for i, lane in enumerate(lanes):
                 self.pending_intents[lane] = {
@@ -356,13 +342,6 @@ class PikaproVectorEnv:
             awaiting_resolution[resolved] = False
             ended = np.flatnonzero(playing & self.state.terminated)
             if len(ended):
-                if (
-                    dones[ended].any()
-                    or (self.state.reward[ended].sum(axis=1) != 0).any()
-                ):
-                    raise RuntimeError(
-                        "Expected one zero-sum terminal result per game."
-                    )
                 dones[ended] = True
                 rewards[ended] = self.state.reward[ended, 0]
                 self._finish(ended, rewards, infos)
@@ -378,16 +357,11 @@ class PikaproVectorEnv:
         starts, self.preview_starts = self.preview_starts, []
         return starts
 
-    def wait_for_prepared_team_previews(self):
+    def advance_policy_version(self):
         if self.preview_starts:
             raise RuntimeError("A team preview was omitted from the rollout.")
-
-    def refresh_prepared_team_previews(self):
-        # No preview is prepared ahead of its episode on the synchronous path.
-        pass
-
-    def retained_battle_counts(self):
-        return self.num_envs, self.num_envs
+        self.policy_version += 1
+        self.preview_cache = TeamPreviewCache()
 
     def reset_timing(self):
         self.timing.clear()

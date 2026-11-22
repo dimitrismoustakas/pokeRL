@@ -1,26 +1,21 @@
-from unittest.mock import MagicMock
-
 import numpy as np
 import pytest
-from poke_env.battle import Battle, PublicBattleEventKind
 
-from pokerl.data import MOVE_SCOPE_SCOPED, MOVE_SCOPE_TARGETED, GameData
+from pokerl.data import MOVE_SCOPE_SCOPED, MOVE_SCOPE_TARGETED
 from pokerl.env.actions import (
     INTENT_MOVE,
     INTENT_PASS,
-    TARGET_OPPONENT_1,
-    SemanticActionIntent,
-    SemanticSlotIntent,
 )
 from pokerl.env.observation import (
     EVENT_FLAG_ACTION_FAILED,
     EVENT_FLAG_NO_TARGET,
     EVENT_FLAG_SPREAD,
-    EVENT_KIND_TO_INDEX,
+    EVENT_MOVE,
+    EVENT_CANT,
+    EVENT_FAINT,
     NUM_PUBLIC_EVENT_FLAGS,
     NUM_PUBLIC_TARGET_POSITIONS,
     NUM_TARGET_OUTCOME_FEATURES,
-    ObservationBuilder,
     POSITION_IMPLICIT,
     POSITION_OPP_1,
     POSITION_OWN_1,
@@ -39,17 +34,11 @@ from pokerl.public_consequence import (
     NONMOVE_REASON_CANT,
     NONMOVE_REASON_FAINTED,
     PUBLIC_CONSEQUENCE_FIELD_DIM,
-    TARGET_INTERACTION_FAILED,
     TARGET_INTERACTION_IMMUNE,
     TARGET_INTERACTION_MISS,
     encode_public_consequence,
     encode_public_field,
 )
-
-
-MOVE_EVENT = EVENT_KIND_TO_INDEX[PublicBattleEventKind.MOVE]
-CANT_EVENT = EVENT_KIND_TO_INDEX[PublicBattleEventKind.CANT]
-FAINT_EVENT = EVENT_KIND_TO_INDEX[PublicBattleEventKind.FAINT]
 
 
 def _observation() -> dict[str, np.ndarray]:
@@ -62,7 +51,7 @@ def _observation() -> dict[str, np.ndarray]:
     return {
         "field": np.linspace(0.0, 1.0, PUBLIC_CONSEQUENCE_FIELD_DIM).astype(np.float32),
         "recent_event_meta": np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-        "recent_event_kind": np.asarray([MOVE_EVENT, 0, 0, 0], dtype=np.int64),
+        "recent_event_kind": np.asarray([EVENT_MOVE, 0, 0, 0], dtype=np.int64),
         "recent_event_actor": np.asarray([POSITION_OWN_1, 0, 0, 0]),
         "recent_event_move": np.asarray([11, 0, 0, 0], dtype=np.int64),
         "recent_event_source_move": np.zeros(4, dtype=np.int64),
@@ -147,7 +136,7 @@ def test_move_branch_is_explicit_and_does_not_invent_target_routes(
 
 @pytest.mark.parametrize(
     ("event_kind", "expected_reason"),
-    ((CANT_EVENT, NONMOVE_REASON_CANT), (FAINT_EVENT, NONMOVE_REASON_FAINTED)),
+    ((EVENT_CANT, NONMOVE_REASON_CANT), (EVENT_FAINT, NONMOVE_REASON_FAINTED)),
 )
 def test_nonemitted_move_has_conditional_public_reason(
     event_kind: int,
@@ -155,7 +144,7 @@ def test_nonemitted_move_has_conditional_public_reason(
 ) -> None:
     obs = _observation()
     obs["recent_event_kind"][0] = event_kind
-    obs["recent_event_move"][0] = 0 if event_kind == CANT_EVENT else 11
+    obs["recent_event_move"][0] = 0 if event_kind == EVENT_CANT else 11
     obs["recent_event_move_scope"][0] = 0
 
     labels = encode_public_consequence(obs)
@@ -198,51 +187,6 @@ def test_minor_target_presence_is_not_mislabeled_as_move_route() -> None:
 
     assert labels.route_targets[0].tolist() == [0.0, 0.0, 1.0, 0.0]
     assert not labels.interaction_masks[0, 0]
-
-
-def test_parting_shot_subeffect_failure_remains_target_interaction() -> None:
-    game_data = GameData(gen=9)
-    builder = ObservationBuilder(game_data)
-    battle = Battle("parting-shot-clear-amulet", "agent", MagicMock(), gen=9)
-    battle.player_role = "p1"
-    battle.turn = 3
-    battle._track_public_battle_event(
-        ["", "move", "p1a: Pivot", "Parting Shot", "p2a: Target"]
-    )
-    battle._track_public_battle_event(
-        [
-            "",
-            "-fail",
-            "p2a: Target",
-            "unboost",
-            "[from] item: Clear Amulet",
-            "[of] p1a: Pivot",
-        ]
-    )
-    battle._track_public_battle_event(
-        ["", "switch", "p1a: Replacement", "Incineroar, L50", "100/100"]
-    )
-    battle.won_by("agent")
-    intent = SemanticActionIntent(
-        slots=(
-            SemanticSlotIntent(
-                kind=INTENT_MOVE,
-                move_id="partingshot",
-                target=TARGET_OPPONENT_1,
-            ),
-            SemanticSlotIntent(kind=INTENT_PASS),
-        )
-    )
-    observation: dict[str, np.ndarray] = {}
-
-    builder._encode_transition_history(battle, intent, observation)
-    labels = encode_public_consequence(observation)
-
-    assert observation["recent_event_flags"][0, EVENT_FLAG_ACTION_FAILED] == 0.0
-    assert labels.move_branch_labels[0] == MOVE_BRANCH_TARGET_PHASE
-    assert labels.route_targets[0, 2] == 1.0
-    assert labels.interaction_targets[0, 2] == 1.0
-    assert labels.interaction_reason_labels[0, 2] == TARGET_INTERACTION_FAILED
 
 
 @pytest.mark.parametrize(

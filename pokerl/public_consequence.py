@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
-from poke_env.battle import PublicBattleEventKind
 
 from .data import MOVE_SCOPE_SCOPED, MOVE_SCOPE_TARGETED, UNKNOWN_IDX
 from .env.actions import INTENT_MOVE
@@ -19,7 +18,9 @@ from .env.observation import (
     EVENT_FLAG_ACTION_FAILED,
     EVENT_FLAG_NO_TARGET,
     EVENT_FLAG_SPREAD,
-    EVENT_KIND_TO_INDEX,
+    EVENT_MOVE,
+    EVENT_CANT,
+    EVENT_FAINT,
     FIELD_TRICK_ROOM_OFFSET,
     NUM_PUBLIC_EVENT_FLAGS,
     NUM_PUBLIC_TARGET_POSITIONS,
@@ -76,9 +77,6 @@ PUBLIC_CONSEQUENCE_OBSERVATION_KEYS = (
     "prev_own_target",
 )
 
-_MOVE_EVENT = EVENT_KIND_TO_INDEX[PublicBattleEventKind.MOVE]
-_CANT_EVENT = EVENT_KIND_TO_INDEX[PublicBattleEventKind.CANT]
-_FAINT_EVENT = EVENT_KIND_TO_INDEX[PublicBattleEventKind.FAINT]
 _OWN_POSITIONS = (POSITION_OWN_1, POSITION_OWN_2)
 _OPPONENT_POSITIONS = (POSITION_OPP_1, POSITION_OPP_2)
 
@@ -146,7 +144,7 @@ def encode_public_consequence(
         [
             np.any(
                 present
-                & (event_kind == _CANT_EVENT)
+                & (event_kind == EVENT_CANT)
                 & (event_actor == opponent_position)
             )
             for opponent_position in _OPPONENT_POSITIONS
@@ -164,21 +162,21 @@ def encode_public_consequence(
             continue
 
         own_move_events = np.flatnonzero(
-            present & (event_kind == _MOVE_EVENT) & (event_actor == own_position)
+            present & (event_kind == EVENT_MOVE) & (event_actor == own_position)
         )
         exact_move_events = own_move_events[
             (event_move[own_move_events] == own_move)
             | (event_source_move[own_move_events] == own_move)
         ]
         own_cant_events = np.flatnonzero(
-            present & (event_kind == _CANT_EVENT) & (event_actor == own_position)
+            present & (event_kind == EVENT_CANT) & (event_actor == own_position)
         )
         compatible_cant_events = own_cant_events[
             (event_move[own_cant_events] == UNKNOWN_IDX)
             | (event_move[own_cant_events] == own_move)
         ]
         own_faint_events = np.flatnonzero(
-            present & (event_kind == _FAINT_EVENT) & (event_actor == own_position)
+            present & (event_kind == EVENT_FAINT) & (event_actor == own_position)
         )
 
         event_index: int | None = None
@@ -234,7 +232,7 @@ def encode_public_consequence(
         labels.cant_masks[slot] = _opponent_cant_mask(
             int(arrays["prev_own_target"][slot]),
             spread=(
-                event_kind[event_index] == _MOVE_EVENT
+                event_kind[event_index] == EVENT_MOVE
                 and bool(event_flags[event_index, EVENT_FLAG_SPREAD])
             ),
         )

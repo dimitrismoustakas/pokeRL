@@ -5,7 +5,6 @@ description = "Reinforcement learning for Pokemon Regulation F doubles battles"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "torch>=2.11,<3",
-    "poke-env==0.15.0+pokerl.1",
     "pikapro==0.2.0+pokerl.1",
     "numpy>=1.24",
 ]
@@ -13,13 +12,11 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest",
-    "pytest-asyncio",
     "ruff",
 ]
 
 [tool.uv.sources]
 pikapro = { path = "vendor/pikapro-0.2.0+pokerl.1.tar.gz" }
-poke-env = { path = "vendor/poke_env-0.15.0+pokerl.1.tar.gz" }
 torch = { index = "pytorch-cu130", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" }
 
 [[tool.uv.index]]
@@ -35,4 +32,4 @@ build-backend = "setuptools.build_meta"
 include = ["pokerl*"]
 
 [tool.setuptools.package-data]
-pokerl = ["item_ids.json"]
+pokerl = ["gen9_dex.json", "gen9_dex.LICENSE"]

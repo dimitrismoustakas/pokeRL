@@ -1,13 +1,7 @@
-"""Import, validate, deduplicate, and audit published competitive teams.
-
-This module deliberately handles only complete published teams.  It never
-generates sets, mixes Pokemon across teams, or repairs an invalid source team.
-Pokemon Showdown is the authority for format legality and canonical packing.
-"""
+"""Validate and import published Regulation F teams and measure roster coverage."""
 
 from __future__ import annotations
 
-import hashlib
 import itertools
 import json
 import re
@@ -20,9 +14,9 @@ from typing import Callable, Iterable, Mapping, Protocol
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from poke_env.data.normalize import to_id_str
-from poke_env.teambuilder.constant_teambuilder import ConstantTeambuilder
-from poke_env.teambuilder.teambuilder import Teambuilder
+from pikapro import to_id
+
+from .team_pool import pack_team, repo_root
 
 
 USER_AGENT = "pokeRL-published-team-import/1.0"
@@ -59,10 +53,6 @@ class ValidatedPublishedTeam:
     team_text: str
     packed_team: str
 
-    @property
-    def packed_sha1(self) -> str:
-        return hashlib.sha1(self.packed_team.encode("utf-8")).hexdigest()
-
 
 @dataclass(frozen=True, slots=True)
 class ManifestTeam:
@@ -72,77 +62,40 @@ class ManifestTeam:
     team_text: str
     packed_team: str
 
-    @property
-    def packed_sha1(self) -> str:
-        return hashlib.sha1(self.packed_team.encode("utf-8")).hexdigest()
-
 
 class TeamValidator(Protocol):
-    def validate_and_pack(
-        self, team_text: str
-    ) -> tuple[bool, str | None, list[str]]: ...
+    def validate(self, team_text: str) -> list[str]: ...
 
 
 class ShowdownTeamValidator:
-    """Validate and pack teams through the repository's local Showdown build."""
+    """Check Regulation F legality with the repository's local Showdown build."""
 
     def __init__(self, showdown_dir: Path, format_id: str):
         self.showdown_dir = showdown_dir.expanduser().resolve()
         self.format_id = format_id
-        self.entrypoint = self.showdown_dir / "pokemon-showdown"
-        if not self.entrypoint.exists():
-            raise FileNotFoundError(
-                f"Pokemon Showdown entrypoint not found at {self.entrypoint}."
-            )
 
-    def _run(self, args: list[str], team_text: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["node", str(self.entrypoint), *args],
+    def validate(self, team_text: str) -> list[str]:
+        query = """
+            const {Teams, TeamValidator} = require('./dist/sim');
+            const text = require('node:fs').readFileSync(0, 'utf8');
+            const problems = TeamValidator.get(process.argv[1]).validateTeam(Teams.import(text));
+            console.log(JSON.stringify(problems || []));
+        """
+        result = subprocess.run(
+            ["node", "-e", query, self.format_id],
             input=team_text,
             text=True,
-            capture_output=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
             cwd=self.showdown_dir,
-            timeout=180,
-            check=False,
+            check=True,
         )
-
-    def validate_and_pack(self, team_text: str) -> tuple[bool, str | None, list[str]]:
-        validation = self._run(["validate-team", self.format_id], team_text)
-        if validation.returncode != 0:
-            problem_text = (
-                validation.stderr.strip()
-                or validation.stdout.strip()
-                or "Unknown Showdown validation error"
-            )
-            return (
-                False,
-                None,
-                [line for line in problem_text.splitlines() if line.strip()],
-            )
-
-        packed = self._run(["pack-team"], team_text)
-        if packed.returncode != 0:
-            problem_text = (
-                packed.stderr.strip()
-                or packed.stdout.strip()
-                or "Unknown Showdown packing error"
-            )
-            return (
-                False,
-                None,
-                [line for line in problem_text.splitlines() if line.strip()],
-            )
-        packed_team = packed.stdout.strip()
-        if not packed_team:
-            return False, None, ["Showdown returned an empty packed team."]
-        return True, packed_team, []
+        return json.loads(result.stdout)
 
 
 def load_published_source_spec(path: str | Path) -> list[PublishedTeamSource]:
     path = Path(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-        raise ValueError("Published-team source spec must use schema_version 1.")
     source_page = raw.get("source_page")
     spread_caveat = raw.get("spread_caveat")
     entries = raw.get("entries")
@@ -210,14 +163,14 @@ def fetch_pokepaste_raw(url: str, timeout: int = 30) -> str:
     with urlopen(request, timeout=timeout) as response:
         payload = response.read()
         charset = response.headers.get_content_charset() or "utf-8"
-    return normalize_team_text(payload.decode(charset, errors="strict"))
+    return payload.decode(charset)
 
 
 def normalize_team_text(team_text: str) -> str:
     normalized = team_text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         raise ValueError("Published team export is empty.")
-    pokemon = Teambuilder.parse_showdown_team(normalized)
+    pokemon = re.split(r"\n(?:[ \t]*\n)+", normalized)
     if len(pokemon) != 6:
         raise ValueError(
             f"Published team export must contain exactly 6 Pokemon, found {len(pokemon)}."
@@ -225,43 +178,17 @@ def normalize_team_text(team_text: str) -> str:
     return normalized + "\n"
 
 
-def _repo_root(manifest_path: Path) -> Path:
-    for candidate in (manifest_path.resolve().parent, *manifest_path.resolve().parents):
-        if (candidate / "pyproject.toml").exists():
-            return candidate
-    raise FileNotFoundError(f"Could not locate repository root above {manifest_path}.")
-
-
-def _read_manifest(path: Path) -> dict[str, object]:
-    loaded = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(loaded, dict):
-        raise ValueError(f"Manifest {path} must contain an object.")
-    if not isinstance(loaded.get("pool"), list):
-        raise ValueError(f"Manifest {path} must contain a pool list.")
-    if not isinstance(loaded.get("curated"), list):
-        raise ValueError(f"Manifest {path} must contain a curated list.")
-    return loaded
-
-
 def load_manifest_teams(manifest_path: str | Path, split: str) -> list[ManifestTeam]:
-    if split not in VALID_SPLITS:
-        raise ValueError(f"Unsupported split {split!r}.")
     manifest_path = Path(manifest_path)
-    manifest = _read_manifest(manifest_path)
-    root = _repo_root(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    root = repo_root(manifest_path.parent)
     records: list[ManifestTeam] = []
     seen_packed: set[str] = set()
     for raw_entry in manifest["pool"]:
-        if not isinstance(raw_entry, dict):
-            raise ValueError(f"Manifest {manifest_path} pool entries must be objects.")
-        file_value = raw_entry.get("file")
-        if not isinstance(file_value, str) or not file_value:
-            raise ValueError(f"Manifest {manifest_path} has an entry without a file.")
-        team_path = Path(file_value)
-        if not team_path.is_absolute():
-            team_path = root / team_path
+        file_value = raw_entry["file"]
+        team_path = root / file_value
         team_text = normalize_team_text(team_path.read_text(encoding="utf-8"))
-        packed = ConstantTeambuilder(team_text).yield_team()
+        packed = pack_team(team_text)
         if packed in seen_packed:
             raise ValueError(
                 f"Manifest {manifest_path} contains duplicate packed team {file_value}."
@@ -289,7 +216,6 @@ def assert_disjoint_splits(
         return
     details = [
         {
-            "packed_sha1": hashlib.sha1(packed.encode("utf-8")).hexdigest(),
             "training": training_by_packed[packed].file,
             "heldout": heldout_by_packed[packed].file,
         }
@@ -318,22 +244,23 @@ def coverage_summary(team_texts: Iterable[str]) -> dict[str, object]:
 
     for team_text in team_texts:
         team_count += 1
-        pokemon = Teambuilder.parse_showdown_team(normalize_team_text(team_text))
+        pokemon = pack_team(team_text).split("]")
         roster: list[str] = []
-        for mon in pokemon:
-            species_id = to_id_str(mon.species or mon.nickname)
+        for slot in pokemon:
+            mon = slot.split("|")
+            species_id = to_id(mon[1] or mon[0])
             roster.append(species_id)
             species[species_id] += 1
-            item_id = to_id_str(mon.item or "")
-            ability_id = to_id_str(mon.ability or "")
-            tera_id = to_id_str(mon.tera_type or "")
+            item_id = to_id(mon[2])
+            ability_id = to_id(mon[3])
+            tera_id = to_id(mon[11].split(",")[5]) if mon[11].count(",") >= 5 else ""
             if item_id:
                 items[item_id] += 1
             if ability_id:
                 abilities[ability_id] += 1
             if tera_id:
                 tera_types[tera_id] += 1
-            move_ids = sorted(to_id_str(move) for move in mon.moves if move)
+            move_ids = sorted(to_id(move) for move in mon[4].split(",") if move)
             moves.update(move_ids)
             exact_sets.add(
                 "|".join([species_id, item_id, ability_id, tera_id, *move_ids])
@@ -390,7 +317,6 @@ def _published_manifest_entry(
         "title": source.title,
         "subset": "curated",
         "file": file_value,
-        "packed_sha1": team.packed_sha1,
         "spread_provenance": "smogon_2026_sample_public_paste",
         "spread_caveat": source.spread_caveat,
         "result": source.result,
@@ -421,10 +347,7 @@ def _next_team_filename(
     curated = manifest.get("curated")
     if not isinstance(curated, list):
         raise ValueError("Manifest curated section must be a list.")
-    return (
-        f"{len(curated) + 1:03d}_{_slugify(team.source.title)}_"
-        f"{team.packed_sha1[:8]}.txt"
-    )
+    return f"{len(curated) + 1:03d}_{_slugify(team.source.title)}.txt"
 
 
 def _find_manifest_entries_by_packed(
@@ -445,7 +368,7 @@ def _find_manifest_entries_by_packed(
             if not path.is_absolute():
                 path = root / path
             text = normalize_team_text(path.read_text(encoding="utf-8"))
-            if ConstantTeambuilder(text).yield_team() == packed_team:
+            if pack_team(text) == packed_team:
                 matched.append(raw_entry)
     return matched
 
@@ -479,7 +402,7 @@ def _append_validated_team(
     manifest: dict[str, object],
     team: ValidatedPublishedTeam,
 ) -> None:
-    root = _repo_root(manifest_path)
+    root = repo_root(manifest_path.parent)
     filename = _next_team_filename(manifest, team)
     curated_path = manifest_path.parent / "curated" / filename
     curated_path.parent.mkdir(parents=True, exist_ok=True)
@@ -524,8 +447,8 @@ def import_published_teams(
 
     training_manifest_path = Path(training_manifest_path)
     heldout_manifest_path = Path(heldout_manifest_path)
-    training_manifest = _read_manifest(training_manifest_path)
-    heldout_manifest = _read_manifest(heldout_manifest_path)
+    training_manifest = json.loads(training_manifest_path.read_text(encoding="utf-8"))
+    heldout_manifest = json.loads(heldout_manifest_path.read_text(encoding="utf-8"))
     training_existing = load_manifest_teams(training_manifest_path, "training")
     heldout_existing = load_manifest_teams(heldout_manifest_path, "heldout")
     assert_disjoint_splits(training_existing, heldout_existing)
@@ -547,27 +470,13 @@ def import_published_teams(
             result.update(status="fetch_failed", problems=[str(exc)])
             results.append(result)
             continue
-        valid, packed_team, problems = validator.validate_and_pack(team_text)
-        if not valid or packed_team is None:
+        problems = validator.validate(team_text)
+        if problems:
             result.update(status="invalid", problems=problems)
             results.append(result)
             continue
-        expected_packed = ConstantTeambuilder(team_text).yield_team()
-        # Showdown preserves display case for ids while poke-env canonicalizes
-        # them to lower case.  Packed-team ids are case-insensitive, so compare
-        # that representation while retaining poke-env's canonical form for
-        # manifest deduplication and runtime loading.
-        if packed_team.casefold() != expected_packed.casefold():
-            result.update(
-                status="packing_mismatch",
-                problems=["Showdown and poke-env produced different packed teams."],
-            )
-            results.append(result)
-            continue
-        packed_team = expected_packed
+        packed_team = pack_team(team_text)
 
-        packed_sha1 = hashlib.sha1(packed_team.encode("utf-8")).hexdigest()
-        result["packed_sha1"] = packed_sha1
         existing = existing_by_packed.get(packed_team)
         if existing is not None:
             result.update(
@@ -586,7 +495,7 @@ def import_published_teams(
                     if existing.split == "training"
                     else heldout_manifest
                 )
-                root = _repo_root(manifest_path)
+                root = repo_root(manifest_path.parent)
                 for entry in _find_manifest_entries_by_packed(
                     manifest, root, packed_team
                 ):
@@ -658,7 +567,6 @@ def import_published_teams(
 
     status_counts = Counter(str(result["status"]) for result in results)
     return {
-        "schema_version": 1,
         "applied": apply,
         "source_count": len(results),
         "status_counts": dict(sorted(status_counts.items())),

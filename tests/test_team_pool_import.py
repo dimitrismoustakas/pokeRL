@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 
 import pytest
-from poke_env.teambuilder.constant_teambuilder import ConstantTeambuilder
 
 from pokerl.team_pool_import import (
     PublishedTeamSource,
@@ -26,23 +25,21 @@ def _team(species: tuple[str, ...], move: str = "Protect") -> str:
         "\n\n".join(
             "\n".join(
                 (
-                    f"{name} @ Leftovers",
+                    f"{name} @ Leftovers" if index == 0 else name,
                     "Ability: Pressure",
                     "Tera Type: Normal",
                     f"- {move}",
                 )
             )
-            for name in species
+            for index, name in enumerate(species)
         )
         + "\n"
     )
 
 
 class _AcceptingValidator:
-    def validate_and_pack(self, team_text: str) -> tuple[bool, str | None, list[str]]:
-        # Showdown preserves display case for ids while poke-env lowercases
-        # them; the importer must still canonicalize to poke-env's bytes.
-        return True, ConstantTeambuilder(team_text).yield_team().swapcase(), []
+    def validate(self, team_text: str) -> list[str]:
+        return []
 
 
 def _write_manifest(root: Path, name: str, team_text: str, *, training: bool) -> Path:
@@ -54,7 +51,6 @@ def _write_manifest(root: Path, name: str, team_text: str, *, training: bool) ->
     entry = {"title": "Existing", "subset": "curated", "file": relative}
     manifest = {
         "purpose": "training" if training else "evaluation_only",
-        "allow_training": training,
         "format": "test-format",
         "stats": {"curated_valid": 1, "generated_valid": 0, "pool_valid": 1},
         "curated": [dict(entry)],
@@ -81,7 +77,6 @@ def _source(order: int, split: str, link: str) -> PublishedTeamSource:
 
 def test_source_spec_requires_unique_approved_exports(tmp_path: Path) -> None:
     spec = {
-        "schema_version": 1,
         "source_page": "https://example.test/source",
         "spread_caveat": "Caveat",
         "entries": [

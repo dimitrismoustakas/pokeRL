@@ -8,7 +8,8 @@ import scripts.train as train_module
 from pokerl.data import MOVE_SCOPE_SCOPED
 from pokerl.env.actions import INTENT_MOVE
 from pokerl.env.observation import (
-    EVENT_KIND_TO_INDEX,
+    EVENT_MOVE,
+    EVENT_CANT,
     FIELD_TURN_OFFSET,
     NUM_PUBLIC_EVENT_FLAGS,
     NUM_PUBLIC_TARGET_POSITIONS,
@@ -22,7 +23,6 @@ from pokerl.public_consequence import (
 )
 from pokerl.training.rollout import RolloutBuffer
 from pokerl.training.preview import TeamPreviewEpisodeStart
-from poke_env.battle import PublicBattleEventKind
 
 
 def _batched_obs(states: list[int], *, aux: bool) -> dict[str, np.ndarray]:
@@ -316,9 +316,7 @@ def _consequence_obs(
     field_value: float,
     cant: bool,
 ) -> dict[str, np.ndarray]:
-    event_kind = EVENT_KIND_TO_INDEX[
-        PublicBattleEventKind.CANT if cant else PublicBattleEventKind.MOVE
-    ]
+    event_kind = EVENT_CANT if cant else EVENT_MOVE
     return {
         "state": np.asarray([state], dtype=np.float32),
         "field": np.full(FIELD_TURN_OFFSET + 1, field_value, dtype=np.float32),
@@ -431,7 +429,7 @@ def test_public_consequences_align_next_and_terminal_observations_through_last_s
         10.0,
         20.0,
     ]
-    # Terminal Showdown observations do not advance the turn counter, so their
+    # Terminal observations do not advance the turn counter, so their
     # field state is not a valid target for the one-turn persistence baseline.
     assert batch.public_consequence_field_masks[:, 0, 0].tolist() == [True, False]
 

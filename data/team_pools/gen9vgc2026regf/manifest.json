@@ -1,6 +1,5 @@
 {
   "purpose": "training",
-  "allow_training": true,
   "generated_at": "2026-04-17T17:38:52.795234+00:00",
   "format": "gen9vgc2026regf",
   "source_page": "https://victoryroad.pro/sv-rental-teams-reg-set-f/",
@@ -20,7 +19,6 @@
     {
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/001_0722poke-teku-s-battle-stadium-s15-9th-place-team_72a45526.txt",
-      "packed_sha1": "72a45526f30ac4c13c72e94590ccdd7244597f10",
       "source_links": [
         "https://pokepast.es/345e5681d1b2bd12"
       ],
@@ -54,7 +52,6 @@
       "title": "15th at Portland",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/002_15th-at-portland_7a7ee6fe.txt",
-      "packed_sha1": "7a7ee6fe07ed619249b0dc9c54563bae83d2212e",
       "source_links": [
         "https://pokepast.es/8715a9643f82bcf0"
       ],
@@ -86,7 +83,6 @@
       "title": "2024 Portland 10-4 13th +80CP",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/003_2024-portland-10-4-13th-80cp_a52dc8c5.txt",
-      "packed_sha1": "a52dc8c579f319fd69ee392a783759ef8a879b23",
       "source_links": [
         "https://pokepast.es/dd1bc1003cb6b384"
       ],
@@ -118,7 +114,6 @@
       "title": "222",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/004_222_c25e9a52.txt",
-      "packed_sha1": "c25e9a52b86bd7fb1cab8daa74fa53aae837945b",
       "source_links": [
         "https://pokepast.es/6110eb3f2e1dd429"
       ],
@@ -150,7 +145,6 @@
       "title": "36th / 664 Liverpool Regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/005_36th-664-liverpool-regionals_a9f209fd.txt",
-      "packed_sha1": "a9f209fd0654bb2cdf71056a8f45026c81026122",
       "source_links": [
         "https://pokepast.es/f7ab633199125a5d"
       ],
@@ -182,7 +176,6 @@
       "title": "37th 2024 Orlando Regional",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/006_37th-2024-orlando-regional_12ee98fa.txt",
-      "packed_sha1": "12ee98fa073934357932681e24dd6abc580a74b5",
       "source_links": [
         "https://pokepast.es/c2b4e3c02eca4684"
       ],
@@ -214,7 +207,6 @@
       "title": "Alta's Global Challenge I 46th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/007_alta-s-global-challenge-i-46th-place-team_fdfef86c.txt",
-      "packed_sha1": "fdfef86cd3e64a70e587cc13f1b711ae99835003",
       "source_links": [
         "https://pokepast.es/d54e96d627081e40"
       ],
@@ -246,7 +238,6 @@
       "title": "Arch Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/008_arch-team_167c99d2.txt",
-      "packed_sha1": "167c99d2966cd6338ecbe08e84573e24f0f09a19",
       "source_links": [
         "https://pokepast.es/c5844ad84c3817af"
       ],
@@ -278,7 +269,6 @@
       "title": "BattleRoom's Portland Regionals Top 4 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/009_battleroom-s-portland-regionals-top-4-team_53f418b1.txt",
-      "packed_sha1": "53f418b1b554617af073ba00d70d15a9ecf0e557",
       "source_links": [
         "https://pokepast.es/4afccee6244b72a7"
       ],
@@ -310,7 +300,6 @@
       "title": "Baxcalibur Redux v2",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/010_baxcalibur-redux-v2_fe4e1484.txt",
-      "packed_sha1": "fe4e148477ab59715ffafac62ec7ebc9a5ec2217",
       "source_links": [
         "https://pokepast.es/c54728cfe1387c5b"
       ],
@@ -342,7 +331,6 @@
       "title": "blue's Battle Stadium S14 25th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/011_blue-s-battle-stadium-s14-25th-place-team_97529c78.txt",
-      "packed_sha1": "97529c78b283fab90b2c5bb2109094e306563be0",
       "source_links": [
         "https://pokepast.es/bc96e7bba408292d"
       ],
@@ -375,7 +363,6 @@
       "title": "bubs' Latias Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/012_bubs-latias-team_2853ce0d.txt",
-      "packed_sha1": "2853ce0d48892131bf025bbafcf81a410fd4006c",
       "source_links": [
         "https://pokepast.es/de3742b26d9da241"
       ],
@@ -407,7 +394,6 @@
       "title": "Copy of Chien-Pao Torn",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/013_copy-of-chien-pao-torn_04996cb1.txt",
-      "packed_sha1": "04996cb113e965c407c572f53f68be9bc087d62a",
       "source_links": [
         "https://pokepast.es/1b71291956611fa8"
       ],
@@ -439,7 +425,6 @@
       "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of UTRECHT WINNING TEAM",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/014_utrecht-winning-team_2bb60816.txt",
-      "packed_sha1": "2bb60816d354e5a54f72cca3514fc57366ed1da9",
       "source_links": [
         "https://pokepast.es/24dcf5e568ffa85e"
       ],
@@ -471,7 +456,6 @@
       "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Testing Liverpoolada",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/015_copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-copy-of-testing-liverpoolada_b10211d2.txt",
-      "packed_sha1": "b10211d255de682bb7c3ce110c834115ad7213b8",
       "source_links": [
         "https://pokepast.es/a4926977eadb521c"
       ],
@@ -503,7 +487,6 @@
       "title": "Copy of Untitled 1089",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/016_copy-of-untitled-1089_4f69cbdc.txt",
-      "packed_sha1": "4f69cbdca591d763c6a72a573c75d7dce7801920",
       "source_links": [
         "https://pokepast.es/92cd2d135946bd95"
       ],
@@ -535,7 +518,6 @@
       "title": "CritDra",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/017_critdra_2496d5a8.txt",
-      "packed_sha1": "2496d5a8075969b642bd505ad9f723489b711e4b",
       "source_links": [
         "https://pokepast.es/d751af8fb0db3183"
       ],
@@ -567,7 +549,6 @@
       "title": "dengo v1.1 -- mc",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/018_dengo-v1-1-mc_48223523.txt",
-      "packed_sha1": "48223523b8b45d3835d4f1d6037fe18ff217decf",
       "source_links": [
         "https://pokepast.es/3675d96625ad0b36"
       ],
@@ -599,7 +580,6 @@
       "title": "dlc blob",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/019_dlc-blob_e25b6222.txt",
-      "packed_sha1": "e25b62223eed1282f4a43b196fe8ff2361537c4e",
       "source_links": [
         "https://pokepast.es/545d7f02c0923752"
       ],
@@ -631,7 +611,6 @@
       "title": "dlc cat",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/020_dlc-cat_757e96e7.txt",
-      "packed_sha1": "757e96e7cde3cef2964d99f0d0cf13b80b9e6612",
       "source_links": [
         "https://pokepast.es/603f3f6b859a1d0e"
       ],
@@ -663,7 +642,6 @@
       "title": "dlc cotton",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/021_dlc-cotton_369b40ac.txt",
-      "packed_sha1": "369b40acc6c6ab1edb11df138072bda5a29c8a43",
       "source_links": [
         "https://pokepast.es/cb9315fbcd4a9c8c"
       ],
@@ -695,7 +673,6 @@
       "title": "dlc lei",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/022_dlc-lei_8610e9df.txt",
-      "packed_sha1": "8610e9dfc1d8e69f6bd43c493a4de44133d85fa7",
       "source_links": [
         "https://pokepast.es/b66c43bbfa67d9cb"
       ],
@@ -727,7 +704,6 @@
       "title": "dlc tank",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/023_dlc-tank_e178e369.txt",
-      "packed_sha1": "e178e3696a64fea548569436c1910aa0509368c7",
       "source_links": [
         "https://pokepast.es/51f91db8f0341564"
       ],
@@ -759,7 +735,6 @@
       "title": "dlc tree",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/024_dlc-tree_84698084.txt",
-      "packed_sha1": "84698084ee1533d92c15063c035238804cfdf805",
       "source_links": [
         "https://pokepast.es/a54bdf12f2fd3e96"
       ],
@@ -791,7 +766,6 @@
       "title": "Dragonite - ChienPao LenVGC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/025_dragonite-chienpao-lenvgc_82d7ea8c.txt",
-      "packed_sha1": "82d7ea8c92c898d939afa244576b16c619132294",
       "source_links": [
         "https://pokepast.es/43fcc3dea73515d9"
       ],
@@ -823,7 +797,6 @@
       "title": "EUIC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/026_euic_ca7dc4da.txt",
-      "packed_sha1": "ca7dc4da0d85393b098c1cb0b2dc676555e884e5",
       "source_links": [
         "https://pokepast.es/220df76357eb4304"
       ],
@@ -855,7 +828,6 @@
       "title": "EUIC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/027_euic_6634416e.txt",
-      "packed_sha1": "6634416e1e2bcdfed4f8b3f2cb5be778e147c9d7",
       "source_links": [
         "https://pokepast.es/f6223c3ae3b06a5d"
       ],
@@ -887,7 +859,6 @@
       "title": "EUIC Squad mejorado",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/028_euic-squad-mejorado_f5eb9a63.txt",
-      "packed_sha1": "f5eb9a638a7a7d0acfb503116a8e32cdbebda1f3",
       "source_links": [
         "https://pokepast.es/e7b2100ab93144ad"
       ],
@@ -919,7 +890,6 @@
       "title": "FuiYnb's Battle Stadium S15 17th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/029_fuiynb-s-battle-stadium-s15-17th-place-team_8b883179.txt",
-      "packed_sha1": "8b883179765c0a0b378483a3a954b73c44eeb4d3",
       "source_links": [
         "https://pokepast.es/a74e079f4e948e26"
       ],
@@ -953,7 +923,6 @@
       "title": "gc final?",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/030_gc-final_087e9f7f.txt",
-      "packed_sha1": "087e9f7ffa2976ce21cb5010af2d203e63f66aa4",
       "source_links": [
         "https://pokepast.es/07ef4ccda742ba60"
       ],
@@ -985,7 +954,6 @@
       "title": "Gouging Fire 1.6.3",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/031_gouging-fire-1-6-3_b33684c1.txt",
-      "packed_sha1": "b33684c1049e36fb0afc6d52377728a204e2ad28",
       "source_links": [
         "https://pokepast.es/60695bcf37fb28f1"
       ],
@@ -1017,7 +985,6 @@
       "title": "hakushu_t's Global Challenge I 39th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/032_hakushu-t-s-global-challenge-i-39th-place-team_390e7e47.txt",
-      "packed_sha1": "390e7e478e35f21672c4cd1810da0d8a4157c45d",
       "source_links": [
         "https://pokepast.es/8e2fd5afe59ed578"
       ],
@@ -1050,7 +1017,6 @@
       "title": "Hatterene - F",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/033_hatterene-f_62522355.txt",
-      "packed_sha1": "6252235528245e39d81e2e76b5bc55be7e9b7cb7",
       "source_links": [
         "https://pokepast.es/c8a292de72a0a96d"
       ],
@@ -1082,7 +1048,6 @@
       "title": "hydrapple",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/034_hydrapple_7ab9ac71.txt",
-      "packed_sha1": "7ab9ac7160b94669611d3eb74aad032e6205d3bf",
       "source_links": [
         "https://pokepast.es/4bb5d746e5b7c7ea"
       ],
@@ -1114,7 +1079,6 @@
       "title": "Knoxville",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/035_knoxville_3753a30c.txt",
-      "packed_sha1": "3753a30c41e9a4769123a909f962e4689d772251",
       "source_links": [
         "https://pokepast.es/65bb0f92cc7c24a6"
       ],
@@ -1146,7 +1110,6 @@
       "title": "Knoxville 2024",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/036_knoxville-2024_cadf17c4.txt",
-      "packed_sha1": "cadf17c45f4d18db1d22f0a889de5bea285ce937",
       "source_links": [
         "https://pokepast.es/1e1da624a640fec2"
       ],
@@ -1178,7 +1141,6 @@
       "title": "LUCK2222",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/037_luck2222_b459b31a.txt",
-      "packed_sha1": "b459b31a965715c78438d2cc92113ee4acc63083",
       "source_links": [
         "https://pokepast.es/4ac42cdcdc499411"
       ],
@@ -1210,7 +1172,6 @@
       "title": "NikolajHoej's Dortmund Regionals Top 16 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/038_nikolajhoej-s-dortmund-regionals-top-16-team_2a4315d0.txt",
-      "packed_sha1": "2a4315d0a120b7b08d951cb76ef713b0372a40aa",
       "source_links": [
         "https://pokepast.es/b8e09de1cec487ab"
       ],
@@ -1242,7 +1203,6 @@
       "title": "Orlando (17th)",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/039_orlando-17th_073036d3.txt",
-      "packed_sha1": "073036d33fb33851b2c4b326c13da7508cb46260",
       "source_links": [
         "https://pokepast.es/119511ed13e6d06d"
       ],
@@ -1274,7 +1234,6 @@
       "title": "Orlando 2024",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/040_orlando-2024_f40494af.txt",
-      "packed_sha1": "f40494af63ffb9d962936c876b0e59c8bdb812b5",
       "source_links": [
         "https://pokepast.es/15bc2cd76307c48b"
       ],
@@ -1306,7 +1265,6 @@
       "title": "Orlando 9-6 50 of 824",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/041_orlando-9-6-50-of-824_de4aa710.txt",
-      "packed_sha1": "de4aa71057d9f65866729f4c8efd886269dafe8f",
       "source_links": [
         "https://pokepast.es/e5efcafa95a990ac"
       ],
@@ -1338,7 +1296,6 @@
       "title": "Orlando Regional (12-3, 10th of 824)",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/042_orlando-regional-12-3-10th-of-824_fe8dcd13.txt",
-      "packed_sha1": "fe8dcd13cb0864caece8f56794d45b4535bdec6d",
       "source_links": [
         "https://pokepast.es/1779c9edb0557f94"
       ],
@@ -1370,7 +1327,6 @@
       "title": "PlayestVGC's Portland Regionals Top 32 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/043_playestvgc-s-portland-regionals-top-32-team_f9ccb120.txt",
-      "packed_sha1": "f9ccb12026ac4a155b2510a9d39f03331616b4d0",
       "source_links": [
         "https://pokepast.es/112d8c1932305cde"
       ],
@@ -1402,7 +1358,6 @@
       "title": "Portland",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/044_portland_ab7fd1ae.txt",
-      "packed_sha1": "ab7fd1ae5460aafceb4ed3307d9c7dbe852fafc4",
       "source_links": [
         "https://pokepast.es/821aa56584db716e"
       ],
@@ -1434,7 +1389,6 @@
       "title": "Portland Regional Finals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/045_portland-regional-finals_9e508f7c.txt",
-      "packed_sha1": "9e508f7cee0b736b6ada8cf91c2955573fa52447",
       "source_links": [
         "https://pokepast.es/39d6e24b136f1ffd"
       ],
@@ -1466,7 +1420,6 @@
       "title": "Portland Regionals Final Copy January 6-7 2024",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/046_portland-regionals-final-copy-january-6-7-2024_a761e9e6.txt",
-      "packed_sha1": "a761e9e6e75c2adac0976a5d2f33d29e152a153e",
       "source_links": [
         "https://pokepast.es/7ca11c280e284b86"
       ],
@@ -1498,7 +1451,6 @@
       "title": "Reg F?",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/047_reg-f_a9f8a787.txt",
-      "packed_sha1": "a9f8a78736d205ee6096e5b111fba77ea19937ba",
       "source_links": [
         "https://pokepast.es/9a073131d4e10c50"
       ],
@@ -1530,7 +1482,6 @@
       "title": "Rosenkreutz's Global Challenge I 64th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/048_rosenkreutz-s-global-challenge-i-64th-place-team_ababb35c.txt",
-      "packed_sha1": "ababb35c857eeed056ff3683c4493d75290e4951",
       "source_links": [
         "https://pokepast.es/1bb353a56ae517c6"
       ],
@@ -1562,7 +1513,6 @@
       "title": "s6 balance - Chatlotte Top 32",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/049_s6-balance-chatlotte-top-32_152a8293.txt",
-      "packed_sha1": "152a8293fe7bef5d07176a7c3da415c08d253490",
       "source_links": [
         "https://pokepast.es/c2d3074886cef2de"
       ],
@@ -1594,7 +1544,6 @@
       "title": "Sarapoke0914's Global Challenge I 11th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/050_sarapoke0914-s-global-challenge-i-11th-place-team_923db2d3.txt",
-      "packed_sha1": "923db2d3ed9a529669e06eabedc379cf7b5c77bf",
       "source_links": [
         "https://pokepast.es/82c0f6f298484f9e"
       ],
@@ -1626,7 +1575,6 @@
       "title": "sora's Battle Stadium S14 20th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/051_sora-s-battle-stadium-s14-20th-place-team_1e6a6a89.txt",
-      "packed_sha1": "1e6a6a89bac9112093bd69ee12a7decfade468c8",
       "source_links": [
         "https://pokepast.es/d743fb71fb349336"
       ],
@@ -1659,7 +1607,6 @@
       "title": "Sun EUIC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/052_sun-euic_246e226f.txt",
-      "packed_sha1": "246e226f1ddea4b04379a8a4f64d05032eb8a9f6",
       "source_links": [
         "https://pokepast.es/98d19c40d8aafbad"
       ],
@@ -1691,7 +1638,6 @@
       "title": "t4 charlotte regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/053_t4-charlotte-regionals_c53b2442.txt",
-      "packed_sha1": "c53b244265dc4fd27b27c4303a93b45148c6bdfa",
       "source_links": [
         "https://pokepast.es/e17dfd516e47b1f6"
       ],
@@ -1723,7 +1669,6 @@
       "title": "t4 Vancouver regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/054_t4-vancouver-regionals_d605638e.txt",
-      "packed_sha1": "d605638e2a6b34f43e925327bbed12e81d9d75a8",
       "source_links": [
         "https://pokepast.es/c146228d46ff7451"
       ],
@@ -1755,7 +1700,6 @@
       "title": "Team Report Version",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/055_team-report-version_f3326620.txt",
-      "packed_sha1": "f3326620f7af8c254784e5ea17d1c98b83defa88",
       "source_links": [
         "https://pokepast.es/33a28379ec49a621"
       ],
@@ -1787,7 +1731,6 @@
       "title": "TH NAT '24",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/056_th-nat-24_54321a44.txt",
-      "packed_sha1": "54321a4417a0b32db05f8980f96a1652ae80bda2",
       "source_links": [
         "https://pokepast.es/3ee53af30d6da528"
       ],
@@ -1820,7 +1763,6 @@
       "title": "Toby Kongmun's 2024 Melbourne Regional Top 16 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/057_toby-kongmun-s-2024-melbourne-regional-top-16-team_c4544256.txt",
-      "packed_sha1": "c4544256625052b3a9c60f573d6eb5604192b797",
       "source_links": [
         "https://pokepast.es/da22ec05ee2ab54f"
       ],
@@ -1852,7 +1794,6 @@
       "title": "Top 8 Knoxville Regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/058_top-8-knoxville-regionals_9884ea5a.txt",
-      "packed_sha1": "9884ea5af412356e4252c1d66b7bff8caa8b7a69",
       "source_links": [
         "https://pokepast.es/c7e9b2c3303f786c"
       ],
@@ -1884,7 +1825,6 @@
       "title": "Trick Room Araquanid LenVGC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/059_trick-room-araquanid-lenvgc_547cb57c.txt",
-      "packed_sha1": "547cb57ceb4d55839e2953929161d6fe3e1f6244",
       "source_links": [
         "https://pokepast.es/4366fc19dec9ba41"
       ],
@@ -1916,7 +1856,6 @@
       "title": "Untitled 1",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/060_untitled-1_71ac1f75.txt",
-      "packed_sha1": "71ac1f75e4d7d780863766c59a59c36d2d84969c",
       "source_links": [
         "https://pokepast.es/652824607b2f80ff"
       ],
@@ -1948,7 +1887,6 @@
       "title": "Untitled 13",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/061_untitled-13_b07c9e02.txt",
-      "packed_sha1": "b07c9e029775692c268a75b4a8938b99142a69aa",
       "source_links": [
         "https://pokepast.es/938812de42ba0546"
       ],
@@ -1980,7 +1918,6 @@
       "title": "Untitled 132",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/062_untitled-132_29340006.txt",
-      "packed_sha1": "293400063149aa0352aa3d6fb2c3a56d08cfbc9b",
       "source_links": [
         "https://pokepast.es/39daf8b9920022c9"
       ],
@@ -2012,7 +1949,6 @@
       "title": "Untitled 222",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/063_untitled-222_2911d16e.txt",
-      "packed_sha1": "2911d16ee31a7abfad52784765cd8be4d478d856",
       "source_links": [
         "https://pokepast.es/925e93d386f4983c"
       ],
@@ -2044,7 +1980,6 @@
       "title": "Untitled 223",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/064_untitled-223_7080d410.txt",
-      "packed_sha1": "7080d410776500447e70d6bf11f4f5d57e61245a",
       "source_links": [
         "https://pokepast.es/d2fd3300e55b0bbb"
       ],
@@ -2076,7 +2011,6 @@
       "title": "Untitled 465",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/065_untitled-465_6037689d.txt",
-      "packed_sha1": "6037689dee6bb7c1b8dbf25b3afb5d5e5bc9be55",
       "source_links": [
         "https://pokepast.es/c3084aa9afacbde1"
       ],
@@ -2108,7 +2042,6 @@
       "title": "Untitled 5",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/066_untitled-5_5554a94e.txt",
-      "packed_sha1": "5554a94e0b2240e55fa05c5da261fadd9ce31d30",
       "source_links": [
         "https://pokepast.es/5ffbad57ad52532f"
       ],
@@ -2140,7 +2073,6 @@
       "title": "Untitled 9",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/067_untitled-9_cc0dface.txt",
-      "packed_sha1": "cc0dface7959c840a37d83046df36169b7b6b112",
       "source_links": [
         "https://pokepast.es/0a21542b22415900"
       ],
@@ -2172,7 +2104,6 @@
       "title": "Untitled PokePaste",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/068_untitled-pokepaste_19cd045d.txt",
-      "packed_sha1": "19cd045ded2e742bee346422a8303e16244934b6",
       "source_links": [
         "https://pokepast.es/eb5b79c77d415666"
       ],
@@ -2204,7 +2135,6 @@
       "title": "utrecht 1.5",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/069_utrecht-1-5_9e0b822f.txt",
-      "packed_sha1": "9e0b822fad945db65f442ee2a52c78b0a3afff95",
       "source_links": [
         "https://pokepast.es/a415070700780d37"
       ],
@@ -2236,7 +2166,6 @@
       "title": "Utrecht Day 2",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/070_utrecht-day-2_431be080.txt",
-      "packed_sha1": "431be080af997a061870656d62a5bce92c4c6def",
       "source_links": [
         "https://pokepast.es/026c9faae5932fc1"
       ],
@@ -2268,7 +2197,6 @@
       "title": "UTRECHT WINNING TEAM",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/071_utrecht-winning-team_c4962227.txt",
-      "packed_sha1": "c4962227035b44389177ef7b541bbff31bfbec22",
       "source_links": [
         "https://pokepast.es/262c301130a20afb"
       ],
@@ -2331,7 +2259,6 @@
       "title": "Vancouver 19th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/072_vancouver-19th-place-team_e8518474.txt",
-      "packed_sha1": "e8518474c5d459c4b8bdd3aea67479ed9e68a062",
       "source_links": [
         "https://pokepast.es/a5338a2ef91191e0"
       ],
@@ -2363,7 +2290,6 @@
       "title": "vancouver final!",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/073_vancouver-final_91a8c855.txt",
-      "packed_sha1": "91a8c8557ceb7c213f2000247a663b295aab93fa",
       "source_links": [
         "https://pokepast.es/b6942957f5578eb5"
       ],
@@ -2395,7 +2321,6 @@
       "title": "weezing+doggy orlando",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/074_weezing-doggy-orlando_c561a292.txt",
-      "packed_sha1": "c561a292d43571d87fa5af078c59183408c6e6b1",
       "source_links": [
         "https://pokepast.es/a52f0bf2560cc2a7"
       ],
@@ -2427,7 +2352,6 @@
       "title": "Wolfe Glick's Charlotte Regionals 2024 Champion Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/075_wolfe-glick-s-charlotte-regionals-2024-champion-team_80590641.txt",
-      "packed_sha1": "8059064184c3357bfc6c57a4237a6a2359c061e7",
       "source_links": [
         "https://pokepast.es/5c338e8429c61030"
       ],
@@ -2459,7 +2383,6 @@
       "title": "‘Saur!",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/076_saur_3e3274e5.txt",
-      "packed_sha1": "3e3274e5e72cad8214f05f50316fe4c087931f20",
       "source_links": [
         "https://pokepast.es/2cd7fdc5d75e2c59"
       ],
@@ -2491,7 +2414,6 @@
       "title": "奥兰多",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/077_team_9b52ac21.txt",
-      "packed_sha1": "9b52ac214410dc775664d7eba22d987e765953fd",
       "source_links": [
         "https://pokepast.es/729d69546a2835ae"
       ],
@@ -2523,7 +2445,6 @@
       "title": "Calm Mind Raging Bolt + Icy Wind Chien-Pao",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/078_calm_mind_raging_bolt_icy_wind_chien_pao_a78a0275.txt",
-      "packed_sha1": "a78a02756e1ecab959246cb1fbd42a02e23f9b77",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Stefano Greppi, 1st place at Birmingham Regional 2026",
@@ -2564,7 +2485,6 @@
       "title": "Roaring Moon + Gholdengo Tailwind",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/079_roaring_moon_gholdengo_tailwind_ce12b22e.txt",
-      "packed_sha1": "ce12b22efe396e087ca700912910a08614a320b1",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Cary D'Ortona, 1st place at Toronto Regional 2026",
@@ -2605,7 +2525,6 @@
       "title": "Regidrago + Gholdengo Tailwind",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/080_regidrago_gholdengo_tailwind_1ad305e8.txt",
-      "packed_sha1": "1ad305e820707694369bf3b31ec4cb650bf0706b",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Justin Tang, Top 4 at Toronto Regional 2026",
@@ -2646,7 +2565,6 @@
       "title": "Choice Band Landorus-Therian Tailwind",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/081_choice_band_landorus_therian_tailwind_9e20b218.txt",
-      "packed_sha1": "9e20b218c715f7a17ef81f98ada5652c221f848b",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Published Regulation F 2.0 sample marked RECREATION",
@@ -2687,7 +2605,6 @@
       "title": "Ursaluna + Porygon2 Tailroom",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/082_ursaluna_porygon2_tailroom_5ef7a954.txt",
-      "packed_sha1": "5ef7a954c9036e9bd16850e0fdbc001edff6373a",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Published Regulation F 2.0 sample archetype",
@@ -2728,7 +2645,6 @@
       "title": "Ursaluna + Farigiraf Tailroom",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/083_ursaluna_farigiraf_tailroom_3a3ba155.txt",
-      "packed_sha1": "3a3ba155ca46e19b889093cfb0bf935ab9386c71",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Eric Stuart, Top 8 at Toronto Regional 2026",
@@ -2769,7 +2685,6 @@
       "title": "Archaludon Rain",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/084_archaludon_rain_8db9df67.txt",
-      "packed_sha1": "8db9df671a24bac3be18f5297e6b530f01f81c9a",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Jeff Lehmann, Top 4 at a Victory Road tournament",
@@ -2810,7 +2725,6 @@
       "title": "Dondozo + Ting-Lu",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/curated/085_dondozo_ting_lu_487b6228.txt",
-      "packed_sha1": "487b6228b03535ca84f97d0a97df31eb45d498a2",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Jong One Moon, Top 4 at a Victory Road tournament",
@@ -3789,7 +3703,6 @@
       "title": "0722poke_teku's Battle Stadium S15 9th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/001_0722poke-teku-s-battle-stadium-s15-9th-place-team_72a45526.txt",
-      "packed_sha1": "72a45526f30ac4c13c72e94590ccdd7244597f10",
       "source_links": [
         "https://pokepast.es/345e5681d1b2bd12"
       ],
@@ -3822,7 +3735,6 @@
       "title": "15th at Portland",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/002_15th-at-portland_7a7ee6fe.txt",
-      "packed_sha1": "7a7ee6fe07ed619249b0dc9c54563bae83d2212e",
       "source_links": [
         "https://pokepast.es/8715a9643f82bcf0"
       ],
@@ -3854,7 +3766,6 @@
       "title": "2024 Portland 10-4 13th +80CP",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/003_2024-portland-10-4-13th-80cp_a52dc8c5.txt",
-      "packed_sha1": "a52dc8c579f319fd69ee392a783759ef8a879b23",
       "source_links": [
         "https://pokepast.es/dd1bc1003cb6b384"
       ],
@@ -3886,7 +3797,6 @@
       "title": "222",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/004_222_c25e9a52.txt",
-      "packed_sha1": "c25e9a52b86bd7fb1cab8daa74fa53aae837945b",
       "source_links": [
         "https://pokepast.es/6110eb3f2e1dd429"
       ],
@@ -3918,7 +3828,6 @@
       "title": "36th / 664 Liverpool Regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/005_36th-664-liverpool-regionals_a9f209fd.txt",
-      "packed_sha1": "a9f209fd0654bb2cdf71056a8f45026c81026122",
       "source_links": [
         "https://pokepast.es/f7ab633199125a5d"
       ],
@@ -3950,7 +3859,6 @@
       "title": "37th 2024 Orlando Regional",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/006_37th-2024-orlando-regional_12ee98fa.txt",
-      "packed_sha1": "12ee98fa073934357932681e24dd6abc580a74b5",
       "source_links": [
         "https://pokepast.es/c2b4e3c02eca4684"
       ],
@@ -3982,7 +3890,6 @@
       "title": "Alta's Global Challenge I 46th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/007_alta-s-global-challenge-i-46th-place-team_fdfef86c.txt",
-      "packed_sha1": "fdfef86cd3e64a70e587cc13f1b711ae99835003",
       "source_links": [
         "https://pokepast.es/d54e96d627081e40"
       ],
@@ -4014,7 +3921,6 @@
       "title": "Arch Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/008_arch-team_167c99d2.txt",
-      "packed_sha1": "167c99d2966cd6338ecbe08e84573e24f0f09a19",
       "source_links": [
         "https://pokepast.es/c5844ad84c3817af"
       ],
@@ -4046,7 +3952,6 @@
       "title": "BattleRoom's Portland Regionals Top 4 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/009_battleroom-s-portland-regionals-top-4-team_53f418b1.txt",
-      "packed_sha1": "53f418b1b554617af073ba00d70d15a9ecf0e557",
       "source_links": [
         "https://pokepast.es/4afccee6244b72a7"
       ],
@@ -4078,7 +3983,6 @@
       "title": "Baxcalibur Redux v2",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/010_baxcalibur-redux-v2_fe4e1484.txt",
-      "packed_sha1": "fe4e148477ab59715ffafac62ec7ebc9a5ec2217",
       "source_links": [
         "https://pokepast.es/c54728cfe1387c5b"
       ],
@@ -4110,7 +4014,6 @@
       "title": "blue's Battle Stadium S14 25th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/011_blue-s-battle-stadium-s14-25th-place-team_97529c78.txt",
-      "packed_sha1": "97529c78b283fab90b2c5bb2109094e306563be0",
       "source_links": [
         "https://pokepast.es/bc96e7bba408292d"
       ],
@@ -4143,7 +4046,6 @@
       "title": "bubs' Latias Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/012_bubs-latias-team_2853ce0d.txt",
-      "packed_sha1": "2853ce0d48892131bf025bbafcf81a410fd4006c",
       "source_links": [
         "https://pokepast.es/de3742b26d9da241"
       ],
@@ -4175,7 +4077,6 @@
       "title": "Copy of Chien-Pao Torn",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/013_copy-of-chien-pao-torn_04996cb1.txt",
-      "packed_sha1": "04996cb113e965c407c572f53f68be9bc087d62a",
       "source_links": [
         "https://pokepast.es/1b71291956611fa8"
       ],
@@ -4207,7 +4108,6 @@
       "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of UTRECHT WINNING TEAM",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/014_utrecht-winning-team_2bb60816.txt",
-      "packed_sha1": "2bb60816d354e5a54f72cca3514fc57366ed1da9",
       "source_links": [
         "https://pokepast.es/24dcf5e568ffa85e"
       ],
@@ -4239,7 +4139,6 @@
       "title": "Copy of Copy of Copy of Copy of Copy of Copy of Copy of Copy of Testing Liverpoolada",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/015_testing-liverpoolada_b10211d2.txt",
-      "packed_sha1": "b10211d255de682bb7c3ce110c834115ad7213b8",
       "source_links": [
         "https://pokepast.es/a4926977eadb521c"
       ],
@@ -4271,7 +4170,6 @@
       "title": "Copy of Untitled 1089",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/016_untitled-1089_4f69cbdc.txt",
-      "packed_sha1": "4f69cbdca591d763c6a72a573c75d7dce7801920",
       "source_links": [
         "https://pokepast.es/92cd2d135946bd95"
       ],
@@ -4303,7 +4201,6 @@
       "title": "CritDra",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/017_critdra_2496d5a8.txt",
-      "packed_sha1": "2496d5a8075969b642bd505ad9f723489b711e4b",
       "source_links": [
         "https://pokepast.es/d751af8fb0db3183"
       ],
@@ -4335,7 +4232,6 @@
       "title": "dengo v1.1 -- mc",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/018_dengo-v1-1-mc_48223523.txt",
-      "packed_sha1": "48223523b8b45d3835d4f1d6037fe18ff217decf",
       "source_links": [
         "https://pokepast.es/3675d96625ad0b36"
       ],
@@ -4367,7 +4263,6 @@
       "title": "dlc blob",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/019_dlc-blob_e25b6222.txt",
-      "packed_sha1": "e25b62223eed1282f4a43b196fe8ff2361537c4e",
       "source_links": [
         "https://pokepast.es/545d7f02c0923752"
       ],
@@ -4399,7 +4294,6 @@
       "title": "dlc cat",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/020_dlc-cat_757e96e7.txt",
-      "packed_sha1": "757e96e7cde3cef2964d99f0d0cf13b80b9e6612",
       "source_links": [
         "https://pokepast.es/603f3f6b859a1d0e"
       ],
@@ -4431,7 +4325,6 @@
       "title": "dlc cotton",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/021_dlc-cotton_369b40ac.txt",
-      "packed_sha1": "369b40acc6c6ab1edb11df138072bda5a29c8a43",
       "source_links": [
         "https://pokepast.es/cb9315fbcd4a9c8c"
       ],
@@ -4463,7 +4356,6 @@
       "title": "dlc lei",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/022_dlc-lei_8610e9df.txt",
-      "packed_sha1": "8610e9dfc1d8e69f6bd43c493a4de44133d85fa7",
       "source_links": [
         "https://pokepast.es/b66c43bbfa67d9cb"
       ],
@@ -4495,7 +4387,6 @@
       "title": "dlc tank",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/023_dlc-tank_e178e369.txt",
-      "packed_sha1": "e178e3696a64fea548569436c1910aa0509368c7",
       "source_links": [
         "https://pokepast.es/51f91db8f0341564"
       ],
@@ -4527,7 +4418,6 @@
       "title": "dlc tree",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/024_dlc-tree_84698084.txt",
-      "packed_sha1": "84698084ee1533d92c15063c035238804cfdf805",
       "source_links": [
         "https://pokepast.es/a54bdf12f2fd3e96"
       ],
@@ -4559,7 +4449,6 @@
       "title": "Dragonite - ChienPao LenVGC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/025_dragonite-chienpao-lenvgc_82d7ea8c.txt",
-      "packed_sha1": "82d7ea8c92c898d939afa244576b16c619132294",
       "source_links": [
         "https://pokepast.es/43fcc3dea73515d9"
       ],
@@ -4591,7 +4480,6 @@
       "title": "EUIC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/026_euic_ca7dc4da.txt",
-      "packed_sha1": "ca7dc4da0d85393b098c1cb0b2dc676555e884e5",
       "source_links": [
         "https://pokepast.es/220df76357eb4304"
       ],
@@ -4623,7 +4511,6 @@
       "title": "EUIC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/027_euic_6634416e.txt",
-      "packed_sha1": "6634416e1e2bcdfed4f8b3f2cb5be778e147c9d7",
       "source_links": [
         "https://pokepast.es/f6223c3ae3b06a5d"
       ],
@@ -4655,7 +4542,6 @@
       "title": "EUIC Squad mejorado",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/028_euic-squad-mejorado_f5eb9a63.txt",
-      "packed_sha1": "f5eb9a638a7a7d0acfb503116a8e32cdbebda1f3",
       "source_links": [
         "https://pokepast.es/e7b2100ab93144ad"
       ],
@@ -4687,7 +4573,6 @@
       "title": "FuiYnb's Battle Stadium S15 17th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/029_fuiynb-s-battle-stadium-s15-17th-place-team_8b883179.txt",
-      "packed_sha1": "8b883179765c0a0b378483a3a954b73c44eeb4d3",
       "source_links": [
         "https://pokepast.es/a74e079f4e948e26"
       ],
@@ -4721,7 +4606,6 @@
       "title": "gc final?",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/030_gc-final_087e9f7f.txt",
-      "packed_sha1": "087e9f7ffa2976ce21cb5010af2d203e63f66aa4",
       "source_links": [
         "https://pokepast.es/07ef4ccda742ba60"
       ],
@@ -4753,7 +4637,6 @@
       "title": "Gouging Fire 1.6.3",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/031_gouging-fire-1-6-3_b33684c1.txt",
-      "packed_sha1": "b33684c1049e36fb0afc6d52377728a204e2ad28",
       "source_links": [
         "https://pokepast.es/60695bcf37fb28f1"
       ],
@@ -4785,7 +4668,6 @@
       "title": "hakushu_t's Global Challenge I 39th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/032_hakushu-t-s-global-challenge-i-39th-place-team_390e7e47.txt",
-      "packed_sha1": "390e7e478e35f21672c4cd1810da0d8a4157c45d",
       "source_links": [
         "https://pokepast.es/8e2fd5afe59ed578"
       ],
@@ -4818,7 +4700,6 @@
       "title": "Hatterene - F",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/033_hatterene-f_62522355.txt",
-      "packed_sha1": "6252235528245e39d81e2e76b5bc55be7e9b7cb7",
       "source_links": [
         "https://pokepast.es/c8a292de72a0a96d"
       ],
@@ -4850,7 +4731,6 @@
       "title": "hydrapple",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/034_hydrapple_7ab9ac71.txt",
-      "packed_sha1": "7ab9ac7160b94669611d3eb74aad032e6205d3bf",
       "source_links": [
         "https://pokepast.es/4bb5d746e5b7c7ea"
       ],
@@ -4882,7 +4762,6 @@
       "title": "Knoxville",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/035_knoxville_3753a30c.txt",
-      "packed_sha1": "3753a30c41e9a4769123a909f962e4689d772251",
       "source_links": [
         "https://pokepast.es/65bb0f92cc7c24a6"
       ],
@@ -4914,7 +4793,6 @@
       "title": "Knoxville 2024",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/036_knoxville-2024_cadf17c4.txt",
-      "packed_sha1": "cadf17c45f4d18db1d22f0a889de5bea285ce937",
       "source_links": [
         "https://pokepast.es/1e1da624a640fec2"
       ],
@@ -4946,7 +4824,6 @@
       "title": "LUCK2222",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/037_luck2222_b459b31a.txt",
-      "packed_sha1": "b459b31a965715c78438d2cc92113ee4acc63083",
       "source_links": [
         "https://pokepast.es/4ac42cdcdc499411"
       ],
@@ -4978,7 +4855,6 @@
       "title": "NikolajHoej's Dortmund Regionals Top 16 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/038_nikolajhoej-s-dortmund-regionals-top-16-team_2a4315d0.txt",
-      "packed_sha1": "2a4315d0a120b7b08d951cb76ef713b0372a40aa",
       "source_links": [
         "https://pokepast.es/b8e09de1cec487ab"
       ],
@@ -5010,7 +4886,6 @@
       "title": "Orlando (17th)",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/039_orlando-17th_073036d3.txt",
-      "packed_sha1": "073036d33fb33851b2c4b326c13da7508cb46260",
       "source_links": [
         "https://pokepast.es/119511ed13e6d06d"
       ],
@@ -5042,7 +4917,6 @@
       "title": "Orlando 2024",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/040_orlando-2024_f40494af.txt",
-      "packed_sha1": "f40494af63ffb9d962936c876b0e59c8bdb812b5",
       "source_links": [
         "https://pokepast.es/15bc2cd76307c48b"
       ],
@@ -5074,7 +4948,6 @@
       "title": "Orlando 9-6 50 of 824",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/041_orlando-9-6-50-of-824_de4aa710.txt",
-      "packed_sha1": "de4aa71057d9f65866729f4c8efd886269dafe8f",
       "source_links": [
         "https://pokepast.es/e5efcafa95a990ac"
       ],
@@ -5106,7 +4979,6 @@
       "title": "Orlando Regional (12-3, 10th of 824)",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/042_orlando-regional-12-3-10th-of-824_fe8dcd13.txt",
-      "packed_sha1": "fe8dcd13cb0864caece8f56794d45b4535bdec6d",
       "source_links": [
         "https://pokepast.es/1779c9edb0557f94"
       ],
@@ -5138,7 +5010,6 @@
       "title": "PlayestVGC's Portland Regionals Top 32 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/043_playestvgc-s-portland-regionals-top-32-team_f9ccb120.txt",
-      "packed_sha1": "f9ccb12026ac4a155b2510a9d39f03331616b4d0",
       "source_links": [
         "https://pokepast.es/112d8c1932305cde"
       ],
@@ -5170,7 +5041,6 @@
       "title": "Portland",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/044_portland_ab7fd1ae.txt",
-      "packed_sha1": "ab7fd1ae5460aafceb4ed3307d9c7dbe852fafc4",
       "source_links": [
         "https://pokepast.es/821aa56584db716e"
       ],
@@ -5202,7 +5072,6 @@
       "title": "Portland Regional Finals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/045_portland-regional-finals_9e508f7c.txt",
-      "packed_sha1": "9e508f7cee0b736b6ada8cf91c2955573fa52447",
       "source_links": [
         "https://pokepast.es/39d6e24b136f1ffd"
       ],
@@ -5234,7 +5103,6 @@
       "title": "Portland Regionals Final Copy January 6-7 2024",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/046_portland-regionals-final-copy-january-6-7-2024_a761e9e6.txt",
-      "packed_sha1": "a761e9e6e75c2adac0976a5d2f33d29e152a153e",
       "source_links": [
         "https://pokepast.es/7ca11c280e284b86"
       ],
@@ -5266,7 +5134,6 @@
       "title": "Reg F?",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/047_reg-f_a9f8a787.txt",
-      "packed_sha1": "a9f8a78736d205ee6096e5b111fba77ea19937ba",
       "source_links": [
         "https://pokepast.es/9a073131d4e10c50"
       ],
@@ -5298,7 +5165,6 @@
       "title": "Rosenkreutz's Global Challenge I 64th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/048_rosenkreutz-s-global-challenge-i-64th-place-team_ababb35c.txt",
-      "packed_sha1": "ababb35c857eeed056ff3683c4493d75290e4951",
       "source_links": [
         "https://pokepast.es/1bb353a56ae517c6"
       ],
@@ -5330,7 +5196,6 @@
       "title": "s6 balance - Chatlotte Top 32",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/049_s6-balance-chatlotte-top-32_152a8293.txt",
-      "packed_sha1": "152a8293fe7bef5d07176a7c3da415c08d253490",
       "source_links": [
         "https://pokepast.es/c2d3074886cef2de"
       ],
@@ -5362,7 +5227,6 @@
       "title": "Sarapoke0914's Global Challenge I 11th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/050_sarapoke0914-s-global-challenge-i-11th-place-team_923db2d3.txt",
-      "packed_sha1": "923db2d3ed9a529669e06eabedc379cf7b5c77bf",
       "source_links": [
         "https://pokepast.es/82c0f6f298484f9e"
       ],
@@ -5394,7 +5258,6 @@
       "title": "sora's Battle Stadium S14 20th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/051_sora-s-battle-stadium-s14-20th-place-team_1e6a6a89.txt",
-      "packed_sha1": "1e6a6a89bac9112093bd69ee12a7decfade468c8",
       "source_links": [
         "https://pokepast.es/d743fb71fb349336"
       ],
@@ -5427,7 +5290,6 @@
       "title": "Sun EUIC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/052_sun-euic_246e226f.txt",
-      "packed_sha1": "246e226f1ddea4b04379a8a4f64d05032eb8a9f6",
       "source_links": [
         "https://pokepast.es/98d19c40d8aafbad"
       ],
@@ -5459,7 +5321,6 @@
       "title": "t4 charlotte regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/053_t4-charlotte-regionals_c53b2442.txt",
-      "packed_sha1": "c53b244265dc4fd27b27c4303a93b45148c6bdfa",
       "source_links": [
         "https://pokepast.es/e17dfd516e47b1f6"
       ],
@@ -5491,7 +5352,6 @@
       "title": "t4 Vancouver regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/054_t4-vancouver-regionals_d605638e.txt",
-      "packed_sha1": "d605638e2a6b34f43e925327bbed12e81d9d75a8",
       "source_links": [
         "https://pokepast.es/c146228d46ff7451"
       ],
@@ -5523,7 +5383,6 @@
       "title": "Team Report Version",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/055_team-report-version_f3326620.txt",
-      "packed_sha1": "f3326620f7af8c254784e5ea17d1c98b83defa88",
       "source_links": [
         "https://pokepast.es/33a28379ec49a621"
       ],
@@ -5555,7 +5414,6 @@
       "title": "TH NAT '24",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/056_th-nat-24_54321a44.txt",
-      "packed_sha1": "54321a4417a0b32db05f8980f96a1652ae80bda2",
       "source_links": [
         "https://pokepast.es/3ee53af30d6da528"
       ],
@@ -5588,7 +5446,6 @@
       "title": "Toby Kongmun's 2024 Melbourne Regional Top 16 Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/057_toby-kongmun-s-2024-melbourne-regional-top-16-team_c4544256.txt",
-      "packed_sha1": "c4544256625052b3a9c60f573d6eb5604192b797",
       "source_links": [
         "https://pokepast.es/da22ec05ee2ab54f"
       ],
@@ -5620,7 +5477,6 @@
       "title": "Top 8 Knoxville Regionals",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/058_top-8-knoxville-regionals_9884ea5a.txt",
-      "packed_sha1": "9884ea5af412356e4252c1d66b7bff8caa8b7a69",
       "source_links": [
         "https://pokepast.es/c7e9b2c3303f786c"
       ],
@@ -5652,7 +5508,6 @@
       "title": "Trick Room Araquanid LenVGC",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/059_trick-room-araquanid-lenvgc_547cb57c.txt",
-      "packed_sha1": "547cb57ceb4d55839e2953929161d6fe3e1f6244",
       "source_links": [
         "https://pokepast.es/4366fc19dec9ba41"
       ],
@@ -5684,7 +5539,6 @@
       "title": "Untitled 1",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/060_untitled-1_71ac1f75.txt",
-      "packed_sha1": "71ac1f75e4d7d780863766c59a59c36d2d84969c",
       "source_links": [
         "https://pokepast.es/652824607b2f80ff"
       ],
@@ -5716,7 +5570,6 @@
       "title": "Untitled 13",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/061_untitled-13_b07c9e02.txt",
-      "packed_sha1": "b07c9e029775692c268a75b4a8938b99142a69aa",
       "source_links": [
         "https://pokepast.es/938812de42ba0546"
       ],
@@ -5748,7 +5601,6 @@
       "title": "Untitled 132",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/062_untitled-132_29340006.txt",
-      "packed_sha1": "293400063149aa0352aa3d6fb2c3a56d08cfbc9b",
       "source_links": [
         "https://pokepast.es/39daf8b9920022c9"
       ],
@@ -5780,7 +5632,6 @@
       "title": "Untitled 222",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/063_untitled-222_2911d16e.txt",
-      "packed_sha1": "2911d16ee31a7abfad52784765cd8be4d478d856",
       "source_links": [
         "https://pokepast.es/925e93d386f4983c"
       ],
@@ -5812,7 +5663,6 @@
       "title": "Untitled 223",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/064_untitled-223_7080d410.txt",
-      "packed_sha1": "7080d410776500447e70d6bf11f4f5d57e61245a",
       "source_links": [
         "https://pokepast.es/d2fd3300e55b0bbb"
       ],
@@ -5844,7 +5694,6 @@
       "title": "Untitled 465",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/065_untitled-465_6037689d.txt",
-      "packed_sha1": "6037689dee6bb7c1b8dbf25b3afb5d5e5bc9be55",
       "source_links": [
         "https://pokepast.es/c3084aa9afacbde1"
       ],
@@ -5876,7 +5725,6 @@
       "title": "Untitled 5",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/066_untitled-5_5554a94e.txt",
-      "packed_sha1": "5554a94e0b2240e55fa05c5da261fadd9ce31d30",
       "source_links": [
         "https://pokepast.es/5ffbad57ad52532f"
       ],
@@ -5908,7 +5756,6 @@
       "title": "Untitled 9",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/067_untitled-9_cc0dface.txt",
-      "packed_sha1": "cc0dface7959c840a37d83046df36169b7b6b112",
       "source_links": [
         "https://pokepast.es/0a21542b22415900"
       ],
@@ -5940,7 +5787,6 @@
       "title": "Untitled PokePaste",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/068_untitled-pokepaste_19cd045d.txt",
-      "packed_sha1": "19cd045ded2e742bee346422a8303e16244934b6",
       "source_links": [
         "https://pokepast.es/eb5b79c77d415666"
       ],
@@ -5972,7 +5818,6 @@
       "title": "utrecht 1.5",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/069_utrecht-1-5_9e0b822f.txt",
-      "packed_sha1": "9e0b822fad945db65f442ee2a52c78b0a3afff95",
       "source_links": [
         "https://pokepast.es/a415070700780d37"
       ],
@@ -6004,7 +5849,6 @@
       "title": "Utrecht Day 2",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/070_utrecht-day-2_431be080.txt",
-      "packed_sha1": "431be080af997a061870656d62a5bce92c4c6def",
       "source_links": [
         "https://pokepast.es/026c9faae5932fc1"
       ],
@@ -6036,7 +5880,6 @@
       "title": "UTRECHT WINNING TEAM",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/071_utrecht-winning-team_c4962227.txt",
-      "packed_sha1": "c4962227035b44389177ef7b541bbff31bfbec22",
       "source_links": [
         "https://pokepast.es/262c301130a20afb"
       ],
@@ -6099,7 +5942,6 @@
       "title": "Vancouver 19th Place Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/072_vancouver-19th-place-team_e8518474.txt",
-      "packed_sha1": "e8518474c5d459c4b8bdd3aea67479ed9e68a062",
       "source_links": [
         "https://pokepast.es/a5338a2ef91191e0"
       ],
@@ -6131,7 +5973,6 @@
       "title": "vancouver final!",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/073_vancouver-final_91a8c855.txt",
-      "packed_sha1": "91a8c8557ceb7c213f2000247a663b295aab93fa",
       "source_links": [
         "https://pokepast.es/b6942957f5578eb5"
       ],
@@ -6163,7 +6004,6 @@
       "title": "weezing+doggy orlando",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/074_weezing-doggy-orlando_c561a292.txt",
-      "packed_sha1": "c561a292d43571d87fa5af078c59183408c6e6b1",
       "source_links": [
         "https://pokepast.es/a52f0bf2560cc2a7"
       ],
@@ -6195,7 +6035,6 @@
       "title": "Wolfe Glick's Charlotte Regionals 2024 Champion Team",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/075_wolfe-glick-s-charlotte-regionals-2024-champion-team_80590641.txt",
-      "packed_sha1": "8059064184c3357bfc6c57a4237a6a2359c061e7",
       "source_links": [
         "https://pokepast.es/5c338e8429c61030"
       ],
@@ -6227,7 +6066,6 @@
       "title": "‘Saur!",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/076_saur_3e3274e5.txt",
-      "packed_sha1": "3e3274e5e72cad8214f05f50316fe4c087931f20",
       "source_links": [
         "https://pokepast.es/2cd7fdc5d75e2c59"
       ],
@@ -6259,7 +6097,6 @@
       "title": "奥兰多",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/077_team_9b52ac21.txt",
-      "packed_sha1": "9b52ac214410dc775664d7eba22d987e765953fd",
       "source_links": [
         "https://pokepast.es/729d69546a2835ae"
       ],
@@ -6291,7 +6128,6 @@
       "title": "Calm Mind Raging Bolt + Icy Wind Chien-Pao",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/078_calm_mind_raging_bolt_icy_wind_chien_pao_a78a0275.txt",
-      "packed_sha1": "a78a02756e1ecab959246cb1fbd42a02e23f9b77",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Stefano Greppi, 1st place at Birmingham Regional 2026",
@@ -6332,7 +6168,6 @@
       "title": "Roaring Moon + Gholdengo Tailwind",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/079_roaring_moon_gholdengo_tailwind_ce12b22e.txt",
-      "packed_sha1": "ce12b22efe396e087ca700912910a08614a320b1",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Cary D'Ortona, 1st place at Toronto Regional 2026",
@@ -6373,7 +6208,6 @@
       "title": "Regidrago + Gholdengo Tailwind",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/080_regidrago_gholdengo_tailwind_1ad305e8.txt",
-      "packed_sha1": "1ad305e820707694369bf3b31ec4cb650bf0706b",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Justin Tang, Top 4 at Toronto Regional 2026",
@@ -6414,7 +6248,6 @@
       "title": "Choice Band Landorus-Therian Tailwind",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/081_choice_band_landorus_therian_tailwind_9e20b218.txt",
-      "packed_sha1": "9e20b218c715f7a17ef81f98ada5652c221f848b",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Published Regulation F 2.0 sample marked RECREATION",
@@ -6455,7 +6288,6 @@
       "title": "Ursaluna + Porygon2 Tailroom",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/082_ursaluna_porygon2_tailroom_5ef7a954.txt",
-      "packed_sha1": "5ef7a954c9036e9bd16850e0fdbc001edff6373a",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Published Regulation F 2.0 sample archetype",
@@ -6496,7 +6328,6 @@
       "title": "Ursaluna + Farigiraf Tailroom",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/083_ursaluna_farigiraf_tailroom_3a3ba155.txt",
-      "packed_sha1": "3a3ba155ca46e19b889093cfb0bf935ab9386c71",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Eric Stuart, Top 8 at Toronto Regional 2026",
@@ -6537,7 +6368,6 @@
       "title": "Archaludon Rain",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/084_archaludon_rain_8db9df67.txt",
-      "packed_sha1": "8db9df671a24bac3be18f5297e6b530f01f81c9a",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Jeff Lehmann, Top 4 at a Victory Road tournament",
@@ -6578,7 +6408,6 @@
       "title": "Dondozo + Ting-Lu",
       "subset": "curated",
       "file": "data/team_pools/gen9vgc2026regf/pool/085_dondozo_ting_lu_487b6228.txt",
-      "packed_sha1": "487b6228b03535ca84f97d0a97df31eb45d498a2",
       "spread_provenance": "smogon_2026_sample_public_paste",
       "spread_caveat": "The source thread states that sample EVs may not be the competitors' exact spreads and may use recreations or Smogon Dex analysis spreads. Entries explicitly marked RECREATION by the source are additionally flagged below.",
       "result": "Jong One Moon, Top 4 at a Victory Road tournament",

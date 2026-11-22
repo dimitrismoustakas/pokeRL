@@ -1,5 +1,7 @@
 """Full agent: spatial encoder -> memory -> action/value heads."""
 
+from dataclasses import asdict
+
 import torch
 import torch.nn as nn
 
@@ -21,7 +23,6 @@ from .encoders import (
     TeamEncoder,
 )
 from .memory import build_memory
-from .signature import architecture_signature, model_signature
 from .heads import (
     ActionHead,
     HiddenInfoHead,
@@ -43,9 +44,6 @@ class PokeAgent(nn.Module):
     def __init__(self, config: ModelConfig, game_data: GameData):
         super().__init__()
         self.config = config
-        self.game_data_signature = game_data.vocab_signature()
-        self.architecture_signature = architecture_signature(config)
-        self.model_signature = model_signature(config, self.game_data_signature)
 
         # --- Spatial encoder ---
         pokemon_encoder = PokemonEncoder(
@@ -184,7 +182,7 @@ class PokeAgent(nn.Module):
         """Forward pass for battle turns.
 
         Args:
-            obs: observation dict from ObservationBuilder
+            obs: player-view tensors from the vector environment
             hidden: LSTM hidden state (or None)
             actions: (batch, 3) actions to evaluate, or None to sample
             action_masks: dict with boolean legality tables:
@@ -350,23 +348,6 @@ class PokeAgent(nn.Module):
             opp_bench_mask,
         )
 
-    def get_preview_value(
-        self, obs: dict[str, torch.Tensor], hidden=None
-    ) -> torch.Tensor:
-        """Preview-only value estimate used as the team-preview baseline."""
-        context, _, own_reps, opp_reps, _ = self.spatial(
-            obs,
-            include_recent_events=False,
-        )
-        context, _ = self.memory(context, hidden)
-        return self.preview_value_head(
-            context,
-            own_reps,
-            opp_reps,
-            obs.get("own_mask"),
-            obs.get("opp_mask"),
-        )
-
     def initial_hidden(self, batch_size: int):
         return self.memory.initial_hidden(batch_size)
 
@@ -389,3 +370,15 @@ class PokeAgent(nn.Module):
         if mask is None:
             return bench_mask
         return mask | bench_mask
+
+
+def policy_weights(agent: PokeAgent) -> dict:
+    return {"model_config": asdict(agent.config), "agent": agent.state_dict()}
+
+
+def load_policy(path, game_data: GameData, device: torch.device) -> PokeAgent:
+    """Load a frozen policy using the dimensions saved with its weights."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    agent = PokeAgent(ModelConfig(**checkpoint["model_config"]), game_data)
+    agent.load_state_dict(checkpoint["agent"])
+    return agent.to(device).eval().requires_grad_(False)

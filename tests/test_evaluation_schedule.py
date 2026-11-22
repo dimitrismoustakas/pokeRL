@@ -4,7 +4,6 @@ import pytest
 
 from pokerl.eval.schedule import (
     balanced_distinct_team_pairs,
-    team_pair_schedule_summary,
 )
 from pokerl.team_pool import TeamPoolEntry
 
@@ -36,12 +35,6 @@ def test_balanced_schedule_covers_all_directed_pairs_before_repeating() -> None:
     pairs = balanced_distinct_team_pairs(entries, games=20, seed=3)
 
     assert len({(left.file, right.file) for left, right in pairs}) == 20
-    summary = team_pair_schedule_summary(pairs)
-    assert summary["distinct_directed_pairs"] == 20
-    assert summary["max_directed_pair_repetitions"] == 1
-    assert summary["left_role_min_count"] == 4
-    assert summary["left_role_max_count"] == 4
-    assert len(summary["schedule_sha256"]) == 64
 
 
 def test_balanced_schedule_validates_inputs() -> None:

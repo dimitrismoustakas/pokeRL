@@ -1,11 +1,13 @@
 """Map Pikapro's interleaved player views into the battle policy's named arrays."""
 
 from collections.abc import Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from itertools import permutations
 
 import numpy as np
 import pikapro
+from pikapro import rl
 
 from pokerl.data import GameData
 from pokerl.env.actions import (
@@ -20,7 +22,6 @@ from pokerl.env.actions import (
     PASS_ACTION,
     SWITCH_OFFSET,
 )
-from pokerl.env.observation import ObservationBuilder
 
 
 # Factored VecEnv commands, distinct from indices into its legal menu.
@@ -56,9 +57,35 @@ def forced_passes(block, side):
     )
 
 
+def player_env(pairs, *, threads):
+    return rl.VecEnv(
+        "gen9vgc",
+        n=len(pairs),
+        teams=pairs,
+        threads=threads,
+        masks="factored",
+        switch_by="position",
+        hp="percent",
+        reward="terminal",
+        opponent="external",
+        spin_us=0,
+    )
+
+
+def preview_observations(pairs, data):
+    """Return the first player's preview tensors for each team pair."""
+    with closing(player_env(pairs, threads=1)) as env:
+        configure_player_inputs(env, data)
+        env.reset(seed=0)
+        previous = np.zeros((2 * len(pairs), 2, 5), dtype=np.int64)
+        obs = model_inputs(env._env.v6_player_inputs(), previous)
+        return {key: rows[::2].copy() for key, rows in obs.items()}
+
+
 def configure_player_inputs(env, data: GameData) -> None:
-    builder = ObservationBuilder(data)
-    metadata = np.stack((builder._move_types, builder._move_categories), axis=1)
+    metadata = np.stack(
+        (data.move_type_indices(), data.move_category_indices()), axis=1
+    )
     env._env.set_v6_vocab(
         data.move_to_idx,
         metadata.tolist(),
@@ -66,7 +93,7 @@ def configure_player_inputs(env, data: GameData) -> None:
         data.species_to_idx,
         data.abilities_to_idx,
         data.item_to_idx,
-        builder._move_target_scopes.tolist(),
+        data.move_target_scope_vector().tolist(),
     )
 
 

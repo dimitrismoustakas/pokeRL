@@ -1,5 +1,5 @@
+from pokerl.env.vector_inputs import preview_observations
 from collections import OrderedDict
-from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,11 +15,10 @@ from pokerl.env.observation import (
     ROLE_ACTIVE_1,
     ROLE_ACTIVE_2,
     ROLE_BENCH,
-    build_team_preview_observation,
 )
 from pokerl.model.agent import PokeAgent
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
-from pokerl.training.league import _InferenceRequest, _LeagueInferenceService
+from pokerl.training.league import _InferenceRow, _LeagueInferenceService
 
 
 pytestmark = pytest.mark.skipif(
@@ -86,26 +85,21 @@ def _service(
     service = _LeagueInferenceService(
         agent,
         torch.device("cuda"),
-        0.0,
         max_models=4,
         greedy=greedy,
         enable_cuda_graphs=True,
         cuda_graph_batch_size=cuda_graph_batch_size,
         cuda_graph_cache_size=cuda_graph_cache_size,
     )
-    with service._condition:
-        service._models = OrderedDict(
-            (path, agent) for path in ("a.pt", "b.pt", "c.pt")
-        )
+    service._models = OrderedDict((path, agent) for path in ("a.pt", "b.pt", "c.pt"))
     return service
 
 
 def _requests(
     batch_size: int,
     *,
-    checkpoint_path: str = "a.pt",
     with_hidden: bool = True,
-) -> list[_InferenceRequest]:
+) -> list[_InferenceRow]:
     requests = []
     for index in range(batch_size):
         legal = np.zeros(8, dtype=np.bool_)
@@ -118,25 +112,21 @@ def _requests(
                 torch.full((1, 1, 1), float(2 * index), device="cuda"),
             )
         requests.append(
-            _InferenceRequest(
-                checkpoint_path=checkpoint_path,
-                kind="battle",
+            _InferenceRow(
                 obs={"x": np.full(8, 0.01 * (index + 1), dtype=np.float32)},
                 masks={"legal": legal},
                 hidden=hidden,
-                future=Future(),
             )
         )
     return requests
 
 
-def _run(service, requests):
+def _run(service, requests, path="a.pt"):
     # Production hidden states are published only after the inference stream
     # synchronizes. Mirror that ownership contract for tensors built directly
     # by this test on the default stream.
     torch.cuda.synchronize()
-    service._run_battle_batch(requests[0].checkpoint_path, requests)
-    return [request.future.result(timeout=1.0) for request in requests]
+    return service._run_battle_batch(path, requests)
 
 
 def test_cuda_graph_handles_padded_split_batches_legality_and_hidden() -> None:
@@ -214,10 +204,10 @@ def test_cuda_graph_recapture_preserves_saved_rng_sequence() -> None:
 def test_cuda_graph_cache_is_lru_bounded_to_two_checkpoints() -> None:
     service = _service(greedy=True, cuda_graph_cache_size=2)
     try:
-        _run(service, _requests(1, checkpoint_path="a.pt"))
-        _run(service, _requests(1, checkpoint_path="b.pt"))
-        _run(service, _requests(1, checkpoint_path="a.pt"))
-        _run(service, _requests(1, checkpoint_path="c.pt"))
+        _run(service, _requests(1), path="a.pt")
+        _run(service, _requests(1), path="b.pt")
+        _run(service, _requests(1), path="a.pt")
+        _run(service, _requests(1), path="c.pt")
 
         assert list(service._cuda_graphs) == ["a.pt", "c.pt"]
         info = service.cache_info()
@@ -265,30 +255,6 @@ def test_cuda_graph_failure_restores_rng_and_falls_back_to_eager(
         service.close()
 
 
-def test_cuda_graph_is_retired_with_pruned_checkpoint() -> None:
-    service = _service(greedy=True)
-    try:
-        _run(service, _requests(1, checkpoint_path="a.pt"))
-        _run(service, _requests(1, checkpoint_path="b.pt"))
-        prune = _InferenceRequest(
-            checkpoint_path="",
-            kind="prune",
-            obs={},
-            masks=None,
-            hidden=None,
-            future=Future(),
-            keep_paths={"b.pt"},
-        )
-        service._run_prune_batch([prune])
-
-        assert prune.future.result(timeout=1.0) is None
-        assert list(service._models) == ["b.pt"]
-        assert list(service._cuda_graphs) == ["b.pt"]
-        assert service.cache_info()["cuda_graph_evictions"] >= 1
-    finally:
-        service.close()
-
-
 def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() -> None:
     game_data = GameData(gen=9)
     team_pool = load_team_pool(
@@ -297,12 +263,12 @@ def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() 
         seed=0,
     )
     own_team, opponent_team = team_pool.sample_packed_pair()
-    one_obs = build_team_preview_observation(
-        game_data,
-        6,
-        own_team,
-        opponent_team,
-    )
+    one_obs = {
+        key: rows[0]
+        for key, rows in preview_observations(
+            [(own_team, opponent_team)], game_data
+        ).items()
+    }
     roles = np.asarray(
         [
             ROLE_ACTIVE_1,
@@ -332,12 +298,10 @@ def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() 
     service = _LeagueInferenceService(
         agent,
         torch.device("cuda"),
-        0.0,
         max_models=2,
         enable_cuda_graphs=True,
     )
-    with service._condition:
-        service._models["full.pt"] = agent
+    service._models["full.pt"] = agent
     try:
         for batch_size in (1, 23, 36, 72):
             obs_np = {
@@ -374,20 +338,17 @@ def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() 
 
             torch.cuda.set_rng_state(saved_rng)
             requests = [
-                _InferenceRequest(
-                    checkpoint_path="full.pt",
-                    kind="battle",
+                _InferenceRow(
                     obs={key: value[index].copy() for key, value in obs_np.items()},
                     masks={key: value[index].copy() for key, value in masks_np.items()},
                     hidden=(
                         hidden[0][:, index : index + 1],
                         hidden[1][:, index : index + 1],
                     ),
-                    future=Future(),
                 )
                 for index in range(batch_size)
             ]
-            graph_results = _run(service, requests)
+            graph_results = _run(service, requests, path="full.pt")
             graph_actions = np.stack([result[0] for result in graph_results])
             graph_hidden = (
                 torch.cat([result[1][0].cpu() for result in graph_results], dim=1),

@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from pokerl.config import TrainingConfig
 from pokerl.training.ppo import PPOTrainer
+from pokerl.training.preview import TeamPreviewEpisodeStart
 from pokerl.training.rollout import RolloutBuffer, TeamPreviewRolloutBatch
 from tests.test_rollout_buffer import (
     _DummyAgent,
@@ -280,3 +281,22 @@ def test_nonfinite_preview_loss_cannot_apply_a_battle_only_step() -> None:
     assert trainer.optimizer.state == {}
     for name, parameter in agent.state_dict().items():
         assert torch.equal(parameter, initial_parameters[name])
+
+
+def test_team_preview_episode_start_owns_copied_payload() -> None:
+    obs_value = np.asarray([4, 5], dtype=np.int64)
+    picks = np.asarray([0, 1, 2, 3], dtype=np.int64)
+    record = TeamPreviewEpisodeStart(
+        obs={"context": obs_value},
+        picks=picks,
+        log_prob=-1.25,
+        value=0.5,
+        policy_version=3,
+        opponent_picks=np.asarray([3, 2, 1, 0], dtype=np.int64),
+        opponent_aux_labels={"opp_item": np.asarray([9], dtype=np.int64)},
+    )
+
+    obs_value[0] = 99
+    picks[0] = 5
+    assert record.obs["context"].tolist() == [4, 5]
+    assert record.picks.tolist() == [0, 1, 2, 3]

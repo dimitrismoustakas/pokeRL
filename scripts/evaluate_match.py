@@ -17,9 +17,10 @@ from pokerl.env.vector_inputs import (
     configure_player_inputs,
     forced_passes,
     model_inputs,
+    player_env,
     remember_actions,
 )
-from pokerl.eval.fixed_bot import load_agent_for_evaluation
+from pokerl.model.agent import load_policy
 from pokerl.eval.metrics import outcome_summary
 from pokerl.eval.schedule import balanced_distinct_team_pairs
 from pokerl.team_pool import load_team_pool
@@ -77,19 +78,7 @@ def play_batch(policies, data, pairs, battle_seed, candidate_seat):
     n = len(pairs)
     games = [None] * n
     with closing(
-        rl.VecEnv(
-            "gen9vgc",
-            n=n,
-            teams=[(a.packed_team, b.packed_team) for a, b in pairs],
-            threads=2,
-            masks="factored",
-            switch_by="position",
-            hp="percent",
-            reward="terminal",
-            opponent="external",
-            record=True,
-            spin_us=0,
-        )
+        player_env([(a.packed_team, b.packed_team) for a, b in pairs], threads=2)
     ) as env:
         configure_player_inputs(env, data)
         codec = VectorActionCodec(env.space)
@@ -125,27 +114,13 @@ def play_batch(policies, data, pairs, battle_seed, candidate_seat):
             ):
                 raise RuntimeError(f"Pikapro interrupted a match: {errors!r}")
             for lane in np.flatnonzero(active & state.terminated):
-                record = env.record(int(lane))
-                replay = rl.replay("gen9vgc", record, log=False)
-                reward = int(state.reward[lane, candidate_seat])
-                winner = replay.winner
-                expected = (
-                    0 if winner is None else (1 if winner == candidate_seat else -1)
-                )
-                if (
-                    not replay.over
-                    or reward != expected
-                    or state.reward[lane].sum() != 0
-                ):
-                    raise RuntimeError(
-                        "The replay and vector environment disagree on the result."
-                    )
+                battle = env.battle(int(lane))
                 games[lane] = {
                     "teams": [team.file for team in pairs[lane]],
                     "candidate_seat": candidate_seat,
-                    "seed": record["seed"],
-                    "turns": replay.turn,
-                    "reward": reward,
+                    "seed": battle.seed,
+                    "turns": battle.turn,
+                    "reward": int(state.reward[lane, candidate_seat]),
                 }
                 active[lane] = False
     return games
@@ -156,12 +131,7 @@ def compare(candidate, opponent, manifest, pairs, seed):
         raise ValueError("At least one reciprocal matchup is required.")
     data = GameData()
     policies = [
-        load_agent_for_evaluation(
-            checkpoint_path=str(path),
-            device=torch.device("cpu"),
-            game_data=data,
-        )
-        for path in (candidate, opponent)
+        load_policy(path, data, torch.device("cpu")) for path in (candidate, opponent)
     ]
     pool = load_team_pool(manifest, usage="evaluation")
     schedule = balanced_distinct_team_pairs(pool.entries, games=pairs, seed=seed)
@@ -220,8 +190,9 @@ def main():
     )
     if args.summary_path:
         args.summary_path.parent.mkdir(parents=True, exist_ok=True)
-        with args.summary_path.open("x", encoding="utf-8") as output:
-            json.dump(result, output, indent=2)
+        args.summary_path.write_text(
+            json.dumps(result, indent=2) + "\n", encoding="utf-8"
+        )
     print(
         json.dumps({k: v for k, v in result.items() if k != "games_detail"}, indent=2)
     )

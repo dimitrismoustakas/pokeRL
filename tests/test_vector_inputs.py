@@ -50,7 +50,7 @@ def test_private_item_changes_only_its_owners_view(teams, owner):
     members = changed[owner].split("]")
     # The sixth member stays on the bench throughout this replay.
     fields = members[5].split("|")
-    fields[2] = "leftovers" if fields[2] != "leftovers" else "lifeorb"
+    fields[2] = "leftovers" if fields[2].lower() != "leftovers" else "lifeorb"
     members[5] = "|".join(fields)
     changed[owner] = "]".join(members)
     with closing(
@@ -96,7 +96,8 @@ def test_opening_eject_pack_replacement_precedes_first_learner_decision(monkeypa
     eject = next(e.packed_team for e in pool.entries if "052_sun-euic" in e.file)
     intimidate = pool.entries[0].packed_team
     assert (
-        "ejectpack" in eject.split("]")[1] and "intimidate" in intimidate.split("]")[3]
+        "ejectpack" in eject.split("]")[1].lower()
+        and "intimidate" in intimidate.split("]")[3].lower()
     )
     eject_lead = [1, 0, 2, 3]
     intimidate_lead = [3, 0, 1, 2]
@@ -111,7 +112,6 @@ def test_opening_eject_pack_replacement_precedes_first_learner_decision(monkeypa
         return [(replacements[-1], None)]
 
     league = SimpleNamespace(
-        agent_template=None,
         device=torch.device("cpu"),
         vector_previews=lambda paths, rows: np.array([intimidate_lead, eject_lead]),
         vector_actions=choose_replacement,
@@ -124,13 +124,15 @@ def test_opening_eject_pack_replacement_precedes_first_learner_decision(monkeypa
             "preview_value": torch.zeros(2),
         },
     )
+    data = GameData()
     pairs = iter([(eject, intimidate), (intimidate, eject)])
     with closing(
         PikaproVectorEnv(
-            SimpleNamespace(num_envs=2),
-            GameData(),
+            2,
+            data,
             league,
-            SimpleNamespace(policy_version=0),
+            None,
+            0,
             lambda: next(pairs),
             {0: "frozen"},
             seed=732,
@@ -140,7 +142,25 @@ def test_opening_eject_pack_replacement_precedes_first_learner_decision(monkeypa
         assert env.state.needs_action[:, 0].all()
         assert len(replacements) == 1
         assert env.pending_intents == [None, None]
-        assert len(env.drain_team_preview_starts()) == 2
+        starts = env.drain_team_preview_starts()
+        assert len(starts) == 2
+        for lane, sample in starts:
+            opponent = (
+                pool.entries[0]
+                if lane == 0
+                else next(e for e in pool.entries if e.packed_team == eject)
+            )
+            picks = [intimidate_lead, eject_lead][lane]
+            slots = [mon.split("|") for mon in opponent.packed_team.split("]")]
+            labels = sample.opponent_aux_labels
+            np.testing.assert_array_equal(
+                labels["opp_mask"], ~np.isin(np.arange(6), picks)
+            )
+            np.testing.assert_array_equal(
+                labels["opp_item"], [data.item_to_idx[mon[2].lower()] for mon in slots]
+            )
+            assert not sample.obs["opp_item"].any()
+
         # The learner chooses its own forced switch in lane zero. In lane one
         # the opponent has already switched and both players choose a move.
         _, masks = env.reset()

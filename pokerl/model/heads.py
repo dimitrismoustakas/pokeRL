@@ -1820,7 +1820,7 @@ class ActionHead(nn.Module):
     ) -> torch.Tensor:
         """Bind each move candidate to its global identity and public mechanics.
 
-        The action id only identifies a slot in the current Showdown request.
+        The action id only identifies a slot in the current battle request.
         This gathers the move actually offered in that slot, embeds its global
         id with the same table used by ``PokemonEncoder``, and attaches generic
         simulator metadata. Switch/pass candidates remain exactly zero.

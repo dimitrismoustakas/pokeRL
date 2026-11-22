@@ -1,13 +1,11 @@
 """Game data: vocab lookups and optional stat-based embedding initialization."""
 
-import hashlib
 import json
 from importlib.resources import files
 
 import torch
 import numpy as np
-from poke_env.data import GenData
-from poke_env.data.normalize import to_id_str
+from pikapro import to_id
 
 
 UNKNOWN_IDX = 0  # reserved for unknown / unobserved
@@ -36,41 +34,39 @@ _TARGETED_MOVE_TARGETS = frozenset(
 
 
 class GameData:
-    """Builds vocab mappings and stat tables from poke-env's gen data."""
+    """Gen 9 species, moves and mechanics used by the policy."""
 
     def __init__(self, gen: int = 9, item_vocab_size: int = 2048):
         self.gen = gen
-        data = GenData.from_gen(gen)
+        data = json.loads(
+            files("pokerl").joinpath(f"gen{gen}_dex.json").read_text(encoding="utf-8")
+        )
 
         # Build vocabs: string id -> integer index (0 = unknown)
-        self.species_to_idx = self._build_vocab(data.pokedex.keys())
-        self.move_to_idx = self._build_vocab(data.moves.keys())
+        self.species_to_idx = self._build_vocab(data["species"].keys())
+        self.move_to_idx = self._build_vocab(data["moves"].keys())
         # Checkpoints number abilities by dex display name. Battle requests use
         # Showdown IDs, so index those same rows by the ID the tracker returns.
-        self._ability_labels = self._build_vocab(
+        ability_labels = self._build_vocab(
             a
-            for pokemon in data.pokedex.values()
+            for pokemon in data["species"].values()
             for a in (pokemon.get("abilities") or {}).values()
         )
         self.abilities_to_idx = {
-            to_id_str(name) if idx != UNKNOWN_IDX else name: idx
-            for name, idx in self._ability_labels.items()
+            to_id(name) if idx != UNKNOWN_IDX else name: idx
+            for name, idx in ability_labels.items()
         }
-        self.item_to_idx = self._build_vocab(
-            self._known_item_ids(data.pokedex.values(), gen)
-        )
-        self.type_to_idx = self._build_vocab(data.type_chart.keys())
+        self.item_to_idx = self._build_vocab(data["items"])
+        self.type_to_idx = self._build_vocab(data["type_chart"].keys())
         if gen >= 9:
             # Stellar is a Tera type, absent from the ordinary defensive type chart.
             self.type_to_idx.setdefault("stellar", len(self.type_to_idx))
         self._item_vocab_size = max(item_vocab_size, len(self.item_to_idx))
-        self._item_hash_offset = len(self.item_to_idx)
-        self._item_hash_buckets = self._item_vocab_size - self._item_hash_offset
 
         # Store raw data for stat init
-        self._pokedex = data.pokedex
-        self._moves = data.moves
-        self._type_chart = data.type_chart
+        self._pokedex = data["species"]
+        self._moves = data["moves"]
+        self._type_chart = data["type_chart"]
 
     @property
     def num_species(self) -> int:
@@ -91,24 +87,6 @@ class GameData:
     @property
     def num_types(self) -> int:
         return len(self.type_to_idx)
-
-    def vocab_signature(self) -> str:
-        """Stable fingerprint for every categorical index used by checkpoints."""
-        payload = {
-            "gen": self.gen,
-            "species": self.species_to_idx,
-            "moves": self.move_to_idx,
-            "abilities": self._ability_labels,
-            "items": self.item_to_idx,
-            "item_vocab_size": self._item_vocab_size,
-            "types": self.type_to_idx,
-        }
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
 
     def species_stats_matrix(self) -> np.ndarray:
         """Base stats matrix: (num_species, 6) with [HP, Atk, Def, SpA, SpD, Spe].
@@ -371,20 +349,6 @@ class GameData:
         with torch.no_grad():
             embedding.weight.copy_(proj(stats))
 
-    def item_index(self, item: str | None) -> int:
-        if not item:
-            return UNKNOWN_IDX
-
-        item_id = str(item).lower()
-        if item_id in self.item_to_idx:
-            return self.item_to_idx[item_id]
-        if self._item_hash_buckets <= 0:
-            return UNKNOWN_IDX
-
-        digest = hashlib.blake2b(item_id.encode("utf-8"), digest_size=8).digest()
-        bucket = int.from_bytes(digest, byteorder="big") % self._item_hash_buckets
-        return self._item_hash_offset + bucket
-
     @staticmethod
     def _build_vocab(keys) -> dict[str, int]:
         vocab = {"<unk>": UNKNOWN_IDX}
@@ -392,21 +356,3 @@ class GameData:
             if key not in vocab:
                 vocab[key] = len(vocab)
         return vocab
-
-    @staticmethod
-    def _known_item_ids(pokedex_entries, gen: int) -> list[str]:
-        items = {GenData.UNKNOWN_ITEM}
-        for pokemon in pokedex_entries:
-            required_item = pokemon.get("requiredItem")
-            if required_item:
-                items.add(required_item)
-
-            required_items = pokemon.get("requiredItems") or []
-            items.update(required_items)
-
-        # The checkpoint vocabulary uses the item exports from Showdown 2f66b849.
-        tables = json.loads(
-            files("pokerl").joinpath("item_ids.json").read_text(encoding="utf-8")
-        )
-        items.update(tables.get(f"gen{gen}", tables["base"]))
-        return sorted(str(item).lower() for item in items if item)
