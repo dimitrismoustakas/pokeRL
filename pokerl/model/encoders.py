@@ -6,6 +6,9 @@ import torch.nn as nn
 from ..data import NUM_MOVE_SCOPES
 from ..env.observation import (
     ACTIVE_MECHANICS_FEATURE_DIM,
+    EXTRA_FEATURES_OFFSET,
+    MOVE_PP_OFFSET,
+    NUM_MOVE_SLOTS,
     NUM_PUBLIC_EVENT_FLAGS,
     NUM_PUBLIC_TARGET_POSITIONS,
     NUM_TARGET_OUTCOME_FEATURES,
@@ -44,14 +47,18 @@ class PokemonEncoder(nn.Module):
         self.item_emb = nn.Embedding(num_items, item_dim, padding_idx=0)
         self.type_emb = nn.Embedding(num_types, type_dim, padding_idx=0)
 
+        move_set_dim = NUM_MOVE_SLOTS * move_dim
+        self.move_token = nn.Sequential(
+            nn.Linear(move_dim + 1, move_set_dim), nn.ReLU()
+        )
         total_input = (
             species_dim
-            + 4 * move_dim  # 4 moves
+            + move_set_dim
             + move_dim  # last revealed move
             + ability_dim
             + item_dim
             + 3 * type_dim  # type_1, type_2, tera_type
-            + continuous_dim
+            + (continuous_dim - NUM_MOVE_SLOTS)
         )
 
         self.mlp = nn.Sequential(
@@ -71,15 +78,19 @@ class PokemonEncoder(nn.Module):
         types: torch.Tensor,  # (batch, 3)  — type_1, type_2, tera_type
         continuous: torch.Tensor,  # (batch, continuous_dim)
     ) -> torch.Tensor:  # (batch, out_dim)
+        pp = continuous[..., MOVE_PP_OFFSET:EXTRA_FEATURES_OFFSET].unsqueeze(-1)
+        tokens = self.move_token(torch.cat((self.move_emb(moves), pp), dim=-1))
+        move_set = tokens.masked_fill((moves == 0).unsqueeze(-1), 0).sum(dim=-2)
         x = torch.cat(
             [
                 self.species_emb(species),
-                self.move_emb(moves).flatten(-2),  # (batch, 4 * move_dim)
+                move_set,
                 self.move_emb(last_move),
                 self.ability_emb(ability),
                 self.item_emb(item),
-                self.type_emb(types).flatten(-2),  # (batch, 2 * type_dim)
-                continuous,
+                self.type_emb(types).flatten(-2),
+                continuous[..., :MOVE_PP_OFFSET],
+                continuous[..., EXTRA_FEATURES_OFFSET:],
             ],
             dim=-1,
         )

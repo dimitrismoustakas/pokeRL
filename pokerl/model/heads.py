@@ -170,6 +170,17 @@ class MaskedSetAttention(nn.Module):
         return summaries.reshape(*query_shape[:-1], values.shape[-1])
 
 
+class _GroupedEmbedding(nn.Embedding):
+    """Indices in the same group share one trainable embedding."""
+
+    def __init__(self, groups: list[int], embedding_dim: int):
+        super().__init__(max(groups) + 1, embedding_dim)
+        self.register_buffer("groups", torch.tensor(groups, dtype=torch.long))
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        return super().forward(self.groups[indices])
+
+
 class ActionHead(nn.Module):
     """Autoregressive action selection for doubles.
 
@@ -228,9 +239,15 @@ class ActionHead(nn.Module):
             raise ValueError("move_embedding_dim must be positive.")
         self.move_embedding_dim = move_embedding_dim
 
-        self.action_id_emb = nn.Embedding(self.num_actions, hidden_dim)
+        # Moves share an action embedding for each target. Switches and pass
+        # retain distinct embeddings. The offered move supplies its identity.
+        action_groups = list(range(NUM_TARGETS)) * NUM_MOVES
+        action_groups.extend(
+            range(NUM_TARGETS, NUM_TARGETS + self.num_actions - SWITCH_OFFSET)
+        )
+        self.action_id_emb = _GroupedEmbedding(action_groups, hidden_dim)
         self.kind_emb = nn.Embedding(3, hidden_dim)
-        self.move_slot_emb = nn.Embedding(NUM_MOVES + 1, hidden_dim)
+        self.move_slot_emb = _GroupedEmbedding([0] * NUM_MOVES + [1], hidden_dim)
         self.target_emb = nn.Embedding(NUM_TARGETS + 1, hidden_dim)
         self.switch_slot_emb = nn.Embedding(MAX_TEAM_SLOTS + 1, hidden_dim)
         self._static_action_features_cache: torch.Tensor | None = None
@@ -2016,22 +2033,6 @@ class ActionHead(nn.Module):
     def _gather_team_slots(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         gather_index = indices.unsqueeze(-1).expand(-1, -1, values.shape[-1])
         return values.gather(1, gather_index)
-
-    @staticmethod
-    def _active_slot_present(
-        battle_obs: dict[str, torch.Tensor],
-        side_prefix: str,
-        slot: int,
-    ) -> torch.Tensor:
-        key = f"{side_prefix}_active_present"
-        if key not in battle_obs:
-            batch_size = battle_obs[f"{side_prefix}_active_indices"].shape[0]
-            return torch.ones(
-                batch_size,
-                dtype=torch.bool,
-                device=battle_obs[f"{side_prefix}_active_indices"].device,
-            )
-        return battle_obs[key][:, slot].to(dtype=torch.bool)
 
     @staticmethod
     def _ensure_long_buffer(tensor: torch.Tensor | None) -> torch.Tensor:

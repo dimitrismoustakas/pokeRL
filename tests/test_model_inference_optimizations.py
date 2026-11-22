@@ -2,8 +2,9 @@ import copy
 
 import torch
 
-from pokerl.env.actions import ACTIONS_PER_SLOT
-from pokerl.env.observation import CONTINUOUS_DIM
+from pokerl.env.actions import ACTIONS_PER_SLOT, NUM_TARGETS, PASS_ACTION, SWITCH_OFFSET
+from pokerl.env.observation import CONTINUOUS_DIM, EXTRA_FEATURES_OFFSET, MOVE_PP_OFFSET
+from pokerl.model.encoders import PokemonEncoder
 from pokerl.model.heads import ActionHead
 
 
@@ -90,6 +91,66 @@ def _make_head_and_inputs(batch_size: int = 3):
         "battle_obs": battle_obs,
     }
     return head, inputs
+
+
+def test_pokemon_move_set_keeps_pp_with_each_known_move() -> None:
+    torch.manual_seed(51)
+    encoder = PokemonEncoder(8, 12, 8, 8, 8, CONTINUOUS_DIM)
+    ids = torch.tensor([1, 2])
+    types = torch.tensor([[1, 2, 3], [3, 4, 5]])
+    moves = torch.tensor([[1, 2, 3, 4], [5, 0, 7, 0]])
+    continuous = torch.rand(2, CONTINUOUS_DIM)
+    pp = slice(MOVE_PP_OFFSET, EXTRA_FEATURES_OFFSET)
+    perm = torch.tensor([[2, 3, 0, 1], [1, 0, 3, 2]])
+
+    def encode(tokens, features):
+        return encoder(ids, tokens, ids, ids, ids, types, features)
+
+    expected = encode(moves, continuous)
+    reordered = continuous.clone()
+    reordered[:, pp] = continuous[:, pp].gather(1, perm)
+    new_moves = moves.gather(1, perm)
+    reordered[:, pp].masked_fill_(new_moves == 0, 0.75)
+    torch.testing.assert_close(encode(new_moves, reordered), expected)
+    assert not torch.allclose(encode(moves, reordered)[0], expected[0])
+
+
+def test_doubles_policy_follows_each_actors_reordered_move_menu() -> None:
+    head, inputs = _make_head_and_inputs()
+    inputs["move_embedding"] = torch.nn.Embedding(17, head.move_embedding_dim)
+    actions = torch.tensor([[7, 16, 1], [SWITCH_OFFSET, 4, 0], [PASS_ACTION, 8, 0]])
+    obs, masks = inputs["battle_obs"], inputs["masks"]
+    joint = masks["joint"]
+    joint[:, 0, 9] = False
+    joint[:, 1 + 7, 6] = False
+
+    # new index -> old index, independently for each active Pokémon
+    perm = torch.tensor([[2, 3, 0, 1], [3, 1, 2, 0]])
+    moves = perm[:, :, None] * NUM_TARGETS + torch.arange(NUM_TARGETS)
+    nonmoves = torch.arange(SWITCH_OFFSET, ACTIONS_PER_SLOT).expand(2, -1)
+    menu = torch.cat((moves.flatten(1), nonmoves), dim=1)
+    alternate = dict(obs)
+    for name in ("own_request_moves", "own_request_move_metadata"):
+        alternate[name] = torch.stack(
+            [obs[name][:, side, perm[side]] for side in (0, 1)], dim=1
+        )
+    first = joint[:, :1, menu[0]]
+    second = joint[:, 1:][:, menu[0]][:, :, menu[1]]
+    new_masks = {**masks, "joint": torch.cat((first, second), dim=1)}
+    new_actions = actions.clone()
+    new_actions[:, :2] = menu.argsort(1).gather(1, actions[:, :2].T).T
+
+    expected = head(**{**inputs, "actions": actions})
+    actual = head(
+        **{
+            **inputs,
+            "actions": new_actions,
+            "battle_obs": alternate,
+            "masks": new_masks,
+        }
+    )
+    for name in ("log_prob", "action_entropy", "base_tera_use_prob"):
+        torch.testing.assert_close(actual[name], expected[name])
 
 
 def _install_scalar_effectiveness_reference(head: ActionHead) -> None:
