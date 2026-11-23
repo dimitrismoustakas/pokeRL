@@ -36,8 +36,8 @@ from pokerl.public_consequence import (
     PUBLIC_CONSEQUENCE_FIELD_DIM,
     TARGET_INTERACTION_IMMUNE,
     TARGET_INTERACTION_MISS,
-    encode_public_consequence,
-    encode_public_field,
+    empty_consequence_batch,
+    encode_consequence_batch,
 )
 
 
@@ -71,23 +71,28 @@ def _observation() -> dict[str, np.ndarray]:
     }
 
 
+def _encode(obs):
+    out = empty_consequence_batch(1)
+    encode_consequence_batch({key: row[None] for key, row in obs.items()}, out)
+    return {key: batch[0] for key, batch in out.items()}
+
+
 def test_target_phase_labels_declared_route_and_conditional_interactions() -> None:
     obs = _observation()
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert labels.move_emitted_targets.tolist() == [1.0, 0.0]
-    assert labels.move_emitted_masks.tolist() == [True, False]
-    assert labels.move_branch_labels[0] == MOVE_BRANCH_TARGET_PHASE
-    assert labels.move_branch_masks.tolist() == [True, False]
-    assert labels.route_targets[0].tolist() == [0.0, 0.0, 1.0, 0.0]
-    assert labels.route_masks[0].all()
-    assert labels.interaction_masks[0].tolist() == [False, False, True, False]
-    assert labels.interaction_targets[0, 2] == 0.0
-    assert not labels.interaction_reason_masks[0].any()
-    assert labels.cant_masks[0].tolist() == [True, False]
-    np.testing.assert_array_equal(labels.field_targets[0], obs["field"])
-    np.testing.assert_array_equal(encode_public_field(obs), obs["field"])
+    assert labels["move_emitted_targets"].tolist() == [1.0, 0.0]
+    assert labels["move_emitted_masks"].tolist() == [True, False]
+    assert labels["move_branch_labels"][0] == MOVE_BRANCH_TARGET_PHASE
+    assert labels["move_branch_masks"].tolist() == [True, False]
+    assert labels["route_targets"][0].tolist() == [0.0, 0.0, 1.0, 0.0]
+    assert labels["route_masks"][0].all()
+    assert labels["interaction_masks"][0].tolist() == [False, False, True, False]
+    assert labels["interaction_targets"][0, 2] == 0.0
+    assert not labels["interaction_reason_masks"][0].any()
+    assert labels["cant_masks"][0].tolist() == [True, False]
+    np.testing.assert_array_equal(labels["field_targets"][0], obs["field"])
 
 
 def test_spread_targets_keep_separate_miss_and_immunity_markers() -> None:
@@ -100,13 +105,13 @@ def test_spread_targets_keep_separate_miss_and_immunity_markers() -> None:
     outcomes[3, TARGET_OUTCOME_DECLARED] = 1.0
     outcomes[3, TARGET_OUTCOME_IMMUNE] = 1.0
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert labels.route_targets[0].tolist() == [0.0, 0.0, 1.0, 1.0]
-    assert labels.interaction_targets[0].tolist() == [0.0, 0.0, 1.0, 1.0]
-    assert labels.interaction_reason_labels[0, 2] == TARGET_INTERACTION_MISS
-    assert labels.interaction_reason_labels[0, 3] == TARGET_INTERACTION_IMMUNE
-    assert labels.cant_masks[0].tolist() == [True, True]
+    assert labels["route_targets"][0].tolist() == [0.0, 0.0, 1.0, 1.0]
+    assert labels["interaction_targets"][0].tolist() == [0.0, 0.0, 1.0, 1.0]
+    assert labels["interaction_reason_labels"][0, 2] == TARGET_INTERACTION_MISS
+    assert labels["interaction_reason_labels"][0, 3] == TARGET_INTERACTION_IMMUNE
+    assert labels["cant_masks"][0].tolist() == [True, True]
 
 
 @pytest.mark.parametrize(
@@ -128,10 +133,10 @@ def test_move_branch_is_explicit_and_does_not_invent_target_routes(
     if flag is not None:
         obs["recent_event_flags"][0, flag] = 1.0
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert labels.move_branch_labels[0] == expected_branch
-    assert not labels.route_masks[0].any()
+    assert labels["move_branch_labels"][0] == expected_branch
+    assert not labels["route_masks"][0].any()
 
 
 @pytest.mark.parametrize(
@@ -147,13 +152,13 @@ def test_nonemitted_move_has_conditional_public_reason(
     obs["recent_event_move"][0] = 0 if event_kind == EVENT_CANT else 11
     obs["recent_event_move_scope"][0] = 0
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert labels.move_emitted_targets[0] == 0.0
-    assert labels.move_emitted_masks[0]
-    assert labels.nonmove_reason_labels[0] == expected_reason
-    assert labels.nonmove_reason_masks[0]
-    assert not labels.move_branch_masks[0]
+    assert labels["move_emitted_targets"][0] == 0.0
+    assert labels["move_emitted_masks"][0]
+    assert labels["nonmove_reason_labels"][0] == expected_reason
+    assert labels["nonmove_reason_masks"][0]
+    assert not labels["move_branch_masks"][0]
 
 
 def test_called_move_aligns_to_the_selected_source_move() -> None:
@@ -161,20 +166,20 @@ def test_called_move_aligns_to_the_selected_source_move() -> None:
     obs["recent_event_move"][0] = 999
     obs["recent_event_source_move"][0] = 11
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert labels.move_emitted_masks[0]
-    assert labels.move_branch_labels[0] == MOVE_BRANCH_TARGET_PHASE
+    assert labels["move_emitted_masks"][0]
+    assert labels["move_branch_labels"][0] == MOVE_BRANCH_TARGET_PHASE
 
 
 def test_public_hit_count_is_conditional_on_unmarked_declared_target() -> None:
     obs = _observation()
     obs["recent_event_target_outcomes"][0, 2, TARGET_OUTCOME_HIT_COUNT] = 0.3
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert labels.hit_count_masks[0, 2]
-    assert labels.hit_count_labels[0, 2] == 2
+    assert labels["hit_count_masks"][0, 2]
+    assert labels["hit_count_labels"][0, 2] == 2
 
 
 def test_minor_target_presence_is_not_mislabeled_as_move_route() -> None:
@@ -183,10 +188,10 @@ def test_minor_target_presence_is_not_mislabeled_as_move_route() -> None:
     outcomes[0, TARGET_OUTCOME_PRESENT] = 1.0
     outcomes[0, TARGET_OUTCOME_FAILED] = 1.0
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert labels.route_targets[0].tolist() == [0.0, 0.0, 1.0, 0.0]
-    assert not labels.interaction_masks[0, 0]
+    assert labels["route_targets"][0].tolist() == [0.0, 0.0, 1.0, 0.0]
+    assert not labels["interaction_masks"][0, 0]
 
 
 @pytest.mark.parametrize(
@@ -199,8 +204,8 @@ def test_incomplete_or_overflowed_segments_are_not_supervised(
     obs = _observation()
     obs["recent_event_meta"] = np.asarray(meta, dtype=np.float32)
 
-    labels = encode_public_consequence(obs)
+    labels = _encode(obs)
 
-    assert not labels.move_emitted_masks.any()
-    assert not labels.route_masks.any()
-    assert not labels.field_masks.any()
+    assert not labels["move_emitted_masks"].any()
+    assert not labels["route_masks"].any()
+    assert not labels["field_masks"].any()

@@ -20,7 +20,7 @@ from pokerl.model.agent import PokeAgent
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
 from pokerl.training.league import _InferenceRow, _LeagueInferenceService
 from pokerl.training.rollout_policy import RolloutPolicy
-from scripts.train import array_to_device
+from pokerl.training.inference_batch import InputTransfer
 
 
 pytestmark = pytest.mark.skipif(
@@ -297,11 +297,13 @@ def _full_agent_inputs():
 
 
 def test_feedback_buffer_reused_with_default_cuda_device() -> None:
-    device = torch.device("cuda")
-    buffer = array_to_device(np.array([1, 2]), device)
-    updated = array_to_device(np.array([3, 4]), device, buffer=buffer)
-    assert updated is buffer
-    np.testing.assert_array_equal(buffer.cpu().numpy(), [3, 4])
+    transfer = InputTransfer({"labels": np.array([1, 2])}, torch.device("cuda"))
+    previous = transfer.stage({"labels": np.array([1, 2])})["labels"]
+    np.testing.assert_array_equal(previous.cpu().numpy(), [1, 2])
+    transfer.host.arrays["labels"][:] = [3, 4]
+    updated = transfer.upload()["labels"]
+    assert updated is previous
+    np.testing.assert_array_equal(updated.cpu().numpy(), [3, 4])
 
 
 @torch.no_grad()

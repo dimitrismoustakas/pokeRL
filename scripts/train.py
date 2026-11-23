@@ -25,13 +25,12 @@ from pokerl.env.actions import (
     NUM_SLOT_INTENT_COMPONENTS,
     NUM_TERA_INTENT_COMPONENTS,
 )
-from pokerl.env.observation import NUM_PUBLIC_TARGET_POSITIONS
 from pokerl.env.vector import PikaproVectorEnv
 from pokerl.model.agent import PokeAgent, load_policy
 from pokerl.public_consequence import (
-    PUBLIC_CONSEQUENCE_FIELD_DIM,
     PUBLIC_CONSEQUENCE_OBSERVATION_KEYS,
-    encode_public_consequence,
+    empty_consequence_batch,
+    encode_consequence_batch,
 )
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
 from pokerl.training.rollout import RolloutBuffer
@@ -39,6 +38,7 @@ from pokerl.training.ppo import PPOTrainer
 from pokerl.training.league import League
 from pokerl.training.recurrent_history import RecurrentObservationHistory
 from pokerl.training.cuda_execution import cuda_model_execution
+from pokerl.training.inference_batch import InputTransfer
 from pokerl.training.rollout_policy import RolloutPolicy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -658,28 +658,6 @@ def _maintain_league_after_update(
     )
 
 
-def array_to_device(
-    array: np.ndarray,
-    device: torch.device,
-    dtype: torch.dtype | None = None,
-    buffer: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Copy a NumPy array into a reusable tensor on ``device``."""
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    source = torch.from_numpy(array)
-    target_dtype = source.dtype if dtype is None else dtype
-    if (
-        buffer is None
-        or buffer.shape != source.shape
-        or buffer.dtype != target_dtype
-        or buffer.device != device
-    ):
-        buffer = torch.empty(source.shape, dtype=target_dtype, device=device)
-    buffer.copy_(source)
-    return buffer
-
-
 def clone_hidden_state(
     hidden: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -735,73 +713,29 @@ def collect_synchronous_rollout(
         "team_preview_episode_starts": float(len(initial_preview_starts)),
     }
     rollout_infos: list[dict] = []
-    rewards_device_buffer: torch.Tensor | None = None
-    dones_device_buffer: torch.Tensor | None = None
-    opponent_intent_slot_labels_np = np.empty(
-        (parallel_env.num_envs, 2, NUM_SLOT_INTENT_COMPONENTS),
-        dtype=np.int64,
+    count = parallel_env.num_envs
+    consequences = empty_consequence_batch(count)
+    slot_shape = (count, 2, NUM_SLOT_INTENT_COMPONENTS)
+    tera_shape = (count, NUM_TERA_INTENT_COMPONENTS)
+    feedback = InputTransfer(
+        {
+            "rewards": np.empty(count, np.float32),
+            "dones": np.empty(count, bool),
+            "opponent_intent_slot_labels": np.empty(slot_shape, np.int64),
+            "opponent_intent_slot_masks": np.empty(slot_shape, bool),
+            "opponent_intent_tera_labels": np.empty(tera_shape, np.int64),
+            "opponent_intent_tera_masks": np.empty(tera_shape, bool),
+            **{
+                f"public_consequence_{name}": values
+                for name, values in consequences.items()
+            },
+        },
+        device,
     )
-    opponent_intent_slot_masks_np = np.empty_like(
-        opponent_intent_slot_labels_np,
-        dtype=bool,
-    )
-    opponent_intent_tera_labels_np = np.empty(
-        (parallel_env.num_envs, NUM_TERA_INTENT_COMPONENTS),
-        dtype=np.int64,
-    )
-    opponent_intent_tera_masks_np = np.empty_like(
-        opponent_intent_tera_labels_np,
-        dtype=bool,
-    )
-    consequence_slot_shape = (parallel_env.num_envs, 2)
-    consequence_target_shape = (
-        parallel_env.num_envs,
-        2,
-        NUM_PUBLIC_TARGET_POSITIONS,
-    )
+    host = feedback.host.arrays
     public_consequence_np = {
-        "move_emitted_targets": np.empty(consequence_slot_shape, dtype=np.float32),
-        "move_emitted_masks": np.empty(consequence_slot_shape, dtype=bool),
-        "nonmove_reason_labels": np.empty(consequence_slot_shape, dtype=np.int64),
-        "nonmove_reason_masks": np.empty(consequence_slot_shape, dtype=bool),
-        "move_branch_labels": np.empty(consequence_slot_shape, dtype=np.int64),
-        "move_branch_masks": np.empty(consequence_slot_shape, dtype=bool),
-        "route_targets": np.empty(consequence_target_shape, dtype=np.float32),
-        "route_masks": np.empty(consequence_target_shape, dtype=bool),
-        "interaction_targets": np.empty(consequence_target_shape, dtype=np.float32),
-        "interaction_masks": np.empty(consequence_target_shape, dtype=bool),
-        "interaction_reason_labels": np.empty(consequence_target_shape, dtype=np.int64),
-        "interaction_reason_masks": np.empty(consequence_target_shape, dtype=bool),
-        "hit_count_labels": np.empty(consequence_target_shape, dtype=np.int64),
-        "hit_count_masks": np.empty(consequence_target_shape, dtype=bool),
+        name: host[f"public_consequence_{name}"] for name in consequences
     }
-    public_consequence_cant_targets_np = np.empty(
-        (parallel_env.num_envs, 2, 2),
-        dtype=np.float32,
-    )
-    public_consequence_cant_masks_np = np.empty_like(
-        public_consequence_cant_targets_np,
-        dtype=bool,
-    )
-    public_consequence_field_targets_np = np.empty(
-        (parallel_env.num_envs, 2, PUBLIC_CONSEQUENCE_FIELD_DIM),
-        dtype=np.float32,
-    )
-    public_consequence_field_masks_np = np.empty(
-        (parallel_env.num_envs, 2),
-        dtype=bool,
-    )
-    opponent_intent_slot_labels_device: torch.Tensor | None = None
-    opponent_intent_slot_masks_device: torch.Tensor | None = None
-    opponent_intent_tera_labels_device: torch.Tensor | None = None
-    opponent_intent_tera_masks_device: torch.Tensor | None = None
-    public_consequence_device_buffers: dict[str, torch.Tensor | None] = {
-        key: None for key in public_consequence_np
-    }
-    public_consequence_cant_targets_device: torch.Tensor | None = None
-    public_consequence_cant_masks_device: torch.Tensor | None = None
-    public_consequence_field_targets_device: torch.Tensor | None = None
-    public_consequence_field_masks_device: torch.Tensor | None = None
     policy = RolloutPolicy(
         agent, obs, action_masks, device, tera_exploration_prob, capture_stream
     )
@@ -848,165 +782,49 @@ def collect_synchronous_rollout(
             profile["env_step_sec"] += time.perf_counter() - started
 
         started = time.perf_counter() if collect_timing else 0.0
-        rewards_t = array_to_device(
-            rewards,
-            device,
-            dtype=torch.float32,
-            buffer=rewards_device_buffer,
-        )
-        dones_t = array_to_device(
-            dones,
-            device,
-            dtype=torch.bool,
-            buffer=dones_device_buffer,
-        )
-        rewards_device_buffer = rewards_t
-        dones_device_buffer = dones_t
-
-        opponent_intent_slot_labels_np.fill(-1)
-        opponent_intent_slot_masks_np.fill(False)
-        opponent_intent_tera_labels_np.fill(-1)
-        opponent_intent_tera_masks_np.fill(False)
-        for consequence_name, consequence_array in public_consequence_np.items():
-            if consequence_name.endswith("labels"):
-                consequence_array.fill(-1)
-            elif consequence_name.endswith("masks"):
-                consequence_array.fill(False)
-            else:
-                consequence_array.fill(0.0)
-        public_consequence_cant_targets_np.fill(0.0)
-        public_consequence_cant_masks_np.fill(False)
-        public_consequence_field_targets_np.fill(0.0)
-        public_consequence_field_masks_np.fill(False)
+        host["rewards"][:] = rewards
+        host["dones"][:] = dones
+        host["opponent_intent_slot_labels"].fill(-1)
+        host["opponent_intent_slot_masks"].fill(False)
+        host["opponent_intent_tera_labels"].fill(-1)
+        host["opponent_intent_tera_masks"].fill(False)
+        consequence_obs = next_obs
+        terminal_lanes = np.flatnonzero(dones)
+        if len(terminal_lanes):
+            final = [
+                infos[lane].pop("final_observation", None) for lane in terminal_lanes
+            ]
+            if any(row is None for row in final):
+                raise RuntimeError(
+                    "Auto-reset transition omitted final_observation for terminal auxiliary labels."
+                )
+            # The learner's next inputs describe new battles in these lanes.
+            # Splice their final public events into separate training columns.
+            consequence_obs = {}
+            for key in PUBLIC_CONSEQUENCE_OBSERVATION_KEYS:
+                if key in next_obs:
+                    column = next_obs[key].copy()
+                    column[terminal_lanes] = [row[key] for row in final]
+                    consequence_obs[key] = column
+        encode_consequence_batch(consequence_obs, public_consequence_np)
+        # A terminal action resolves its moves without advancing the public field a turn.
+        public_consequence_np["field_masks"][terminal_lanes] = False
         for env_index, info in enumerate(infos):
-            if dones[env_index]:
-                consequence_observation = info.pop("final_observation", None)
-                if consequence_observation is None:
-                    raise RuntimeError(
-                        "Auto-reset transition omitted final_observation for "
-                        "terminal auxiliary labels."
-                    )
-            else:
-                consequence_observation = {
-                    key: next_obs[key][env_index]
-                    for key in PUBLIC_CONSEQUENCE_OBSERVATION_KEYS
-                    if key in next_obs
-                }
-            consequence = encode_public_consequence(consequence_observation)
-            for consequence_name, consequence_array in public_consequence_np.items():
-                consequence_array[env_index] = getattr(consequence, consequence_name)
-            public_consequence_cant_targets_np[env_index] = consequence.cant_targets
-            public_consequence_cant_masks_np[env_index] = consequence.cant_masks
-            public_consequence_field_targets_np[env_index] = consequence.field_targets
-            # A terminal observation resolves the selected moves, but the simulator
-            # does not advance battle.turn after the battle-ending action. The
-            # field head's persistence baseline is explicitly a one-turn
-            # transition, so supervising that non-advanced terminal field would
-            # teach a systematic false deviation. Other exact consequences stay
-            # valid on the terminal segment.
-            if not dones[env_index]:
-                public_consequence_field_masks_np[env_index] = consequence.field_masks
-
             slot_labels = info.get("opponent_intent_slot_labels")
             if slot_labels is None:
                 continue
-            required_keys = {
-                "opponent_intent_slot_masks",
-                "opponent_intent_tera_labels",
-                "opponent_intent_tera_masks",
-            }
-            missing_keys = required_keys.difference(info)
-            if missing_keys:
-                raise RuntimeError(
-                    "Semantic opponent intent omitted keys: "
-                    + ", ".join(sorted(missing_keys))
-                )
-            opponent_intent_slot_labels_np[env_index] = slot_labels
-            opponent_intent_slot_masks_np[env_index] = info[
+            host["opponent_intent_slot_labels"][env_index] = slot_labels
+            host["opponent_intent_slot_masks"][env_index] = info[
                 "opponent_intent_slot_masks"
             ]
-            opponent_intent_tera_labels_np[env_index] = info[
+            host["opponent_intent_tera_labels"][env_index] = info[
                 "opponent_intent_tera_labels"
             ]
-            opponent_intent_tera_masks_np[env_index] = info[
+            host["opponent_intent_tera_masks"][env_index] = info[
                 "opponent_intent_tera_masks"
             ]
 
-        opponent_intent_slot_labels_t = array_to_device(
-            opponent_intent_slot_labels_np,
-            device,
-            dtype=torch.long,
-            buffer=opponent_intent_slot_labels_device,
-        )
-        opponent_intent_slot_masks_t = array_to_device(
-            opponent_intent_slot_masks_np,
-            device,
-            dtype=torch.bool,
-            buffer=opponent_intent_slot_masks_device,
-        )
-        opponent_intent_tera_labels_t = array_to_device(
-            opponent_intent_tera_labels_np,
-            device,
-            dtype=torch.long,
-            buffer=opponent_intent_tera_labels_device,
-        )
-        opponent_intent_tera_masks_t = array_to_device(
-            opponent_intent_tera_masks_np,
-            device,
-            dtype=torch.bool,
-            buffer=opponent_intent_tera_masks_device,
-        )
-        opponent_intent_slot_labels_device = opponent_intent_slot_labels_t
-        opponent_intent_slot_masks_device = opponent_intent_slot_masks_t
-        opponent_intent_tera_labels_device = opponent_intent_tera_labels_t
-        opponent_intent_tera_masks_device = opponent_intent_tera_masks_t
-
-        public_consequence_t: dict[str, torch.Tensor] = {}
-        for consequence_name, consequence_array in public_consequence_np.items():
-            consequence_dtype = (
-                torch.long
-                if consequence_name.endswith("labels")
-                else (
-                    torch.bool if consequence_name.endswith("masks") else torch.float32
-                )
-            )
-            public_consequence_t[consequence_name] = array_to_device(
-                consequence_array,
-                device,
-                dtype=consequence_dtype,
-                buffer=public_consequence_device_buffers[consequence_name],
-            )
-            public_consequence_device_buffers[consequence_name] = public_consequence_t[
-                consequence_name
-            ]
-        public_consequence_cant_targets_t = array_to_device(
-            public_consequence_cant_targets_np,
-            device,
-            dtype=torch.float32,
-            buffer=public_consequence_cant_targets_device,
-        )
-        public_consequence_cant_masks_t = array_to_device(
-            public_consequence_cant_masks_np,
-            device,
-            dtype=torch.bool,
-            buffer=public_consequence_cant_masks_device,
-        )
-        public_consequence_field_targets_t = array_to_device(
-            public_consequence_field_targets_np,
-            device,
-            dtype=torch.float32,
-            buffer=public_consequence_field_targets_device,
-        )
-        public_consequence_field_masks_t = array_to_device(
-            public_consequence_field_masks_np,
-            device,
-            dtype=torch.bool,
-            buffer=public_consequence_field_masks_device,
-        )
-        public_consequence_cant_targets_device = public_consequence_cant_targets_t
-        public_consequence_cant_masks_device = public_consequence_cant_masks_t
-        public_consequence_field_targets_device = public_consequence_field_targets_t
-        public_consequence_field_masks_device = public_consequence_field_masks_t
+        feedback_t = feedback.upload()
 
         if collect_timing:
             profile["feedback_to_device_sec"] += time.perf_counter() - started
@@ -1018,20 +836,7 @@ def collect_synchronous_rollout(
             masks_for_buffer,
             log_probs_t,
             values_t,
-            rewards_t,
-            dones_t,
-            opponent_intent_slot_labels=opponent_intent_slot_labels_t,
-            opponent_intent_slot_masks=opponent_intent_slot_masks_t,
-            opponent_intent_tera_labels=opponent_intent_tera_labels_t,
-            opponent_intent_tera_masks=opponent_intent_tera_masks_t,
-            public_consequence_cant_targets=public_consequence_cant_targets_t,
-            public_consequence_cant_masks=public_consequence_cant_masks_t,
-            public_consequence_field_targets=public_consequence_field_targets_t,
-            public_consequence_field_masks=public_consequence_field_masks_t,
-            **{
-                f"public_consequence_{name}": value
-                for name, value in public_consequence_t.items()
-            },
+            **feedback_t,
         )
         preview_starts = parallel_env.drain_team_preview_starts()
         buffer.register_team_preview_starts(
@@ -1045,6 +850,7 @@ def collect_synchronous_rollout(
         if hidden is not None:
             started = time.perf_counter() if collect_timing else 0.0
             h, c = hidden
+            dones_t = feedback_t["dones"]
             not_done = (~dones_t).to(h.dtype).view(1, dones_t.shape[0], 1)
             hidden = (h * not_done, c * not_done)
             if collect_timing:
