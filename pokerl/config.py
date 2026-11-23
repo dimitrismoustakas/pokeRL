@@ -100,6 +100,7 @@ class TrainingConfig:
     # estimate for each archived opponent. PFSP focuses on opponents the live
     # policy struggles against while retaining a uniform coverage component.
     league_payoff_half_life_updates: float = 20.0
+    league_sampler: str = "random"
     league_pfsp_exponent: float = 2.0
     league_pfsp_uniform_fraction: float = 0.1
     # Collapse the many small frozen-opponent CUDA launches into one replay.
@@ -153,6 +154,8 @@ class TrainingConfig:
                 "league_update_interval must be positive "
                 f"(got {self.league_update_interval})."
             )
+        if self.league_sampler not in ("random", "balanced"):
+            raise ValueError(f"Unknown league sampler: {self.league_sampler!r}.")
         if self.league_refresh_interval <= 0:
             raise ValueError(
                 "league_refresh_interval must be positive "

@@ -38,6 +38,7 @@ class LeagueMember:
     lifetime_wins: int = 0
     lifetime_losses: int = 0
     lifetime_draws: int = 0
+    assignment_balance: float = 0.0
 
     def payoff_evidence(
         self,
@@ -1174,6 +1175,7 @@ class League:
                     "league_update_interval",
                     "league_refresh_interval",
                     "league_payoff_half_life_updates",
+                    "league_sampler",
                     "league_pfsp_exponent",
                     "league_pfsp_uniform_fraction",
                 )
@@ -1230,6 +1232,24 @@ class League:
 
         available_paths = [str(row["checkpoint_path"]) for row in rows]
         available_weights = [float(row["first_draw_probability"]) for row in rows]
+        if self.config.league_sampler == "balanced":
+            members = [self._members[path] for path in available_paths]
+            for member, expected in zip(
+                members, _expected_group_counts(available_weights, count), strict=True
+            ):
+                member.assignment_balance += expected
+            selected = sorted(
+                members, key=lambda m: m.assignment_balance, reverse=True
+            )[:count]
+            for member in selected:
+                member.assignment_balance -= 1
+            while len(selected) < count:
+                member = max(members, key=lambda m: m.assignment_balance)
+                member.assignment_balance -= 1
+                selected.append(member)
+            self._rng.shuffle(selected)
+            return [member.path for member in selected]
+
         sampled: list[str] = []
 
         # First exhaust a weighted-without-replacement draw, guaranteeing
@@ -1261,3 +1281,63 @@ class League:
                 return index
         # Floating-point roundoff can place the threshold at the endpoint.
         return len(weights) - 1
+
+
+def _expected_group_counts(weights: list[float], count: int) -> list[float]:
+    """Marginal counts for the league's successive weighted draws."""
+    total = math.fsum(weights)
+    probabilities = [weight / total for weight in weights]
+    if count >= len(weights):
+        return [1 + (count - len(weights)) * p for p in probabilities]
+    if count == 1:
+        return probabilities
+    if count == 2:
+        # Sum the weights left after the likeliest opponent explicitly. Its
+        # probability can round to one while other opponents still have weight.
+        peak = max(probabilities)
+        others = probabilities.copy()
+        others.remove(peak)
+        remaining = math.fsum(others)
+        base = 1 + math.fsum(p / (1 - p) for p in others)
+        return [
+            peak * base
+            if p == peak
+            else p * (base - p / (1 - p)) + peak * (p / remaining)
+            for p in probabilities
+        ]
+
+    # A weighted draw orders independent exponential clocks. An opponent gets
+    # a slot when at most count-1 of the other clocks have rung at its arrival.
+    # Integrate on log time from the fastest clock's lower tail to the slowest's upper tail.
+    rates = np.asarray(probabilities)
+    positive = rates[rates > 0]
+    eps = np.finfo(float).eps
+    start = math.log(eps) - math.log(positive.max())
+    stop = math.log(-math.log(eps)) - math.log(positive.min())
+    edges = np.linspace(start, stop, math.ceil(stop - start) + 1)
+    nodes, weights_dt = np.polynomial.legendre.leggauss(12)
+    half = (edges[1] - edges[0]) / 2
+    log_time = (edges[:-1, None] + half * (1 + nodes)).ravel()
+    log_rates = np.log(rates, out=np.full_like(rates, -np.inf), where=rates > 0)
+    log_hazard = log_rates[:, None] + log_time
+    with np.errstate(over="ignore"):
+        hazard = np.exp(log_hazard)
+    early = -np.expm1(-hazard)
+    late = np.exp(-hazard)
+    density = np.exp(log_hazard - hazard)
+
+    # Combine counts on either side of each candidate, excluding its own clock.
+    before = np.zeros((len(rates) + 1, count, len(log_time)))
+    before[0, 0] = 1
+    for i in range(len(rates)):
+        before[i + 1] = before[i] * late[i]
+        before[i + 1, 1:] += before[i, :-1] * early[i]
+    after = np.ones((count, len(log_time)))  # cumulative counts in the suffix
+    expected = np.empty(len(rates))
+    dt = np.tile(half * weights_dt, len(edges) - 1)
+    for i in reversed(range(len(rates))):
+        available = (before[i] * after[::-1]).sum(axis=0)
+        expected[i] = (dt * density[i] * available).sum()
+        after[1:] = after[1:] * late[i] + after[:-1] * early[i]
+        after[0] *= late[i]
+    return expected.tolist()

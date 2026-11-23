@@ -1,10 +1,11 @@
+from itertools import permutations
 import random
 from types import SimpleNamespace
 
 import pytest
 
 from pokerl.config import TrainingConfig
-from pokerl.training.league import League, LeagueMember
+from pokerl.training.league import League, LeagueMember, _expected_group_counts
 from scripts.train import (
     _maintain_league_after_update,
     _record_opponent_outcome,
@@ -238,16 +239,22 @@ def test_group_sampling_is_distinct_when_archive_allows_it() -> None:
     assert single.sample_checkpoint_paths(2) == ["only.pt", "only.pt"]
 
 
-def test_restore_preserves_league_draws_and_payoffs_with_smaller_cache(tmp_path):
+@pytest.mark.parametrize("sampler", ["random", "balanced"])
+def test_restore_preserves_league_draws_and_payoffs_with_smaller_cache(
+    tmp_path, sampler
+):
     paths = [tmp_path / f"step_{i}.pt" for i in range(3)]
     for path in paths:
         path.touch()
     saved = _league_state_stub(
-        list(map(str, paths)), config=TrainingConfig(league_size=3), seed=37
+        list(map(str, paths)),
+        config=TrainingConfig(league_size=3, league_sampler=sampler),
+        seed=37,
     )
     saved.record_outcomes(
         {str(paths[0]): {"wins": 3, "losses": 1, "draws": 0}}, update=5
     )
+    saved.sample_checkpoint_paths(2)
     restored = _league_state_stub([], config=TrainingConfig(league_size=1), seed=999)
     restored.load_state_dict(saved.state_dict())
 
@@ -256,3 +263,36 @@ def test_restore_preserves_league_draws_and_payoffs_with_smaller_cache(tmp_path)
     assert [restored.sample_checkpoint_paths(2) for _ in range(12)] == [
         saved.sample_checkpoint_paths(2) for _ in range(12)
     ]
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4, 6])
+def test_balanced_sampler_tracks_expected_weighted_draws(groups):
+    weights = [0.45, 0.25, 0.15, 0.10, 0.05]
+    expected = [max(0, groups - len(weights)) * p for p in weights]
+    for order in permutations(range(len(weights)), min(groups, len(weights))):
+        remaining = 1.0
+        probability = 1.0
+        for i in order:
+            probability *= weights[i] / remaining
+            remaining -= weights[i]
+        for i in order:
+            expected[i] += probability
+    assert _expected_group_counts(weights, groups) == pytest.approx(expected, abs=1e-11)
+
+    paths = [str(i) for i in range(len(weights))]
+    league = _league_state_stub(
+        paths, config=TrainingConfig(league_sampler="balanced"), seed=7
+    )
+    league.sampling_distribution = lambda **_: [
+        {"checkpoint_path": path, "first_draw_probability": p}
+        for path, p in zip(paths, weights, strict=True)
+    ]
+    counts = [0] * len(paths)
+    for _ in range(60):
+        picked = league.sample_checkpoint_paths(groups)
+        assert len(set(picked)) == min(groups, len(paths))
+        for path in picked:
+            counts[int(path)] += 1
+    assert (
+        max(abs(count - 60 * p) for count, p in zip(counts, expected, strict=True)) < 1
+    )

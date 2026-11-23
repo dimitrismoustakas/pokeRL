@@ -328,6 +328,11 @@ def parse_args() -> argparse.Namespace:
         help="Half-life for current-policy opponent payoff evidence.",
     )
     parser.add_argument(
+        "--league-sampler",
+        choices=("random", "balanced"),
+        help="Draw opponents randomly or balance assignments against their PFSP weights.",
+    )
+    parser.add_argument(
         "--league-pfsp-exponent",
         type=float,
         default=None,
@@ -476,6 +481,7 @@ def training_config(args: argparse.Namespace) -> TrainingConfig:
         "league_update_interval": args.league_update_interval,
         "league_refresh_interval": args.league_refresh_interval,
         "league_payoff_half_life_updates": args.league_payoff_half_life_updates,
+        "league_sampler": args.league_sampler,
         "league_pfsp_exponent": args.league_pfsp_exponent,
         "league_pfsp_uniform_fraction": args.league_pfsp_uniform_fraction,
         "league_cuda_graphs": args.league_cuda_graphs,
@@ -1101,6 +1107,8 @@ def train():
         del opponent_template
         if state is not None:
             league.load_state_dict(state["league"])
+            if args.league_sampler is not None:
+                train_config.league_sampler = args.league_sampler
         if fixed_opponent is None and not league.checkpoints:
             with cuda_model_execution(device):
                 league.add_checkpoint(agent, step=trainer.global_step)
@@ -1192,6 +1200,7 @@ def train():
                 "league_payoff_half_life_updates": (
                     train_config.league_payoff_half_life_updates
                 ),
+                "league_sampler": train_config.league_sampler,
                 "league_pfsp_exponent": train_config.league_pfsp_exponent,
                 "league_pfsp_uniform_fraction": (
                     train_config.league_pfsp_uniform_fraction
