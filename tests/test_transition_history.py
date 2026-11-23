@@ -9,6 +9,7 @@ from pokerl.env.observation import (
     POSITION_OPP_2,
 )
 from pokerl.model.agent import PokeAgent
+from pokerl.model.preview_cache import PREVIEW_COLUMNS
 from pokerl.model.encoders import RecentEventEncoder
 
 
@@ -72,7 +73,7 @@ def test_recent_event_encoder_is_zero_without_history_and_receives_gradient() ->
 def test_team_preview_bypasses_zero_recent_event_history() -> None:
     game_data = GameData(gen=9)
     preview_obs = preview_observations([(PACKED_TEAM, PACKED_TEAM)] * 2, game_data)
-    obs_batch = {key: torch.from_numpy(value) for key, value in preview_obs.items()}
+    obs_batch = {key: torch.from_numpy(preview_obs[key]) for key in PREVIEW_COLUMNS}
     agent = PokeAgent(ModelConfig(), game_data).eval()
 
     def fail_if_called(_obs):

@@ -271,7 +271,7 @@ class PokeAgent(nn.Module):
         # Team preview precedes every public event and submitted intent. Its
         # recent-event representation is therefore exactly zero; bypass the
         # recurrent event encoder instead of evaluating a padded 12-step GRU.
-        context, _, own_reps, opp_reps, _ = self.spatial(
+        context, own_reps, opp_reps = self.spatial.encode_teams(
             obs,
             include_recent_events=False,
         )

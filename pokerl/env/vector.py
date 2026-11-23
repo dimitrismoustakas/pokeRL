@@ -20,7 +20,7 @@ from pokerl.env.vector_inputs import (
     opponent_intent_labels,
     remember_actions,
 )
-from pokerl.model.preview_cache import TeamPreviewCache
+from pokerl.model.preview_cache import PREVIEW_COLUMNS, TeamPreviewCache
 from pokerl.training.cuda_execution import cuda_model_execution
 from pokerl.training.preview import TeamPreviewEpisodeStart
 
@@ -119,12 +119,6 @@ class PikaproVectorEnv:
             self.timing["native_step_calls"] += 1
         self._project()
 
-    def _rows(self, lanes, side):
-        return [
-            {key: array[2 * lane + side] for key, array in self.obs.items()}
-            for lane in lanes
-        ]
-
     @torch.no_grad()
     def _team_previews(self, lanes):
         started = perf_counter()
@@ -143,16 +137,23 @@ class PikaproVectorEnv:
             self.opponent_turn_calls[lane].clear()
         self.episode_start[lanes] = started
         self.first_tera[lanes] = -1
-        rows = self._rows(lanes, 0)
+        preview_obs = {key: self.obs[key] for key in PREVIEW_COLUMNS}
+        learner_rows = 2 * lanes
         with cuda_model_execution(self.league.device):
             result = self.preview_cache.predict(
-                self.learner, self.league.device, rows, include_value=True
+                self.learner,
+                self.league.device,
+                preview_obs,
+                learner_rows,
+                include_value=True,
             )
             picks = result["picks"].cpu().numpy()
             log_probs = result["log_prob"].cpu().numpy()
             values = result["preview_value"].cpu().numpy().reshape(-1)
         opponent_started = perf_counter()
-        opponent_picks = self.league.vector_previews(paths, self._rows(lanes, 1))
+        opponent_picks = self.league.vector_previews(
+            paths, preview_obs, learner_rows + 1
+        )
         if self.collect_timing:
             self.timing["native_opponent_preview_sec"] += (
                 perf_counter() - opponent_started
@@ -174,7 +175,7 @@ class PikaproVectorEnv:
                 (
                     int(lane),
                     TeamPreviewEpisodeStart(
-                        rows[i],
+                        VectorInputRow(preview_obs, learner_rows[i]),
                         picks[i],
                         log_probs[i],
                         values[i],

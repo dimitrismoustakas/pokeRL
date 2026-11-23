@@ -253,26 +253,21 @@ class _LeagueInferenceService:
             "cuda_graph_last_error": self._cuda_graph_last_error,
         }
 
-    def run_ready(self, kind, rows):
-        """Batch one vector tick by checkpoint, returning results in lane order."""
+    def run_grouped(self, paths, forward):
+        """Run each checkpoint's batch on the inference worker and restore lane order."""
         self._finish_prefetches()
-        return self._worker.submit(self._run_groups, kind, list(rows)).result()
 
-    def _run_groups(self, kind, rows):
-        groups = {}
-        for lane, (path, obs, masks, hidden) in enumerate(rows):
-            groups.setdefault(path, []).append(
-                (lane, _InferenceRow(obs, masks, hidden))
-            )
-        forward = (
-            self._run_battle_batch if kind == "battle" else self._run_preview_batch
-        )
-        results = [None] * len(rows)
-        for path, group in groups.items():
-            batch = forward(path, [row for _, row in group])
-            for (lane, _), value in zip(group, batch, strict=True):
-                results[lane] = value
-        return results
+        def run():
+            groups = {}
+            for lane, path in enumerate(paths):
+                groups.setdefault(path, []).append(lane)
+            results = [None] * len(paths)
+            for path, lanes in groups.items():
+                for lane, result in zip(lanes, forward(path, lanes), strict=True):
+                    results[lane] = result
+            return results
+
+        return self._worker.submit(run).result()
 
     def close(self) -> None:
         self._worker.shutdown(wait=True)
@@ -791,7 +786,7 @@ class _LeagueInferenceService:
                 for index, action in enumerate(actions)
             ]
 
-    def _run_preview_batch(self, checkpoint_path, requests):
+    def _run_preview_batch(self, checkpoint_path, observations, indices):
         agent = self._get_agent(checkpoint_path)
         cache = self._preview_encodings.get(agent)
         if cache is None:
@@ -800,7 +795,8 @@ class _LeagueInferenceService:
             result = cache.predict(
                 agent,
                 self._device,
-                [row.obs for row in requests],
+                observations,
+                indices,
                 include_value=False,
                 greedy=self._greedy,
             )
@@ -955,16 +951,21 @@ class League:
         return self._current_update
 
     def vector_actions(self, paths, observations, masks, hidden):
-        return self._inference.run_ready(
-            "battle", zip(paths, observations, masks, hidden, strict=True)
-        )
+        def forward(path, lanes):
+            requests = [
+                _InferenceRow(observations[i], masks[i], hidden[i]) for i in lanes
+            ]
+            return self._inference._run_battle_batch(path, requests)
 
-    def vector_previews(self, paths, observations):
-        rows = (
-            (path, obs, None, None)
-            for path, obs in zip(paths, observations, strict=True)
-        )
-        return np.stack(self._preview_inference.run_ready("preview", rows))
+        return self._inference.run_grouped(paths, forward)
+
+    def vector_previews(self, paths, observations, indices):
+        def forward(path, lanes):
+            return self._preview_inference._run_preview_batch(
+                path, observations, indices[lanes]
+            )
+
+        return np.stack(self._preview_inference.run_grouped(paths, forward))
 
     def add_checkpoint(
         self,

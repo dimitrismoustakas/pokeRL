@@ -113,7 +113,9 @@ def test_opening_eject_pack_replacement_precedes_first_learner_decision(monkeypa
 
     league = SimpleNamespace(
         device=torch.device("cpu"),
-        vector_previews=lambda paths, rows: np.array([intimidate_lead, eject_lead]),
+        vector_previews=lambda paths, observations, indices: np.array(
+            [intimidate_lead, eject_lead]
+        ),
         vector_actions=choose_replacement,
     )
     monkeypatch.setattr(

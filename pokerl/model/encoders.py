@@ -380,16 +380,11 @@ class SpatialEncoder(nn.Module):
     def forward(
         self,
         obs: dict[str, torch.Tensor],
-        *,
-        include_recent_events: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             obs: dictionary with keys for own team, opponent team, field.
                  See observation.py for the exact structure.
-            include_recent_events: whether to encode transition history. Team
-                preview happens before any public event or submitted intent, so
-                that path can supply the same all-zero representation directly.
 
         Returns:
             context:     (batch, context_dim) flat battle representation
@@ -400,11 +395,7 @@ class SpatialEncoder(nn.Module):
                              opponent team, for preview auxiliaries
             opp_active_reps: (batch, 2, pokemon_dim) opponent active pokemon representations
         """
-        own_reps, own_summary = self.encode_side(obs, "own")
-        opp_reps, opp_summary = self.encode_side(obs, "opp")
-        context = self.battle_context(
-            obs, own_summary, opp_summary, include_recent_events=include_recent_events
-        )
+        context, own_reps, opp_reps = self.encode_teams(obs, include_recent_events=True)
 
         # Extract our active pokemon representations by index
         active_indices = obs["own_active_indices"]  # (batch, 2)
@@ -421,6 +412,14 @@ class SpatialEncoder(nn.Module):
         )
 
         return context, active_reps, own_reps, opp_reps, opp_active_reps
+
+    def encode_teams(self, obs, *, include_recent_events):
+        own_reps, own_summary = self.encode_side(obs, "own")
+        opp_reps, opp_summary = self.encode_side(obs, "opp")
+        context = self.battle_context(
+            obs, own_summary, opp_summary, include_recent_events=include_recent_events
+        )
+        return context, own_reps, opp_reps
 
     def encode_side(self, obs, side):
         team = self.team_own if side == "own" else self.team_opp
