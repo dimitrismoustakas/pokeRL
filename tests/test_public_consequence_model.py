@@ -146,6 +146,33 @@ def test_zero_initialized_consequence_adapter_preserves_policy_exactly() -> None
     )
 
 
+@pytest.mark.parametrize("offer_moves", [False, True])
+def test_ppo_and_rollout_agree_on_forced_switches_and_sparse_moves(
+    offer_moves: bool,
+) -> None:
+    head, inputs = _head_and_inputs()
+    joint = inputs["masks"]["joint"]
+    actions = inputs["actions"]
+    joint.zero_()
+    joint[:, 0, SWITCH_OFFSET] = True
+    actions[:, 0] = SWITCH_OFFSET
+    actions[:, 1] = SWITCH_OFFSET + 1
+    if offer_moves:
+        joint[:, 0, 19] = True
+        actions[1:, 0] = 19
+    rows = torch.arange(len(actions))
+    joint[rows, actions[:, 0] + 1, SWITCH_OFFSET + 1] = True
+    if offer_moves:
+        joint[rows, actions[:, 0] + 1, 7] = True
+        actions[:2, 1] = 7
+    with torch.no_grad():
+        head.public_consequence_policy_adapter.weight.normal_()
+        rollout = head(**inputs)
+    ppo = head(**inputs)
+    for key in ("log_prob", "entropy", "public_consequence_field_logits"):
+        torch.testing.assert_close(ppo[key], rollout[key])
+
+
 def test_actor_gradient_cannot_train_detached_world_predictions() -> None:
     head, inputs = _head_and_inputs()
     with torch.no_grad():

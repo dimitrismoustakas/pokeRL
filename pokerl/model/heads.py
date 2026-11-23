@@ -583,6 +583,7 @@ class ActionHead(nn.Module):
             public_target_reps,
             target_mechanics_1,
             field_persistence,
+            mask1,
         )
         logits1 = logits1.masked_fill(~mask1, -1e8)
         a1, log_prob1, entropy1 = self._categorical_choice(
@@ -649,6 +650,7 @@ class ActionHead(nn.Module):
             public_target_reps,
             target_mechanics_2,
             field_persistence,
+            mask2,
         )
         logits2 = logits2.masked_fill(~mask2, -1e8)
         a2, log_prob2, entropy2 = self._categorical_choice(
@@ -1020,6 +1022,7 @@ class ActionHead(nn.Module):
         public_target_reps: torch.Tensor,
         target_mechanics: torch.Tensor,
         field_persistence: torch.Tensor | None = None,
+        legal: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, _PublicConsequenceState]:
         # The first score layer is linear across these five inputs. Project each
         # query, target and offered move once before gathering the 27 action rows.
@@ -1046,44 +1049,61 @@ class ActionHead(nn.Module):
         )
         raw_logits = self.score[2](score_hidden).squeeze(-1)
 
-        # Actor gradients never enter the consequence model: the adapter consumes
-        # detached probabilities.  Decode every candidate without autograd for
-        # that policy feature, then (during PPO) recompute only the two selected
-        # candidates below so auxiliary gradients do not build a 27-action graph.
-        recompute_selected = torch.is_grad_enabled()
+        # PPO already has each slot's legal mask. The adapter only changes
+        # move scores, so decode the legal move candidates in the minibatch.
+        # CUDA rollout graphs take the fixed-shape path.
+        compact = torch.is_grad_enabled() and legal is not None
+        all_logits = None
         with torch.no_grad():
-            all_consequence_logits = self._all_public_consequence_logits(
-                score_hidden.detach(),
-                public_target_reps.detach(),
-                target_mechanics.detach(),
-                field_persistence,
-            )
-            detached_predictions = self._public_consequence_adapter_predictions(
-                all_consequence_logits,
-                matchup_features.detach(),
-            )
+            if compact:
+                rows, moves = legal[:, :SWITCH_OFFSET].nonzero(as_tuple=True)
+                hidden = score_hidden[rows, moves].unsqueeze(1)
+                persistence = (
+                    field_persistence[rows] if field_persistence is not None else None
+                )
+                decoded = self._public_consequence_action_logits(hidden, persistence)
+                decoded.update(
+                    self._public_consequence_target_logits(
+                        hidden,
+                        public_target_reps[rows],
+                        target_mechanics[rows, moves].unsqueeze(1),
+                    )
+                )
+                predictions = self._public_consequence_adapter_predictions(
+                    decoded, matchup_features[rows, moves].unsqueeze(1)
+                ).squeeze(1)
+            else:
+                all_logits = self._all_public_consequence_logits(
+                    score_hidden,
+                    public_target_reps,
+                    target_mechanics,
+                    field_persistence,
+                )
+                predictions = self._public_consequence_adapter_predictions(
+                    all_logits, matchup_features
+                )
 
-        # Value the grounded outcomes in the current slot context.  A global
-        # scalar valuation could learn that execution is generally preferable
-        # to failure, but could not express that (for example) activating Trick
-        # Room is useful for one matchup and harmful for another.
-        consequence_weights = self.public_consequence_policy_adapter(query).unsqueeze(1)
-        consequence_residual = (consequence_weights * detached_predictions).sum(
-            dim=-1
-        ) / math.sqrt(detached_predictions.shape[-1])
-        consequence_residual = consequence_residual * self._action_is_move.to(
-            dtype=consequence_residual.dtype
-        ).unsqueeze(0)
+        weights = self.public_consequence_policy_adapter(query)
+        if compact:
+            residual = (weights[rows] * predictions).sum(-1) / math.sqrt(
+                predictions.shape[-1]
+            )
+            logits = raw_logits.index_put((rows, moves), residual, accumulate=True)
+        else:
+            residual = (weights.unsqueeze(1) * predictions).sum(-1) / math.sqrt(
+                predictions.shape[-1]
+            )
+            logits = raw_logits + residual * self._action_is_move.to(
+                residual.dtype
+            ).unsqueeze(0)
         state = _PublicConsequenceState(
-            score_hidden=score_hidden,
-            public_target_reps=public_target_reps,
-            target_mechanics=target_mechanics,
-            # In inference the already decoded tensors are also the selected
-            # output.  PPO needs a gradient-bearing selected recomputation.
-            all_logits=None if recompute_selected else all_consequence_logits,
-            field_persistence=field_persistence,
+            score_hidden,
+            public_target_reps,
+            target_mechanics,
+            None if torch.is_grad_enabled() else all_logits,
+            field_persistence,
         )
-        return raw_logits + consequence_residual, state
+        return logits, state
 
     @staticmethod
     def _field_persistence(
@@ -1329,9 +1349,6 @@ class ActionHead(nn.Module):
             ],
             dim=-1,
         ).flatten(start_dim=-2)
-        target_predictions = target_predictions * self._action_is_move.to(
-            dtype=target_predictions.dtype
-        ).view(1, self.num_actions, 1)
         return torch.cat(
             [
                 move_event_probabilities,
