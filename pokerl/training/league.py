@@ -384,9 +384,8 @@ class _LeagueInferenceService:
     ):
         """Run one logical request batch through bounded fixed-shape graphs."""
         chunk_size = self._cuda_graph_batch_size
-        chunk_results: list[
-            tuple[np.ndarray, list[tuple[torch.Tensor, torch.Tensor] | None]]
-        ] = []
+        chunks = range(0, len(requests), chunk_size)
+        hidden_rows = []
 
         saved_rng: torch.Tensor | None = None
         try:
@@ -396,7 +395,14 @@ class _LeagueInferenceService:
                     agent,
                     len(requests),
                 )
-                for start in range(0, len(requests), chunk_size):
+                actions = torch.empty(
+                    (len(requests), 3), dtype=torch.long, device="cpu", pin_memory=True
+                )
+                inputs_copied = torch.cuda.Event() if len(chunks) > 1 else None
+                for start in chunks:
+                    if start:
+                        # The same pinned inputs are refilled for the next graph.
+                        inputs_copied.synchronize()
                     stop = min(start + chunk_size, len(requests))
                     chunk = requests[start:stop]
                     chunk_masks = request_masks[start:stop]
@@ -410,9 +416,11 @@ class _LeagueInferenceService:
                     if executor.graph is None:
                         self._capture_cuda_graph(executor, agent, chunk)
 
-                    actions, hidden_views = self._replay_cuda_graph(
+                    hidden_views = self._replay_cuda_graph(
                         executor,
                         chunk,
+                        actions[start:stop],
+                        inputs_copied,
                         sampling_exponentials=(
                             None
                             if sampling_exponentials is None
@@ -422,12 +430,15 @@ class _LeagueInferenceService:
                         ),
                     )
 
-                    chunk_results.append((actions, hidden_views))
+                    hidden_rows.extend(hidden_views)
+                self._cuda_stream.synchronize()
         except Exception as exc:
             # Capture is an optional execution optimization. Restore the exact
             # pre-attempt RNG state so eager fallback samples the same policy it
             # would have sampled if graphs had never been attempted.
             with cuda_model_execution(self._device):
+                if self._cuda_stream is not None:
+                    self._cuda_stream.synchronize()
                 if saved_rng is not None:
                     torch.cuda.set_rng_state(saved_rng, self._device)
                 self._cuda_graph_fallbacks += 1
@@ -436,15 +447,10 @@ class _LeagueInferenceService:
                 self._clear_cuda_graphs()
             return None
 
-        self._cuda_graph_replays += len(chunk_results)
+        self._cuda_graph_replays += len(chunks)
         self._cuda_graph_real_rows += len(requests)
-        self._cuda_graph_padded_rows += len(chunk_results) * chunk_size - len(requests)
-
-        return [
-            pair
-            for actions, hidden in chunk_results
-            for pair in zip(actions, hidden, strict=True)
-        ]
+        self._cuda_graph_padded_rows += len(chunks) * chunk_size - len(requests)
+        return list(zip(actions.numpy(), hidden_rows, strict=True))
 
     def _make_sampling_exponentials(
         self,
@@ -693,18 +699,22 @@ class _LeagueInferenceService:
         self,
         executor: _CudaGraphExecutor,
         requests: list[_InferenceRow],
+        actions: torch.Tensor,
+        inputs_copied: torch.cuda.Event | None,
         sampling_exponentials: tuple[
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
         ]
         | None,
-    ) -> tuple[np.ndarray, list[tuple[torch.Tensor, torch.Tensor] | None]]:
+    ) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
         if self._cuda_stream is None or executor.graph is None:
             raise RuntimeError("CUDA graph executor was not captured.")
         batch_size = len(requests)
         with torch.cuda.stream(self._cuda_stream), torch.inference_mode():
             self._copy_cuda_graph_inputs(executor)
+            if inputs_copied is not None:
+                inputs_copied.record(self._cuda_stream)
             self._stage_cuda_graph_hidden(executor, requests)
             if executor.sampling_exponentials is None:
                 raise RuntimeError("CUDA graph sampling inputs were not allocated.")
@@ -726,15 +736,9 @@ class _LeagueInferenceService:
                     output_hidden[0][:, :batch_size].clone(),
                     output_hidden[1][:, :batch_size].clone(),
                 )
-        self._cuda_stream.synchronize()
-        actions_tensor = executor.output.get("actions")
-        if not isinstance(actions_tensor, torch.Tensor):
-            raise RuntimeError("CUDA graph output omitted actions.")
-        actions = actions_tensor[:batch_size].cpu().numpy()
-        hidden_views = [
-            self._slice_hidden(stable_hidden, index) for index in range(batch_size)
-        ]
-        return actions, hidden_views
+            actions_tensor = executor.output["actions"]
+            actions.copy_(actions_tensor[:batch_size], non_blocking=True)
+        return [self._slice_hidden(stable_hidden, index) for index in range(batch_size)]
 
     def _evict_cuda_graph(self, checkpoint_path: str) -> None:
         executor = self._cuda_graphs.pop(checkpoint_path, None)
