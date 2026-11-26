@@ -450,6 +450,7 @@ class PPOTrainer:
             )
         )
         if hidden_info_enabled:
+            hidden_info_slot_mask = aux_label_valid_all & ~aux_labels_all["opp_mask"]
             metric_sums["aux_hidden_info_loss"] = torch.zeros((), device=self.device)
         if opponent_intent_enabled:
             metric_sums["aux_opponent_intent_loss"] = torch.zeros(
@@ -485,6 +486,15 @@ class PPOTrainer:
                 mb_envs = mb_envs_cpu.to(device=self.device)
                 preview_indices = preview_indices_cpu.to(device=self.device)
                 E_mb = mb_envs.numel()
+
+                if hidden_info_enabled:
+                    # The policy uses every opponent slot. Only the auxiliary
+                    # decoder and its targets use these supervised rows.
+                    labeled_slots = hidden_info_slot_mask[:, mb_envs].nonzero(
+                        as_tuple=True
+                    )
+                    step, local_env, slot = labeled_slots
+                    rollout_slots = (step, mb_envs[local_env], slot)
 
                 mb_obs_seq = {k: v[:, mb_envs] for k, v in obs_seq.items()}
                 mb_actions_seq = actions_seq[:, mb_envs]  # (T, E_mb, 3)
@@ -949,11 +959,12 @@ class PPOTrainer:
                 public_consequence_persistence_mb = None
                 if hidden_info_enabled:
                     aux_labels_mb = {
-                        key: value[:, mb_envs] for key, value in aux_labels_all.items()
+                        key: value[rollout_slots]
+                        for key, value in aux_labels_all.items()
                     }
-                    aux_label_valid_mb = aux_label_valid_all[:, mb_envs]
+                    aux_label_valid_mb = aux_label_valid_all[rollout_slots]
                     hidden_info_out = self.agent.hidden_info_head.decode(
-                        belief_opp_reps_seq_mb,
+                        belief_opp_reps_seq_mb[labeled_slots],
                     )
                     hidden_info_loss = self._hidden_info_loss(
                         logits=hidden_info_out,
@@ -1058,7 +1069,14 @@ class PPOTrainer:
                                 hidden_info_out,
                                 aux_labels_mb,
                                 aux_label_valid_mb,
-                                mb_obs_seq,
+                                {
+                                    key: mb_obs_seq[key][labeled_slots]
+                                    for key in (
+                                        "opp_mask",
+                                        "opp_continuous",
+                                        "opp_moves",
+                                    )
+                                },
                             )
                         )
                     if opponent_intent_out is not None:
@@ -1097,7 +1115,7 @@ class PPOTrainer:
                     support_names = []
                     if hidden_info_loss is not None:
                         support_names.append("memory_grad_hidden_info_valid_slots")
-                        support_tensors.append(aux_label_valid_mb.sum())
+                        support_tensors.append(aux_label_valid_all[:, mb_envs].sum())
                     if opponent_intent_loss is not None:
                         support_names.append(
                             "memory_grad_opponent_intent_valid_components"
@@ -1882,17 +1900,15 @@ class PPOTrainer:
         labels: dict[str, torch.Tensor],
         label_valid: torch.Tensor,
     ) -> torch.Tensor:
-        """Masked CE/BCE against exact selected-team terminal labels."""
-        opp_pad = labels["opp_mask"]  # (T, E_mb, 6) True if padding slot
-        opp_cont = labels["opp_continuous"]  # (T, E_mb, 6, cont_dim)
+        """Masked CE/BCE over the supplied opponent slots and their exact labels."""
+        opp_pad = labels["opp_mask"]
+        opp_cont = labels["opp_continuous"]
         item_known = opp_cont[..., ITEM_KNOWN_OFFSET] > 0.5
         ability_known = opp_cont[..., ABILITY_KNOWN_OFFSET] > 0.5
         tera_known = opp_cont[..., TERA_KNOWN_OFFSET] > 0.5
 
         if label_valid.shape != opp_pad.shape:
-            raise ValueError(
-                "Hidden-info validity must have shape (steps, envs, team_size)."
-            )
+            raise ValueError("Hidden-info validity must match the opponent slots.")
         base_mask = label_valid & ~opp_pad
 
         item_mask = (base_mask & item_known).reshape(-1)
@@ -1908,7 +1924,7 @@ class PPOTrainer:
         tera_logits = logits["tera_type_logits"].reshape(
             -1, logits["tera_type_logits"].shape[-1]
         )
-        move_logits = logits["move_logits"]  # (T, E_mb, 6, num_moves)
+        move_logits = logits["move_logits"]
 
         item_labels = labels["opp_item"].reshape(-1)
         ability_labels = labels["opp_ability"].reshape(-1)
@@ -1932,7 +1948,7 @@ class PPOTrainer:
         # Multi-hot move labels from slot indices. Slot value 0 is "no move" and
         # is not a valid move id, so we ignore it. A pokemon's label is valid if
         # at least one move slot is > 0.
-        move_slots = labels["opp_moves"]  # (T, E_mb, 6, 4)
+        move_slots = labels["opp_moves"]
         num_moves = move_logits.shape[-1]
         multihot = torch.zeros_like(move_logits)
         valid_slot = move_slots > 0
@@ -1941,7 +1957,7 @@ class PPOTrainer:
         # Zero out slot 0 contribution (it was set to 1.0 anywhere safe_slots==0).
         multihot[..., 0] = 0.0
 
-        move_slot_mask = base_mask & valid_slot.any(dim=-1)  # (T, E_mb, 6)
+        move_slot_mask = base_mask & valid_slot.any(dim=-1)
         if move_slot_mask.any():
             move_loss_raw = F.binary_cross_entropy_with_logits(
                 move_logits, multihot, reduction="none"
