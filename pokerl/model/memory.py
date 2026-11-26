@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import PackedSequence
@@ -25,50 +26,35 @@ def _build_packed_lstm_plan(dones: torch.Tensor) -> _PackedLSTMPlan:
         raise ValueError("Packed LSTM dones must have shape (steps, envs).")
 
     num_steps, num_envs = dones.shape
-    done_rows = dones.tolist()
-    fragments: list[tuple[int, int, int]] = []
-    for env_index in range(num_envs):
-        start = 0
-        for step, done_row in enumerate(done_rows):
-            if not done_row[env_index]:
-                continue
-            fragments.append((env_index, start, step + 1 - start))
-            start = step + 1
-        if start < num_steps:
-            fragments.append((env_index, start, num_steps - start))
+    terminal = dones.numpy().T.copy()
+    terminal[:, -1] = True
+    env, last_step = np.nonzero(terminal)
+    ends = last_step + 1
+    starts = np.zeros_like(ends)
+    starts[1:] = np.where(env[1:] == env[:-1], ends[:-1], 0)
+    lengths = ends - starts
 
-    fragments.sort(key=lambda fragment: (-fragment[2], fragment[0], fragment[1]))
-    max_length = fragments[0][2]
-    batch_sizes = torch.tensor(
-        [
-            sum(length > sequence_step for _, _, length in fragments)
-            for sequence_step in range(max_length)
-        ],
-        dtype=torch.int64,
-    )
+    # Equal-length sequences retain environment and start-time order.
+    order = np.argsort(-lengths, kind="stable")
+    env, starts, lengths = env[order], starts[order], lengths[order]
+    time = np.arange(lengths[0])
+    batch_sizes = np.searchsorted(-lengths, -time)
 
-    gather_indices = torch.tensor(
-        [
-            (start + sequence_step) * num_envs + env_index
-            for sequence_step, active_count in enumerate(batch_sizes.tolist())
-            for env_index, start, _ in fragments[:active_count]
-        ],
-        dtype=torch.int64,
-    )
-    initial_state_indices = torch.tensor(
-        [env_index if start == 0 else num_envs for env_index, start, _ in fragments],
-        dtype=torch.int64,
-    )
-    final_state_indices = torch.empty(num_envs, dtype=torch.int64)
-    for fragment_index, (env_index, start, length) in enumerate(fragments):
-        if start + length == num_steps:
-            final_state_indices[env_index] = fragment_index
+    # PackedSequence concatenates one row of active fragments at each time.
+    row_starts = np.cumsum(batch_sizes) - batch_sizes
+    packed_time = np.repeat(time, batch_sizes)
+    fragment = np.arange(num_steps * num_envs) - row_starts[packed_time]
+    gather_indices = (starts[fragment] + packed_time) * num_envs + env[fragment]
+    initial_state_indices = np.where(starts == 0, env, num_envs)
+    final_fragments = np.flatnonzero(ends[order] == num_steps)
+    final_state_indices = np.empty(num_envs, dtype=np.int64)
+    final_state_indices[env[final_fragments]] = final_fragments
 
     return _PackedLSTMPlan(
-        gather_indices=gather_indices,
-        batch_sizes=batch_sizes,
-        initial_state_indices=initial_state_indices,
-        final_state_indices=final_state_indices,
+        gather_indices=torch.from_numpy(gather_indices),
+        batch_sizes=torch.from_numpy(batch_sizes),
+        initial_state_indices=torch.from_numpy(initial_state_indices),
+        final_state_indices=torch.from_numpy(final_state_indices),
     )
 
 

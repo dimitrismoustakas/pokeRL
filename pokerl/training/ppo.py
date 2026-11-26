@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ..config import TrainingConfig
 from ..env.actions import (
@@ -219,6 +220,18 @@ class PPOTrainer:
 
         Returns a dict of loss metrics for logging.
         """
+        # Six-token FP32 team attention is faster with the math kernel on Turing.
+        if (
+            self.device.type == "cuda"
+            and self._trainable_params[0].dtype == torch.float32
+            and not torch.is_autocast_enabled("cuda")
+            and torch.cuda.get_device_capability(self.device) == (7, 5)
+        ):
+            with sdpa_kernel(SDPBackend.MATH):
+                return self._update(batch)
+        return self._update(batch)
+
+    def _update(self, batch: RolloutBatch) -> dict[str, float]:
         T = batch.num_steps
         E = batch.num_envs
         if self.config.num_minibatches > E:
