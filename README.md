@@ -27,7 +27,7 @@ On the local 4 GB Quadro T2000, use `--device cuda --num-epochs 4 --opponent-gro
 | `--num-envs` | `--rollout-steps` | Decisions per update | `--num-minibatches` | Frozen inference batch | Cache size |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 576 | 32 | 18,432 | 8 | 72 | 5 |
-| 576 | 16 | 9,216 | 4 | 72 | 6 |
+| 576 | 16 | 9,216 | 4 | 72 | 8 |
 | 144 | 64 | 9,216 | 4 | 36 | 4 |
 
 Set the frozen inference batch with `--league-cuda-graph-batch-size`. Set both `--league-size` and `--league-cuda-graph-cache-size` to the cache size. `--league-sampler` accepts `random` or `balanced`.
