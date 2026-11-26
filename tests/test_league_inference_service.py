@@ -1,5 +1,4 @@
 from contextlib import contextmanager
-from collections import OrderedDict
 
 import pytest
 import numpy as np
@@ -362,55 +361,34 @@ def test_action_batch_size_profile_accumulates_once_per_batch() -> None:
     }
 
 
-def test_league_inference_model_cache_is_lru_bounded() -> None:
-    service = _service_stub()
-    service._models = OrderedDict()
-    service._max_models = 2
-    loaded: dict[str, object] = {}
+def test_league_reuses_evicted_model_storage_for_new_weights(tmp_path) -> None:
+    service = _LeagueInferenceService(
+        torch.nn.Linear(1, 1, bias=False), torch.device("cpu"), max_models=2
+    )
+    paths = [str(tmp_path / f"{i}.pt") for i in range(3)]
+    for i, path in enumerate(paths):
+        torch.save({"agent": {"weight": torch.tensor([[float(i)]])}}, path)
+    try:
+        first = service._get_agent(paths[0])
+        second = service._get_agent(paths[1])
+        storage = second.weight.data_ptr()
+        assert service._get_agent(paths[0]) is first
+        third = service._get_agent(paths[2])
+        assert third.weight.data_ptr() == storage
+        assert third.weight.item() == 2
+        assert first.weight.item() == 0
+        assert list(service._models) == [paths[0], paths[2]]
 
-    def load_agent(path: str):
-        return loaded.setdefault(path, object())
+        def predict(path, lanes):
+            return [service._get_agent(path).weight.item()] * len(lanes)
 
-    service._load_agent = load_agent
-
-    first = service._get_agent("first.pt")
-    service._get_agent("second.pt")
-    assert service._get_agent("first.pt") is first
-    service._get_agent("third.pt")
-
-    assert list(service._models) == ["first.pt", "third.pt"]
-    assert service.cache_info() == {
-        "capacity": 2,
-        "resident_models": 2,
-        "hits": 1,
-        "misses": 3,
-        "loads": 3,
-        "evictions": 1,
-        "action_batch_size_histogram": {
-            "1": 0,
-            "2": 0,
-            "3-4": 0,
-            "5-8": 0,
-            "9-12": 0,
-            "13-16": 0,
-            "17-24": 0,
-            "25-36": 0,
-            ">36": 0,
-        },
-        "cuda_graphs_enabled": False,
-        "cuda_graph_batch_size": 16,
-        "cuda_graph_capacity": 4,
-        "resident_cuda_graphs": 0,
-        "cuda_graph_hits": 0,
-        "cuda_graph_misses": 0,
-        "cuda_graph_captures": 0,
-        "cuda_graph_replays": 0,
-        "cuda_graph_evictions": 0,
-        "cuda_graph_fallbacks": 0,
-        "cuda_graph_real_rows": 0,
-        "cuda_graph_padded_rows": 0,
-        "cuda_graph_last_error": None,
-    }
+        # For B, A, C with A and C resident, C can wait until A has run.
+        lanes = [paths[i] for i in (1, 0, 1, 2)]
+        before = service.cache_info()["loads"]
+        assert service.run_grouped(lanes, predict) == [1, 0, 1, 2]
+        assert service.cache_info()["loads"] - before == 2
+    finally:
+        service.close()
 
 
 def test_league_staging_packs_cpu_before_entering_cuda_guard(

@@ -1372,6 +1372,10 @@ class ActionHead(nn.Module):
             not self.training
             and all(not parameter.requires_grad for parameter in parameters)
         )
+        # A replay can use new weights in the same model storage. Capture the
+        # embeddings that produce these features with the rest of the forward.
+        if cache_allowed and self._action_ids.is_cuda:
+            cache_allowed = not torch.cuda.is_current_stream_capturing()
         cache_key = (
             tuple(
                 (

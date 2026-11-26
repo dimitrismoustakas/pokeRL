@@ -9,7 +9,6 @@ from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from weakref import WeakKeyDictionary
 
 import numpy as np
 import torch
@@ -113,9 +112,8 @@ def _shared_vector_columns(rows):
 
 @dataclass
 class _CudaGraphExecutor:
-    """One fixed-shape CUDA graph tied to a frozen checkpoint's parameters."""
+    """One fixed-shape CUDA graph bound to a resident model's storage."""
 
-    checkpoint_path: str
     obs_schema: BatchSchema
     masks_schema: BatchSchema
     obs_host: PackedInputs
@@ -187,7 +185,7 @@ class _LeagueInferenceService:
         self._agent_template.requires_grad_(False)
         self._device = device
         self._cuda_stream: torch.cuda.Stream | None = None
-        self._preview_encodings = WeakKeyDictionary()
+        self._preview_encodings: dict[str, TeamPreviewCache] = {}
         self._greedy = greedy
         self._max_models = max_models
         self._models: OrderedDict[str, PokeAgent] = OrderedDict()
@@ -263,7 +261,20 @@ class _LeagueInferenceService:
             for lane, path in enumerate(paths):
                 groups.setdefault(path, []).append(lane)
             results = [None] * len(paths)
+            remaining = {path: order for order, path in enumerate(groups)}
             for path, lanes in groups.items():
+                del remaining[path]
+                if (
+                    remaining
+                    and len(self._models) == self._max_models
+                    and path not in self._models
+                ):
+                    # Evict an unused opponent first, otherwise the one needed
+                    # last in this batch. Ties retain least-recently-used order.
+                    victim = max(
+                        self._models, key=lambda name: remaining.get(name, len(groups))
+                    )
+                    self._models.move_to_end(victim, last=False)
                 for lane, result in zip(lanes, forward(path, lanes), strict=True):
                     results[lane] = result
             return results
@@ -278,6 +289,7 @@ class _LeagueInferenceService:
             with cuda_model_execution(self._device):
                 self._clear_cuda_graphs()
                 self._models.clear()
+                self._preview_encodings.clear()
                 self._device_batch_buffers.clear()
             self._host_batch_buffers.clear()
 
@@ -512,7 +524,6 @@ class _LeagueInferenceService:
                 pin_memory=True,
             )
             executor = _CudaGraphExecutor(
-                checkpoint_path=checkpoint_path,
                 obs_schema=obs_schema,
                 masks_schema=masks_schema,
                 obs_host=obs_host,
@@ -793,9 +804,9 @@ class _LeagueInferenceService:
 
     def _run_preview_batch(self, checkpoint_path, observations, indices):
         agent = self._get_agent(checkpoint_path)
-        cache = self._preview_encodings.get(agent)
+        cache = self._preview_encodings.get(checkpoint_path)
         if cache is None:
-            cache = self._preview_encodings[agent] = TeamPreviewCache()
+            cache = self._preview_encodings[checkpoint_path] = TeamPreviewCache()
         with cuda_model_execution(self._device), self._device_execution_context():
             result = cache.predict(
                 agent,
@@ -816,23 +827,24 @@ class _LeagueInferenceService:
         agent = self._load_agent(checkpoint_path)
         self._models[checkpoint_path] = agent
         self._cache_loads += 1
-        if len(self._models) > self._max_models:
-            with cuda_model_execution(self._device):
-                path, expired = self._models.popitem(last=False)
-                self._evict_cuda_graph(path)
-                del expired
-                self._cache_evictions += 1
         return agent
 
     def _load_agent(self, checkpoint_path: str) -> PokeAgent:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        agent_copy = copy.deepcopy(self._agent_template)
-        agent_copy.load_state_dict(checkpoint["agent"])
+        graph = None
         with cuda_model_execution(self._device):
-            agent_copy.to(self._device)
-        agent_copy.eval()
-        agent_copy.requires_grad_(False)
-        return agent_copy
+            if len(self._models) < self._max_models:
+                agent = copy.deepcopy(self._agent_template).to(self._device)
+            else:
+                old_path, agent = self._models.popitem(last=False)
+                self._preview_encodings.pop(old_path, None)
+                graph = self._cuda_graphs.pop(old_path, None)
+                self._cache_evictions += 1
+            # Copy into the same parameter storage read by the captured graph.
+            agent.load_state_dict(checkpoint["agent"])
+            if graph is not None:
+                self._cuda_graphs[checkpoint_path] = graph
+        return agent
 
     def _build_hidden_batch(
         self,

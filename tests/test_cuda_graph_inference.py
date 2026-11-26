@@ -17,6 +17,7 @@ from pokerl.env.observation import (
     ROLE_BENCH,
 )
 from pokerl.model.agent import PokeAgent
+from pokerl.model.preview_cache import TeamPreviewCache
 from pokerl.team_pool import default_team_pool_manifest_path, load_team_pool
 from pokerl.training.league import _InferenceRow, _LeagueInferenceService
 from pokerl.training.rollout_policy import RolloutPolicy
@@ -338,20 +339,26 @@ def test_learner_graph_matches_eager_on_changing_inputs_and_hidden_state() -> No
         hidden = eager["hidden"]
 
 
-def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() -> None:
+def test_full_agent_graph_matches_eager_across_batches_and_weight_swaps(
+    tmp_path,
+) -> None:
     game_data, one_obs, one_masks = _full_agent_inputs()
     torch.manual_seed(77)
     torch.cuda.manual_seed_all(77)
     agent = PokeAgent(ModelConfig(), game_data).cuda().eval().requires_grad_(False)
+    first, second = (str(tmp_path / f"{name}.pt") for name in ("first", "second"))
+    torch.save({"agent": agent.state_dict()}, first)
+    other = PokeAgent(ModelConfig(), game_data)
+    torch.save({"agent": other.state_dict()}, second)
     service = _LeagueInferenceService(
         agent,
         torch.device("cuda"),
-        max_models=2,
+        max_models=1,
         enable_cuda_graphs=True,
     )
-    service._models["full.pt"] = agent
     try:
-        for batch_size in (1, 23, 36, 72):
+        for batch_size, path in ((1, first), (23, second), (36, first), (72, second)):
+            agent.load_state_dict(torch.load(path, map_location="cpu")["agent"])
             obs_np = {
                 key: np.repeat(value[None, ...], batch_size, axis=0)
                 for key, value in one_obs.items()
@@ -396,7 +403,7 @@ def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() 
                 )
                 for index in range(batch_size)
             ]
-            graph_results = _run(service, requests, path="full.pt")
+            graph_results = _run(service, requests, path=path)
             graph_actions = np.stack([result[0] for result in graph_results])
             graph_hidden = (
                 torch.cat([result[1][0].cpu() for result in graph_results], dim=1),
@@ -412,7 +419,23 @@ def test_full_agent_eager_and_graph_match_actions_and_cuda_rng_across_batches() 
             assert torch.allclose(
                 graph_hidden[1], eager_hidden[1], atol=5e-7, rtol=0
             ), f"cell-state max abs error: {cell_max_abs_error.item():.3g}"
+            preview_rng = torch.cuda.get_rng_state()
+            lanes = np.arange(batch_size)
+            expected_picks = (
+                TeamPreviewCache()
+                .predict(
+                    agent, torch.device("cuda"), obs_np, lanes, include_value=False
+                )["picks"]
+                .cpu()
+                .numpy()
+            )
+            torch.cuda.set_rng_state(preview_rng)
+            actual_picks = service._worker.submit(
+                service._run_preview_batch, path, obs_np, lanes
+            ).result()
+            np.testing.assert_array_equal(actual_picks, expected_picks)
         info = service.cache_info()
+        assert info["cuda_graph_captures"] == 1
         assert info["cuda_graph_fallbacks"] == 0
         assert info["cuda_graph_last_error"] is None
     finally:
