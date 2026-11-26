@@ -340,7 +340,7 @@ class ActionHead(nn.Module):
         )
         self.public_consequence_target_head = nn.Linear(
             target_consequence_dim,
-            2 + NUM_TARGET_INTERACTION_REASONS + MAX_PUBLIC_HIT_COUNT,
+            3 + NUM_TARGET_INTERACTION_REASONS + MAX_PUBLIC_HIT_COUNT,
         )
         self.public_consequence_policy_adapter = nn.Linear(
             hidden_dim,
@@ -801,6 +801,7 @@ class ActionHead(nn.Module):
                 "interaction_logits",
                 "interaction_reason_logits",
                 "hit_count_logits",
+                "damage_prediction",
                 "cant_logits",
                 "field_logits",
                 "field_probs",
@@ -1224,8 +1225,9 @@ class ActionHead(nn.Module):
             interaction_logits,
             interaction_reason_logits,
             hit_count_logits,
+            damage_prediction,
         ) = target_consequence_logits.split(
-            (1, 1, NUM_TARGET_INTERACTION_REASONS, MAX_PUBLIC_HIT_COUNT),
+            (1, 1, NUM_TARGET_INTERACTION_REASONS, MAX_PUBLIC_HIT_COUNT, 1),
             dim=-1,
         )
         route_logits = route_logits.squeeze(-1)
@@ -1235,6 +1237,7 @@ class ActionHead(nn.Module):
             "interaction_logits": interaction_logits,
             "interaction_reason_logits": interaction_reason_logits,
             "hit_count_logits": hit_count_logits,
+            "damage_prediction": damage_prediction.squeeze(-1),
         }
 
     def _all_public_consequence_logits(

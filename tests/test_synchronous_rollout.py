@@ -191,7 +191,14 @@ class _ScriptedParallelEnv:
             key: np.stack([observation[key] for observation in next_observations])
             for key in next_observations[0]
         }
-        return batched_obs, _batched_masks(self.num_envs), rewards, dones, infos
+        return (
+            batched_obs,
+            _batched_masks(self.num_envs),
+            rewards,
+            dones,
+            infos,
+            np.empty((self.num_envs, 0, 4), np.float32),
+        )
 
 
 def test_collect_synchronous_rollout_prefers_private_exact_labels_and_preserves_sequences(
@@ -283,6 +290,7 @@ class _MissingFinalObservationEnv:
             np.asarray([1.0], dtype=np.float32),
             np.asarray([True]),
             [{}],
+            np.empty((1, 0, 4), np.float32),
         )
 
 
@@ -385,6 +393,7 @@ class _ConsequenceAlignmentEnv:
             np.asarray([0.0], dtype=np.float32),
             np.asarray([done]),
             [info],
+            np.full((1, 1, 4), -1, np.float32),
         )
 
 

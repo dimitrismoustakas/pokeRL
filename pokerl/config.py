@@ -66,6 +66,7 @@ class TrainingConfig:
     aux_hidden_info_coef: float = 0.25
     aux_opponent_intent_coef: float = 0.25
     aux_public_consequence_coef: float = 0.1
+    aux_damage_coef: float = 0.0
     diagnose_memory_gradients: bool = False
 
     # Batching
@@ -180,6 +181,7 @@ class TrainingConfig:
             ("tera_slot_entropy_coef", self.tera_slot_entropy_coef),
             ("aux_hidden_info_coef", self.aux_hidden_info_coef),
             ("aux_opponent_intent_coef", self.aux_opponent_intent_coef),
+            ("aux_damage_coef", self.aux_damage_coef),
         ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(

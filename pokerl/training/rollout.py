@@ -73,6 +73,8 @@ class RolloutBatch:
     public_consequence_interaction_reason_masks: torch.Tensor
     public_consequence_hit_count_labels: torch.Tensor
     public_consequence_hit_count_masks: torch.Tensor
+    public_consequence_damage_targets: torch.Tensor
+    public_consequence_damage_masks: torch.Tensor
     public_consequence_cant_targets: torch.Tensor  # (steps, envs, 2, 2) float
     public_consequence_cant_masks: torch.Tensor  # (steps, envs, 2, 2) bool
     public_consequence_field_targets: torch.Tensor  # (steps, envs, 2, 33) float
@@ -255,7 +257,7 @@ class RolloutBuffer:
                 ),
             )
         target_shape = (num_steps, num_envs, 2, NUM_PUBLIC_TARGET_POSITIONS)
-        for target_name in ("route", "interaction"):
+        for target_name in ("route", "interaction", "damage"):
             setattr(
                 self,
                 f"_public_consequence_{target_name}_targets",
@@ -437,6 +439,8 @@ class RolloutBuffer:
         public_consequence_interaction_reason_masks: torch.Tensor | None = None,
         public_consequence_hit_count_labels: torch.Tensor | None = None,
         public_consequence_hit_count_masks: torch.Tensor | None = None,
+        public_consequence_damage_targets: torch.Tensor | None = None,
+        public_consequence_damage_masks: torch.Tensor | None = None,
         public_consequence_cant_targets: torch.Tensor | None = None,
         public_consequence_cant_masks: torch.Tensor | None = None,
         public_consequence_field_targets: torch.Tensor | None = None,
@@ -498,6 +502,8 @@ class RolloutBuffer:
             "interaction_reason_masks": public_consequence_interaction_reason_masks,
             "hit_count_labels": public_consequence_hit_count_labels,
             "hit_count_masks": public_consequence_hit_count_masks,
+            "damage_targets": public_consequence_damage_targets,
+            "damage_masks": public_consequence_damage_masks,
         }
         for consequence_name, consequence_value in consequence_values.items():
             destination = getattr(self, f"_public_consequence_{consequence_name}")[slot]
@@ -680,6 +686,8 @@ class RolloutBuffer:
             public_consequence_hit_count_masks=(
                 self._public_consequence_hit_count_masks
             ),
+            public_consequence_damage_targets=self._public_consequence_damage_targets,
+            public_consequence_damage_masks=self._public_consequence_damage_masks,
             public_consequence_cant_targets=self._public_consequence_cant_targets,
             public_consequence_cant_masks=self._public_consequence_cant_masks,
             public_consequence_field_targets=self._public_consequence_field_targets,
@@ -823,7 +831,7 @@ class RolloutBuffer:
         ):
             getattr(self, f"_public_consequence_{label_name}_labels").fill_(-1)
             getattr(self, f"_public_consequence_{label_name}_masks").fill_(False)
-        for target_name in ("route", "interaction"):
+        for target_name in ("route", "interaction", "damage"):
             getattr(self, f"_public_consequence_{target_name}_targets").zero_()
             getattr(self, f"_public_consequence_{target_name}_masks").fill_(False)
         self._public_consequence_cant_targets.zero_()

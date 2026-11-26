@@ -2,9 +2,9 @@
 
 ## Battle simulation and observations
 
-[Pikapro’s Rust vector environment](../vendor/pikapro-player-inputs.patch) runs Regulation F doubles in process. Each lane holds one battle. Both players bring four Pokémon from six at level 50. The collector records each seat’s own exact stats, public opposing HP, revealed moves and items, field state, recent events and legal actions. Private opponent attributes are available separately as training labels.
+[Pikapro’s Rust vector environment](../vendor/pikapro-player-inputs.patch) runs Regulation F doubles in process. Each lane holds one battle. Both players bring four Pokémon from six at level 50. The collector records each seat’s own exact stats, public opposing HP, revealed moves and items, field state, recent events and legal actions. The player sees when an item was lost and which stat Protosynthesis or Quark Drive currently boosts. Private opponent attributes are available separately as training labels.
 
-Our Rust changes are in the [Python extension binding](../vendor/pikapro-player-inputs.patch#L27), [public action tracker](../vendor/pikapro-player-inputs.patch#L822) and [player-view updates](../vendor/pikapro-player-inputs.patch#L1414). The build uses the complete patched Rust sources in [the Pikapro source distribution](../vendor/pikapro-0.2.0+pokerl.1.tar.gz). On Windows the result is an importable Python extension (`.pyd`). [The Python collector](../pokerl/env/vector.py) feeds the arrays to PyTorch, batches opponents by checkpoint, and resets finished lanes. Pikapro also runs paired policy evaluation. Pokémon Showdown checks the legality of external teams on import.
+Our Rust changes are in the [Python extension binding](../vendor/pikapro-player-inputs.patch#L27), [public action tracker](../vendor/pikapro-player-inputs.patch#L840) and [player-view updates](../vendor/pikapro-player-inputs.patch#L1458). The build uses the complete patched Rust sources in [the Pikapro source distribution](../vendor/pikapro-0.2.0+pokerl.1.tar.gz). On Windows the result is an importable Python extension (`.pyd`). [The Python collector](../pokerl/env/vector.py) feeds the arrays to PyTorch, batches opponents by checkpoint, and resets finished lanes. Pikapro also runs paired policy evaluation. Pokémon Showdown checks the legality of external teams on import.
 
 ## Policy
 
@@ -14,7 +14,7 @@ At team preview the policy chooses one of 15 four-member subsets, then one of 12
 
 [The battle head](../pokerl/model/heads.py) chooses the first active Pokémon’s action, the second Pokémon’s action conditional on the first, then whether and where to Terastallize. A move candidate carries its identity, target and mechanics. All four menu positions share the scoring weights. Permuting the live menu permutes the corresponding scores and legal masks. The selected indices are mapped back to simulator orders.
 
-The policy also predicts hidden attributes, opponent actions and public consequences. The action head can use predictions derived from the player’s observations. Exact supervision stays in the rollout and loss computation.
+The policy also predicts hidden attributes, opponent actions and public consequences. The action head can use predictions derived from the player’s observations. Exact supervision stays in the rollout and loss computation. A positive `--aux-damage-coef` trains the move-and-target head to predict the fraction of visible HP lost to a selected attack. The reward is the battle result.
 
 ## Learning and evaluation
 

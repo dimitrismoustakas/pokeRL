@@ -71,10 +71,27 @@ def _observation() -> dict[str, np.ndarray]:
     }
 
 
-def _encode(obs):
+def _encode(obs, damage=None):
     out = empty_consequence_batch(1)
-    encode_consequence_batch({key: row[None] for key, row in obs.items()}, out)
+    if damage is None:
+        damage = np.full(obs["recent_event_target_outcomes"].shape[:2], -1, np.float32)
+    encode_consequence_batch(
+        {key: row[None] for key, row in obs.items()}, out, damage[None]
+    )
     return {key: batch[0] for key, batch in out.items()}
+
+
+def test_damage_labels_only_the_matching_move_and_observed_targets():
+    obs = _observation()
+    damage = np.full((4, 4), -1, np.float32)
+    damage[0, 2] = 0.46
+    outcomes = obs["recent_event_target_outcomes"]
+    outcomes[0, 3, [TARGET_OUTCOME_DECLARED, TARGET_OUTCOME_IMMUNE]] = 1
+    labels = _encode(obs, damage)
+    np.testing.assert_array_equal(labels["damage_masks"], [[0, 0, 1, 1], [0, 0, 0, 0]])
+    np.testing.assert_allclose(labels["damage_targets"][0, 2:], [0.46, 0])
+    obs["prev_own_move"][0] += 1
+    assert not _encode(obs, damage)["damage_masks"].any()
 
 
 def test_target_phase_labels_declared_route_and_conditional_interactions() -> None:

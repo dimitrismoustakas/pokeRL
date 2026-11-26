@@ -25,10 +25,10 @@ index d9ba739..cf26940 100644
          Ok(s) => return Ok(Seed::fast(s)),
          // An int out of range, or a bool.
 diff --git a/crates/pikapro-py/src/rl.rs b/crates/pikapro-py/src/rl.rs
-index eb8254f..06a5836 100644
+index eb8254f..9f3ea67 100644
 --- a/crates/pikapro-py/src/rl.rs
 +++ b/crates/pikapro-py/src/rl.rs
-@@ -377,10 +377,433 @@ fn bindable<T: Element>(a: &Bound<'_, PyAny>, name: &str, len: usize, dtype: &st
+@@ -377,10 +377,444 @@ fn bindable<T: Element>(a: &Bound<'_, PyAny>, name: &str, len: usize, dtype: &st
      Ok(arr.clone().unbind())
  }
  
@@ -198,8 +198,9 @@ index eb8254f..06a5836 100644
 +    }
 +}
 +
-+/// Checkpoint categorical team inputs from the two information sets.
-+/// The opponent is read exclusively through the public side of the view.
++const MON_FEATURES: usize = 57;
++const BOTH_TEAM_FEATURES: usize = 12 * MON_FEATURES;
++
 +/// Resolve the four public field positions from the same arrays exposed to the policy.
 +fn v6_active_mechanics(
 +    teams: &[i64],
@@ -223,7 +224,7 @@ index eb8254f..06a5836 100644
 +        let slot = (pos % 2) as i64;
 +        let team = &teams[side * 78..(side + 1) * 78];
 +        if let Some(row) = team.chunks_exact(13).position(|mon| mon[10] == slot) {
-+            let offset = (side * 6 + row) * 51;
++            let offset = (side * 6 + row) * MON_FEATURES;
 +            active[0] = 1.;
 +            for (dest, column) in active[1..4].iter_mut().zip([FIRST_TURN, PROTECT_CHAIN, ACTIVE_TURNS]) {
 +                *dest = continuous[offset + column];
@@ -278,6 +279,7 @@ index eb8254f..06a5836 100644
 +    }
 +}
 +
++/// Encode each team as seen from this player's information set.
 +fn v6_team_categories(
 +    view: &PlayerView<'_>,
 +    tables: &pikapro_rl::tables::Tables,
@@ -321,8 +323,9 @@ index eb8254f..06a5836 100644
 +            if let AbilityState::Known(a) = m.ability() {
 +                r[1] = vocab.v6_abilities[a.index()];
 +            }
-+            if let ItemState::Known(a) = m.item() {
-+                r[2] = vocab.v6_items[a.index()];
++            let item = m.item();
++            if let ItemState::Known(id) | ItemState::Gone { item: Some(id), .. } = item {
++                r[2] = vocab.v6_items[id.index()];
 +            }
 +            if let Some(current) = m.species() {
 +                let types = m.active.and_then(|a| a.types).unwrap_or(tables.dex.species(current).types);
@@ -356,8 +359,8 @@ index eb8254f..06a5836 100644
 +            if let Some(last) = m.active.and_then(|a| a.last_move) {
 +                last_moves[who * 6 + i] = vocab.v6_moves[1 + last.index()];
 +            }
-+            let offset = (who * 6 + i) * 51;
-+            let out = &mut continuous[offset..offset + 51];
++            let offset = (who * 6 + i) * MON_FEATURES;
++            let out = &mut continuous[offset..offset + MON_FEATURES];
 +            let truth = |b: bool| f32::from(u8::from(b));
 +            let (v, max) = m.hp();
 +            if max > 0 && (who == 0 || m.public.is_some_and(|p| p.hp.is_known())) {
@@ -380,6 +383,11 @@ index eb8254f..06a5836 100644
 +                out[8 + j] = f32::from(*boost) / 6.;
 +            }
 +            if let Some(active) = m.active {
++                if let Some(stat) = active.boosted_stat
++                    && !m.is_fainted()
++                {
++                    out[51 + stat as usize] = 1.;
++                }
 +                // Nightmare is unavailable in Generation 9 Regulation F.
 +                let effects = [
 +                    V::CONFUSION,
@@ -439,10 +447,13 @@ index eb8254f..06a5836 100644
 +            out[38] = truth(m.is_revealed());
 +            out[39] = r[6..10].iter().filter(|&&id| id != 0).count() as f32 / 4.;
 +            out[40] = truth(matches!(m.ability(), AbilityState::Known(_)));
-+            out[41] = truth(matches!(m.item(), ItemState::Known(_)));
++            out[41] = truth(matches!(
++                item, ItemState::Known(_) | ItemState::NoItem | ItemState::Gone { item: Some(_), .. }
++            ));
 +            out[42] = truth(tera.is_some());
 +            out[43] =
 +                truth(m.terastallized() || m.public.is_some_and(|p| p.flags.has(pikapro_view::MonFlags::USED_TERA)));
++            out[56] = truth(matches!(item, ItemState::Gone { .. }));
 +        }
 +    }
 +}
@@ -462,7 +473,7 @@ index eb8254f..06a5836 100644
      env: VecEnv,
      info: ObsInfo,
      bufs: Bufs,
-@@ -574,7 +997,19 @@ impl PyVecEnv {
+@@ -574,7 +1008,19 @@ impl PyVecEnv {
          let threads = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
          let env = py.detach(|| VecEnv::new(config, threads)).map_err(err)?;
          let bufs = new_bufs(py, &env);
@@ -483,7 +494,7 @@ index eb8254f..06a5836 100644
      }
  
      #[getter]
-@@ -837,6 +1272,335 @@ impl PyVecEnv {
+@@ -837,6 +1283,342 @@ impl PyVecEnv {
          Ok(Some(d))
      }
  
@@ -553,6 +564,7 @@ index eb8254f..06a5836 100644
 +            flags,
 +            outcomes,
 +            activations,
++            damage,
 +            meta,
 +            joint,
 +            tera,
@@ -569,13 +581,14 @@ index eb8254f..06a5836 100644
 +            let mut flags = vec![0f32; n * 2 * 12 * 5];
 +            let mut outcomes = vec![0f32; n * 2 * 12 * 4 * 8];
 +            let mut activations = vec![0i64; n * 2 * 12 * 4];
++            let mut damage = vec![-1f32; n * 2 * 12 * 4];
 +            let mut meta = vec![0f32; n * 2 * 3];
 +            let tables = pikapro_rl::tables::Tables::for_format(&self.env.config().format);
 +            let mut mechanics = vec![0f32; n * 2 * 4 * 17];
 +            let mut mechanics_move = vec![0i64; n * 2 * 4];
 +            let mut teams = vec![0i64; n * 2 * 2 * 6 * 13];
 +            let mut last_moves = vec![0i64; n * 2 * 2 * 6];
-+            let mut continuous = vec![0f32; n * 2 * 2 * 6 * 51];
++            let mut continuous = vec![0f32; n * 2 * BOTH_TEAM_FEATURES];
 +            let mut field = vec![0f32; n * 2 * 36];
 +            let mut joint = vec![false; n * 2 * 28 * 27];
 +            let mut tera = vec![false; n * 2 * 2];
@@ -594,7 +607,7 @@ index eb8254f..06a5836 100644
 +                                &e.slot.last_own_roster[side.index()],
 +                                &e.slot.shown_species[side.foe().index()],
 +                                &mut teams[seat * 156..(seat + 1) * 156],
-+                                &mut continuous[seat * 612..(seat + 1) * 612],
++                                &mut continuous[seat * BOTH_TEAM_FEATURES..(seat + 1) * BOTH_TEAM_FEATURES],
 +                                &mut last_moves[seat * 12..(seat + 1) * 12],
 +                            );
 +                            v6_request_menu(
@@ -715,11 +728,14 @@ index eb8254f..06a5836 100644
 +                                    }
 +                                    outcomes[p * 8 + 6] = f32::from(t.hit_count) / 10.;
 +                                    activations[p] = t.activation.map_or(0, |m| self.v6_moves[1 + m.index()]);
++                                    if let Some(loss) = t.damage {
++                                        damage[p] = loss;
++                                    }
 +                                }
 +                            }
 +                            v6_active_mechanics(
 +                                &teams[seat * 156..(seat + 1) * 156],
-+                                &continuous[seat * 612..(seat + 1) * 612],
++                                &continuous[seat * BOTH_TEAM_FEATURES..(seat + 1) * BOTH_TEAM_FEATURES],
 +                                &events[seat * 96..(seat + 1) * 96],
 +                                &flags[seat * 60..(seat + 1) * 60],
 +                                &outcomes[seat * 384..(seat + 1) * 384],
@@ -736,6 +752,7 @@ index eb8254f..06a5836 100644
 +                flags,
 +                outcomes,
 +                activations,
++                damage,
 +                meta,
 +                joint,
 +                tera,
@@ -750,11 +767,12 @@ index eb8254f..06a5836 100644
 +            )
 +        });
 +        let out = PyDict::new(py);
++        out.set_item("move_damage", array(py, damage, vec![n, 2, 12, 4])?)?;
 +        out.set_item("own_request_moves", array(py, requests, vec![n, 2, 2, 4])?)?;
 +        out.set_item("own_request_move_metadata", array(py, request_meta, vec![n, 2, 2, 4, 2])?)?;
 +        out.set_item("teams", array(py, teams, vec![n, 2, 2, 6, 13])?)?;
 +        out.set_item("last_moves", array(py, last_moves, vec![n, 2, 2, 6])?)?;
-+        out.set_item("continuous", array(py, continuous, vec![n, 2, 2, 6, 51])?)?;
++        out.set_item("continuous", array(py, continuous, vec![n, 2, 2, 6, MON_FEATURES])?)?;
 +        out.set_item("field", array(py, field, vec![n, 2, 36])?)?;
 +        out.set_item("joint", array(py, joint, vec![n, 2, 28, 27])?)?;
 +        out.set_item("can_tera", array(py, tera, vec![n, 2, 2])?)?;
@@ -820,10 +838,10 @@ index eb8254f..06a5836 100644
      /// what the environment hasn't consumed yet).
      fn battle(&self, py: Python<'_>, #[pyo3(from_py_with = arg::i)] i: usize) -> PyResult<PyBattle> {
 diff --git a/crates/pikapro-rl/src/env/battle.rs b/crates/pikapro-rl/src/env/battle.rs
-index c8a321a..be60011 100644
+index c8a321a..80fdcf2 100644
 --- a/crates/pikapro-rl/src/env/battle.rs
 +++ b/crates/pikapro-rl/src/env/battle.rs
-@@ -12,11 +12,335 @@ use pikapro_view::{OpenSheet, OwnOverlay, OwnTeam, PlayerView, PublicTracker, Se
+@@ -12,11 +12,363 @@ use pikapro_view::{OpenSheet, OwnOverlay, OwnTeam, PlayerView, PublicTracker, Se
  
  use super::{Ctx, EpisodeRecord, OpponentSpec, OtsView, Profile};
  use crate::eval::POLICY_TRIES;
@@ -859,6 +877,8 @@ index c8a321a..be60011 100644
 +    pub flags: u8,
 +    pub hit_count: u8,
 +    pub activation: Option<pikapro_data::MoveId>,
++    /// Fraction of visible HP lost to this move's direct hits, including rounded zero.
++    pub damage: Option<f32>,
 +}
 +
 +#[derive(Clone, Copy, Debug, Default)]
@@ -1019,7 +1039,33 @@ index c8a321a..be60011 100644
 +}
 +
 +impl PublicActions {
-+    pub fn observe(&mut self, event: &pikapro::BattleEvent) {
++    fn apply(&mut self, tracker: &mut PublicTracker, event: &pikapro::BattleEvent) {
++        use pikapro::BattleEvent::Damage;
++        use pikapro::event::DamageSource;
++        // Read both bars through the public tracker. Recoil, status, and
++        // item damage have their own sources; direct HP paid by the user
++        // (Substitute, Belly Drum) names the user as its target.
++        if let Damage { target, source: DamageSource::Move, .. } = event
++            && let Some(i) = self.active_move
++            && field_position(target) != 0
++            && field_position(target) != self.current[i].core[1]
++        {
++            let slot = usize::from(target.pos.slot);
++            let before = tracker.side(target.pos.side).slots[slot].hp;
++            tracker.apply(event);
++            let after = tracker.side(target.pos.side).slots[slot].hp;
++            if before.is_known() && after.is_known() {
++                let fraction = |bar: pikapro_view::HpView| f32::from(bar.hp) / f32::from(bar.max);
++                let result = &mut self.current[i].outcomes[usize::from(field_position(target) - 1)];
++                *result.damage.get_or_insert(0.) += (fraction(before) - fraction(after)).max(0.);
++            }
++        } else {
++            tracker.apply(event);
++        }
++        self.observe(event);
++    }
++
++    fn observe(&mut self, event: &pikapro::BattleEvent) {
 +        use pikapro::BattleEvent::*;
 +        use pikapro::event::{CantReason, FieldEffect, MoveAttr as Attribute, MoveFrom};
 +        use pikapro::state::SideCondition as C;
@@ -1160,7 +1206,7 @@ index c8a321a..be60011 100644
  /// Mixed into an episode's battle seed for its own draws (side, opponent,
  /// open sheets), so they don't share the battle's stream.
  const META_SEED: u64 = 0x5EED_0FE9_150D_E5E5;
-@@ -32,6 +356,12 @@ pub struct EnvSlot {
+@@ -32,6 +384,12 @@ pub struct EnvSlot {
      /// With [`OtsView::Player0`] and open sheets, player 0's alone
      /// ([`EnvSlot::tracker_of`]).
      pub(crate) tracker: PublicTracker,
@@ -1173,7 +1219,7 @@ index c8a321a..be60011 100644
      /// With [`OtsView::Player0`] and open sheets, player 1's: the same
      /// events, with closed sheets. `None`
      /// otherwise: both players read `tracker`.
-@@ -109,10 +439,15 @@ impl EnvSlot {
+@@ -109,10 +467,14 @@ impl EnvSlot {
                  tracker.set_open_sheet(side, sheet);
              }
          }
@@ -1183,8 +1229,7 @@ index c8a321a..be60011 100644
 +        let mut shown_species = [[None; 6]; 2];
 +        let mut public_actions = PublicActions::default();
 +        for e in &recent_events {
-+            public_actions.observe(e);
-+            tracker.apply(e);
++            public_actions.apply(&mut tracker, e);
 +            record_switch(&tracker, e, &mut shown_species);
              if let Some(c) = &mut closed {
 -                c.apply(&e);
@@ -1192,7 +1237,7 @@ index c8a321a..be60011 100644
              }
          }
          let own = SideId::BOTH.map(|s| OwnOverlay::from_battle(battle, s));
-@@ -122,6 +457,11 @@ impl EnvSlot {
+@@ -122,6 +484,11 @@ impl EnvSlot {
              t
          });
          EnvSlot {
@@ -1204,7 +1249,7 @@ index c8a321a..be60011 100644
              tracker,
              closed,
              own,
-@@ -289,6 +629,7 @@ pub(crate) struct Job<'a> {
+@@ -289,6 +656,7 @@ pub(crate) struct Job<'a> {
      pub ctx: &'a Ctx,
      pub config: &'a PoolConfig,
      pub base_seed: u64,
@@ -1212,7 +1257,7 @@ index c8a321a..be60011 100644
      pub opponents: &'a [OpponentSpec],
      pub profile: bool,
  }
-@@ -317,6 +658,11 @@ fn run(
+@@ -317,6 +685,11 @@ fn run(
          *stage = Stage::Starting(next_episode(job, env, i));
          begin(job, env, i, actions.is_some() && !failed)?;
          prof.other += clock.lap();
@@ -1224,7 +1269,7 @@ index c8a321a..be60011 100644
      } else if let Some(actions) = actions {
          // Who was asked before anything is submitted: a player's choice can
          // resolve the turn and issue the other a new request, which this
-@@ -611,7 +957,8 @@ fn episode(job: &Job<'_>, i: usize, started: u64, carry: Option<Carry>, place: P
+@@ -611,7 +984,8 @@ fn episode(job: &Job<'_>, i: usize, started: u64, carry: Option<Carry>, place: P
              (sheets, agent_side, opponent, ctx.series.map(|b| Box::new(Series::new(b))))
          }
      };
@@ -1234,7 +1279,7 @@ index c8a321a..be60011 100644
      // The sheets player 0 sees, by side.
      let open = ots.then(|| [&sheets[0], &sheets[1]]);
      let closed = ots && ctx.ots_view != OtsView::Both;
-@@ -713,12 +1060,24 @@ fn submit(
+@@ -713,12 +1087,24 @@ fn submit(
      legal: Option<&LegalActions>,
      choice: Choice,
      dirty: &mut bool,
@@ -1259,7 +1304,7 @@ index c8a321a..be60011 100644
          && let Some(legal) = legal
          && let Err(e) = legal.check(&choice)
      {
-@@ -754,13 +1113,18 @@ fn submit(
+@@ -754,13 +1140,18 @@ fn submit(
  fn act(ctx: &Ctx, env: &mut Env<EnvSlot>, p: usize, acts: &[i64], dirty: &mut bool) -> i8 {
      let side = env.slot.side_of(p);
      let legal = slot_shown(&env.battle, &env.slot, side);
@@ -1280,10 +1325,12 @@ index c8a321a..be60011 100644
          Submitted::Ok => status::SUBMITTED,
          Submitted::Unavailable => status::UNAVAILABLE,
          Submitted::Rejected(_) => status::REJECTED,
-@@ -829,14 +1193,25 @@ fn sync(ctx: &Ctx, env: &mut Env<EnvSlot>, prof: &mut Profile, clock: &mut Clock
+@@ -828,15 +1219,23 @@ fn sync(ctx: &Ctx, env: &mut Env<EnvSlot>, prof: &mut Profile, clock: &mut Clock
+     let slot = &mut env.slot;
      // Read in place, then dropped (a drain would copy each event out first).
      for e in env.battle.events() {
-         slot.tracker.apply(e);
+-        slot.tracker.apply(e);
++        slot.public_actions.apply(&mut slot.tracker, e);
 +        record_switch(&slot.tracker, e, &mut slot.shown_species);
          if let Some(c) = &mut slot.closed {
              c.apply(e);
@@ -1292,9 +1339,6 @@ index c8a321a..be60011 100644
 -    env.battle.drain_events();
 +    slot.recent_events.clear();
 +    slot.recent_events.extend(env.battle.drain_events());
-+    for event in &slot.recent_events {
-+        slot.public_actions.observe(event);
-+    }
 +    slot.resolution += 1;
      prof.view += clock.lap();
      for side in SideId::BOTH {

@@ -518,14 +518,15 @@ def test_amortized_target_decoder_matches_explicit_broadcast_reference() -> None
         + mechanic
     )
     explicit = head.public_consequence_target_head(explicit_hidden)
-    route, interaction, reason, hit_count = explicit.split(
-        (1, 1, NUM_TARGET_INTERACTION_REASONS, MAX_PUBLIC_HIT_COUNT), dim=-1
+    route, interaction, reason, hit_count, damage = explicit.split(
+        (1, 1, NUM_TARGET_INTERACTION_REASONS, MAX_PUBLIC_HIT_COUNT, 1), dim=-1
     )
 
     torch.testing.assert_close(actual["route_logits"], route.squeeze(-1))
     torch.testing.assert_close(actual["interaction_logits"], interaction.squeeze(-1))
     torch.testing.assert_close(actual["interaction_reason_logits"], reason)
     torch.testing.assert_close(actual["hit_count_logits"], hit_count)
+    torch.testing.assert_close(actual["damage_prediction"], damage.squeeze(-1))
 
 
 def test_all_candidate_target_logits_are_zero_for_switch_and_pass() -> None:

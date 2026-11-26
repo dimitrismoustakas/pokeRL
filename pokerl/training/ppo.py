@@ -66,6 +66,7 @@ _PUBLIC_CONSEQUENCE_LOGIT_NAMES = (
     "interaction_logits",
     "interaction_reason_logits",
     "hit_count_logits",
+    "damage_prediction",
     "cant_logits",
     "field_logits",
     "field_change_logits",
@@ -460,6 +461,7 @@ class PPOTrainer:
                 (),
                 device=self.device,
             )
+            metric_sums["aux_damage_mse"] = torch.zeros((), device=self.device)
 
         for epoch in range(self.config.num_epochs):
             env_order_cpu = torch.randperm(E, device="cpu")
@@ -1037,6 +1039,16 @@ class PPOTrainer:
                         + self.config.aux_public_consequence_coef
                         * public_consequence_loss
                     )
+                    damage_mask = batch.public_consequence_damage_masks[:, mb_envs]
+                    damage_error = (
+                        public_consequence_out["public_consequence_damage_prediction"]
+                        - batch.public_consequence_damage_targets[:, mb_envs]
+                    )
+                    damage_mse = (
+                        damage_error.square() * damage_mask
+                    ).sum() / damage_mask.sum().clamp_min(1)
+                    if self.config.aux_damage_coef:
+                        loss = loss + self.config.aux_damage_coef * damage_mse
 
                 pending_aux_diagnostics: dict[str, float] = {}
                 if epoch == self.config.num_epochs - 1:
@@ -1150,6 +1162,7 @@ class PPOTrainer:
                         objectives["public_consequence"] = (
                             self.config.aux_public_consequence_coef
                             * public_consequence_loss
+                            + self.config.aux_damage_coef * damage_mse
                         )
                     if all(value > 0 for value in support.values()):
                         pending_memory_diagnostics = self._gradient_diagnostics(
@@ -1306,6 +1319,7 @@ class PPOTrainer:
                         metric_sums["aux_public_consequence_loss"].add_(
                             public_consequence_loss.detach()
                         )
+                        metric_sums["aux_damage_mse"].add_(damage_mse.detach())
                 num_updates += 1
 
         if num_updates == 0:
@@ -1317,6 +1331,9 @@ class PPOTrainer:
         averaged = {
             key: (value / num_updates).item() for key, value in metric_sums.items()
         }
+        averaged["aux_damage_labeled_targets"] = (
+            batch.public_consequence_damage_masks.sum().item()
+        )
         averaged.update(
             {key: value.item() for key, value in initial_policy_shift.items()}
         )

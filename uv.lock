@@ -359,7 +359,7 @@ source = { path = "vendor/pikapro-0.2.0+pokerl.1.tar.gz" }
 dependencies = [
     { name = "numpy" },
 ]
-sdist = { hash = "sha256:dc0d6482acde1e05e2283c9c4fadcf732dd010663dd905305c1fb15f57e9c33a" }
+sdist = { hash = "sha256:973ea0afbefe7f7b8ec41f887e2bbca5756832c3bcfe8846f70dd921a4fcb4ee" }
 
 [package.metadata]
 requires-dist = [

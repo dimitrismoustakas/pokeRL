@@ -8,13 +8,16 @@ import torch
 
 from pokerl.data import GameData
 from pokerl.env.actions import SWITCH_OFFSET
+from pokerl.env.observation import ITEM_LOST_OFFSET, PARADOX_BOOST_OFFSET
 from pokerl.env.vector import PikaproVectorEnv
 from pokerl.env.vector_inputs import (
+    DECODED_CHOICE,
     HOLD,
     RESET,
     VectorActionCodec,
     configure_player_inputs,
     model_inputs,
+    player_env,
 )
 from pokerl.team_pool import load_team_pool
 
@@ -23,6 +26,79 @@ from pokerl.team_pool import load_team_pool
 def teams():
     pool = load_team_pool("data/team_pools/gen9vgc2026regf/manifest.json", seed=51)
     return pool.sample_packed_pair()
+
+
+def test_paradox_announcement_item_loss_and_damage_are_public():
+    pool = load_team_pool("data/team_pools/gen9vgc2026regf/manifest.json")
+    team = next(
+        entry.packed_team for entry in pool.entries if "009_battleroom" in entry.file
+    )
+    lead, rest = team.split("]", 1)
+    pairs = []
+    for evs in ("4,,252,,,252", "4,,,252,,252"):
+        fields = lead.split("|")
+        fields[6] = evs
+        pairs.append((team, "|".join(fields) + "]" + rest))
+    data = GameData()
+    previous = np.zeros((4, 2, 5), dtype=np.int64)
+    with closing(player_env(pairs, threads=1)) as env:
+        configure_player_inputs(env, data)
+        for lane in range(2):
+            env._env.set_battle_seed(lane, [23, 9, 12, 19])
+        env.reset(seed=138)
+        preview = model_inputs(env._env.v6_player_inputs(), previous)
+        for rows in preview.values():
+            np.testing.assert_array_equal(rows[0], rows[2])
+
+        codec = VectorActionCodec(env.space)
+        orders = np.full((2, 2, 2), -1, dtype=np.int64)
+        orders[:, 0, 0] = codec.preview[5, 1, 2, 3]
+        orders[:, 1, 0] = codec.preview[0, 1, 2, 3]
+        env.step(orders)
+        opening = model_inputs(env._env.v6_player_inputs(), previous)
+        for seat, side in enumerate(("opp_", "own_")):
+            for lane, boosted_stat in enumerate((4, 2)):  # Speed or Sp. Atk
+                row = 2 * lane + seat
+                slots = opening[side + "species"][row]
+                mon = np.flatnonzero(slots == data.species_to_idx["fluttermane"]).item()
+                state = opening[side + "continuous"][row, mon]
+                assert state[ITEM_LOST_OFFSET] == 1
+                assert (
+                    opening[side + "item"][row, mon]
+                    == data.item_to_idx["boosterenergy"]
+                )
+                np.testing.assert_array_equal(
+                    state[PARADOX_BOOST_OFFSET:ITEM_LOST_OFFSET],
+                    np.eye(5)[boosted_stat],
+                )
+
+        # Two attacks into Ogerpon take its public bar from 100 to 46 to 0.
+        # In the other lane Flutter Mane switches out and keeps the item loss.
+        for lane, choices in enumerate(
+            (
+                ("move 1 2, move 2 2", "move 1 2, move 2 1"),
+                ("move 4, move 4", "switch 3, move 4"),
+            )
+        ):
+            battle = env.battle(lane)
+            for seat, choice in enumerate(choices):
+                orders[lane, seat, 0] = DECODED_CHOICE + env.space.encode(
+                    battle.parse_choice(seat, choice)
+                )
+        env.step(orders)
+        assert not env.take_errors()
+        block = env._env.v6_player_inputs()
+        for seat, target in enumerate((3, 1)):
+            damage = block["move_damage"][0, seat, :, target]
+            np.testing.assert_allclose(damage[damage >= 0], [0.54, 0.46], atol=1e-6)
+        switched = model_inputs(block, previous)
+        for row, side in ((2, "opp_"), (3, "own_")):
+            mon = np.flatnonzero(
+                switched[side + "species"][row] == data.species_to_idx["fluttermane"]
+            ).item()
+            state = switched[side + "continuous"][row, mon]
+            assert state[ITEM_LOST_OFFSET] == 1
+            assert not state[PARADOX_BOOST_OFFSET:ITEM_LOST_OFFSET].any()
 
 
 def test_reset_stream_distinguishes_lanes_and_episodes_on_identical_teams(teams):

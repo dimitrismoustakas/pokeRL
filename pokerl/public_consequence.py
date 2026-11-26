@@ -104,6 +104,8 @@ def empty_consequence_batch(size: int) -> dict[str, np.ndarray]:
         "interaction_reason_masks": np.empty(targets, bool),
         "hit_count_labels": np.empty(targets, np.int64),
         "hit_count_masks": np.empty(targets, bool),
+        "damage_targets": np.empty(targets, np.float32),
+        "damage_masks": np.empty(targets, bool),
         "cant_targets": np.empty(opponents, np.float32),
         "cant_masks": np.empty(opponents, bool),
         "field_targets": np.empty((*slots, PUBLIC_CONSEQUENCE_FIELD_DIM), np.float32),
@@ -112,7 +114,7 @@ def empty_consequence_batch(size: int) -> dict[str, np.ndarray]:
 
 
 def encode_consequence_batch(
-    obs: Mapping[str, np.ndarray], out: dict[str, np.ndarray]
+    obs: Mapping[str, np.ndarray], out: dict[str, np.ndarray], move_damage: np.ndarray
 ) -> None:
     """Write slot-aligned consequences for a batch of post-action player observations."""
     for name, values in out.items():
@@ -190,12 +192,27 @@ def encode_consequence_batch(
     )
     out["move_branch_labels"][lanes, slots] = branch
     out["move_branch_masks"][lanes, slots] = branch >= 0
+    outcomes = obs["recent_event_target_outcomes"][lanes, events]
+    visible_loss = move_damage[lanes, events]
+    stopped_at_target = (outcomes[..., TARGET_OUTCOME_DECLARED] > 0.5) & (
+        outcomes[
+            ...,
+            [
+                TARGET_OUTCOME_MISSED,
+                TARGET_OUTCOME_IMMUNE,
+                TARGET_OUTCOME_BLOCKED,
+                TARGET_OUTCOME_PROTECTED,
+            ],
+        ].any(axis=-1)
+    )
+    out["damage_targets"][lanes, slots] = np.maximum(visible_loss, 0)
+    out["damage_masks"][lanes, slots] = (visible_loss >= 0) | stopped_at_target
     targeted = branch == MOVE_BRANCH_TARGET_PHASE
     _encode_target_phase(
         out,
         lanes[targeted],
         slots[targeted],
-        obs["recent_event_target_outcomes"][lanes[targeted], events[targeted]],
+        outcomes[targeted],
     )
 
     spread = np.zeros_like(resolved)

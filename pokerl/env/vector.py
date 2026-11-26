@@ -315,6 +315,7 @@ class PikaproVectorEnv:
         awaiting_resolution = playing.copy()
         rewards = np.zeros(self.num_envs, np.float32)
         dones = np.zeros(self.num_envs, bool)
+        move_damage = np.empty_like(self.block["move_damage"][:, 0])
         infos = [{} for _ in range(self.num_envs)]
         first = True
         while playing.any():
@@ -345,11 +346,13 @@ class PikaproVectorEnv:
             if len(ended):
                 dones[ended] = True
                 rewards[ended] = self.state.reward[ended, 0]
+                move_damage[ended] = self.block["move_damage"][ended, 0]
                 self._finish(ended, rewards, infos)
             playing &= ~(self.state.needs_action[:, 0] & ~forced_passes(self.block, 0))
         if self.collect_timing:
             self.timing["native_environment_sec"] += perf_counter() - started
-        return *self._current(), rewards, dones, infos
+        move_damage[~dones] = self.block["move_damage"][~dones, 0]
+        return *self._current(), rewards, dones, infos, move_damage
 
     def reset(self):
         return self._current()

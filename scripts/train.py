@@ -432,6 +432,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--aux-damage-coef",
+        type=float,
+        default=None,
+        help="Weight of the auxiliary regression on public HP lost to the chosen attack.",
+    )
+    parser.add_argument(
         "--diagnose-memory-gradients",
         action="store_true",
         help=(
@@ -496,6 +502,7 @@ def training_config(args: argparse.Namespace) -> TrainingConfig:
         "aux_hidden_info_coef": args.aux_hidden_info_coef,
         "aux_opponent_intent_coef": args.aux_opponent_intent_coef,
         "aux_public_consequence_coef": args.aux_public_consequence_coef,
+        "aux_damage_coef": args.aux_damage_coef,
         "diagnose_memory_gradients": args.diagnose_memory_gradients,
     }
     settings = {name: value for name, value in overrides.items() if value is not None}
@@ -783,7 +790,9 @@ def collect_synchronous_rollout(
                 masks_for_buffer = masks_t
 
         started = time.perf_counter() if collect_timing else 0.0
-        next_obs, next_masks, rewards, dones, infos = parallel_env.step(actions)
+        next_obs, next_masks, rewards, dones, infos, move_damage = parallel_env.step(
+            actions
+        )
         if collect_timing:
             profile["env_step_sec"] += time.perf_counter() - started
 
@@ -812,7 +821,7 @@ def collect_synchronous_rollout(
                     column = next_obs[key].copy()
                     column[terminal_lanes] = [row[key] for row in final]
                     consequence_obs[key] = column
-        encode_consequence_batch(consequence_obs, public_consequence_np)
+        encode_consequence_batch(consequence_obs, public_consequence_np, move_damage)
         # A terminal action resolves its moves without advancing the public field a turn.
         public_consequence_np["field_masks"][terminal_lanes] = False
         for env_index, info in enumerate(infos):
@@ -1185,6 +1194,7 @@ def train():
                 "aux_public_consequence_coef": (
                     train_config.aux_public_consequence_coef
                 ),
+                "aux_damage_coef": train_config.aux_damage_coef,
                 "diagnose_memory_gradients": train_config.diagnose_memory_gradients,
                 "league_size": train_config.league_size,
                 "league_update_interval": train_config.league_update_interval,
